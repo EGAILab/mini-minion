@@ -1,0 +1,37 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+dist/
+build/
+*.egg-info/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# uv
+.uv/
+uv.lock
+
+# editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# os
+.DS_Store
+Thumbs.db
+
+# superseded config format
+config.toml
+
+# runtime workspace (user data, not source)
+~/.mini-minion/

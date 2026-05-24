@@ -1,0 +1,31 @@
+{
+  "models": {
+    "providers": {
+      "aliyuncs": {
+        "baseUrl": "https://coding.dashscope.aliyuncs.com/v1",
+        "api": "openai-completions",
+        "models": [
+          {"id": "glm-5", "name": "glm-5 (Custom Provider)", "maxTokens": 128000}
+        ]
+      },
+      "lmstudio": {
+        "baseUrl": "http://127.0.0.1:1234/v1",
+        "api": "lmstudio",
+        "models": [
+          {"id": "qwen-qwen3.5-9b", "name": "Qwen 3.5 9B", "maxTokens": 4096}
+        ]
+      }
+    }
+  },
+  "agents": {
+    "main": {
+      "model": "lmstudio/qwen-qwen3.5-9b"
+    },
+    "researcher": {
+      "model": "aliyuncs/glm-5"
+    }
+  },
+  "workspace": {
+    "path": "~/.mini-minion"
+  }
+}
