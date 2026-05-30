@@ -73,3 +73,34 @@ def test_read_offset_beyond_eof(tmp_path):
     result = ReadTool().execute(path=str(f), offset=100)
     # Should not crash; returns empty or benign output
     assert isinstance(result, str)
+
+
+def test_read_binary_file_returns_error(tmp_path):
+    """Files containing null bytes must be rejected with a clear error."""
+    f = tmp_path / "data.bin"
+    f.write_bytes(b"not text\x00binary content")
+    result = ReadTool().execute(path=str(f))
+    assert "binary" in result.lower()
+
+
+def test_read_byte_cap_truncates(tmp_path):
+    """Files exceeding _MAX_BYTES must be truncated with a continuation hint."""
+    f = tmp_path / "large.txt"
+    # Use 300-char lines (301 bytes each). The byte cap triggers after ~170 lines,
+    # which is before the 200-line default limit, so bytes win the race.
+    line = "x" * 300 + "\n"
+    f.write_text(line * 300, encoding="utf-8")
+    result = ReadTool().execute(path=str(f))
+    assert "KB" in result
+    assert "offset=" in result
+
+
+def test_read_streams_correct_lines_at_offset(tmp_path):
+    """Streaming must return the correct window without loading the whole file."""
+    f = tmp_path / "lines.txt"
+    f.write_text("\n".join(str(i) for i in range(1, 101)), encoding="utf-8")
+    result = ReadTool().execute(path=str(f), offset=50, limit=5)
+    assert "50: 50" in result
+    assert "54: 54" in result
+    assert "49: 49" not in result
+    assert "55: 55" not in result

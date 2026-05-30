@@ -8,14 +8,14 @@ _IS_WINDOWS = platform.system() == "Windows"
 
 
 def test_bash_runs_command():
-    tool = BashTool()
+    tool = BashTool(confirm=False)
     result = tool.execute(command="echo hello")
     assert "hello" in result
 
 
 def test_bash_uses_platform_shell():
     """Verify the correct shell interpreter is used per OS."""
-    tool = BashTool()
+    tool = BashTool(confirm=False)
     if _IS_WINDOWS:
         # $env:OS is PowerShell-only; cmd.exe does not expand it
         result = tool.execute(command="$env:OS")
@@ -28,7 +28,7 @@ def test_bash_uses_platform_shell():
 
 def test_bash_captures_stderr():
     """Stderr output from the subprocess must be returned."""
-    tool = BashTool()
+    tool = BashTool(confirm=False)
     if _IS_WINDOWS:
         result = tool.execute(command="Write-Error 'deliberate_error'")
     else:
@@ -37,20 +37,20 @@ def test_bash_captures_stderr():
 
 
 def test_bash_timeout():
-    tool = BashTool()
+    tool = BashTool(confirm=False)
     result = tool.execute(command='python -c "import time; time.sleep(5)"', timeout=1)
     assert "timed out" in result.lower()
 
 
 def test_bash_no_output():
-    tool = BashTool()
+    tool = BashTool(confirm=False)
     result = tool.execute(command='python -c "pass"')
     assert result == "(no output)"
 
 
 def test_bash_nonzero_exit_still_returns_output():
     """A command that exits non-zero should still return whatever it printed."""
-    tool = BashTool()
+    tool = BashTool(confirm=False)
     if _IS_WINDOWS:
         result = tool.execute(command="Write-Output 'before_exit'; exit 1")
     else:
@@ -59,7 +59,7 @@ def test_bash_nonzero_exit_still_returns_output():
 
 
 def test_bash_schema():
-    tool = BashTool()
+    tool = BashTool(confirm=False)
     schema = tool.schema
     assert schema.name == "bash"
     assert "command" in schema.parameters["properties"]
@@ -70,7 +70,7 @@ def test_bash_schema():
 
 def test_bash_schema_description_matches_os():
     """Schema description must name the correct shell for the running OS."""
-    tool = BashTool()
+    tool = BashTool(confirm=False)
     desc = tool.schema.description.lower()
     if _IS_WINDOWS:
         assert "powershell" in desc

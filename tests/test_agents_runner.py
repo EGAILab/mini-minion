@@ -143,6 +143,54 @@ def test_empty_response_no_print(capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_tool_call_with_parse_error_feeds_error_to_model(capsys):
+    """When tc.error is set, the parse error is fed back as the tool result instead of executing."""
+    messages: list[dict] = []
+    provider = _provider(
+        LLMResponse(
+            text="",
+            tool_calls=[ToolCall(id="x", name="echo", arguments={}, error="Invalid JSON arguments for 'echo': ...")],
+            finish_reason="tool_calls",
+        ),
+        LLMResponse(text="I see the error, let me retry.", finish_reason="stop"),
+    )
+
+    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages)
+
+    tool_result = next(m for m in messages if m["role"] == "tool")
+    assert "Invalid JSON" in tool_result["content"]
+    assert tool_result["tool_call_id"] == "x"
+    assert "Ada: I see the error" in capsys.readouterr().out
+
+
+def test_tool_round_limit_stops_loop(capsys):
+    """Loop must stop after _MAX_TOOL_ROUNDS calls when the model never stops using tools."""
+    from mini_minion.agents.runner import _MAX_TOOL_ROUNDS
+
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    messages: list[dict] = []
+
+    # Provider always responds with tool_calls — never a final answer.
+    never_stops = [
+        LLMResponse(
+            text="",
+            tool_calls=[ToolCall(id=f"tc{i}", name="echo", arguments={"text": "x"})],
+            finish_reason="tool_calls",
+        )
+        for i in range(_MAX_TOOL_ROUNDS + 5)
+    ]
+    provider = _provider(*never_stops)
+
+    run_turn(provider, "Ada", "system", 100, registry, messages)
+
+    # Provider called exactly _MAX_TOOL_ROUNDS times, not forever.
+    assert provider.chat.call_count == _MAX_TOOL_ROUNDS
+    # Last message is the cap notification appended as an assistant message.
+    assert messages[-1]["role"] == "assistant"
+    assert "Stopped" in messages[-1]["content"]
+
+
 def test_provider_called_with_correct_args():
     registry = ToolRegistry()
     registry.register(_EchoTool())

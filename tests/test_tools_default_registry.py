@@ -1,5 +1,7 @@
 """Tests for default_registry factory."""
 
+import builtins
+
 from mini_minion.tools import default_registry
 
 
@@ -44,3 +46,57 @@ def test_default_registry_can_execute_glob(tmp_path):
     reg = default_registry()
     result = reg.execute("glob", {"pattern": "*.py", "path": str(tmp_path)})
     assert "a.py" in result
+
+
+# ---------------------------------------------------------------------------
+# root parameter — verify it is threaded to all file tools
+# ---------------------------------------------------------------------------
+
+
+def test_default_registry_root_enforced_in_read(tmp_path):
+    """Read outside the workspace root must be rejected when root is set."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_text("shh")
+    reg = default_registry(root=root)
+    result = reg.execute("read", {"path": str(outside)})
+    assert "outside the workspace root" in result
+
+
+def test_default_registry_root_enforced_in_write(tmp_path):
+    """Write outside the workspace root must be rejected when root is set."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "evil.txt"
+    reg = default_registry(root=root)
+    result = reg.execute("write", {"path": str(outside), "content": "bad"})
+    assert "outside the workspace root" in result
+    assert not outside.exists()
+
+
+def test_default_registry_root_enforced_in_glob(tmp_path):
+    """Glob with explicit path outside the workspace root must be rejected."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "other"
+    outside.mkdir()
+    reg = default_registry(root=root)
+    result = reg.execute("glob", {"pattern": "*", "path": str(outside)})
+    assert "outside the workspace root" in result
+
+
+# ---------------------------------------------------------------------------
+# confirm_bash parameter — verify it is threaded to BashTool
+# ---------------------------------------------------------------------------
+
+
+def test_default_registry_confirm_bash_false_runs_without_prompt(monkeypatch):
+    """confirm_bash=False must not call input() before running bash commands."""
+    monkeypatch.setattr(
+        builtins, "input",
+        lambda _: (_ for _ in ()).throw(AssertionError("input() must not be called")),
+    )
+    reg = default_registry(confirm_bash=False)
+    result = reg.execute("bash", {"command": "echo hello-from-test"})
+    assert "hello-from-test" in result

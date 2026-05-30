@@ -1,6 +1,6 @@
 # mini-minion
 
-A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution, and persistent memory. Two agents — **Ada** (general assistant) and **Elizabeth** (research specialist) — run a Think-Act-Observe loop, calling tools until they reach a final answer, then persisting conversation history across sessions.
+A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution, and persistent memory. Two agents — **Ada** (general assistant) and **Elizabeth** (research specialist) — run a Think-Act-Observe loop, calling tools until they reach a final answer, then persisting conversation history across sessions. Responses can be streamed token-by-token in interactive mode.
 
 ---
 
@@ -29,7 +29,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 **Requirements:** Python 3.11+, [uv](https://docs.astral.sh/uv/)
 
 ```bash
-# Install dependencies
+# Install dependencies (uv.lock is committed — this gives a reproducible environment)
 uv sync
 
 # Set API keys
@@ -55,12 +55,13 @@ You: exit
 
 ```
 mini-minion/
-├── config.json                  # Provider, model, agent, and workspace config
+├── config.json                  # Provider, model, agent, routing, and workspace config
 ├── .env                         # API keys (never commit)
 ├── pyproject.toml               # Package metadata and dependencies
 ├── src/mini_minion/
 │   ├── minion.py                # Entry point — interactive REPL
 │   ├── config.py                # Config loader (config.json + .env)
+│   ├── context.py               # Context window overflow detection and history compaction
 │   ├── providers/               # LLM API adapters
 │   │   ├── base.py              # Protocol, ToolCall, LLMResponse types
 │   │   ├── openai_compatible.py # OpenAI Chat Completions adapter
@@ -88,7 +89,7 @@ mini-minion/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store
 │       └── __init__.py
-└── tests/                       # pytest test suite (110 tests)
+└── tests/                       # pytest test suite (256 tests, 1 skipped)
 ```
 
 ---
@@ -105,24 +106,31 @@ mini-minion/
         "baseUrl": "http://127.0.0.1:1234/v1",
         "api": "lmstudio",
         "models": [
-          {"id": "qwen-qwen3.5-9b", "name": "Qwen 3.5 9B", "maxTokens": 4096}
+          {"id": "qwen-qwen3.5-9b", "name": "Qwen 3.5 9B", "contextWindow": 8192, "maxOutputTokens": 4096}
         ]
       },
       "aliyuncs": {
         "baseUrl": "https://coding.dashscope.aliyuncs.com/v1",
         "api": "openai-completions",
         "models": [
-          {"id": "glm-5", "name": "glm-5", "maxTokens": 128000}
+          {"id": "glm-5", "name": "glm-5", "contextWindow": 128000, "maxOutputTokens": 4096}
         ]
       }
     }
   },
   "agents": {
     "main":       {"model": "lmstudio/qwen-qwen3.5-9b"},
-    "researcher": {"model": "aliyuncs/glm-5"}
+    "researcher": {"model": "aliyuncs/glm-5", "route_prefix": "/research"}
   },
   "workspace": {
     "path": "~/.mini-minion"
+  },
+  "streaming": {
+    "chat_mode": true,
+    "task_mode": false
+  },
+  "compaction": {
+    "preserve_tokens": 4000
   }
 }
 ```
@@ -133,9 +141,15 @@ mini-minion/
 |---|---|
 | `models.providers.<name>.baseUrl` | API base URL for the provider |
 | `models.providers.<name>.api` | Adapter type: `openai-completions`, `lmstudio`, or `anthropic` |
-| `models.providers.<name>.models` | List of available models with `id` and `maxTokens` |
+| `models.providers.<name>.models` | List of available models with `id`, `contextWindow`, and `maxOutputTokens` |
 | `agents.<id>.model` | `"<provider>/<model-id>"` — which model each agent uses |
+| `agents.<id>.route_prefix` | Optional command prefix that routes to this agent (e.g. `"/research"`). Omit for the default fallback agent. |
 | `workspace.path` | Root directory for persisted history and memory (tilde-expanded) |
+| `streaming.chat_mode` | `true` to stream tokens in the interactive REPL; `false` for full-response display |
+| `streaming.task_mode` | `true` to stream tokens in programmatic/task invocations; `false` by default |
+| `models.providers.<name>.models[].contextWindow` | The model's total token capacity; used per-agent as the compaction budget |
+| `models.providers.<name>.models[].maxOutputTokens` | Maximum tokens the model may generate per response; sent to the API as `max_tokens` |
+| `compaction.preserve_tokens` | Tokens reserved for the next response and overhead; clamped to `[2000, 8000]` |
 
 ### `.env`
 
@@ -161,21 +175,27 @@ router.resolve()
     │  "/research ..." → researcher (Elizabeth)
     │  everything else → main (Ada)
     ▼
-run_turn(provider, agent_name, system_prompt, max_tokens, tools, messages)
+compactor.compact(history, provider)   ← summarises old history if over token budget
+    │  no-op when under budget
+    ▼
+run_turn(provider, agent_name, system_prompt, max_tokens, tools, messages, stream)
     │
-    │  ┌─────────────────────────────────────────────┐
-    │  │           Think-Act-Observe loop             │
-    │  │                                              │
-    │  │  provider.chat(system, messages, tools, n)   │
-    │  │       │                                      │
-    │  │       ▼                                      │
-    │  │  LLMResponse(text, tool_calls, finish_reason)│
-    │  │       │                                      │
-    │  │  finish_reason == "tool_calls"?              │
-    │  │    yes → execute each tool → append results  │
-    │  │          → loop                              │
-    │  │    no  → print response → return             │
-    │  └─────────────────────────────────────────────┘
+    │  ┌────────────────────────────────────────────────────┐
+    │  │              Think-Act-Observe loop                 │
+    │  │                                                    │
+    │  │  provider.chat(system, messages, tools, n,         │
+    │  │                on_token=callback if stream else None│
+    │  │       │                                            │
+    │  │       ▼                                            │
+    │  │  LLMResponse(text, tool_calls, finish_reason,      │
+    │  │              was_streamed)                         │
+    │  │       │                                            │
+    │  │  finish_reason == "tool_calls"?                    │
+    │  │    yes → execute each tool → append results        │
+    │  │          → loop                                    │
+    │  │    no  → print response (or newline if streamed)   │
+    │  │          → return                                  │
+    │  └────────────────────────────────────────────────────┘
     │
     ▼
 short_term.save(agent_id, messages)   ← persists history to JSONL
@@ -192,8 +212,11 @@ session_store.touch(agent_id, ...)    ← updates turn count and timestamp
 │   ├── main.jsonl        ← Ada's conversation history
 │   └── researcher.jsonl  ← Elizabeth's conversation history
 ├── memory/
-│   ├── project-goals.md  ← long-term notes saved by agents
-│   └── api-research.md
+│   ├── main/             ← Ada's long-term notes (isolated)
+│   │   ├── project-goals.md
+│   │   └── api-research.md
+│   └── researcher/       ← Elizabeth's long-term notes (isolated)
+│       └── findings.md
 └── sessions.json         ← session metadata (turn counts, timestamps)
 ```
 
@@ -205,13 +228,15 @@ session_store.touch(agent_id, ...)    ← updates turn count and timestamp
 
 **File:** `src/mini_minion/config.py`
 
-Loads `config.json` and `.env` at import time. Exposes two module-level values:
+Loads `config.json` and `.env` at import time. Exposes four module-level values:
 
 ```python
-from mini_minion.config import agents, workspace
+from mini_minion.config import agents, workspace, streaming, compaction
 
-agents    # dict[str, AgentModelConfig] — one entry per agent in config.json
-workspace # Path — resolved workspace directory
+agents     # dict[str, AgentModelConfig] — one entry per agent in config.json
+workspace  # Path — resolved workspace directory
+streaming  # StreamingConfig — whether to stream in each execution mode
+compaction # CompactionConfig — shared token reservation (context_window is per-agent on ModelConfig)
 ```
 
 **Types:**
@@ -226,16 +251,40 @@ class ProviderConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    id: str         # e.g. "qwen-qwen3.5-9b"
-    max_tokens: int
+    id: str              # e.g. "qwen-qwen3.5-9b"
+    context_window: int  # total token capacity; used as compaction budget for this agent
+    max_output_tokens: int  # generation limit sent to the API as max_tokens
 
 @dataclass(frozen=True)
 class AgentModelConfig:
     provider: ProviderConfig
     model: ModelConfig
+    route_prefix: str | None = None   # "/research", "/code", etc.; None = default fallback
+
+@dataclass(frozen=True)
+class StreamingConfig:
+    chat_mode: bool   # stream in the interactive REPL?
+    task_mode: bool   # stream in programmatic/task use?
+
+@dataclass(frozen=True)
+class CompactionConfig:
+    preserve_tokens: int   # tokens reserved for response + overhead; clamped to [2k, 8k]
+    # context_window is per-agent, stored in ModelConfig.context_window
 ```
 
-API key resolution order: `config.json` `apiKey` field → `{PROVIDER_NAME}_API_KEY` environment variable.
+API key resolution: set `{PROVIDER_NAME_UPPERCASE}_API_KEY` in `.env` (or the environment directly). Inline `apiKey` fields in `config.json` are not supported — they risk being committed to version control.
+
+**Validation errors:**
+
+If `config.json` is missing, malformed JSON, or fails validation, startup raises `ConfigError` with a list of every problem found:
+
+```
+Invalid config.json:
+  agents.main.model: Unknown provider 'lmstdio'. Did you mean 'lmstudio'?
+  streaming.chat_mode: Expected boolean (true/false), got 'true'. JSON strings are not booleans.
+```
+
+All issues are collected in one pass — fix everything before restarting. The error object exposes `ConfigError.issues: list[ConfigIssue]`, where each `ConfigIssue` has a `path` (dot-separated JSON key) and a `message`.
 
 ---
 
@@ -255,8 +304,11 @@ class LLMProvider(Protocol):
         messages: list[dict],
         tools: list[dict],
         max_tokens: int,
+        on_token: Callable[[str], None] | None = None,  # pass to enable streaming
     ) -> LLMResponse: ...
 ```
+
+When `on_token` is provided, the provider calls it with each text fragment as it arrives. When `on_token` is `None` (the default), a single blocking request is made.
 
 #### Response types
 
@@ -272,7 +324,10 @@ class LLMResponse:
     text: str
     tool_calls: list[ToolCall] = []
     finish_reason: str = "stop"   # "stop" | "tool_calls"
+    was_streamed: bool = False    # True if text was already printed via on_token
 ```
+
+`was_streamed` tells the runner whether the text has already been printed token-by-token. When `True`, the runner only needs to print a final newline rather than the full response text.
 
 #### Factory
 
@@ -336,9 +391,11 @@ agent_id, message = resolve("what is dependency injection?")
 # → ("main", "what is dependency injection?")
 ```
 
-Rules:
-- `/research ` (with trailing space) → `"researcher"`, payload is everything after the prefix
-- Everything else → `"main"`
+Routing is **config-driven**: rules are read from `config.json` at startup via `_build_routes()`, not hard-coded. Each agent with a `"route_prefix"` field gets a routing entry; the agent without one is the default fallback.
+
+- A prefix matches only when followed by a space (so `/research ` matches but `/researchfoo` does not).
+- Routes are sorted longest-first to prevent prefix shadowing.
+- Adding a new routed agent requires only a `"route_prefix"` entry in `config.json` — no Python changes.
 
 #### Runner (`runner.py`)
 
@@ -352,10 +409,11 @@ run_turn(
     max_tokens,   # int
     tools,        # ToolRegistry
     messages,     # list[dict] — mutated in place
+    stream,       # bool — True to stream tokens as they arrive (default False)
 )
 ```
 
-Implements the TAO loop. Appends all messages (assistant turns, tool calls, tool results) directly to the `messages` list. Prints `"{agent_name}: {text}"` when the agent produces a text response. Tool calls are printed as `"  [tool: name({args})]"` for observability.
+Implements the TAO loop. Appends all messages (assistant turns, tool calls, tool results) directly to the `messages` list. When `stream=True`, tokens are printed as they arrive and a final newline is added when done. When `stream=False`, the full response is printed as `"{agent_name}: {text}"` after the model finishes. Tool calls are always printed as `"  [tool: name({args})]"` for observability.
 
 ---
 
@@ -399,27 +457,27 @@ registry.execute("tool_name", {"arg": "value"})  # str
 
 | Tool class | Name | Description |
 |---|---|---|
-| `ReadTool` | `read` | Read a file (with optional `offset`/`limit`) or list a directory |
-| `WriteTool` | `write` | Write content to a file, creating parent directories as needed |
-| `GlobTool` | `glob` | Find files matching a glob pattern, sorted by modification time |
-| `BashTool` | `bash` | Run a shell command — PowerShell on Windows, bash on Unix |
+| `ReadTool` | `read` | Read a file (numbered lines, optional `offset`/`limit`) or list a directory. Rejects binary files and caps at 50 KB. Paths outside the workspace root are rejected. |
+| `WriteTool` | `write` | Write content to a file, creating parent directories as needed. Paths outside the workspace root are rejected. |
+| `GlobTool` | `glob` | Find files matching a glob pattern, sorted newest-first. Skips `.git`/`.venv`/`__pycache__`/etc. Caps at 200 results. Paths outside the workspace root are rejected. |
+| `BashTool` | `bash` | Run a shell command — PowerShell on Windows, bash on Unix. Prints the command and requires `y` confirmation before executing (by default). |
 | `SaveMemoryTool` | `save_memory` | Save a Markdown note to long-term memory |
-| `SearchMemoryTool` | `search_memory` | Case-insensitive search across all long-term memory notes |
+| `SearchMemoryTool` | `search_memory` | Case-insensitive search across all long-term memory notes (capped at 20 results) |
 
 **`ReadTool` parameters:**
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `path` | string | required | File or directory path |
+| `path` | string | required | File or directory path (must be inside the workspace root) |
 | `offset` | integer | 1 | First line to return (1-indexed) |
-| `limit` | integer | 200 | Maximum lines to return |
+| `limit` | integer | 200 | Maximum lines to return; also hard-capped at 50 KB |
 
 **`GlobTool` parameters:**
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `pattern` | string | required | Glob pattern (e.g. `**/*.py`) |
-| `path` | string | cwd | Root directory to search in |
+| `path` | string | workspace root | Root directory to search in (must be inside the workspace root) |
 
 **`BashTool` parameters:**
 
@@ -433,13 +491,23 @@ registry.execute("tool_name", {"arg": "value"})  # str
 ```python
 from mini_minion.tools import default_registry
 from mini_minion.memory import LongTermMemory
+from pathlib import Path
 
-# Without memory tools (4 tools: read, write, glob, bash)
+# Minimal (4 tools: read, write, glob, bash) — unrestricted paths, bash requires confirmation
 reg = default_registry()
 
+# With workspace sandboxing and bash confirmation (recommended for interactive use)
+reg = default_registry(root=Path.cwd(), confirm_bash=True)
+
 # With memory tools (6 tools: + save_memory, search_memory)
-reg = default_registry(long_term=LongTermMemory(some_path))
+reg = default_registry(long_term=LongTermMemory(some_path), root=Path.cwd())
 ```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `long_term` | `LongTermMemory \| None` | `None` | If provided, also registers `save_memory` and `search_memory` tools |
+| `root` | `Path \| None` | `None` | Workspace root — `read`/`write`/`glob` reject paths outside this boundary. `None` = unrestricted |
+| `confirm_bash` | `bool` | `True` | If `True`, `bash` prints the command and requires `y` before executing |
 
 ---
 
@@ -481,7 +549,7 @@ mem.list_keys()                        # list[str] — all stored keys
 mem.delete("api-research")            # bool — True if file existed
 ```
 
-`search()` is a simple substring scan across all `.md` files. It returns all matching `(key, content)` pairs sorted alphabetically by key.
+`search()` is a case-insensitive keyword scan across all `.md` files. It splits the query on whitespace and returns notes where any term appears in the content or key. Results are sorted alphabetically by key and capped at 20 (`_SEARCH_MAX_RESULTS`) to prevent context flooding. `SearchMemoryTool` appends a note to the output when the cap is hit.
 
 ---
 
@@ -508,6 +576,32 @@ store.list_sessions()
 
 Timestamps are ISO 8601 UTC strings. The file is created on first write; `list_sessions()` returns `[]` if the file does not exist yet.
 
+### `context`
+
+**File:** `src/mini_minion/context.py`
+
+Detects context window overflow and compacts conversation history before it grows too large for the model.
+
+```python
+from mini_minion.context import Compactor
+
+compactor = Compactor(context_window=32_768, preserve_tokens=4_000)
+
+# Called before every run_turn() — no-op when under budget
+messages = compactor.compact(messages, provider)
+```
+
+`compact()` estimates the total token count of the history (4 chars ≈ 1 token). If the total exceeds `context_window - preserve_tokens`, it:
+
+1. Scans from the start to find the largest prefix that fits the usable budget (the **head**).
+2. Calls the provider with a structured summarisation prompt and `max_tokens=2_000`.
+3. Truncates any tool outputs in the remaining tail that exceed 2 000 characters.
+4. Returns `[summary_message] + pruned_tail`.
+
+If the summarisation call fails, `compact()` returns the original list unchanged — the session continues without interruption.
+
+`preserve_tokens` is clamped to `[2_000, 8_000]` at construction time, so misconfigured values never produce a negative usable budget.
+
 ---
 
 ## Adding a Provider
@@ -521,7 +615,12 @@ class MyProvider:
     def __init__(self, api_key: str, model: str) -> None:
         ...
 
-    def chat(self, system, messages, tools, max_tokens) -> LLMResponse:
+    def chat(self, system, messages, tools, max_tokens, on_token=None) -> LLMResponse:
+        if on_token is not None:
+            # streaming path: call on_token(fragment) for each text chunk
+            ...
+            return LLMResponse(text="...", tool_calls=[...], finish_reason="stop", was_streamed=True)
+        # blocking path
         ...
         return LLMResponse(text="...", tool_calls=[...], finish_reason="stop")
 ```
@@ -588,24 +687,15 @@ AGENTS["coder"] = AgentConfig(
 )
 ```
 
-2. Add a model assignment in `config.json`:
+2. Add a model assignment and routing prefix in `config.json`:
 
 ```json
 "agents": {
-  "coder": {"model": "lmstudio/qwen-qwen3.5-9b"}
+  "coder": {"model": "lmstudio/qwen-qwen3.5-9b", "route_prefix": "/code"}
 }
 ```
 
-3. Add a routing rule in `agents/router.py`:
-
-```python
-def resolve(message: str) -> tuple[str, str]:
-    if message.startswith("/research "):
-        return "researcher", message[len("/research "):]
-    if message.startswith("/code "):
-        return "coder", message[len("/code "):]
-    return "main", message
-```
+That's it — `router.py` and `minion.py` pick up the new prefix automatically at next startup. No Python changes needed for routing.
 
 ---
 
@@ -622,7 +712,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "session" -v
 ```
 
-The test suite covers 110 cases across all modules. One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed:
+The test suite covers 256 cases across all modules (256 passed, 1 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed:
 
 ```bash
 uv add anthropic

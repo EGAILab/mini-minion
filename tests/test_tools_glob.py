@@ -1,6 +1,6 @@
 """Tests for GlobTool."""
 
-from mini_minion.tools.glob import GlobTool
+from mini_minion.tools.glob import _MAX_RESULTS, GlobTool
 
 
 def test_glob_finds_files(tmp_path):
@@ -42,3 +42,24 @@ def test_glob_returns_one_path_per_line(tmp_path):
     result = GlobTool().execute(pattern="*.py", path=str(tmp_path))
     lines = result.strip().splitlines()
     assert len(lines) == 3
+
+
+def test_glob_skips_git_directory(tmp_path):
+    """Files inside .git/ must be excluded from results."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "config").write_text("")
+    (tmp_path / "real.py").write_text("")
+    result = GlobTool().execute(pattern="**/*", path=str(tmp_path))
+    assert "real.py" in result
+    assert ".git" not in result
+
+
+def test_glob_caps_results(tmp_path):
+    """More than _MAX_RESULTS matches must be capped with a truncation hint."""
+    for i in range(_MAX_RESULTS + 10):
+        (tmp_path / f"f{i}.py").write_text("")
+    result = GlobTool().execute(pattern="*.py", path=str(tmp_path))
+    lines = [l for l in result.splitlines() if l and not l.startswith("(")]
+    assert len(lines) == _MAX_RESULTS
+    assert "capped" in result.lower()

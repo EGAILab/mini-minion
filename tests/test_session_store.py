@@ -1,5 +1,7 @@
 """Tests for SessionStore."""
 
+import os
+
 from mini_minion.session.store import SessionInfo, SessionStore
 
 
@@ -76,3 +78,39 @@ def test_store_persists_to_file(tmp_path):
     store2 = SessionStore(path)
     sessions = store2.list_sessions()
     assert any(s.agent_id == "main" for s in sessions)
+
+
+def test_load_corrupt_json_returns_empty_and_renames(tmp_path):
+    """Corrupt sessions.json must not crash; file is renamed to .corrupt."""
+    path = tmp_path / "sessions.json"
+    path.write_text("{not valid json", encoding="utf-8")
+    store = SessionStore(path)
+
+    result = store._load()
+
+    assert result == {}
+    assert not path.exists()
+    assert (tmp_path / "sessions.corrupt").exists()
+
+
+def test_save_is_atomic_via_temp_file(tmp_path, monkeypatch):
+    """_save() must write through a .tmp file and replace atomically."""
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+
+    replaced: list[tuple] = []
+    real_replace = os.replace
+
+    def _spy(src, dst):
+        replaced.append((str(src), dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _spy)
+
+    store._save({"x": {}})
+
+    assert len(replaced) == 1
+    src, dst = replaced[0]
+    assert src.endswith(".tmp")
+    assert dst == path
+    assert path.exists()

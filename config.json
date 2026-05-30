@@ -5,14 +5,14 @@
         "baseUrl": "https://coding.dashscope.aliyuncs.com/v1",
         "api": "openai-completions",
         "models": [
-          {"id": "glm-5", "name": "glm-5 (Custom Provider)", "maxTokens": 128000}
+          {"id": "glm-5", "name": "glm-5 (Custom Provider)", "contextWindow": 128000, "maxOutputTokens": 4096}
         ]
       },
       "lmstudio": {
         "baseUrl": "http://127.0.0.1:1234/v1",
         "api": "lmstudio",
         "models": [
-          {"id": "qwen-qwen3.5-9b", "name": "Qwen 3.5 9B", "maxTokens": 4096}
+          {"id": "qwen-qwen3.5-9b", "name": "Qwen 3.5 9B", "contextWindow": 8192, "maxOutputTokens": 4096}
         ]
       }
     }
@@ -22,10 +22,18 @@
       "model": "lmstudio/qwen-qwen3.5-9b"
     },
     "researcher": {
-      "model": "aliyuncs/glm-5"
+      "model": "aliyuncs/glm-5",
+      "route_prefix": "/research"
     }
   },
   "workspace": {
     "path": "~/.mini-minion"
+  },
+  "streaming": {
+    "chat_mode": true,
+    "task_mode": false
+  },
+  "compaction": {
+    "preserve_tokens": 4000
   }
 }

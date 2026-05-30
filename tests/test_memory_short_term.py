@@ -78,3 +78,32 @@ def test_base_dir_created_if_missing(tmp_path):
     new_dir = tmp_path / "nested" / "dir"
     mem = ShortTermMemory(new_dir)
     assert new_dir.exists()
+
+
+def test_load_skips_corrupt_jsonl_lines(tmp_path):
+    """A corrupt JSONL line must be silently skipped; valid lines are returned."""
+    p = tmp_path / "agent1.jsonl"
+    good_msg = {"role": "user", "content": "hello"}
+    p.write_text(
+        json.dumps(good_msg) + "\n" + "not valid json }{{\n",
+        encoding="utf-8",
+    )
+    mem = ShortTermMemory(tmp_path)
+    result = mem.load("agent1")
+    assert result == [good_msg]
+
+
+def test_save_uses_atomic_write(tmp_path, monkeypatch):
+    """save() must use os.replace() for crash-safe atomic writes."""
+    import os as os_module
+    replace_calls: list[tuple] = []
+    original_replace = os_module.replace
+
+    def spy_replace(src, dst):
+        replace_calls.append((src, dst))
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os_module, "replace", spy_replace)
+    mem = ShortTermMemory(tmp_path)
+    mem.save("agent1", [{"role": "user", "content": "test"}])
+    assert replace_calls, "os.replace() was not called during save()"
