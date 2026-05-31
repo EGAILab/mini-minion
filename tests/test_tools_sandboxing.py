@@ -1,6 +1,4 @@
-"""Tests for tool workspace-root sandboxing and bash confirmation."""
-
-import builtins
+"""Tests for tool workspace-root sandboxing and bash confirmation callable."""
 
 from mini_minion.tools.bash import BashTool
 from mini_minion.tools.glob import GlobTool
@@ -119,22 +117,22 @@ def test_glob_defaults_to_root_when_no_path_given(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# BashTool — confirmation prompt
+# BashTool — confirmation callable
 # ---------------------------------------------------------------------------
 
 
-def test_bash_confirm_y_runs_command(monkeypatch, capsys):
-    monkeypatch.setattr(builtins, "input", lambda _: "y")
-    tool = BashTool(confirm=True)
+def test_bash_confirm_callable_true_runs_command():
+    """A confirm callable that returns True must allow the command to run."""
+    tool = BashTool(confirm=lambda _: True)
 
     result = tool.execute(command="echo hello")
 
     assert "hello" in result
 
 
-def test_bash_confirm_n_cancels(monkeypatch, capsys):
-    monkeypatch.setattr(builtins, "input", lambda _: "n")
-    tool = BashTool(confirm=True)
+def test_bash_confirm_callable_false_cancels():
+    """A confirm callable that returns False must cancel execution."""
+    tool = BashTool(confirm=lambda _: False)
 
     result = tool.execute(command="echo should-not-run")
 
@@ -142,27 +140,31 @@ def test_bash_confirm_n_cancels(monkeypatch, capsys):
     assert "should-not-run" not in result
 
 
-def test_bash_confirm_false_runs_without_prompt(monkeypatch):
-    # If confirm=False, input() must never be called.
-    monkeypatch.setattr(builtins, "input", lambda _: (_ for _ in ()).throw(AssertionError("input() called")))
-    tool = BashTool(confirm=False)
+def test_bash_confirm_none_runs_without_calling_confirm():
+    """confirm=None must run the command directly without calling any confirm function."""
+    # Pass a callable that raises if ever called — proves confirm=None bypasses it.
+    def _raise(_: str) -> bool:
+        raise AssertionError("confirm callable must not be called when confirm=None")
 
+    tool = BashTool(confirm=None)
     result = tool.execute(command="echo no-prompt")
 
     assert "no-prompt" in result
 
 
-def test_bash_confirm_prints_command_before_prompt(monkeypatch, capsys):
-    monkeypatch.setattr(builtins, "input", lambda _: "n")
-    BashTool(confirm=True).execute(command="echo marker")
+def test_bash_confirm_receives_command_string():
+    """The confirm callable must be called with the full command string."""
+    received: list[str] = []
+    tool = BashTool(confirm=lambda cmd: received.append(cmd) or False)
 
-    out = capsys.readouterr().out
-    assert "echo marker" in out
+    tool.execute(command="echo marker")
+
+    assert received == ["echo marker"]
 
 
 def test_bash_tool_cwd_is_used(tmp_path):
     """BashTool cwd= starts the subprocess in the specified directory."""
-    tool = BashTool(confirm=False, cwd=tmp_path)
+    tool = BashTool(confirm=None, cwd=tmp_path)
     result = tool.execute(command='python -c "import os; print(os.getcwd())"')
     # Normalize separators for cross-platform comparison.
     assert str(tmp_path).lower().replace("\\", "/") in result.lower().replace("\\", "/")

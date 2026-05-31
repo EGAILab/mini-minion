@@ -276,11 +276,12 @@ def test_compact_noop_when_under_budget():
     assert provider.calls == []  # no LLM call made
 
 
-def test_compact_triggers_when_over_budget(capsys):
+def test_compact_triggers_when_over_budget():
     compactor = _make_compactor_with_usable(1)  # everything overflows
     msgs = [_msg("user", "a" * 100), _msg("assistant", "b" * 100), _msg("user", "c" * 100)]
     provider = _MockProvider("Summary of the conversation.")
-    result = compactor.compact(msgs, provider)
+    compaction_calls: list[bool] = []
+    result = compactor.compact(msgs, provider, on_compaction=lambda: compaction_calls.append(True))
 
     # First two messages are the summary injection pair (user + assistant ack)
     assert result[0]["role"] == "user"
@@ -289,9 +290,8 @@ def test_compact_triggers_when_over_budget(capsys):
     assert result[1]["role"] == "assistant"
     # Provider was called
     assert len(provider.calls) == 1
-    # Compaction notice was printed
-    captured = capsys.readouterr()
-    assert "Compacting session history" in captured.out
+    # on_compaction was called exactly once
+    assert compaction_calls == [True]
 
 
 def test_compact_returns_original_on_provider_error():

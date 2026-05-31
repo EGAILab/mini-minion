@@ -4,61 +4,71 @@ This is the last file you should read when exploring the codebase. By the time
 you get here, you should already understand: config loading (``config.py``),
 agents (``agents/``), providers (``providers/``), tools (``tools/``), memory
 (``memory/``), context compaction (``context.py``), and the TAO loop
-(``agents/runner.py``). This file just wires them all together.
+(``agents/runner.py``).  This file's job is to wire everything together and
+provide the one presentation layer that uses a terminal.
 
 What is a REPL?
 ---------------
-REPL stands for *Read–Evaluate–Print Loop*. It is the simplest possible
-interactive program:
+REPL stands for *Read–Evaluate–Print Loop*:
 
-1. **Read** — call ``input()`` to wait for the user to type something and press Enter.
-2. **Evaluate** — process the input (in our case, send it to an LLM agent).
-3. **Print** — show the response (done inside ``run_turn()``).
+1. **Read** — call ``input()`` to wait for the user to type something.
+2. **Evaluate** — route the message and call ``session.send()``.
+3. **Print** — the ``_on_event`` handler renders events as terminal output.
 4. **Loop** — go back to step 1 until the user types ``exit``.
 
-What is wired together here
-----------------------------
-``main()`` creates exactly one of each subsystem per agent:
+How the CLI adapter works
+--------------------------
+The agent runtime (``runner.py``, ``context.py``, ``bash.py``) no longer calls
+``print()`` or ``input()`` directly.  Instead it emits structured event objects.
+This file defines two presentation callbacks:
 
-- :class:`ShortTermMemory` — one shared instance (handles all agents' JSONL files).
-- :class:`LongTermMemory` — one instance per agent (isolated note folders).
-- :class:`SessionStore` — one shared instance (the ``sessions.json`` metadata file).
-- :class:`ToolRegistry` — one per agent (each wired to that agent's memory backend).
-- LLM provider — one per agent (each pointing at the model in ``config.json``).
-- Conversation history — one ``list[dict]`` per agent, loaded from disk at startup.
-- :class:`Compactor` — one per agent (sized to that model's context window).
+- ``_on_event(event)`` — renders events as terminal output (prefix + text,
+  tool status lines, streaming tokens, compaction notice).
+- ``_console_confirm(command)`` — called by :class:`BashTool` before running a
+  shell command; prints the command and prompts the user for ``y/N``.
 
-Per-turn execution order
-------------------------
-For each message the user types:
+Any other presentation (JSON logs, web SSE, silent batch) only needs to replace
+these two functions — the rest of the stack is unchanged.
 
-1. ``resolve()`` — route to the right agent, strip any prefix.
-2. Append the user message to history — **before** compaction sees it.
-3. ``compact()`` — summarise old history if the context window is nearly full.
-4. ``short_term.save()`` — persist the user message before the provider call.
-5. ``run_turn()`` — TAO loop: THINK → ACT → OBSERVE until a final answer.
-6. ``session_store.touch()`` — update turn count.
-7. ``short_term.save()`` (in ``finally``) — persist the full updated history.
+AgentSession
+------------
+All per-agent state (history, provider, tools, compactor) lives in an
+:class:`AgentSession` instance.  ``main()`` creates one per agent and stores
+them in a ``sessions`` dict keyed by agent ID.  The REPL calls
+``sessions[agent_id].send(message, on_event=..., stream=...)`` each turn.
 
 Error recovery
 --------------
-If ``run_turn()`` raises, the ``except`` block rolls back any partial assistant
-or tool messages that were appended mid-turn (``del histories[agent_id][snapshot_len:]``),
-records the error as an assistant message so the model has context on the next
-turn, and continues the REPL. The user can try again without restarting.
+:meth:`AgentSession.send` re-raises on provider failure.  ``main()`` catches
+the exception, prints a user-friendly error, and continues the REPL.
+The history rollback and error record persistence happen inside the session
+before the exception propagates — so the caller only needs to handle display.
 
-The ``finally`` block always persists — even on failure, the user message and
-any error record are written to disk.
+Streaming
+---------
+``streaming.chat_mode`` from ``config.json`` controls whether tokens are emitted
+one-by-one via :class:`StreamingStarted` / :class:`TokenStreamed` events.
+When ``False``, the full response arrives in a single :class:`FinalAnswer` event.
+The ``_on_event`` handler handles both cases transparently by tracking whether
+streaming is currently active.
 
 Talks to
 --------
-Every module in the package. This is the integration layer.
+Every module in the package.  This is the integration layer.
 """
 
 import sys
 from pathlib import Path
 
-from .agents import AGENTS, resolve, run_turn
+from .agents import AGENTS, AgentSession, resolve
+from .agents.events import (
+    CompactionStarted,
+    FinalAnswer,
+    MaxRoundsReached,
+    StreamingStarted,
+    TokenStreamed,
+    ToolCalled,
+)
 from .config import agents as agents_cfg
 from .config import compaction as compaction_cfg
 from .config import streaming, workspace
@@ -66,25 +76,21 @@ from .context import Compactor
 from .memory import LongTermMemory, ShortTermMemory
 from .providers import create_provider
 from .session import SessionStore
+from .skills import discover_skills, format_skills_prompt
 from .tools import default_registry
 
 
 def main() -> None:
     """Start the interactive mini-minion chat session.
 
-    This function is the application's entry point. It sets up all subsystems,
-    then runs an infinite input loop until the user types ``exit`` or ``quit``.
-
-    The conversation history for each agent is kept in memory (as a Python
-    list of message dicts) during the session and written to disk after every
-    turn, so it survives restarts.
+    Sets up all subsystems (one :class:`AgentSession` per agent), defines the
+    console event handler and bash confirmation callback, then runs the REPL
+    until the user types ``exit``.
 
     Streaming is enabled when ``config.json`` has ``"streaming": {"chat_mode": true}``.
-    Context window compaction is enabled when the token count approaches
-    ``config.json`` ``"compaction": {"context_window": ...}``.
+    Context compaction is per-agent, sized to each model's ``context_window``.
     """
     # Validate that AGENTS (definitions.py) and agents_cfg (config.json) have the same keys.
-    # A mismatch means an agent can be routed to by config but crash at AGENTS[agent_id].
     _cfg_ids = set(agents_cfg)
     _def_ids = set(AGENTS)
     if _cfg_ids != _def_ids:
@@ -98,79 +104,107 @@ def main() -> None:
             "AGENTS in definitions.py and 'agents' in config.json must have the same keys."
         )
 
-    # --- Memory setup ---
-    # Short-term: stores full conversation history as JSONL files.
-    # One file per agent: ~/.mini-minion/sessions/main.jsonl, etc.
+    # --- Skill discovery ---
+    # Global skills (~/.mini-minion/skills/) are scanned first so project-level
+    # skills (.mini-minion/skills/) can override them (later entry wins).
+    _skill_paths = [workspace / "skills", Path.cwd() / ".mini-minion" / "skills"]
+    skills = discover_skills(_skill_paths)
+    _skills_suffix = format_skills_prompt(skills)
+
+    # --- Shared resources ---
     short_term = ShortTermMemory(workspace / "sessions")
-
-    # Long-term: one memory store per agent, each isolated in its own subdirectory.
-    # ~/.mini-minion/memory/main/     → Ada's notes
-    # ~/.mini-minion/memory/researcher/ → Elizabeth's notes
-    long_terms = {
-        agent_id: LongTermMemory(workspace / "memory" / agent_id)
-        for agent_id in AGENTS
-    }
-
-    # Session store: a single JSON file tracking turn counts + timestamps.
     session_store = SessionStore(workspace / "sessions.json")
-
-    # --- Tool setup ---
-    # Lock in the project directory at startup as the workspace root.
-    # File tools (read, write, glob) reject paths outside this boundary.
     _tool_root = Path.cwd()
 
-    # One registry per agent, each wired to that agent's own LongTermMemory.
-    # This prevents agents from reading or overwriting each other's notes.
-    tool_registries = {
-        agent_id: default_registry(long_term=long_terms[agent_id], root=_tool_root)
-        for agent_id in AGENTS
-    }
+    # --- Console callbacks (the only two places that call print/input) ---
 
-    # --- Provider setup ---
-    # One LLM client per agent, each pointing at the model specified in config.json.
-    # providers["main"]      → talks to LM Studio with Qwen 3.5
-    # providers["researcher"] → talks to Aliyun with GLM-5
-    providers = {
-        agent_id: create_provider(
+    def _console_confirm(command: str) -> bool:
+        """Called by BashTool before running a shell command.
+
+        Prints the command, prompts for y/N, returns True only on "y".
+        """
+        print(f"\n[bash] {command}")
+        return input("Run this command? [y/N]: ").strip().lower() == "y"
+
+    # --- Session setup — one AgentSession per agent ---
+    sessions: dict[str, AgentSession] = {}
+    for agent_id, cfg in agents_cfg.items():
+        long_term = LongTermMemory(workspace / "memory" / agent_id)
+        tools = default_registry(
+            long_term=long_term,
+            root=_tool_root,
+            bash_confirm=_console_confirm,
+            skills=skills,
+        )
+        provider = create_provider(
             api=cfg.provider.api,
             base_url=cfg.provider.base_url,
             api_key=cfg.provider.api_key,
             model=cfg.model.id,
         )
-        for agent_id, cfg in agents_cfg.items()
-    }
-
-    # --- History setup ---
-    # Load each agent's conversation history from disk into a Python list.
-    # Each element is a dict like {"role": "user", "content": "hello"}.
-    # run_turn() will append to these lists, and we save them back to disk
-    # after each turn (so progress is never lost even on an abrupt exit).
-    histories: dict[str, list[dict]] = {
-        agent_id: short_term.load(agent_id) for agent_id in AGENTS
-    }
-
-    # Ensure every agent has a session record (creates one if this is first run).
-    for agent_id in AGENTS:
-        session_store.get_or_create(agent_id)
-
-    # Determine whether to stream responses in this interactive session.
-    # streaming.chat_mode comes from the "streaming.chat_mode" key in config.json.
-    use_streaming = streaming.chat_mode
-
-    # Context window compaction: one Compactor per agent, each using its model's
-    # own context_window. preserve_tokens is shared (from the "compaction" block).
-    compactors = {
-        agent_id: Compactor(
-            context_window=agents_cfg[agent_id].model.context_window,
+        compactor = Compactor(
+            context_window=cfg.model.context_window,
             preserve_tokens=compaction_cfg.preserve_tokens,
         )
-        for agent_id in AGENTS
-    }
+        sessions[agent_id] = AgentSession(
+            agent_id=agent_id,
+            agent=AGENTS[agent_id],
+            provider=provider,
+            max_output_tokens=cfg.model.max_output_tokens,
+            tools=tools,
+            compactor=compactor,
+            short_term=short_term,
+            session_store=session_store,
+            soul_suffix=_skills_suffix,
+        )
+
+    use_streaming = streaming.chat_mode
+
+    # --- Console event handler ---
+    # Tracks whether a streaming response is currently in progress so that the
+    # correct newline is printed at the end and FinalAnswer doesn't re-print
+    # text that was already streamed token-by-token.
+    _streaming_active = False
+
+    def _on_event(event: object) -> None:
+        """Render one agent runtime event as terminal output.
+
+        Handles all six event types emitted by the runner, compactor, and
+        (indirectly) the bash tool confirm flow.
+        """
+        nonlocal _streaming_active
+
+        if isinstance(event, StreamingStarted):
+            # Print the "Ada: " prefix before the first token so subsequent
+            # TokenStreamed events appear inline after it.
+            print(f"\n{event.agent_name}: ", end="", flush=True)
+            _streaming_active = True
+
+        elif isinstance(event, TokenStreamed):
+            print(event.token, end="", flush=True)
+
+        else:
+            # Any non-token event ends an in-progress streaming line.
+            # Capture the flag BEFORE clearing it so we know whether to
+            # re-print FinalAnswer text (which is already on screen if streamed).
+            was_streaming = _streaming_active
+            if _streaming_active:
+                print()
+                _streaming_active = False
+
+            if isinstance(event, FinalAnswer):
+                # Skip re-printing when tokens were already streamed to screen.
+                if event.text and not was_streaming:
+                    print(f"\n{event.agent_name}: {event.text}")
+            elif isinstance(event, ToolCalled):
+                print(f"  [tool: {event.name}({event.args})]")
+            elif isinstance(event, MaxRoundsReached):
+                print(f"\n{event.agent_name}: {event.message}")
+            elif isinstance(event, CompactionStarted):
+                print("\n  Compacting session history...")
 
     # --- REPL loop ---
     print("Mini-Minion ready. Type 'exit' or '/quit' to quit.")
-    # Print one hint per agent that has a route_prefix configured in config.json.
-    # This is driven by config so it stays accurate when agents are added/removed.
     for agent_id, cfg_entry in agents_cfg.items():
         if cfg_entry.route_prefix:
             agent_name = AGENTS[agent_id].name
@@ -183,59 +217,18 @@ def main() -> None:
         if user_input.lower() in ("exit", "quit", "/quit"):
             break
 
-        # Route the message: "/research ..." → researcher, anything else → main.
-        # resolve() strips the command prefix and returns the clean message.
         agent_id, message = resolve(user_input)
-        agent = AGENTS[agent_id]
-        cfg = agents_cfg[agent_id]
 
-        # Append the user's message first so compaction sees the complete
-        # message list (including this new message) when checking the budget.
-        histories[agent_id].append({"role": "user", "content": message})
-
-        # Compact the history if it's approaching the model's context limit.
-        # compact() is a no-op when under budget; it summarises the older half
-        # and prunes large tool outputs when over budget.
-        histories[agent_id] = compactors[agent_id].compact(histories[agent_id], providers[agent_id])
-
-        # Save immediately — the user turn is on disk even if the provider call
-        # fails before the finally block runs.
-        short_term.save(agent_id, histories[agent_id])
-
-        # Snapshot the history length so we can roll back any partial assistant/
-        # tool messages that run_turn appends before a mid-turn crash.
-        snapshot_len = len(histories[agent_id])
+        # Reset streaming state before each turn in case the previous turn's
+        # provider raised mid-stream and left _streaming_active True.
+        _streaming_active = False
 
         try:
-            # Run the TAO loop: the model thinks, optionally calls tools, then replies.
-            # run_turn() mutates histories[agent_id] in place, adding all assistant
-            # messages and tool results.
-            # stream=use_streaming enables token-by-token output when chat_mode is True.
-            run_turn(
-                providers[agent_id],
-                agent.name,           # display name printed before responses (e.g. "Ada")
-                agent.soul,           # the system prompt that defines the agent's personality
-                cfg.model.max_output_tokens,
-                tool_registries[agent_id],
-                histories[agent_id],
-                stream=use_streaming,
-            )
-            # Update turn count only on success — failed turns don't count.
-            session_store.touch(agent_id, increment_turns=True)
+            sessions[agent_id].send(message, on_event=_on_event, stream=use_streaming)
         except Exception as exc:
-            # Roll back any partial messages appended before the crash so the
-            # history ends at a clean turn boundary.
-            del histories[agent_id][snapshot_len:]
-            # Record the failure so the model has context on the next turn.
-            histories[agent_id].append({
-                "role": "assistant",
-                "content": f"[Provider error: {exc.__class__.__name__}: {exc}]",
-            })
-            print(f"\n[Error] {agent.name} failed to respond: {exc}", file=sys.stderr)
+            agent_name = AGENTS[agent_id].name
+            print(f"\n[Error] {agent_name} failed to respond: {exc}", file=sys.stderr)
             print("  Your message was kept. Try again or rephrase.", file=sys.stderr)
-        finally:
-            # Always persist — user message and any error message survive a crash.
-            short_term.save(agent_id, histories[agent_id])
 
 
 if __name__ == "__main__":

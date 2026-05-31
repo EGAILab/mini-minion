@@ -15,11 +15,13 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
   - [providers](#providers)
   - [agents](#agents)
   - [tools](#tools)
+  - [skills](#skills)
   - [memory](#memory)
   - [session](#session)
 - [Adding a Provider](#adding-a-provider)
 - [Adding a Tool](#adding-a-tool)
 - [Adding an Agent](#adding-an-agent)
+- [Adding a Skill](#adding-a-skill)
 - [Running Tests](#running-tests)
 
 ---
@@ -70,9 +72,13 @@ mini-minion/
 │   │   └── __init__.py          # create_provider() factory
 │   ├── agents/                  # Agent definitions and execution
 │   │   ├── definitions.py       # AgentConfig, AGENTS dict
+│   │   ├── events.py            # Structured event dataclasses emitted by the runner
 │   │   ├── router.py            # Message → agent routing
 │   │   ├── runner.py            # TAO loop (run_turn)
+│   │   ├── session.py           # AgentSession — headless per-agent execution unit
 │   │   └── __init__.py
+│   ├── skills/                  # Agent skills (SKILL.md files with YAML frontmatter)
+│   │   └── __init__.py          # discover_skills(), format_skills_prompt(), SkillInfo
 │   ├── tools/                   # Executable tools for agents
 │   │   ├── base.py              # Tool ABC, ToolSchema
 │   │   ├── registry.py          # ToolRegistry
@@ -81,6 +87,7 @@ mini-minion/
 │   │   ├── glob.py              # GlobTool — file pattern search
 │   │   ├── bash.py              # BashTool — shell commands
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
+│   │   ├── skill.py             # SkillTool — load skill instructions on demand
 │   │   └── __init__.py          # default_registry() factory
 │   ├── memory/                  # Persistent memory storage
 │   │   ├── short_term.py        # JSONL conversation history
@@ -89,7 +96,7 @@ mini-minion/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store
 │       └── __init__.py
-└── tests/                       # pytest test suite (256 tests, 1 skipped)
+└── tests/                       # pytest test suite (304 tests, 1 skipped)
 ```
 
 ---
@@ -175,32 +182,44 @@ router.resolve()
     │  "/research ..." → researcher (Elizabeth)
     │  everything else → main (Ada)
     ▼
-compactor.compact(history, provider)   ← summarises old history if over token budget
-    │  no-op when under budget
-    ▼
-run_turn(provider, agent_name, system_prompt, max_tokens, tools, messages, stream)
+AgentSession.send(message, on_event=callback, stream=True/False)
     │
-    │  ┌────────────────────────────────────────────────────┐
-    │  │              Think-Act-Observe loop                 │
-    │  │                                                    │
-    │  │  provider.chat(system, messages, tools, n,         │
-    │  │                on_token=callback if stream else None│
-    │  │       │                                            │
-    │  │       ▼                                            │
-    │  │  LLMResponse(text, tool_calls, finish_reason,      │
-    │  │              was_streamed)                         │
-    │  │       │                                            │
-    │  │  finish_reason == "tool_calls"?                    │
-    │  │    yes → execute each tool → append results        │
-    │  │          → loop                                    │
-    │  │    no  → print response (or newline if streamed)   │
-    │  │          → return                                  │
-    │  └────────────────────────────────────────────────────┘
+    ├─ compactor.compact(history, provider, on_compaction=...)
+    │      no-op when under budget; fires CompactionStarted event when triggered
     │
-    ▼
-short_term.save(agent_id, messages)   ← persists history to JSONL
-session_store.touch(agent_id, ...)    ← updates turn count and timestamp
+    └─ run_turn(provider, agent_name, system, max_tokens, tools, messages,
+                on_event=callback, stream=True/False)
+           │
+           │  ┌────────────────────────────────────────────────────┐
+           │  │              Think-Act-Observe loop                 │
+           │  │                                                    │
+           │  │  provider.chat(system, messages, tools, n,         │
+           │  │                on_token=callback if stream else None│
+           │  │       │                                            │
+           │  │       ▼                                            │
+           │  │  LLMResponse(text, tool_calls, finish_reason)      │
+           │  │       │                                            │
+           │  │  finish_reason == "tool_calls"?                    │
+           │  │    yes → emit ToolCalled event → execute tool      │
+           │  │          → append results → loop                   │
+           │  │    no  → emit FinalAnswer event → return           │
+           │  └────────────────────────────────────────────────────┘
+           │
+           ▼
+    short_term.save(agent_id, messages)   ← persists history to JSONL
+    session_store.touch(agent_id, ...)    ← updates turn count and timestamp
 ```
+
+**Event system:** `run_turn` and `AgentSession` emit structured event objects to the `on_event` callback rather than calling `print()` or `input()` directly. This makes the agent runtime usable headlessly (tests, scripts, web APIs) — pass `on_event=None` for silent execution.
+
+| Event class | Emitted when |
+|---|---|
+| `StreamingStarted(agent_name)` | First token of a streaming response arrives |
+| `TokenStreamed(token)` | Each subsequent streaming token |
+| `FinalAnswer(agent_name, text)` | Model produces a complete (non-tool) response |
+| `ToolCalled(name, args)` | A tool is about to be executed |
+| `MaxRoundsReached(agent_name, message)` | TAO loop hits the turn limit |
+| `CompactionStarted()` | History compaction is about to run |
 
 **Message format** is the OpenAI Chat Completions wire format throughout — `{"role": "user"|"assistant"|"tool", "content": "..."}`. Providers that use a different format (Anthropic) convert internally.
 
@@ -217,8 +236,13 @@ session_store.touch(agent_id, ...)    ← updates turn count and timestamp
 │   │   └── api-research.md
 │   └── researcher/       ← Elizabeth's long-term notes (isolated)
 │       └── findings.md
+├── skills/               ← global skills (available to all agents)
+│   └── my-skill/
+│       └── SKILL.md
 └── sessions.json         ← session metadata (turn counts, timestamps)
 ```
+
+Project-level skills live at `.mini-minion/skills/` relative to the working directory. They override global skills with the same name.
 
 ---
 
@@ -397,23 +421,54 @@ Routing is **config-driven**: rules are read from `config.json` at startup via `
 - Routes are sorted longest-first to prevent prefix shadowing.
 - Adding a new routed agent requires only a `"route_prefix"` entry in `config.json` — no Python changes.
 
+#### Session (`session.py`)
+
+```python
+from mini_minion.agents import AgentSession
+
+session = AgentSession(
+    agent_id="main",
+    agent=AGENTS["main"],
+    provider=provider,
+    max_output_tokens=4096,
+    tools=registry,
+    compactor=compactor,
+    short_term=short_term,
+    session_store=session_store,
+    soul_suffix="",          # optional text appended to the system prompt each turn
+)
+
+# Headless (returns text, no output)
+text = session.send("What is REST?")
+
+# With event callback (drive any presentation layer)
+events = []
+text = session.send("What is REST?", on_event=events.append, stream=True)
+
+# Read conversation history (defensive copy)
+history = session.history
+```
+
+`AgentSession` encapsulates all per-agent state: history, provider, tools, compactor, memory persistence, and session tracking. It is the recommended entry point for non-CLI use (tests, scripts, web APIs). `minion.py` creates one instance per agent and drives them from the REPL.
+
 #### Runner (`runner.py`)
 
 ```python
 from mini_minion.agents.runner import run_turn
 
 run_turn(
-    provider,     # LLMProvider
-    agent_name,   # str — used for console output prefix
-    system,       # str — system prompt / soul
-    max_tokens,   # int
-    tools,        # ToolRegistry
-    messages,     # list[dict] — mutated in place
-    stream,       # bool — True to stream tokens as they arrive (default False)
+    provider,              # LLMProvider
+    agent_name,            # str — used in event agent_name fields
+    system,                # str — system prompt / soul
+    max_tokens,            # int
+    tools,                 # ToolRegistry
+    messages,              # list[dict] — mutated in place
+    on_event=None,         # Callable[[object], None] | None — receives structured events
+    stream=False,          # bool — True to emit streaming token events
 )
 ```
 
-Implements the TAO loop. Appends all messages (assistant turns, tool calls, tool results) directly to the `messages` list. When `stream=True`, tokens are printed as they arrive and a final newline is added when done. When `stream=False`, the full response is printed as `"{agent_name}: {text}"` after the model finishes. Tool calls are always printed as `"  [tool: name({args})]"` for observability.
+Implements the TAO loop. Emits structured events via `on_event` rather than calling `print()` directly. Pass `on_event=None` for silent execution. See the event table in the Architecture section for the full list of emitted types.
 
 ---
 
@@ -460,9 +515,10 @@ registry.execute("tool_name", {"arg": "value"})  # str
 | `ReadTool` | `read` | Read a file (numbered lines, optional `offset`/`limit`) or list a directory. Rejects binary files and caps at 50 KB. Paths outside the workspace root are rejected. |
 | `WriteTool` | `write` | Write content to a file, creating parent directories as needed. Paths outside the workspace root are rejected. |
 | `GlobTool` | `glob` | Find files matching a glob pattern, sorted newest-first. Skips `.git`/`.venv`/`__pycache__`/etc. Caps at 200 results. Paths outside the workspace root are rejected. |
-| `BashTool` | `bash` | Run a shell command — PowerShell on Windows, bash on Unix. Prints the command and requires `y` confirmation before executing (by default). |
+| `BashTool` | `bash` | Run a shell command — PowerShell on Windows, bash on Unix. Calls the injected `confirm` callable before executing; pass `None` to skip confirmation. |
 | `SaveMemoryTool` | `save_memory` | Save a Markdown note to long-term memory |
 | `SearchMemoryTool` | `search_memory` | Case-insensitive search across all long-term memory notes (capped at 20 results) |
+| `SkillTool` | `skill` | Load a skill's instructions into context by name. Only registered when skills are discovered at startup. |
 
 **`ReadTool` parameters:**
 
@@ -491,23 +547,79 @@ registry.execute("tool_name", {"arg": "value"})  # str
 ```python
 from mini_minion.tools import default_registry
 from mini_minion.memory import LongTermMemory
+from mini_minion.skills import discover_skills
 from pathlib import Path
 
-# Minimal (4 tools: read, write, glob, bash) — unrestricted paths, bash requires confirmation
+# Minimal (4 tools: read, write, glob, bash) — unrestricted paths, no confirmation
 reg = default_registry()
 
-# With workspace sandboxing and bash confirmation (recommended for interactive use)
-reg = default_registry(root=Path.cwd(), confirm_bash=True)
+# With workspace sandboxing and console bash confirmation (recommended for interactive use)
+reg = default_registry(root=Path.cwd(), bash_confirm=lambda cmd: input(f"Run {cmd}? [y/N]: ") == "y")
 
 # With memory tools (6 tools: + save_memory, search_memory)
 reg = default_registry(long_term=LongTermMemory(some_path), root=Path.cwd())
+
+# With skill tool (7 tools: + skill)
+skills = discover_skills([Path("~/.mini-minion/skills").expanduser()])
+reg = default_registry(skills=skills)
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `long_term` | `LongTermMemory \| None` | `None` | If provided, also registers `save_memory` and `search_memory` tools |
 | `root` | `Path \| None` | `None` | Workspace root — `read`/`write`/`glob` reject paths outside this boundary. `None` = unrestricted |
-| `confirm_bash` | `bool` | `True` | If `True`, `bash` prints the command and requires `y` before executing |
+| `bash_confirm` | `Callable[[str], bool] \| None` | `None` | Called with the command string before execution; return `True` to allow, `False` to cancel. `None` = no confirmation |
+| `skills` | `SkillRegistry \| None` | `None` | If provided (and non-empty), registers a `skill` tool that agents can call to load skill instructions |
+
+---
+
+### `skills`
+
+**File:** `src/mini_minion/skills/__init__.py`
+
+Discovers and loads agent skills from SKILL.md files on disk.
+
+```python
+from mini_minion.skills import discover_skills, format_skills_prompt, SkillInfo
+
+# Scan one or more directories — later entries override earlier on name collision
+registry = discover_skills([
+    Path("~/.mini-minion/skills").expanduser(),  # global (lower priority)
+    Path(".mini-minion/skills"),                  # project (higher priority)
+])
+
+# Build the <available_skills> block injected into every agent's system prompt
+prompt_suffix = format_skills_prompt(registry)
+# Returns "" when registry is empty or all skills lack descriptions
+```
+
+**Skill file format** (`~/.mini-minion/skills/my-skill/SKILL.md`):
+
+```markdown
+---
+name: my-skill
+description: One-line description shown to the agent in the system prompt.
+---
+
+# My Skill
+
+Full instructions the agent receives when it calls `skill(name="my-skill")`.
+```
+
+The `name:` field is required; a SKILL.md without it is silently skipped. The `description:` field is optional but must be non-empty for the skill to appear in the system prompt listing.
+
+**`SkillInfo`:**
+
+```python
+@dataclass
+class SkillInfo:
+    name: str
+    description: str
+    path: Path      # path to SKILL.md
+    content: str    # body text (frontmatter stripped)
+```
+
+Companion files (e.g. `EXAMPLES.md`, `template.py`) placed alongside `SKILL.md` are listed in the `skill` tool's response so the agent knows what supporting files are available.
 
 ---
 
@@ -589,6 +701,9 @@ compactor = Compactor(context_window=32_768, preserve_tokens=4_000)
 
 # Called before every run_turn() — no-op when under budget
 messages = compactor.compact(messages, provider)
+
+# With notification callback (called once when compaction actually runs)
+messages = compactor.compact(messages, provider, on_compaction=lambda: print("Compacting..."))
 ```
 
 `compact()` estimates the total token count of the history (4 chars ≈ 1 token). If the total exceeds `context_window - preserve_tokens`, it:
@@ -699,6 +814,37 @@ That's it — `router.py` and `minion.py` pick up the new prefix automatically a
 
 ---
 
+## Adding a Skill
+
+Create a directory with a `SKILL.md` inside either the global or project skills location:
+
+```
+~/.mini-minion/skills/openapi-design/SKILL.md    ← global (all projects)
+.mini-minion/skills/openapi-design/SKILL.md       ← project-local (overrides global)
+```
+
+**Minimal `SKILL.md`:**
+
+```markdown
+---
+name: openapi-design
+description: Design OpenAPI 3.1 specs following REST best practices.
+---
+
+# OpenAPI Design
+
+When designing an OpenAPI spec:
+1. Use semantic versioning for the `info.version` field.
+2. Group endpoints by resource, not by HTTP method.
+3. Always define reusable schemas under `components/schemas`.
+```
+
+On the next startup, the skill is automatically discovered and its description appears in every agent's system prompt. Agents call `skill(name="openapi-design")` to load the full instructions into their context.
+
+You can also place companion files (examples, templates) alongside `SKILL.md`; they are listed in the `skill` tool's response so the agent knows to `read` them if needed.
+
+---
+
 ## Running Tests
 
 ```bash
@@ -712,7 +858,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "session" -v
 ```
 
-The test suite covers 256 cases across all modules (256 passed, 1 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed:
+The test suite covers 304 cases across all modules (304 passed, 1 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed:
 
 ```bash
 uv add anthropic

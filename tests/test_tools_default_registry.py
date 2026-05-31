@@ -1,7 +1,5 @@
 """Tests for default_registry factory."""
 
-import builtins
-
 from mini_minion.tools import default_registry
 
 
@@ -87,16 +85,19 @@ def test_default_registry_root_enforced_in_glob(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# confirm_bash parameter — verify it is threaded to BashTool
+# bash_confirm parameter — verify it is threaded to BashTool
 # ---------------------------------------------------------------------------
 
 
-def test_default_registry_confirm_bash_false_runs_without_prompt(monkeypatch):
-    """confirm_bash=False must not call input() before running bash commands."""
-    monkeypatch.setattr(
-        builtins, "input",
-        lambda _: (_ for _ in ()).throw(AssertionError("input() must not be called")),
-    )
-    reg = default_registry(confirm_bash=False)
+def test_default_registry_bash_confirm_none_runs_without_prompt():
+    """bash_confirm=None must run bash commands without calling any confirm callable."""
+    reg = default_registry(bash_confirm=None)
     result = reg.execute("bash", {"command": "echo hello-from-test"})
     assert "hello-from-test" in result
+
+
+def test_default_registry_bash_confirm_callable_cancel():
+    """A confirm callable that returns False must cancel the command."""
+    reg = default_registry(bash_confirm=lambda _: False)
+    result = reg.execute("bash", {"command": "echo should-not-run"})
+    assert "cancelled" in result.lower()

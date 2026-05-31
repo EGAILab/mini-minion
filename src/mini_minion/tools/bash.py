@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import platform
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from .base import Tool, ToolSchema
@@ -83,12 +84,17 @@ class BashTool(Tool):
     Returns combined stdout + stderr as a string.
     """
 
-    def __init__(self, confirm: bool = True, cwd: Path | None = None) -> None:
-        # confirm=True: print command and require y/N before executing.
-        # confirm=False: run immediately (use for tests or trusted pipelines).
+    def __init__(
+        self,
+        confirm: Callable[[str], bool] | None = None,
+        cwd: Path | None = None,
+    ) -> None:
+        # confirm: called with the command string before execution; returns True
+        # to proceed, False to cancel.  None means run without asking (headless).
+        # The CLI passes a callable that calls input(); tests pass a lambda.
         self._confirm = confirm
         # cwd: working directory for the subprocess; None inherits from the
-        # parent process. Set to the workspace root so shell commands start
+        # parent process.  Set to the workspace root so shell commands start
         # in a predictable location.
         self._cwd = cwd
 
@@ -131,11 +137,8 @@ class BashTool(Tool):
         command = str(kwargs["command"])
         timeout = int(kwargs.get("timeout") or _DEFAULT_TIMEOUT)
 
-        if self._confirm:
-            print(f"\n[bash] {command}")
-            answer = input("Run this command? [y/N]: ").strip().lower()
-            if answer != "y":
-                return "Command cancelled by user."
+        if self._confirm is not None and not self._confirm(command):
+            return "Command cancelled by user."
 
         try:
             result = subprocess.run(

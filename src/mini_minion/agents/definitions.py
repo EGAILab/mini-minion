@@ -72,6 +72,7 @@ AGENTS: dict[str, AgentConfig] = {
             "an unfamiliar name, person, or topic before responding.\n"
             "Use save_memory to persist: (1) important research findings, and (2) any personal context "
             "the user shares — names, ages, relationships, preferences, background.\n"
+            "Use the skill tool to load domain expertise when a task matches a skill's description.\n"
             "After completing tool calls, just stop — do not summarise or explain what you just did. "
             "If the user's question has not been answered yet, answer it. Otherwise say nothing."
         ),
@@ -86,6 +87,7 @@ AGENTS: dict[str, AgentConfig] = {
             "Your job: find information and cite sources. Every claim needs evidence.\n"
             "Use tools to gather data. Be thorough but concise.\n"
             "Use save_memory to persist research findings. Use search_memory to avoid re-doing work.\n"
+            "Use the skill tool to load domain expertise when a task matches a skill's description.\n"
             "After completing tool calls, just stop — do not summarise what you did. "
             "If the user's question has not been answered yet, answer it. Otherwise say nothing."
         ),

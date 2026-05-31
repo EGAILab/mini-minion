@@ -3,6 +3,13 @@
 import json
 from unittest.mock import Mock
 
+from mini_minion.agents.events import (
+    FinalAnswer,
+    MaxRoundsReached,
+    StreamingStarted,
+    TokenStreamed,
+    ToolCalled,
+)
 from mini_minion.agents.runner import run_turn
 from mini_minion.providers.base import LLMResponse, ToolCall
 from mini_minion.tools.base import Tool, ToolSchema
@@ -32,18 +39,27 @@ def _provider(*responses: LLMResponse) -> Mock:
     return p
 
 
-def test_simple_text_response(capsys):
+def _run(provider, messages, stream=False):
+    """Run a turn and return collected events."""
+    events: list[object] = []
+    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages, on_event=events.append, stream=stream)
+    return events
+
+
+def test_simple_text_response():
     messages: list[dict] = []
     provider = _provider(LLMResponse(text="Hello!", finish_reason="stop"))
 
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages)
+    events = _run(provider, messages)
 
     assert len(messages) == 1
     assert messages[0] == {"role": "assistant", "content": "Hello!"}
-    assert "Ada: Hello!" in capsys.readouterr().out
+    final = next(e for e in events if isinstance(e, FinalAnswer))
+    assert final.text == "Hello!"
+    assert final.agent_name == "Ada"
 
 
-def test_tool_call_then_stop(capsys):
+def test_tool_call_then_stop():
     registry = ToolRegistry()
     registry.register(_EchoTool())
     messages: list[dict] = [{"role": "user", "content": "hi"}]
@@ -56,8 +72,8 @@ def test_tool_call_then_stop(capsys):
         ),
         LLMResponse(text="Done.", finish_reason="stop"),
     )
-
-    run_turn(provider, "Ada", "system", 100, registry, messages)
+    events: list[object] = []
+    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append)
 
     # user + assistant(tool_call) + tool_result + assistant(final)
     assert len(messages) == 4
@@ -65,10 +81,16 @@ def test_tool_call_then_stop(capsys):
     assert messages[1]["tool_calls"][0]["function"]["name"] == "echo"
     assert messages[2] == {"role": "tool", "tool_call_id": "tc1", "content": "pong"}
     assert messages[3] == {"role": "assistant", "content": "Done."}
-    assert "Ada: Done." in capsys.readouterr().out
+
+    tool_events = [e for e in events if isinstance(e, ToolCalled)]
+    assert len(tool_events) == 1
+    assert tool_events[0].name == "echo"
+
+    final = next(e for e in events if isinstance(e, FinalAnswer))
+    assert final.text == "Done."
 
 
-def test_multiple_tool_calls_in_one_response(capsys):
+def test_multiple_tool_calls_in_one_response():
     """All tool calls from a single response must be executed before the next LLM call."""
     registry = ToolRegistry()
     registry.register(_EchoTool())
@@ -86,15 +108,19 @@ def test_multiple_tool_calls_in_one_response(capsys):
         LLMResponse(text="all done", finish_reason="stop"),
     )
 
-    run_turn(provider, "Ada", "system", 100, registry, messages)
+    events: list[object] = []
+    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append)
 
     tool_results = [m for m in messages if m["role"] == "tool"]
     assert len(tool_results) == 2
     assert tool_results[0]["content"] == "first"
     assert tool_results[1]["content"] == "second"
 
+    tool_events = [e for e in events if isinstance(e, ToolCalled)]
+    assert len(tool_events) == 2
 
-def test_unknown_tool_returns_error_and_continues(capsys):
+
+def test_unknown_tool_returns_error_and_continues():
     """An unknown tool call must not crash the loop; the error is fed back as a tool result."""
     messages: list[dict] = []
     provider = _provider(
@@ -106,14 +132,15 @@ def test_unknown_tool_returns_error_and_continues(capsys):
         LLMResponse(text="recovered", finish_reason="stop"),
     )
 
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages)
+    events = _run(provider, messages)
 
     tool_result = next(m for m in messages if m["role"] == "tool")
     assert "nonexistent" in tool_result["content"].lower() or "unknown" in tool_result["content"].lower()
-    assert "Ada: recovered" in capsys.readouterr().out
+    final = next(e for e in events if isinstance(e, FinalAnswer))
+    assert final.text == "recovered"
 
 
-def test_tool_call_arguments_serialised(capsys):
+def test_tool_call_arguments_serialised():
     """Tool call arguments in the assistant message must be JSON-serialised strings."""
     registry = ToolRegistry()
     registry.register(_EchoTool())
@@ -128,22 +155,36 @@ def test_tool_call_arguments_serialised(capsys):
         LLMResponse(text="ok", finish_reason="stop"),
     )
 
-    run_turn(provider, "Ada", "system", 100, registry, messages)
+    _run(provider, messages)
 
     raw_args = messages[0]["tool_calls"][0]["function"]["arguments"]
     assert json.loads(raw_args) == {"text": "hi"}
 
 
-def test_empty_response_no_print(capsys):
+def test_empty_response_emits_final_answer_with_empty_text():
+    """Empty text response still emits FinalAnswer (with empty text)."""
     messages: list[dict] = []
     provider = _provider(LLMResponse(text="", finish_reason="stop"))
 
+    events = _run(provider, messages)
+
+    final_events = [e for e in events if isinstance(e, FinalAnswer)]
+    assert len(final_events) == 1
+    assert final_events[0].text == ""
+
+
+def test_no_events_when_on_event_is_none():
+    """When on_event is None, run_turn completes silently without error."""
+    messages: list[dict] = []
+    provider = _provider(LLMResponse(text="Hello!", finish_reason="stop"))
+
+    # Should not raise and should still mutate messages
     run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages)
 
-    assert capsys.readouterr().out == ""
+    assert messages == [{"role": "assistant", "content": "Hello!"}]
 
 
-def test_tool_call_with_parse_error_feeds_error_to_model(capsys):
+def test_tool_call_with_parse_error_feeds_error_to_model():
     """When tc.error is set, the parse error is fed back as the tool result instead of executing."""
     messages: list[dict] = []
     provider = _provider(
@@ -155,15 +196,16 @@ def test_tool_call_with_parse_error_feeds_error_to_model(capsys):
         LLMResponse(text="I see the error, let me retry.", finish_reason="stop"),
     )
 
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages)
+    events = _run(provider, messages)
 
     tool_result = next(m for m in messages if m["role"] == "tool")
     assert "Invalid JSON" in tool_result["content"]
     assert tool_result["tool_call_id"] == "x"
-    assert "Ada: I see the error" in capsys.readouterr().out
+    final = next(e for e in events if isinstance(e, FinalAnswer))
+    assert "I see the error" in final.text
 
 
-def test_tool_round_limit_stops_loop(capsys):
+def test_tool_round_limit_stops_loop():
     """Loop must stop after _MAX_TOOL_ROUNDS calls when the model never stops using tools."""
     from mini_minion.agents.runner import _MAX_TOOL_ROUNDS
 
@@ -171,7 +213,6 @@ def test_tool_round_limit_stops_loop(capsys):
     registry.register(_EchoTool())
     messages: list[dict] = []
 
-    # Provider always responds with tool_calls — never a final answer.
     never_stops = [
         LLMResponse(
             text="",
@@ -181,14 +222,16 @@ def test_tool_round_limit_stops_loop(capsys):
         for i in range(_MAX_TOOL_ROUNDS + 5)
     ]
     provider = _provider(*never_stops)
+    events: list[object] = []
+    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append)
 
-    run_turn(provider, "Ada", "system", 100, registry, messages)
-
-    # Provider called exactly _MAX_TOOL_ROUNDS times, not forever.
     assert provider.chat.call_count == _MAX_TOOL_ROUNDS
-    # Last message is the cap notification appended as an assistant message.
     assert messages[-1]["role"] == "assistant"
     assert "Stopped" in messages[-1]["content"]
+
+    max_events = [e for e in events if isinstance(e, MaxRoundsReached)]
+    assert len(max_events) == 1
+    assert "Stopped" in max_events[0].message
 
 
 def test_provider_called_with_correct_args():
@@ -203,3 +246,54 @@ def test_provider_called_with_correct_args():
     assert call_args[0] == "my system prompt"
     assert call_args[3] == 512
     assert any(d["function"]["name"] == "echo" for d in call_args[2])
+
+
+def test_streaming_emits_token_events():
+    """With stream=True and on_event provided, StreamingStarted + TokenStreamed events are emitted."""
+    messages: list[dict] = []
+
+    # Mock provider that calls on_token to simulate streaming
+    def _streaming_chat(system, msgs, tools, max_tokens, on_token=None):
+        if on_token:
+            on_token("Hel")
+            on_token("lo!")
+        return LLMResponse(text="Hello!", finish_reason="stop", was_streamed=True)
+
+    provider = Mock()
+    provider.chat = Mock(side_effect=_streaming_chat)
+    events: list[object] = []
+
+    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages,
+             on_event=events.append, stream=True)
+
+    stream_start = [e for e in events if isinstance(e, StreamingStarted)]
+    tokens = [e for e in events if isinstance(e, TokenStreamed)]
+    assert len(stream_start) == 1
+    assert stream_start[0].agent_name == "Ada"
+    assert len(tokens) == 2
+    assert tokens[0].token == "Hel"
+    assert tokens[1].token == "lo!"
+
+
+def test_no_streaming_without_stream_flag():
+    """With stream=False (default), no StreamingStarted or TokenStreamed events are emitted."""
+    messages: list[dict] = []
+
+    def _streaming_chat(system, msgs, tools, max_tokens, on_token=None):
+        # on_token should not be passed when stream=False
+        assert on_token is None, "on_token should not be passed with stream=False"
+        return LLMResponse(text="Hello!", finish_reason="stop")
+
+    provider = Mock()
+    provider.chat = Mock(side_effect=_streaming_chat)
+    events: list[object] = []
+
+    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages,
+             on_event=events.append, stream=False)
+
+    stream_start = [e for e in events if isinstance(e, StreamingStarted)]
+    tokens = [e for e in events if isinstance(e, TokenStreamed)]
+    assert stream_start == []
+    assert tokens == []
+    final = next(e for e in events if isinstance(e, FinalAnswer))
+    assert final.text == "Hello!"

@@ -27,6 +27,7 @@ Talks to
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 from mini_minion.providers.base import LLMProvider
 
@@ -114,16 +115,23 @@ class Compactor:
         total = sum(_estimate_tokens(m) for m in messages)
         return total > self._usable_tokens
 
-    def compact(self, messages: list[dict], provider: LLMProvider) -> list[dict]:
+    def compact(
+        self,
+        messages: list[dict],
+        provider: LLMProvider,
+        on_compaction: "Callable[[], None] | None" = None,
+    ) -> list[dict]:
         """Return a compacted version of ``messages``, or the original list unchanged.
 
         When compaction is triggered:
 
-        1. Splits the history into an older ``head`` (to summarise) and a
+        1. Calls ``on_compaction()`` (if provided) so the caller can notify
+           the user before the summarisation LLM call is made.
+        2. Splits the history into an older ``head`` (to summarise) and a
            recent ``tail`` (to preserve).
-        2. Calls ``provider.chat()`` to produce a structured summary of the head.
-        3. Prunes oversized tool outputs in the tail.
-        4. Returns ``[summary_msg] + pruned_tail``.
+        3. Calls ``provider.chat()`` to produce a structured summary of the head.
+        4. Prunes oversized tool outputs in the tail.
+        5. Returns ``[summary_msg] + pruned_tail``.
 
         Falls back silently to the original list if the summarisation call
         fails, so a transient provider error never crashes the session.
@@ -131,6 +139,10 @@ class Compactor:
         Args:
             messages: The full in-memory conversation history for one agent.
             provider: The agent's configured LLMProvider, used for summarisation.
+            on_compaction: Optional zero-argument callback invoked when compaction
+                is about to happen.  The caller uses this to emit a status event
+                (e.g. :class:`CompactionStarted`) without ``compact()`` having any
+                knowledge of event types.  ``None`` for silent/headless callers.
 
         Returns:
             Compacted message list, or the original list if compaction was not
@@ -144,7 +156,8 @@ class Compactor:
             # History is too short to split — nothing to summarise.
             return messages
 
-        print("\n  Compacting session history...")
+        if on_compaction is not None:
+            on_compaction()
         try:
             summary = self._summarise(head, provider)
         except Exception:

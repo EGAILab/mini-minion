@@ -9,6 +9,10 @@ from mini_minion.memory.short_term import ShortTermMemory
 def _run_main(tmp_path, inputs, run_turn_effect=None):
     """Run main() with a controlled workspace, input sequence, and run_turn behaviour.
 
+    After the refactor, main() uses AgentSession which calls run_turn internally.
+    We patch mini_minion.agents.session.run_turn (where AgentSession imports it)
+    rather than mini_minion.minion.run_turn (which no longer exists there).
+
     Args:
         tmp_path: Pytest temporary directory used as the workspace root.
         inputs: Sequence of strings returned by successive ``input()`` calls.
@@ -25,7 +29,7 @@ def _run_main(tmp_path, inputs, run_turn_effect=None):
 
     with (
         patch("mini_minion.minion.workspace", tmp_path),
-        patch("mini_minion.minion.run_turn", rt_mock),
+        patch("mini_minion.agents.session.run_turn", rt_mock),
         patch("mini_minion.minion.create_provider", return_value=Mock()),
         patch("builtins.input", side_effect=iter(inputs)),
     ):
@@ -117,13 +121,13 @@ def test_compaction_receives_user_message(tmp_path):
 
     seen: list[list[dict]] = []
 
-    def spy_compact(self, messages, provider):
+    def spy_compact(self, messages, provider, on_compaction=None):
         seen.append(list(messages))
         return messages  # pass-through, no actual compaction
 
     with (
         patch("mini_minion.minion.workspace", tmp_path),
-        patch("mini_minion.minion.run_turn", Mock()),
+        patch("mini_minion.agents.session.run_turn", Mock()),
         patch("mini_minion.minion.create_provider", return_value=Mock()),
         patch("builtins.input", side_effect=iter(["hello", "quit"])),
         patch.object(Compactor, "compact", spy_compact),
@@ -136,3 +140,31 @@ def test_compaction_receives_user_message(tmp_path):
         if m.get("role") == "user" and m.get("content") == "hello"
     ]
     assert user_msgs_seen, "compact() was called before the user message was appended"
+
+
+def test_streaming_response_printed_once(tmp_path, capsys):
+    """Streamed response text must appear exactly once — not duplicated by FinalAnswer handler."""
+    import mini_minion.minion as minion_mod
+    from mini_minion.agents.events import FinalAnswer, StreamingStarted, TokenStreamed
+
+    def _emit_streaming_events(provider, name, soul, max_tokens, tools, messages, on_event=None, **kwargs):
+        # Simulate the runner emitting streaming events then FinalAnswer.
+        if on_event:
+            on_event(StreamingStarted(agent_name=name))
+            on_event(TokenStreamed(token="Hello"))
+            on_event(TokenStreamed(token=" world"))
+            on_event(FinalAnswer(agent_name=name, text="Hello world"))
+
+    with (
+        patch("mini_minion.minion.workspace", tmp_path),
+        patch("mini_minion.agents.session.run_turn", side_effect=_emit_streaming_events),
+        patch("mini_minion.minion.create_provider", return_value=Mock()),
+        patch("mini_minion.minion.streaming") as mock_streaming,
+        patch("builtins.input", side_effect=iter(["hi", "quit"])),
+    ):
+        mock_streaming.chat_mode = True
+        minion_mod.main()
+
+    out = capsys.readouterr().out
+    # "Hello world" should appear exactly once in the output, not twice.
+    assert out.count("Hello world") == 1

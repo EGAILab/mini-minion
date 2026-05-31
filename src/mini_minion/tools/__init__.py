@@ -22,6 +22,7 @@ Talks to
 - ``runner.py`` receives the :class:`ToolRegistry` and calls it during the TAO loop.
 """
 
+from collections.abc import Callable
 from pathlib import Path
 
 from .base import Tool, ToolSchema
@@ -30,13 +31,15 @@ from .glob import GlobTool
 from .memory import SaveMemoryTool, SearchMemoryTool
 from .read import ReadTool
 from .registry import ToolRegistry
+from .skill import SkillTool
 from .write import WriteTool
 
 
 def default_registry(
     long_term: "LongTermMemory | None" = None,
     root: Path | None = None,
-    confirm_bash: bool = True,
+    bash_confirm: "Callable[[str], bool] | None" = None,
+    skills: "SkillRegistry | None" = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` with all standard tools registered.
 
@@ -44,15 +47,21 @@ def default_registry(
         long_term: If provided, also registers memory tools with this backend.
         root: Workspace root path. File tools reject paths outside this boundary.
             Pass ``None`` to disable path restriction (unrestricted access).
-        confirm_bash: If ``True`` (default), the bash tool prints each command
-            and requires ``y`` confirmation before executing.
+        bash_confirm: Optional callable passed to :class:`BashTool`.  Called
+            with the command string before execution; returns ``True`` to
+            proceed, ``False`` to cancel.  ``None`` (default) runs commands
+            without asking — suitable for tests and headless pipelines.  The
+            CLI passes its ``_console_confirm`` function so the user is prompted.
+        skills: Optional :data:`SkillRegistry` from :func:`discover_skills`.
+            When non-empty, also registers a :class:`SkillTool` so the model
+            can load skill content on demand.
 
     Returns:
         ToolRegistry: A populated registry ready to pass to :func:`run_turn`.
     """
     registry = ToolRegistry()
     # Register the four core filesystem and shell tools unconditionally.
-    for tool in [ReadTool(root), WriteTool(root), GlobTool(root), BashTool(confirm=confirm_bash, cwd=root)]:
+    for tool in [ReadTool(root), WriteTool(root), GlobTool(root), BashTool(confirm=bash_confirm, cwd=root)]:
         registry.register(tool)
 
     # Only add memory tools if a LongTermMemory backend was provided.
@@ -61,7 +70,11 @@ def default_registry(
         registry.register(SaveMemoryTool(long_term))
         registry.register(SearchMemoryTool(long_term))
 
+    # Only add the skill tool if at least one skill was discovered.
+    if skills:
+        registry.register(SkillTool(skills))
+
     return registry
 
 
-__all__ = ["Tool", "ToolSchema", "ToolRegistry", "default_registry"]
+__all__ = ["Tool", "ToolSchema", "ToolRegistry", "SkillTool", "default_registry"]
