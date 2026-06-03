@@ -113,7 +113,7 @@ mini-minion/
         "baseUrl": "http://127.0.0.1:1234/v1",
         "api": "lmstudio",
         "models": [
-          {"id": "qwen-qwen3.5-9b", "name": "Qwen 3.5 9B", "contextWindow": 8192, "maxOutputTokens": 4096}
+          {"id": "qwen-qwen3.5-9b", "name": "Qwen 3.5 9B", "contextWindow": 262144, "maxOutputTokens": 32768}
         ]
       },
       "aliyuncs": {
@@ -137,7 +137,7 @@ mini-minion/
     "task_mode": false
   },
   "compaction": {
-    "preserve_tokens": 4000
+    "preserve_tokens": 32768
   }
 }
 ```
@@ -156,7 +156,7 @@ mini-minion/
 | `streaming.task_mode` | `true` to stream tokens in programmatic/task invocations; `false` by default |
 | `models.providers.<name>.models[].contextWindow` | The model's total token capacity; used per-agent as the compaction budget |
 | `models.providers.<name>.models[].maxOutputTokens` | Maximum tokens the model may generate per response; sent to the API as `max_tokens` |
-| `compaction.preserve_tokens` | Tokens reserved for the next response and overhead; clamped to `[2000, 8000]` |
+| `compaction.preserve_tokens` | Tokens reserved for the next response and overhead; clamped to `[2000, 40000]` |
 
 ### `.env`
 
@@ -715,7 +715,7 @@ messages = compactor.compact(messages, provider, on_compaction=lambda: print("Co
 
 If the summarisation call fails, `compact()` returns the original list unchanged — the session continues without interruption.
 
-`preserve_tokens` is clamped to `[2_000, 8_000]` at construction time, so misconfigured values never produce a negative usable budget.
+`preserve_tokens` is clamped to `[2_000, 40_000]` at construction time, so misconfigured values never produce a negative usable budget.
 
 ---
 

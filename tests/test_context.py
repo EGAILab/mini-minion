@@ -359,7 +359,7 @@ def test_compaction_config_preserve_tokens_clamped_low():
 def test_compaction_config_preserve_tokens_clamped_high():
     """preserve_tokens above _MAX_PRESERVE is clamped down."""
     compactor = Compactor(context_window=100_000, preserve_tokens=50_000)
-    assert compactor._preserve_tokens == 8_000  # _MAX_PRESERVE
+    assert compactor._preserve_tokens == 40_000  # _MAX_PRESERVE
 
 
 # ---------------------------------------------------------------------------

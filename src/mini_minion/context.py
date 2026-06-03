@@ -36,7 +36,7 @@ from mini_minion.providers.base import LLMProvider
 # Floor and ceiling for the preserve_tokens setting.  Prevents accidental
 # misconfiguration from making the usable budget negative or trivially small.
 _MIN_PRESERVE = 2_000
-_MAX_PRESERVE = 8_000
+_MAX_PRESERVE = 40_000
 
 # How many tokens to reserve by default for the model's response + overhead.
 _DEFAULT_PRESERVE = 4_000
@@ -90,9 +90,9 @@ class Compactor:
     Args:
         context_window (int): Total token capacity of the model in use.
             Set this to match the model's actual context window size (e.g.
-            32 768 for Qwen 3.5 9B, 128 000 for GPT-4o).
+            262 144 for Qwen 3.5 9B, 128 000 for GPT-4o).
         preserve_tokens (int): Tokens to reserve for the model's response and
-            protocol overhead.  Clamped to [2 000, 8 000].  Defaults to 4 000.
+            protocol overhead.  Clamped to [2 000, 40 000].  Defaults to 4 000.
     """
 
     def __init__(

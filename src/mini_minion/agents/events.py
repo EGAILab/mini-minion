@@ -10,7 +10,9 @@ How the event flow works
 Every agent turn produces a stream of events in roughly this order:
 
 1. If streaming is enabled, one :class:`StreamingStarted` followed by N
-   :class:`TokenStreamed` events (one per token).
+   :class:`TokenStreamed` events (one per token).  In non-streaming mode,
+   any preamble text the model emits before tool calls arrives as a single
+   :class:`ThoughtEmitted` event instead.
 2. Zero or more :class:`ToolCalled` events, one per tool the model invokes.
 3. Exactly one :class:`FinalAnswer` when the turn ends.
 
@@ -22,7 +24,8 @@ the model never stops calling tools.
 Who emits what
 --------------
 - ``agents/runner.py`` emits :class:`StreamingStarted`, :class:`TokenStreamed`,
-  :class:`ToolCalled`, :class:`FinalAnswer`, :class:`MaxRoundsReached`.
+  :class:`ThoughtEmitted`, :class:`ToolCalled`, :class:`FinalAnswer`,
+  :class:`MaxRoundsReached`.
 - ``agents/session.py`` translates the compactor's plain callback into
   :class:`CompactionStarted` before forwarding it to the compactor.
 - ``minion.py`` receives all events via its ``_on_event`` handler, which renders
@@ -79,6 +82,24 @@ class ToolCalled:
     """
     name: str
     args: dict
+
+
+@dataclass
+class ThoughtEmitted:
+    """Preamble text the model produced before requesting tool calls (non-streaming only).
+
+    In streaming mode this text was already rendered token-by-token via
+    :class:`TokenStreamed` events, so no separate event is needed.  In
+    non-streaming mode the text would otherwise be silently discarded, so the
+    runner emits this event before the first :class:`ToolCalled` event of the
+    same round.
+
+    Attributes:
+        agent_name: The agent's display name, e.g. ``"Ada"``.
+        text: The full preamble text the model generated before its tool call.
+    """
+    agent_name: str
+    text: str
 
 
 @dataclass

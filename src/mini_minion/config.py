@@ -337,7 +337,7 @@ class CompactionConfig:
 
     Attributes:
         preserve_tokens (int): Tokens to reserve for the model's response and
-            protocol overhead.  Clamped to [2 000, 8 000] at runtime.
+            protocol overhead.  Clamped to [2 000, 40 000] at runtime.
             Defaults to 4 000.
     """
     preserve_tokens: int

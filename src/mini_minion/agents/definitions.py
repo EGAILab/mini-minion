@@ -71,10 +71,13 @@ AGENTS: dict[str, AgentConfig] = {
             "Use search_memory to recall past notes — always search memory first when you encounter "
             "an unfamiliar name, person, or topic before responding.\n"
             "Use save_memory to persist: (1) important research findings, and (2) any personal context "
-            "the user shares — names, ages, relationships, preferences, background.\n"
+            "the user shares — names, ages, relationships, preferences, background, "
+            "location, city, address, zip code.\n"
             "Use the skill tool to load domain expertise when a task matches a skill's description.\n"
-            "After completing tool calls, just stop — do not summarise or explain what you just did. "
-            "If the user's question has not been answered yet, answer it. Otherwise say nothing."
+            "After completing tool calls, always respond directly with your answer to the user — "
+            "do not summarise or explain what tools you ran, just give the answer. "
+            "If tools returned no useful result, say so and provide your best answer anyway. "
+            "Saving something to memory does not count as answering the user; always speak the answer aloud."
         ),
     ),
     "researcher": AgentConfig(
@@ -88,8 +91,9 @@ AGENTS: dict[str, AgentConfig] = {
             "Use tools to gather data. Be thorough but concise.\n"
             "Use save_memory to persist research findings. Use search_memory to avoid re-doing work.\n"
             "Use the skill tool to load domain expertise when a task matches a skill's description.\n"
-            "After completing tool calls, just stop — do not summarise what you did. "
-            "If the user's question has not been answered yet, answer it. Otherwise say nothing."
+            "After completing tool calls, always respond directly with your answer to the user — "
+            "do not summarise what tools you ran, just give the answer. "
+            "If tools returned no useful result, say so and provide your best answer anyway."
         ),
     ),
 }

@@ -7,6 +7,7 @@ from mini_minion.agents.events import (
     FinalAnswer,
     MaxRoundsReached,
     StreamingStarted,
+    ThoughtEmitted,
     TokenStreamed,
     ToolCalled,
 )
@@ -88,6 +89,81 @@ def test_tool_call_then_stop():
 
     final = next(e for e in events if isinstance(e, FinalAnswer))
     assert final.text == "Done."
+
+
+def test_preamble_text_before_tools_emits_thought_event():
+    """Text emitted alongside tool calls must surface as ThoughtEmitted (non-streaming)."""
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    messages: list[dict] = []
+
+    provider = _provider(
+        LLMResponse(
+            text="Let me look that up for you.",
+            tool_calls=[ToolCall(id="tc1", name="echo", arguments={"text": "ping"})],
+            finish_reason="tool_calls",
+            was_streamed=False,
+        ),
+        LLMResponse(text="Done.", finish_reason="stop"),
+    )
+    events = _run(provider, messages)
+
+    thought_events = [e for e in events if isinstance(e, ThoughtEmitted)]
+    assert len(thought_events) == 1
+    assert thought_events[0].text == "Let me look that up for you."
+    assert thought_events[0].agent_name == "Ada"
+
+    # ThoughtEmitted must appear before the ToolCalled event.
+    thought_idx = next(i for i, e in enumerate(events) if isinstance(e, ThoughtEmitted))
+    tool_idx = next(i for i, e in enumerate(events) if isinstance(e, ToolCalled))
+    assert thought_idx < tool_idx
+
+
+def test_no_thought_event_when_preamble_was_streamed():
+    """When text was already streamed token-by-token, no ThoughtEmitted is emitted."""
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    messages: list[dict] = []
+    _call = [0]
+
+    def _chat(system, msgs, tools, max_tokens, on_token=None):
+        _call[0] += 1
+        if _call[0] == 1:
+            if on_token:
+                on_token("Let me check.")
+            return LLMResponse(
+                text="Let me check.",
+                tool_calls=[ToolCall(id="tc1", name="echo", arguments={"text": "x"})],
+                finish_reason="tool_calls",
+                was_streamed=True,
+            )
+        return LLMResponse(text="Done.", finish_reason="stop")
+
+    provider = Mock()
+    provider.chat = Mock(side_effect=_chat)
+    events: list[object] = []
+    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append, stream=True)
+
+    assert not any(isinstance(e, ThoughtEmitted) for e in events)
+
+
+def test_no_thought_event_when_tool_call_has_no_text():
+    """Tool calls with an empty preamble must not emit ThoughtEmitted."""
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    messages: list[dict] = []
+
+    provider = _provider(
+        LLMResponse(
+            text="",
+            tool_calls=[ToolCall(id="tc1", name="echo", arguments={"text": "x"})],
+            finish_reason="tool_calls",
+        ),
+        LLMResponse(text="Done.", finish_reason="stop"),
+    )
+    events = _run(provider, messages)
+
+    assert not any(isinstance(e, ThoughtEmitted) for e in events)
 
 
 def test_multiple_tool_calls_in_one_response():

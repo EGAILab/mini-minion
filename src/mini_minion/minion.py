@@ -66,6 +66,7 @@ from .agents.events import (
     FinalAnswer,
     MaxRoundsReached,
     StreamingStarted,
+    ThoughtEmitted,
     TokenStreamed,
     ToolCalled,
 )
@@ -192,7 +193,10 @@ def main() -> None:
                 print()
                 _streaming_active = False
 
-            if isinstance(event, FinalAnswer):
+            if isinstance(event, ThoughtEmitted):
+                # Non-streaming preamble the model emitted before calling tools.
+                print(f"\n{event.agent_name}: {event.text}")
+            elif isinstance(event, FinalAnswer):
                 # Skip re-printing when tokens were already streamed to screen.
                 if event.text and not was_streaming:
                     print(f"\n{event.agent_name}: {event.text}")

@@ -62,7 +62,7 @@ from collections.abc import Callable
 
 from ..providers import LLMProvider, LLMResponse
 from ..tools import ToolRegistry
-from .events import FinalAnswer, MaxRoundsReached, StreamingStarted, TokenStreamed, ToolCalled
+from .events import FinalAnswer, MaxRoundsReached, StreamingStarted, ThoughtEmitted, TokenStreamed, ToolCalled
 
 # Maximum LLM calls allowed per turn. Prevents indefinite loops when a model
 # repeatedly requests tools without producing a final answer.
@@ -169,6 +169,14 @@ def run_turn(
             if on_event:
                 on_event(FinalAnswer(agent_name=agent_name, text=response.text or ""))
             return
+
+        # In non-streaming mode the model may narrate before calling tools
+        # (e.g. "Let me search memory for you.").  That text was already stored
+        # in the assistant message but never shown.  Emit it now so the caller
+        # can display it before the tool status lines appear.
+        # Streaming mode skips this — the tokens were already sent via on_token.
+        if response.text and not response.was_streamed and on_event:
+            on_event(ThoughtEmitted(agent_name=agent_name, text=response.text))
 
         # --- ACT: execute each requested tool ---
         for tc in response.tool_calls:
