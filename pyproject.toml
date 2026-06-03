@@ -10,6 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0"]
+tiktoken  = ["tiktoken>=0.7.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

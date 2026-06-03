@@ -88,11 +88,19 @@ class LongTermMemory:
         return p.read_text(encoding="utf-8") if p.exists() else None
 
     def search(self, query: str, max_results: int = _SEARCH_MAX_RESULTS) -> list[tuple[str, str]]:
-        """Search all memory notes for any term in the query.
+        """Search all memory notes, ranked by term frequency and recency.
 
-        Splits ``query`` on whitespace and returns notes where at least one
-        term appears in the content or key. Case-insensitive. Capped at
-        ``max_results`` to prevent flooding the context window.
+        Improvements over a simple any-term scan:
+
+        - **Scored by term frequency**: notes that match more query terms rank
+          higher than notes that match only one.
+        - **Stop-word filter**: terms shorter than 3 characters are ignored
+          (e.g. "a", "an", "in") to reduce false positives.
+        - **Recency tie-breaker**: among notes with the same term-match score,
+          newer files rank slightly higher.  The tie-breaker never overrides
+          relevance — a more-matching note always wins.
+        - **Deterministic**: same query on same files always returns same order
+          (secondary sort by key name).
 
         Args:
             query (str): One or more keywords to search for (case-insensitive).
@@ -100,22 +108,44 @@ class LongTermMemory:
                 :data:`_SEARCH_MAX_RESULTS`.
 
         Returns:
-            list[tuple[str, str]]: List of ``(key, content)`` pairs for
-                matching notes, sorted alphabetically by key.
+            list[tuple[str, str]]: ``(key, content)`` pairs, best match first.
         """
-        results = []
-        terms = [t for t in query.lower().split() if t]
+        # Filter out stop-word candidates (< 3 chars) to reduce noise.
+        terms = [t.lower() for t in query.split() if len(t) >= 3]
         if not terms:
-            return results
-        for p in sorted(self._dir.glob("*.md")):
-            content = p.read_text(encoding="utf-8")
+            return []
+
+        scored: list[tuple[float, str, str]] = []  # (score, key, content)
+
+        for p in self._dir.glob("*.md"):
+            try:
+                content = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+
             content_lower = content.lower()
             stem_lower = p.stem.lower()
-            if any(t in content_lower or t in stem_lower for t in terms):
-                results.append((p.stem, content))
-                if len(results) >= max_results:
-                    break
-        return results
+
+            # Count distinct matching terms — more matches → higher score.
+            match_count = sum(
+                1 for t in terms if t in content_lower or t in stem_lower
+            )
+            if match_count == 0:
+                continue
+
+            # Recency tie-breaker: newer mtime → fractionally higher score.
+            # Division by 1e10 keeps the factor < 1 so it never overrides
+            # the integer term-match score.
+            try:
+                recency = p.stat().st_mtime / 1e10
+            except OSError:
+                recency = 0.0
+
+            scored.append((match_count + recency, p.stem, content))
+
+        # Sort: highest score first; deterministic secondary sort by key name.
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [(key, content) for _, key, content in scored[:max_results]]
 
     def list_keys(self) -> list[str]:
         """Return a sorted list of all stored note keys.

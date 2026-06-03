@@ -4,9 +4,15 @@ import pytest
 from unittest.mock import Mock, patch
 
 from mini_minion.agents.definitions import AgentConfig
-from mini_minion.agents.events import CompactionStarted, FinalAnswer, ToolCalled
+from mini_minion.agents.events import (
+    CompactionFailed,
+    CompactionStarted,
+    FinalAnswer,
+    ToolCalled,
+)
 from mini_minion.agents.session import AgentSession
 from mini_minion.context import Compactor
+from mini_minion.memory.long_term import LongTermMemory
 from mini_minion.memory.short_term import ShortTermMemory
 from mini_minion.providers.base import LLMResponse
 from mini_minion.session import SessionStore
@@ -240,3 +246,138 @@ def test_history_property_returns_defensive_copy(tmp_path):
     h.clear()
 
     assert len(session.history) > 0
+
+
+# ---------------------------------------------------------------------------
+# max_tool_rounds forwarding
+# ---------------------------------------------------------------------------
+
+def test_max_tool_rounds_forwarded_to_run_turn(tmp_path):
+    """AgentSession must forward agent.max_tool_rounds to run_turn."""
+    provider = _mock_provider()
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    session = AgentSession(
+        agent_id="main",
+        agent=AgentConfig(name="Ada", soul="You are Ada.", max_tool_rounds=7),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+    )
+    captured: dict = {}
+
+    def _fake_run_turn(*args, **kwargs):
+        captured["max_tool_rounds"] = kwargs.get("max_tool_rounds")
+
+    with patch("mini_minion.agents.session.run_turn", side_effect=_fake_run_turn):
+        try:
+            session.send("hello")
+        except Exception:
+            pass
+
+    assert captured.get("max_tool_rounds") == 7
+
+
+# ---------------------------------------------------------------------------
+# CompactionFailed event
+# ---------------------------------------------------------------------------
+
+def test_send_emits_compaction_failed_event_on_summarisation_error(tmp_path):
+    """When compaction summarisation fails, CompactionFailed event must be emitted."""
+    provider = _mock_provider()
+    session = _make_session(tmp_path, provider=provider)
+    session._history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    events: list[object] = []
+
+    with patch.object(session._compactor, "needs_compaction", return_value=True):
+        with patch.object(
+            session._compactor,
+            "_summarise",
+            side_effect=RuntimeError("summarisation failed"),
+        ):
+            session.send("new message", on_event=events.append)
+
+    failed = [e for e in events if isinstance(e, CompactionFailed)]
+    assert len(failed) == 1
+    assert "RuntimeError" in failed[0].error
+
+
+# ---------------------------------------------------------------------------
+# User context injection
+# ---------------------------------------------------------------------------
+
+def test_user_context_injected_into_system_prompt(tmp_path):
+    """When user_context.md exists, its content must appear in the system prompt."""
+    long_term = LongTermMemory(tmp_path / "memory")
+    long_term.save("user_context", "User is a Python expert.")
+
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    provider = _mock_provider()
+
+    session = AgentSession(
+        agent_id="main",
+        agent=AgentConfig(name="Ada", soul="Base soul."),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        long_term=long_term,
+    )
+
+    captured_system: list[str] = []
+
+    def _capture(system, msgs, tools, max_tokens, on_token=None):
+        captured_system.append(system)
+        return LLMResponse(text="ok", finish_reason="stop")
+
+    provider.chat = Mock(side_effect=_capture)
+    session.send("hello")
+
+    assert len(captured_system) == 1
+    assert "User is a Python expert." in captured_system[0]
+    assert "user_context" in captured_system[0].lower()
+
+
+def test_no_user_context_when_file_absent(tmp_path):
+    """When user_context.md is absent, the system prompt must not contain the block."""
+    long_term = LongTermMemory(tmp_path / "memory")
+    # Do NOT save user_context — file absent
+
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    provider = _mock_provider()
+
+    session = AgentSession(
+        agent_id="main",
+        agent=AgentConfig(name="Ada", soul="Base soul."),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        long_term=long_term,
+    )
+
+    captured_system: list[str] = []
+
+    def _capture(system, msgs, tools, max_tokens, on_token=None):
+        captured_system.append(system)
+        return LLMResponse(text="ok", finish_reason="stop")
+
+    provider.chat = Mock(side_effect=_capture)
+    session.send("hello")
+
+    assert "<user_context>" not in captured_system[0]

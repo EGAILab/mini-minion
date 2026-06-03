@@ -121,7 +121,7 @@ def test_compaction_receives_user_message(tmp_path):
 
     seen: list[list[dict]] = []
 
-    def spy_compact(self, messages, provider, on_compaction=None):
+    def spy_compact(self, messages, provider, on_compaction=None, on_compaction_failed=None):
         seen.append(list(messages))
         return messages  # pass-through, no actual compaction
 

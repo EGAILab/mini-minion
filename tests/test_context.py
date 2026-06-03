@@ -69,9 +69,16 @@ def test_estimate_tokens_grows_with_content():
 
 
 def test_estimate_tokens_consistent_with_json_length():
-    msg = _msg("user", "hello world")
-    expected = max(1, len(json.dumps(msg)) // 4)
-    assert _estimate_tokens(msg) == expected
+    """When tiktoken is not installed, estimate uses the 4-char heuristic."""
+    try:
+        import tiktoken  # noqa: F401
+        # tiktoken installed — exact counts differ from heuristic, skip check
+        import pytest
+        pytest.skip("tiktoken installed — heuristic formula test not applicable")
+    except ImportError:
+        msg = _msg("user", "hello world")
+        expected = max(1, len(json.dumps(msg)) // 4)
+        assert _estimate_tokens(msg) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -384,3 +391,107 @@ def test_format_head_truncates_long_user_message():
     result = compactor._format_head(msgs)
     assert "u" * _MAX_HEAD_CONTENT in result
     assert "u" * (_MAX_HEAD_CONTENT + 1) not in result
+
+
+# ---------------------------------------------------------------------------
+# _prune — microcompact behaviour
+# ---------------------------------------------------------------------------
+
+def test_prune_microcompacts_old_tool_results():
+    """Tool results older than the last _tail_keep_full are replaced with one-liners."""
+    from mini_minion.context import _TAIL_KEEP_FULL_RESULTS
+    compactor = Compactor(context_window=10_000)
+    # Build more tool results than the keep-full threshold.
+    tail = [_tool_result("x" * 100, call_id=f"tc{i}") for i in range(_TAIL_KEEP_FULL_RESULTS + 2)]
+    pruned = compactor._prune(tail)
+
+    # The first two results (oldest) should be microcompacted.
+    assert "chars" in pruned[0]["content"]
+    assert "re-read" in pruned[0]["content"]
+    assert pruned[0]["content"] != "x" * 100
+
+    # The last _TAIL_KEEP_FULL_RESULTS results should be kept in full.
+    for msg in pruned[-_TAIL_KEEP_FULL_RESULTS:]:
+        assert msg["content"] == "x" * 100
+
+
+def test_prune_keeps_all_when_fewer_than_threshold(tmp_path=None):
+    """When the tail has ≤ _tail_keep_full tool results, all are kept in full."""
+    from mini_minion.context import _TAIL_KEEP_FULL_RESULTS
+    compactor = Compactor(context_window=10_000)
+    tail = [_tool_result("content", call_id=f"tc{i}") for i in range(_TAIL_KEEP_FULL_RESULTS - 1)]
+    pruned = compactor._prune(tail)
+    for msg in pruned:
+        assert msg["content"] == "content"
+
+
+def test_prune_microcompact_preserves_tool_call_id():
+    """Microcompacted messages must retain their tool_call_id."""
+    compactor = Compactor(context_window=10_000, tail_keep_full_results=1)
+    tail = [
+        _tool_result("old result", call_id="old_id"),
+        _tool_result("new result", call_id="new_id"),
+    ]
+    pruned = compactor._prune(tail)
+    assert pruned[0]["tool_call_id"] == "old_id"
+    assert pruned[1]["tool_call_id"] == "new_id"
+
+
+def test_prune_microcompact_does_not_mutate_original():
+    """Microcompaction must not mutate the original dict."""
+    compactor = Compactor(context_window=10_000, tail_keep_full_results=0)
+    original = _tool_result("original content", call_id="x")
+    compactor._prune([original])
+    assert original["content"] == "original content"
+
+
+def test_prune_non_tool_messages_unchanged_with_microcompact():
+    """Non-tool messages must pass through _prune unchanged even with microcompact."""
+    compactor = Compactor(context_window=10_000, tail_keep_full_results=0)
+    user_msg = _msg("user", "x" * 5_000)
+    pruned = compactor._prune([user_msg])
+    assert pruned[0]["content"] == user_msg["content"]
+
+
+def test_tail_keep_full_results_configurable():
+    """tail_keep_full_results constructor param must override the default."""
+    compactor = Compactor(context_window=10_000, tail_keep_full_results=2)
+    tail = [_tool_result(f"result {i}", call_id=f"tc{i}") for i in range(5)]
+    pruned = compactor._prune(tail)
+    # First 3 (indices 0-2) are microcompacted; last 2 (indices 3-4) are kept full.
+    assert "chars" in pruned[0]["content"]
+    assert "chars" in pruned[1]["content"]
+    assert "chars" in pruned[2]["content"]
+    assert pruned[3]["content"] == "result 3"
+    assert pruned[4]["content"] == "result 4"
+
+
+# ---------------------------------------------------------------------------
+# compact() — CompactionFailed callback
+# ---------------------------------------------------------------------------
+
+def test_compact_calls_on_compaction_failed_on_provider_error():
+    """When summarisation fails, on_compaction_failed must be called with the error."""
+    compactor = _make_compactor_with_usable(1)
+    msgs = [_msg("user", "a" * 100), _msg("assistant", "b" * 100)]
+    failures: list[str] = []
+    compactor.compact(msgs, _FailingProvider(), on_compaction_failed=failures.append)
+    assert len(failures) == 1
+    assert "RuntimeError" in failures[0]
+
+
+def test_compact_returns_original_when_failed_with_callback():
+    """compact() must still return original history when on_compaction_failed is set."""
+    compactor = _make_compactor_with_usable(1)
+    msgs = [_msg("user", "a" * 100), _msg("assistant", "b" * 100)]
+    result = compactor.compact(msgs, _FailingProvider(), on_compaction_failed=lambda e: None)
+    assert result == msgs
+
+
+def test_compact_no_failure_callback_when_succeeds():
+    """on_compaction_failed must NOT be called on a successful compaction."""
+    compactor = _make_compactor_with_usable(1)
+    msgs = [_msg("user", "a" * 100), _msg("assistant", "b" * 100), _msg("user", "c")]
+    failures: list[str] = []
+    compactor.compact(msgs, _MockProvider(), on_compaction_failed=failures.append)
+    assert failures == []

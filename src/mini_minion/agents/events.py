@@ -9,25 +9,25 @@ How the event flow works
 ------------------------
 Every agent turn produces a stream of events in roughly this order:
 
-1. If streaming is enabled, one :class:`StreamingStarted` followed by N
-   :class:`TokenStreamed` events (one per token).  In non-streaming mode,
-   any preamble text the model emits before tool calls arrives as a single
-   :class:`ThoughtEmitted` event instead.
-2. Zero or more :class:`ToolCalled` events, one per tool the model invokes.
-3. Exactly one :class:`FinalAnswer` when the turn ends.
-
-Additionally, :class:`CompactionStarted` may appear *before* the turn if the
-conversation history was too long and needed to be summarised first.
-:class:`MaxRoundsReached` replaces :class:`FinalAnswer` in the rare case where
-the model never stops calling tools.
+1. **Before the turn** — if compaction was triggered:
+   ``CompactionStarted`` (about to summarise), or ``CompactionFailed``
+   (summarisation provider call failed; original history retained).
+2. **During the turn** — if streaming is enabled:
+   one ``StreamingStarted`` followed by N ``TokenStreamed`` events (one per
+   token).  In non-streaming mode, any preamble text the model emits *before*
+   calling tools arrives as a single ``ThoughtEmitted`` event.
+3. Zero or more ``ToolCalled`` events, one per tool the model invokes.
+4. Exactly one ``FinalAnswer`` when the turn ends successfully, or
+   ``MaxRoundsReached`` when the tool-round cap is hit.
 
 Who emits what
 --------------
 - ``agents/runner.py`` emits :class:`StreamingStarted`, :class:`TokenStreamed`,
   :class:`ThoughtEmitted`, :class:`ToolCalled`, :class:`FinalAnswer`,
   :class:`MaxRoundsReached`.
-- ``agents/session.py`` translates the compactor's plain callback into
-  :class:`CompactionStarted` before forwarding it to the compactor.
+- ``agents/session.py`` translates the compactor's plain callbacks into
+  :class:`CompactionStarted` and :class:`CompactionFailed` events before
+  forwarding them to the compactor.
 - ``minion.py`` receives all events via its ``_on_event`` handler, which renders
   them as terminal output.  Tests and other callers can use a custom handler
   (e.g. ``events.append``) to collect events for assertions without any I/O.
@@ -140,3 +140,18 @@ class CompactionStarted:
     No attributes — the event is a pure notification that compaction is
     about to happen.  The caller can use it to show a status indicator.
     """
+
+
+@dataclass
+class CompactionFailed:
+    """Emitted when the summarisation LLM call during compaction fails.
+
+    The compactor falls back to the original history when this happens —
+    the conversation continues, but the context window is not reclaimed.
+    Repeated failures will eventually cause the context window to overflow.
+
+    Attributes:
+        error: Short description of the failure, e.g.
+               ``"TimeoutError: provider did not respond"``.
+    """
+    error: str

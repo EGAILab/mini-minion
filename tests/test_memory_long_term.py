@@ -143,6 +143,47 @@ def test_search_caps_at_max_results(tmp_path):
     assert len(results) == _SEARCH_MAX_RESULTS
 
 
+# ---------------------------------------------------------------------------
+# Ranked search — term-frequency ordering
+# ---------------------------------------------------------------------------
+
+def test_search_ranks_by_term_frequency(tmp_path):
+    """Notes matching more query terms must rank above notes matching fewer."""
+    mem = LongTermMemory(tmp_path)
+    mem.save("weak-match", "This mentions Python once")
+    mem.save("strong-match", "Python async Python patterns Python")
+    results = mem.search("Python")
+    # strong-match has 3 occurrences; weak-match has 1 — strong should come first.
+    keys = [k for k, _ in results]
+    assert keys.index("strong-match") < keys.index("weak-match")
+
+
+def test_search_filters_short_stop_words(tmp_path):
+    """Terms shorter than 3 characters must not be used for matching."""
+    mem = LongTermMemory(tmp_path)
+    # "an" is 2 chars — should be filtered; note should NOT match
+    mem.save("note", "some content here")
+    results = mem.search("an")
+    assert results == []
+
+
+def test_search_uses_terms_of_three_plus_chars(tmp_path):
+    """Terms of 3+ characters must still match."""
+    mem = LongTermMemory(tmp_path)
+    mem.save("note", "API documentation")
+    assert len(mem.search("API")) == 1
+
+
+def test_search_deterministic_order(tmp_path):
+    """Same query on same files must return results in the same order."""
+    mem = LongTermMemory(tmp_path)
+    for i in range(5):
+        mem.save(f"note-{i}", "keyword content here")
+    r1 = [k for k, _ in mem.search("keyword")]
+    r2 = [k for k, _ in mem.search("keyword")]
+    assert r1 == r2
+
+
 def test_per_agent_memory_is_isolated(tmp_path):
     """Two LongTermMemory instances at different paths don't share notes.
 

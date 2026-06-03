@@ -62,6 +62,7 @@ from pathlib import Path
 
 from .agents import AGENTS, AgentSession, resolve
 from .agents.events import (
+    CompactionFailed,
     CompactionStarted,
     FinalAnswer,
     MaxRoundsReached,
@@ -116,6 +117,7 @@ def main() -> None:
     short_term = ShortTermMemory(workspace / "sessions")
     session_store = SessionStore(workspace / "sessions.json")
     _tool_root = Path.cwd()
+    _tasks_dir = workspace / "tasks"
 
     # --- Console callbacks (the only two places that call print/input) ---
 
@@ -136,6 +138,8 @@ def main() -> None:
             root=_tool_root,
             bash_confirm=_console_confirm,
             skills=skills,
+            tasks_dir=_tasks_dir,
+            agent_id=agent_id,
         )
         provider = create_provider(
             api=cfg.provider.api,
@@ -157,6 +161,7 @@ def main() -> None:
             short_term=short_term,
             session_store=session_store,
             soul_suffix=_skills_suffix,
+            long_term=long_term,
         )
 
     use_streaming = streaming.chat_mode
@@ -170,14 +175,12 @@ def main() -> None:
     def _on_event(event: object) -> None:
         """Render one agent runtime event as terminal output.
 
-        Handles all six event types emitted by the runner, compactor, and
+        Handles all event types emitted by the runner, compactor, and
         (indirectly) the bash tool confirm flow.
         """
         nonlocal _streaming_active
 
         if isinstance(event, StreamingStarted):
-            # Print the "Ada: " prefix before the first token so subsequent
-            # TokenStreamed events appear inline after it.
             print(f"\n{event.agent_name}: ", end="", flush=True)
             _streaming_active = True
 
@@ -185,19 +188,14 @@ def main() -> None:
             print(event.token, end="", flush=True)
 
         else:
-            # Any non-token event ends an in-progress streaming line.
-            # Capture the flag BEFORE clearing it so we know whether to
-            # re-print FinalAnswer text (which is already on screen if streamed).
             was_streaming = _streaming_active
             if _streaming_active:
                 print()
                 _streaming_active = False
 
             if isinstance(event, ThoughtEmitted):
-                # Non-streaming preamble the model emitted before calling tools.
                 print(f"\n{event.agent_name}: {event.text}")
             elif isinstance(event, FinalAnswer):
-                # Skip re-printing when tokens were already streamed to screen.
                 if event.text and not was_streaming:
                     print(f"\n{event.agent_name}: {event.text}")
             elif isinstance(event, ToolCalled):
@@ -206,6 +204,8 @@ def main() -> None:
                 print(f"\n{event.agent_name}: {event.message}")
             elif isinstance(event, CompactionStarted):
                 print("\n  Compacting session history...")
+            elif isinstance(event, CompactionFailed):
+                print(f"\n  [Warning] Compaction failed: {event.error}")
 
     # --- REPL loop ---
     print("Mini-Minion ready. Type 'exit' or '/quit' to quit.")
@@ -223,8 +223,6 @@ def main() -> None:
 
         agent_id, message = resolve(user_input)
 
-        # Reset streaming state before each turn in case the previous turn's
-        # provider raised mid-stream and left _streaming_active True.
         _streaming_active = False
 
         try:
