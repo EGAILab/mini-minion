@@ -91,3 +91,60 @@ def test_register_overwrites_same_name():
     reg.register(_ConstTool())
     assert reg.execute("add", {"a": 1, "b": 2}) == "const"
     assert len(reg.definitions) == 1
+
+
+# ---------------------------------------------------------------------------
+# IMP-11: Per-tool execution hooks
+# ---------------------------------------------------------------------------
+
+
+class _EchoTool(Tool):
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(name="echo", description="Echo.", parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]})
+
+    def execute(self, **kwargs: object) -> str:
+        return str(kwargs.get("text", ""))
+
+
+def test_after_execute_hook_called_with_correct_args():
+    """after_execute hook receives (name, args, output, elapsed_ms)."""
+    calls: list = []
+    reg = ToolRegistry(after_execute=lambda n, a, o, e: calls.append((n, a, o, e)))
+    reg.register(_EchoTool())
+    output = reg.execute("echo", {"text": "hi"})
+    assert len(calls) == 1
+    name, args, out, elapsed = calls[0]
+    assert name == "echo"
+    assert args == {"text": "hi"}
+    assert out == "hi"
+    assert elapsed >= 0
+
+
+def test_before_execute_hook_called():
+    calls: list = []
+    reg = ToolRegistry(before_execute=lambda n, a: calls.append(n))
+    reg.register(_EchoTool())
+    reg.execute("echo", {"text": "x"})
+    assert calls == ["echo"]
+
+
+def test_hook_exception_does_not_crash_execution():
+    """A buggy hook must never prevent the tool from running."""
+    def bad_hook(n, a, o, e):
+        raise RuntimeError("hook broke")
+
+    reg = ToolRegistry(after_execute=bad_hook)
+    reg.register(_EchoTool())
+    assert reg.execute("echo", {"text": "hello"}) == "hello"
+
+
+def test_is_read_only_returns_true_for_read_only_tool():
+    from mini_minion.tools.read import ReadTool
+    reg = ToolRegistry()
+    reg.register(ReadTool(root=None))
+    assert reg.is_read_only("read") is True
+
+
+def test_is_read_only_returns_false_for_unknown_tool():
+    assert ToolRegistry().is_read_only("nonexistent") is False

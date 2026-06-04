@@ -52,7 +52,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 
-from .base import LLMResponse, ToolCall
+from .base import LLMResponse, TokenUsage, ToolCall
 
 
 class AnthropicProvider:
@@ -151,11 +151,18 @@ class AnthropicProvider:
                 # block.input is already a dict (not a JSON string) in the Anthropic SDK.
                 tool_calls.append(ToolCall(id=block.id, name=block.name, arguments=block.input))
 
+        _usage = None
+        if hasattr(response, "usage") and response.usage is not None:
+            _usage = TokenUsage(
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+            )
         return LLMResponse(
             text="\n".join(text_parts),
             tool_calls=tool_calls,
             finish_reason="tool_calls" if tool_calls else (response.stop_reason or "stop"),
             was_streamed=False,
+            usage=_usage,
         )
 
     def _chat_streaming(
@@ -200,12 +207,19 @@ class AnthropicProvider:
             elif block.type == "tool_use":
                 tool_calls.append(ToolCall(id=block.id, name=block.name, arguments=block.input))
 
+        _usage = None
+        if hasattr(final_message, "usage") and final_message.usage is not None:
+            _usage = TokenUsage(
+                input_tokens=final_message.usage.input_tokens,
+                output_tokens=final_message.usage.output_tokens,
+            )
         return LLMResponse(
             text="\n".join(text_parts),
             tool_calls=tool_calls,
             finish_reason="tool_calls" if tool_calls else (final_message.stop_reason or "stop"),
             # was_streamed is True only if we actually called on_token at least once.
             was_streamed=text_emitted,
+            usage=_usage,
         )
 
 

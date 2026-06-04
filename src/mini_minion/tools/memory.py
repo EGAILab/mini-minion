@@ -124,6 +124,7 @@ class SearchMemoryTool(Tool):
                 "appears in the note content or note name. When nothing matches, "
                 "lists available note names so you can refine the search."
             ),
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {

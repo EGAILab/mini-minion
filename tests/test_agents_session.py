@@ -207,11 +207,11 @@ def test_send_emits_compaction_started_event(tmp_path):
 def test_send_increments_turn_count_on_success(tmp_path):
     """Successful turn must increment the turn counter in the session store."""
     session = _make_session(tmp_path)
-    store = SessionStore(tmp_path / "sessions.json")
-
-    before = store.get_or_create("main").turn_count
+    # Create fresh instances before and after to verify disk persistence.
+    # The in-memory cache is per-instance, so a new instance always reads from disk.
+    before = SessionStore(tmp_path / "sessions.json").get_or_create("main").turn_count
     session.send("hello")
-    after = store.get_or_create("main").turn_count
+    after = SessionStore(tmp_path / "sessions.json").get_or_create("main").turn_count
 
     assert after == before + 1
 
@@ -381,3 +381,42 @@ def test_no_user_context_when_file_absent(tmp_path):
     session.send("hello")
 
     assert "<user_context>" not in captured_system[0]
+
+
+# ---------------------------------------------------------------------------
+# IMP-08: TurnCompleted event
+# ---------------------------------------------------------------------------
+
+
+def test_turn_completed_event_emitted(tmp_path):
+    """TurnCompleted must be emitted after every successful turn."""
+    import uuid
+    from mini_minion.agents.events import TurnCompleted
+
+    provider = _mock_provider(text="done")
+    session = _make_session(tmp_path, provider=provider)
+    events: list[object] = []
+    session.send("hello", on_event=events.append)
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    tc = completed[0]
+    assert tc.agent_name == "Ada"
+    assert uuid.UUID(tc.trace_id)   # must be a valid UUID
+    assert tc.turn_number == 1
+    assert tc.elapsed_ms >= 0
+    assert isinstance(tc.compacted, bool)
+
+
+def test_turn_completed_not_emitted_on_failure(tmp_path):
+    """TurnCompleted must NOT be emitted when the turn raises."""
+    from mini_minion.agents.events import TurnCompleted
+    provider = Mock()
+    provider.chat = Mock(side_effect=RuntimeError("fail"))
+    session = _make_session(tmp_path, provider=provider)
+    events: list[object] = []
+    try:
+        session.send("hello", on_event=events.append)
+    except RuntimeError:
+        pass
+    assert not any(isinstance(e, TurnCompleted) for e in events)

@@ -248,3 +248,24 @@ def test_streaming_was_streamed_false_when_no_text_tokens():
     result = p._chat_streaming({}, on_token=lambda t: None)
 
     assert result.was_streamed is False
+
+
+# ---------------------------------------------------------------------------
+# IMP-07: Usage population
+# ---------------------------------------------------------------------------
+
+
+def test_blocking_populates_usage_when_api_returns_it():
+    from mini_minion.providers.base import TokenUsage
+    p = _provider()
+    usage = Mock()
+    usage.input_tokens = 120
+    usage.output_tokens = 40
+    resp = Mock(content=[_block("text", text="ok")], stop_reason="end_turn", usage=usage)
+    p._client.messages.create.return_value = resp
+
+    result = p._chat_blocking({})
+
+    assert isinstance(result.usage, TokenUsage)
+    assert result.usage.input_tokens == 120
+    assert result.usage.output_tokens == 40

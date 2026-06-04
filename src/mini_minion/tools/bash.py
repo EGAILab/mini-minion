@@ -48,6 +48,16 @@ _IS_WINDOWS = platform.system() == "Windows"
 
 _DEFAULT_TIMEOUT = 30  # seconds
 
+# Known cloud instance metadata endpoints and link-local addresses.
+# String scan catches the most common attack vectors. Not exhaustive —
+# a numeric IP like 0xa9fea9fe would bypass it. See docs for limitations.
+_SSRF_MARKERS = frozenset({
+    "169.254.169.254",          # AWS/GCP/Azure instance metadata
+    "metadata.google.internal", # GCP metadata DNS alias
+    "169.254.170.2",            # ECS task metadata endpoint
+    "fd00:ec2::254",            # AWS IMDSv2 IPv6
+})
+
 # The description is platform-specific so the model uses the right shell syntax.
 _DESCRIPTION = (
     "Run a PowerShell command. Use PowerShell syntax and cmdlets: "
@@ -136,6 +146,13 @@ class BashTool(Tool):
         """
         command = str(kwargs["command"])
         timeout = int(kwargs.get("timeout") or _DEFAULT_TIMEOUT)
+
+        # SSRF guard: block requests to cloud metadata endpoints.
+        if any(marker in command for marker in _SSRF_MARKERS):
+            return (
+                "Error: command blocked — requests to cloud instance metadata "
+                "endpoints (169.254.169.254 and equivalents) are not permitted."
+            )
 
         if self._confirm is not None and not self._confirm(command):
             return "Command cancelled by user."

@@ -25,7 +25,7 @@ from __future__ import annotations
 import pathlib
 from pathlib import Path
 
-from .base import Tool, ToolSchema, _within
+from .base import Tool, ToolSchema, _is_sensitive, _within
 
 
 class WriteTool(Tool):
@@ -75,6 +75,11 @@ class WriteTool(Tool):
                 On error: a human-readable error message.
         """
         path = pathlib.Path(str(kwargs["path"]))
+        if _is_sensitive(path):
+            return (
+                f"Error: '{path}' is a protected system path and cannot be written. "
+                "Writing to credential files and secret directories is not permitted."
+            )
         if self._root and not _within(path, self._root):
             return f"Error: '{path}' is outside the workspace root '{self._root}'"
         content = str(kwargs["content"])

@@ -76,8 +76,10 @@ import logging
 import random
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..providers import LLMProvider, LLMResponse
+from ..providers.base import TokenUsage
 from ..tools import ToolRegistry
 from .events import (
     FinalAnswer,
@@ -86,6 +88,7 @@ from .events import (
     ThoughtEmitted,
     TokenStreamed,
     ToolCalled,
+    ToolCompleted,
 )
 
 _log = logging.getLogger("mini_minion.runner")
@@ -122,23 +125,45 @@ def _call_with_retry(fn: Callable[[], LLMResponse]) -> LLMResponse:
         immediately for non-retryable errors.
     """
     last_exc: Exception | None = None
+
+    # range(_MAX_RETRIES + 1) gives attempts 0, 1, 2, 3 — four chances total
+    # (one original attempt plus up to _MAX_RETRIES retries).
     for attempt in range(_MAX_RETRIES + 1):
         try:
-            return fn()
+            return fn()  # success — exit immediately, no retry needed
         except Exception as exc:
-            last_exc = exc
+            last_exc = exc  # save so we can re-raise after all attempts exhausted
+
+            # --- Determine if this error is worth retrying ---
+            # HTTP errors carry a .response.status_code attribute; network/OS
+            # errors do not, so we use getattr with a None default.
             response_obj = getattr(exc, "response", None)
             status = getattr(response_obj, "status_code", None)
+
             is_retryable = (
+                # 429 = rate limited; 5xx = server-side problem.  Both are
+                # temporary — the provider will recover on its own.
                 (status is not None and status in _RETRYABLE_HTTP_STATUS)
+                # Network-level errors (DNS failure, dropped connection, OS socket error).
                 or isinstance(exc, (TimeoutError, ConnectionError, OSError))
+                # Some providers raise plain Exception with a description string
+                # instead of a typed error class, so also check the message text.
                 or any(
                     kw in str(exc).lower()
                     for kw in ("timeout", "connection", "rate limit", "timed out")
                 )
             )
+
+            # Stop immediately if the error is permanent (e.g. 400 Bad Request,
+            # 401 Unauthorized) or we have exhausted all retry attempts.
             if not is_retryable or attempt == _MAX_RETRIES:
                 raise
+
+            # --- Exponential backoff: 2s → 4s → 8s ---
+            # 2 ** attempt gives 1, 2, 4 for attempts 0, 1, 2.
+            # Multiplying by _RETRY_BASE_SECONDS (2.0) gives 2, 4, 8 seconds.
+            # Adding random jitter (0–0.5 s) spreads out simultaneous retries
+            # from multiple agents so they don't all hammer the provider at once.
             delay = _RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0, 0.5)
             _log.warning(
                 "Provider call failed (attempt %d/%d, %s). Retrying in %.1f s.",
@@ -148,7 +173,26 @@ def _call_with_retry(fn: Callable[[], LLMResponse]) -> LLMResponse:
                 delay,
             )
             time.sleep(delay)
-    raise last_exc  # type: ignore[misc]  — unreachable; satisfies mypy
+
+    # This line is unreachable in practice: the loop either returns on success
+    # or raises inside the except block.  It exists only to satisfy the type
+    # checker, which cannot prove that raise always runs before the loop ends.
+    raise last_exc  # type: ignore[misc]
+
+
+def _timed_execute(registry: ToolRegistry, name: str, arguments: dict) -> tuple[str, int]:
+    """Execute a tool and return ``(output, elapsed_ms)``.
+
+    Wrapped into its own function so ``ThreadPoolExecutor.submit()`` can call it
+    as a picklable callable.  Returns the elapsed time in milliseconds so the
+    caller can emit a :class:`ToolCompleted` event with timing information.
+    ``time.monotonic()`` is used instead of ``time.time()`` because it is
+    unaffected by system clock adjustments (NTP, daylight saving, etc.).
+    """
+    start = time.monotonic()
+    output = registry.execute(name, arguments)
+    elapsed = int((time.monotonic() - start) * 1000)
+    return output, elapsed
 
 
 def run_turn(
@@ -161,7 +205,7 @@ def run_turn(
     on_event: Callable[[object], None] | None = None,
     stream: bool = False,
     max_tool_rounds: int = _MAX_TOOL_ROUNDS,
-) -> None:
+) -> TokenUsage | None:
     """Drive a single user turn to completion, executing tools as needed.
 
     Sends the current conversation to the LLM, handles any tool calls the
@@ -184,10 +228,12 @@ def run_turn(
             task-focused agents that need more sequential tool calls.
 
     Returns:
-        None.  Side effects: appends to ``messages`` and calls ``on_event``.
-        If the model requests tools on every round without producing a final
-        answer, a :class:`MaxRoundsReached` event is emitted and the function
-        returns normally — no exception is raised.
+        TokenUsage | None: Accumulated token usage across all provider.chat()
+            calls within this turn, or None if no provider returned usage data.
+            Side effects: appends to ``messages`` and calls ``on_event``.
+            If the model requests tools on every round without producing a final
+            answer, a :class:`MaxRoundsReached` event is emitted and the function
+            returns normally — no exception is raised.
     """
     _header_printed = [False]
 
@@ -200,6 +246,15 @@ def run_turn(
         on_event(TokenStreamed(token=token))
 
     _token_callback = _on_token if (on_event is not None and stream) else None
+
+    # Token usage accumulators — summed across all provider.chat() calls in this turn.
+    # A single user turn can involve multiple LLM calls (one per tool-call round),
+    # so we add up usage from each call and report the total at the end.
+    # _has_usage stays False when the provider doesn't report usage (e.g. local models
+    # via LM Studio often omit it), so we can return None instead of a misleading zero.
+    _total_input = 0
+    _total_output = 0
+    _has_usage = False
 
     # --- TAO loop ---
     for _round in range(max_tool_rounds):
@@ -216,6 +271,12 @@ def run_turn(
             )
         )
 
+        # Accumulate token usage from this provider.chat() call.
+        if response.usage is not None:
+            _total_input += response.usage.input_tokens
+            _total_output += response.usage.output_tokens
+            _has_usage = True
+
         assistant_msg: dict = {"role": "assistant", "content": response.text}
         if response.tool_calls:
             assistant_msg["tool_calls"] = [
@@ -228,8 +289,15 @@ def run_turn(
             ]
 
         # --- Recovery A: empty response ---
-        # Some models return nothing on edge cases (unusual prompt characters,
-        # uncertainty).  Inject a nudge and loop — don't burn a round on silence.
+        # Some models occasionally return no text and no tool calls — this can
+        # happen when the prompt contains unusual characters, when the model is
+        # uncertain, or when the context is ambiguous.  Rather than silently
+        # failing, we inject a "nudge" message that asks the model to try again.
+        #
+        # The nudge is two messages: an empty assistant message (to record in
+        # history that the model said nothing) followed by a system-style user
+        # message asking it to respond.  We only nudge on non-final rounds; on
+        # the last round we let the loop fall through to MaxRoundsReached.
         if not response.text and not response.tool_calls:
             if _round < max_tool_rounds - 1:
                 _log.debug("Empty response on round %d — injecting recovery nudge.", _round)
@@ -241,12 +309,22 @@ def run_turn(
                         "Please respond to the user's message or call a tool to proceed.]"
                     ),
                 })
-                continue
-            # Last round — fall through to MaxRoundsReached.
+                continue  # skip the rest of the loop body and call the LLM again
+            # Last round with still-empty response — fall through to MaxRoundsReached.
 
         # --- Recovery B: truncated response (model hit max_tokens mid-sentence) ---
-        # Inject a continuation prompt so the model picks up where it stopped.
-        # Only attempt once — accept a second truncation.
+        # When `finish_reason == "length"` the model ran out of its token budget
+        # before finishing its sentence.  The response ends abruptly mid-thought.
+        # We save the partial text into history and inject a continuation prompt
+        # so the model can pick up exactly where it stopped.
+        #
+        # We only attempt this once (checked by _round < max_tool_rounds - 1) to
+        # avoid infinite continuation loops if the model keeps truncating.  A
+        # second truncation is accepted as-is and emitted as a FinalAnswer.
+        #
+        # Note: this path only applies when there are no tool calls.  A truncated
+        # response that also has tool calls is treated normally — the tool calls
+        # are executed and the loop continues as usual.
         if response.finish_reason == "length" and not response.tool_calls:
             messages.append(assistant_msg)
             if _round < max_tool_rounds - 1:
@@ -264,7 +342,7 @@ def run_turn(
             # Last round and still truncated — emit what we have.
             if on_event:
                 on_event(FinalAnswer(agent_name=agent_name, text=response.text or ""))
-            return
+            return TokenUsage(_total_input, _total_output) if _has_usage else None
 
         messages.append(assistant_msg)
 
@@ -272,27 +350,103 @@ def run_turn(
         if response.finish_reason != "tool_calls":
             if on_event:
                 on_event(FinalAnswer(agent_name=agent_name, text=response.text or ""))
-            return
+            return TokenUsage(_total_input, _total_output) if _has_usage else None
 
-        # In non-streaming mode the model may narrate before calling tools.
-        # That text was stored in the assistant message but never shown.
-        # Emit it now so the caller can display it before tool status lines.
-        # Streaming mode skips this — tokens were already sent via on_token.
+        # --- Show preamble text that preceded the tool call (non-streaming only) ---
+        # When the model writes "Let me check that for you." before calling a tool,
+        # that text is stored in the assistant message (for conversation history)
+        # but would never be displayed to the user — the runner only emits
+        # FinalAnswer for text that ends the turn, and tool-call rounds don't end.
+        #
+        # ThoughtEmitted fixes this gap: emit the preamble now so the user can
+        # see what the model said before the tool status lines appear.
+        #
+        # We skip this in streaming mode (`was_streamed=True`) because the text
+        # was already printed token-by-token via the on_token callback while the
+        # model was generating.  Emitting it again would duplicate the output.
         if response.text and not response.was_streamed and on_event:
             on_event(ThoughtEmitted(agent_name=agent_name, text=response.text))
 
         # --- ACT: execute each requested tool ---
-        for tc in response.tool_calls:
-            if on_event:
-                on_event(ToolCalled(name=tc.name, args=tc.arguments))
+        # The model may request multiple tools in a single response (e.g. read
+        # three files at once).  When all of them are read-only and parse-error-
+        # free we can run them in parallel threads — they don't write anything, so
+        # there's no risk of one call interfering with another.
+        #
+        # When any tool is write-capable (bash, write, save_memory, update_task)
+        # or has a parse error, we fall back to serial execution so the model's
+        # intended ordering is respected.
+        _all_read_only = (
+            len(response.tool_calls) > 1          # only worth parallelising if there are 2+
+            and all(not tc.error for tc in response.tool_calls)   # skip if any args failed to parse
+            and all(tools.is_read_only(tc.name) for tc in response.tool_calls)  # all must be safe
+        )
 
-            if tc.error:
-                output = tc.error
-            else:
-                output = tools.execute(tc.name, tc.arguments)
+        if _all_read_only:
+            # Emit all ToolCalled events BEFORE any tool executes.
+            # This lets the UI show "[tool: read(...)]" for all pending calls up
+            # front, rather than interleaving "started" and "finished" lines.
+            for tc in response.tool_calls:
+                if on_event:
+                    on_event(ToolCalled(name=tc.name, args=tc.arguments))
 
-            # --- OBSERVE: append the tool result ---
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+            # Run all tools concurrently using a thread pool.
+            # ThreadPoolExecutor(max_workers=N) creates at most N threads — one
+            # per tool call.  executor.submit() schedules each call and returns a
+            # Future.  We key _futures by Future so we can look up which tool call
+            # each Future belongs to when it completes.
+            _results: dict[str, tuple[str, int]] = {}
+            with ThreadPoolExecutor(max_workers=len(response.tool_calls)) as executor:
+                _futures = {
+                    executor.submit(_timed_execute, tools, tc.name, tc.arguments): tc
+                    for tc in response.tool_calls
+                }
+                # as_completed() yields Futures in completion order (fastest first),
+                # which may differ from the original call order.  That's fine here
+                # because we store results by tool_call_id and re-order below.
+                for future in as_completed(_futures):
+                    _tc = _futures[future]
+                    _out, _elapsed = future.result()
+                    _results[_tc.id] = (_out, _elapsed)
+
+            # --- OBSERVE: append tool-result messages in the ORIGINAL call order ---
+            # IMPORTANT: the OpenAI API requires that tool-result messages appear
+            # in the same order as the tool calls in the preceding assistant message.
+            # If we appended in completion order (fastest-first), the provider would
+            # reject the request with a validation error.  We restore original order
+            # by iterating response.tool_calls (unchanged) and looking up results
+            # by tool_call_id from the dict we built above.
+            for tc in response.tool_calls:
+                _output, _elapsed_ms = _results[tc.id]
+                if on_event:
+                    on_event(ToolCompleted(name=tc.name, elapsed_ms=_elapsed_ms, output_chars=len(_output)))
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": _output})
+
+        else:
+            # --- Serial execution (write tools, single tool, or parse errors) ---
+            # Execute each tool call one at a time in the order the model requested.
+            for tc in response.tool_calls:
+                if on_event:
+                    on_event(ToolCalled(name=tc.name, args=tc.arguments))
+
+                if tc.error:
+                    # The provider couldn't parse the model's JSON arguments.
+                    # Feed the parse error back as the tool's output so the model
+                    # can see what went wrong and retry with corrected arguments.
+                    output = tc.error
+                    elapsed_ms = 0
+                else:
+                    _tool_start = time.monotonic()
+                    output = tools.execute(tc.name, tc.arguments)
+                    elapsed_ms = int((time.monotonic() - _tool_start) * 1000)
+
+                if on_event:
+                    on_event(ToolCompleted(name=tc.name, elapsed_ms=elapsed_ms, output_chars=len(output)))
+
+                # --- OBSERVE: append this tool's result before moving to the next ---
+                # The result becomes part of the conversation history so the model
+                # can see what the tool returned on the next Think step.
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 
     # Cap reached without a final answer.
     _limit_msg = (
@@ -302,3 +456,4 @@ def run_turn(
     messages.append({"role": "assistant", "content": _limit_msg})
     if on_event:
         on_event(MaxRoundsReached(agent_name=agent_name, message=_limit_msg))
+    return TokenUsage(_total_input, _total_output) if _has_usage else None

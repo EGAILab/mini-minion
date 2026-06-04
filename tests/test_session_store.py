@@ -114,3 +114,32 @@ def test_save_is_atomic_via_temp_file(tmp_path, monkeypatch):
     assert src.endswith(".tmp")
     assert dst == path
     assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# IMP-14: In-memory cache
+# ---------------------------------------------------------------------------
+
+
+def test_cache_avoids_repeated_disk_reads(tmp_path):
+    """After the first load, subsequent reads use the cache (no file I/O)."""
+    store = SessionStore(tmp_path / "sessions.json")
+    store.get_or_create("main")
+
+    # Corrupt the file — if the cache is working, this won't affect the store.
+    (tmp_path / "sessions.json").write_text("CORRUPTED", encoding="utf-8")
+
+    info = store.touch("main", increment_turns=True)
+    assert info.turn_count == 1
+
+
+def test_cache_write_through_persists_to_disk(tmp_path):
+    """After touch(), a new SessionStore instance sees the updated data."""
+    store1 = SessionStore(tmp_path / "sessions.json")
+    store1.get_or_create("main")
+    store1.touch("main", increment_turns=True)
+    store1.touch("main", increment_turns=True)
+
+    # New instance reads fresh from disk.
+    store2 = SessionStore(tmp_path / "sessions.json")
+    assert store2.get_or_create("main").turn_count == 2

@@ -199,3 +199,25 @@ def test_streaming_multiple_tool_calls_assembled():
     assert len(result.tool_calls) == 2
     names = {tc.name for tc in result.tool_calls}
     assert names == {"read", "glob"}
+
+
+# ---------------------------------------------------------------------------
+# IMP-07: Usage population
+# ---------------------------------------------------------------------------
+
+
+def test_blocking_populates_usage_when_api_returns_it():
+    from mini_minion.providers.base import TokenUsage
+    p = _provider()
+    usage = Mock()
+    usage.prompt_tokens = 80
+    usage.completion_tokens = 30
+    resp = _blocking_response(content="ok")
+    resp.usage = usage
+    p._client.chat.completions.create.return_value = resp
+
+    result = p._chat_blocking({})
+
+    assert isinstance(result.usage, TokenUsage)
+    assert result.usage.input_tokens == 80
+    assert result.usage.output_tokens == 30

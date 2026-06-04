@@ -72,25 +72,34 @@ class SessionStore:
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        # None = not yet loaded from disk; {} = loaded and empty; populated = loaded with data.
+        # This distinction prevents a get_or_create() call before any _load() from
+        # mistakenly thinking no sessions exist and creating duplicates.
+        self._cache: dict[str, dict] | None = None
 
     def _load(self) -> dict[str, dict]:
-        """Read the sessions file from disk.
+        """Return cached data, loading from disk on the first call.
 
         Returns:
             dict[str, dict]: Raw dict mapping agent_id → session data dict.
                 Returns an empty dict if the file doesn't exist yet.
         """
+        if self._cache is not None:
+            return self._cache
+        # First access — load from disk and populate the cache.
         if not self._path.exists():
-            return {}
+            self._cache = {}
+            return self._cache
         try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
+            self._cache = json.loads(self._path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             # Corrupt file — preserve it for post-mortem and start fresh.
             os.replace(self._path, self._path.with_suffix(".corrupt"))
-            return {}
+            self._cache = {}
+        return self._cache
 
     def _save(self, data: dict[str, dict]) -> None:
-        """Write the sessions dict to disk as formatted JSON.
+        """Write the sessions dict to disk and update the in-memory cache.
 
         Args:
             data (dict[str, dict]): The complete sessions data to persist.
@@ -102,6 +111,7 @@ class SessionStore:
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(tmp, self._path)
+        self._cache = data  # keep cache in sync with what was just written
 
     def get_or_create(self, agent_id: str) -> SessionInfo:
         """Return the session for an agent, creating it if it doesn't exist.
@@ -161,6 +171,7 @@ class SessionStore:
         Returns:
             list[SessionInfo]: One :class:`SessionInfo` per agent that has ever
                 run. Returns an empty list if the sessions file doesn't exist.
+                Uses the in-memory cache when available to avoid a disk read.
         """
         return [SessionInfo(**v) for v in self._load().values()]
 

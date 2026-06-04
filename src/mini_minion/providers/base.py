@@ -38,6 +38,18 @@ from typing import Protocol
 
 
 @dataclass
+class TokenUsage:
+    """Token consumption for a single provider.chat() call.
+
+    Attributes:
+        input_tokens:  Tokens in the prompt sent to the model.
+        output_tokens: Tokens the model generated in its response.
+    """
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass
 class ToolCall:
     """Represents a single tool invocation requested by the LLM.
 
@@ -90,6 +102,8 @@ class LLMResponse:
     finish_reason: str = "stop"
     # Streaming flag: set by the provider when on_token was called at least once.
     was_streamed: bool = False
+    # None means the provider didn't return usage data (e.g. streaming on OpenAI-compatible).
+    usage: "TokenUsage | None" = None
 
 
 class LLMProvider(Protocol):

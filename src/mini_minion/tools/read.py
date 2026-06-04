@@ -28,7 +28,7 @@ import itertools
 import pathlib
 from pathlib import Path
 
-from .base import Tool, ToolSchema, _within
+from .base import Tool, ToolSchema, _is_sensitive, _within
 
 _DEFAULT_LIMIT = 200   # maximum lines returned per call if no limit is specified
 _MAX_BYTES = 50 * 1024  # stop streaming beyond 50 KB to bound memory and context usage
@@ -61,6 +61,7 @@ class ReadTool(Tool):
         return ToolSchema(
             name="read",
             description="Read a file with line numbers, or list the contents of a directory.",
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -97,6 +98,13 @@ class ReadTool(Tool):
                 On error: a human-readable error message.
         """
         path = pathlib.Path(str(kwargs["path"]))
+        # Sensitive-path check runs before workspace-root check so it cannot
+        # be bypassed by passing root=None.
+        if _is_sensitive(path):
+            return (
+                f"Error: '{path}' is a protected system path and cannot be read. "
+                "Access to credential files and secret directories is not permitted."
+            )
         if self._root and not _within(path, self._root):
             return f"Error: '{path}' is outside the workspace root '{self._root}'"
 

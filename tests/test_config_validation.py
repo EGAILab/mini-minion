@@ -325,3 +325,37 @@ def test_models_section_string_returns_issue():
     issues = _v(raw)
     paths = _paths(issues)
     assert "models" in paths
+
+
+# ---------------------------------------------------------------------------
+# IMP-09: API key startup validation
+# ---------------------------------------------------------------------------
+
+
+def test_missing_api_key_raises_for_remote_provider():
+    """A remote provider with no API key set in the environment emits a ConfigIssue."""
+    raw = {
+        "models": {"providers": {"myprovider": {
+            "baseUrl": "https://api.example.com/v1",
+            "api": "openai-completions",
+            "models": [{"id": "gpt-4", "contextWindow": 128000, "maxOutputTokens": 4096}],
+        }}},
+        "agents": {"main": {"model": "myprovider/gpt-4"}},
+    }
+    import os
+    from unittest.mock import patch
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MYPROVIDER_API_KEY", None)
+        issues = _validate(raw)
+    assert any("MYPROVIDER_API_KEY" in i.message for i in issues)
+
+
+def test_missing_api_key_no_error_for_lmstudio():
+    """LM Studio provider with no key does not emit a ConfigIssue — it doesn't need one."""
+    raw = copy.deepcopy(_VALID)  # uses lmstudio, which is in _LOCAL_APIS
+    import os
+    from unittest.mock import patch
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("LMSTUDIO_API_KEY", None)
+        issues = _validate(raw)
+    assert not any("LMSTUDIO_API_KEY" in i.message for i in issues)

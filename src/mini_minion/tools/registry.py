@@ -28,20 +28,36 @@ Talks to
 
 from __future__ import annotations
 
+import time as _time
+from collections.abc import Callable
+
 from .base import Tool
 
 
 class ToolRegistry:
     """A container for a set of tools, with LLM-friendly definitions and dispatch.
 
-    Args: (none — start empty, then call ``register()``.)
+    Args:
+        before_execute: Optional hook called before each tool execution.
+            Signature: ``(name: str, arguments: dict) -> None``.
+            Exceptions from this hook are silently swallowed so they never
+            crash the tool loop.
+        after_execute: Optional hook called after each tool execution.
+            Signature: ``(name: str, arguments: dict, output: str, elapsed_ms: int) -> None``.
+            Exceptions are silently swallowed.
 
     Attributes:
         _tools (dict[str, Tool]): Internal mapping of tool name → Tool instance.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        before_execute: "Callable[[str, dict], None] | None" = None,
+        after_execute: "Callable[[str, dict, str, int], None] | None" = None,
+    ) -> None:
         self._tools: dict[str, Tool] = {}
+        self._before_execute = before_execute
+        self._after_execute = after_execute
 
     def register(self, tool: Tool) -> None:
         """Add a tool to the registry.
@@ -105,9 +121,36 @@ class ToolRegistry:
             # Return an error string instead of raising — the agent can read
             # this and potentially correct the tool name on the next iteration.
             return f"Unknown tool: {name!r}"
+
+        if self._before_execute is not None:
+            try:
+                self._before_execute(name, arguments)
+            except Exception:
+                pass  # hooks must never crash the tool loop
+
+        _start = _time.monotonic()
         try:
-            return tool.execute(**arguments)
+            output = tool.execute(**arguments)
         except Exception as exc:
             # Catch all exceptions and return them as strings.
             # This prevents a buggy tool from crashing the entire conversation.
-            return f"Error: {exc}"
+            output = f"Error: {exc}"
+
+        elapsed_ms = int((_time.monotonic() - _start) * 1000)
+
+        if self._after_execute is not None:
+            try:
+                self._after_execute(name, arguments, output, elapsed_ms)
+            except Exception:
+                pass  # hooks must never crash the tool loop
+
+        return output
+
+    def is_read_only(self, name: str) -> bool:
+        """Return True if the named tool declares itself as read-only.
+
+        Used by the runner to identify tool-call batches that can execute
+        concurrently. Unknown tools return False (safe default: treat as mutating).
+        """
+        tool = self._tools.get(name)
+        return tool.schema.is_read_only if tool else False

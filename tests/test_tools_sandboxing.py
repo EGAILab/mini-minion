@@ -168,3 +168,68 @@ def test_bash_tool_cwd_is_used(tmp_path):
     result = tool.execute(command='python -c "import os; print(os.getcwd())"')
     # Normalize separators for cross-platform comparison.
     assert str(tmp_path).lower().replace("\\", "/") in result.lower().replace("\\", "/")
+
+
+# ---------------------------------------------------------------------------
+# IMP-01: Sensitive-path guardrails
+# ---------------------------------------------------------------------------
+
+
+from pathlib import Path as _Path
+from mini_minion.tools.base import _is_sensitive
+
+
+class TestSensitivePaths:
+    def test_ssh_dir_is_sensitive(self):
+        assert _is_sensitive(_Path("~/.ssh/id_rsa").expanduser())
+
+    def test_aws_dir_is_sensitive(self):
+        assert _is_sensitive(_Path("~/.aws/credentials").expanduser())
+
+    def test_docker_config_is_sensitive(self):
+        assert _is_sensitive(_Path("~/.docker/config.json").expanduser())
+
+    def test_kube_config_is_sensitive(self):
+        assert _is_sensitive(_Path("~/.kube/config").expanduser())
+
+    def test_gnupg_dir_is_sensitive(self):
+        assert _is_sensitive(_Path("~/.gnupg/secring.gpg").expanduser())
+
+    def test_normal_path_is_not_sensitive(self, tmp_path):
+        assert not _is_sensitive(tmp_path / "myfile.txt")
+
+    def test_read_tool_blocks_sensitive_path(self, tmp_path):
+        result = ReadTool(root=None).execute(path=str(_Path("~/.ssh/id_rsa").expanduser()))
+        assert "protected" in result.lower() or "permitted" in result.lower()
+
+    def test_write_tool_blocks_sensitive_path(self, tmp_path):
+        result = WriteTool(root=None).execute(
+            path=str(_Path("~/.ssh/id_rsa").expanduser()), content="evil"
+        )
+        assert "protected" in result.lower() or "permitted" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# IMP-01: SSRF guardrails
+# ---------------------------------------------------------------------------
+
+
+class TestSSRF:
+    def test_bash_blocks_aws_metadata(self):
+        tool = BashTool(confirm=None)
+        result = tool.execute(command="curl http://169.254.169.254/latest/meta-data/")
+        assert "blocked" in result.lower()
+
+    def test_bash_blocks_gcp_metadata_dns(self):
+        tool = BashTool(confirm=None)
+        result = tool.execute(command="curl http://metadata.google.internal/")
+        assert "blocked" in result.lower()
+
+    def test_bash_allows_normal_curl(self):
+        """curl to a normal domain must not be blocked by the SSRF check."""
+        # confirm=False cancels the command without running it; result should
+        # NOT be the SSRF error string.
+        tool = BashTool(confirm=lambda cmd: False)
+        result = tool.execute(command="curl https://example.com")
+        assert "blocked" not in result.lower()
+        assert "cancelled" in result.lower()

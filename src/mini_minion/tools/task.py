@@ -84,6 +84,7 @@ class ReadTaskTool(Tool):
                 "and resume from where you left off."
             ),
             parameters={"type": "object", "properties": {}, "required": []},
+            is_read_only=True,
         )
 
     def execute(self, **kwargs: object) -> str:  # noqa: ARG002

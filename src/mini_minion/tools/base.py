@@ -48,7 +48,7 @@ Talks to
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -69,10 +69,60 @@ class ToolSchema:
         parameters (dict): A JSON Schema object describing the tool's arguments.
             The LLM uses this to know what fields to fill in. Example:
             ``{"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}``
+        is_read_only (bool): True if the tool never mutates filesystem or state.
+            Used by the runner to identify batches that can execute concurrently.
+            Defaults to False (safe: treat unknown tools as mutating).
     """
     name: str
     description: str
     parameters: dict
+    is_read_only: bool = False
+
+
+# Paths that are always denied regardless of workspace root setting.
+# Resolved lazily at check time so Path.home() works correctly in tests
+# that set a custom HOME environment variable.
+_SENSITIVE_DIRS = [
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.kube",
+]
+_SENSITIVE_FILES = [
+    "~/.docker/config.json",
+    "~/.kube/config",
+    "~/.netrc",
+    "~/.git-credentials",
+]
+
+
+def _is_sensitive(path: Path) -> bool:
+    """Return True if path is a known credential or secret location.
+
+    Checked before _within() so credential paths are denied even when
+    workspace root sandboxing is disabled (root=None). Resolves the
+    path and all sensitive targets before comparing, so symlinks and
+    relative references cannot bypass the check.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+
+    for dir_str in _SENSITIVE_DIRS:
+        sensitive_dir = Path(dir_str).expanduser().resolve()
+        try:
+            resolved.relative_to(sensitive_dir)
+            return True
+        except ValueError:
+            pass
+
+    for file_str in _SENSITIVE_FILES:
+        sensitive_file = Path(file_str).expanduser().resolve()
+        if resolved == sensitive_file:
+            return True
+
+    return False
 
 
 class Tool(ABC):

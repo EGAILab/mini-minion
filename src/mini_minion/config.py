@@ -146,6 +146,9 @@ def _validate(raw: dict) -> list[ConfigIssue]:
         issues.append(ConfigIssue("models.providers", "Expected an object."))
         providers_raw = {}
 
+    # API types that work without an API key (no env var warning for these).
+    _LOCAL_APIS = frozenset({"lmstudio"})
+
     for pname, praw in providers_raw.items():
         ppath = f"models.providers.{pname}"
         if not isinstance(praw, dict):
@@ -158,6 +161,13 @@ def _validate(raw: dict) -> list[ConfigIssue]:
                 f"{ppath}.apiKey",
                 f"Inline API keys risk being committed to version control. "
                 f"Use the `{pname.upper()}_API_KEY` environment variable in `.env` instead.",
+            ))
+        api_key_in_env = os.environ.get(f"{pname.upper()}_API_KEY", "")
+        if not api_key_in_env and praw.get("api") not in _LOCAL_APIS:
+            issues.append(ConfigIssue(
+                ppath,
+                f"Environment variable {pname.upper()}_API_KEY is not set. "
+                f"API calls will fail at runtime with an authentication error.",
             ))
         models_list = praw.get("models", [])
         if not isinstance(models_list, list):

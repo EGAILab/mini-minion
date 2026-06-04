@@ -36,7 +36,7 @@ from collections.abc import Callable
 
 from openai import OpenAI
 
-from .base import LLMResponse, ToolCall
+from .base import LLMResponse, TokenUsage, ToolCall
 
 
 def _parse_tool_arguments(raw: str, tool_name: str) -> tuple[dict, str | None]:
@@ -146,6 +146,12 @@ class OpenAICompatibleProvider:
         for tc in (msg.tool_calls or []):
             args, err = _parse_tool_arguments(tc.function.arguments or "", tc.function.name)
             tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args, error=err))
+        _usage = None
+        if response.usage is not None:
+            _usage = TokenUsage(
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            )
         return LLMResponse(
             text=msg.content or "",
             tool_calls=tool_calls,
@@ -153,6 +159,7 @@ class OpenAICompatibleProvider:
             # even if the API returned something else — this ensures the runner loops.
             finish_reason="tool_calls" if tool_calls else (response.choices[0].finish_reason or "stop"),
             was_streamed=False,
+            usage=_usage,
         )
 
     def _chat_streaming(

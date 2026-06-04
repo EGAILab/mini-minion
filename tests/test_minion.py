@@ -168,3 +168,39 @@ def test_streaming_response_printed_once(tmp_path, capsys):
     out = capsys.readouterr().out
     # "Hello world" should appear exactly once in the output, not twice.
     assert out.count("Hello world") == 1
+
+
+# ---------------------------------------------------------------------------
+# IMP-15: Graceful shutdown
+# ---------------------------------------------------------------------------
+
+
+def test_keyboard_interrupt_at_prompt_exits_cleanly(tmp_path, capsys):
+    """KeyboardInterrupt at the input() prompt causes a clean exit, not a traceback."""
+    import mini_minion.minion as minion_mod
+    with (
+        patch("mini_minion.minion.workspace", tmp_path),
+        patch("mini_minion.agents.session.run_turn", Mock()),
+        patch("mini_minion.minion.create_provider", return_value=Mock()),
+        patch("builtins.input", side_effect=KeyboardInterrupt),
+    ):
+        minion_mod.main()  # must return without raising
+
+    out = capsys.readouterr().out
+    assert "Goodbye" in out
+
+
+def test_keyboard_interrupt_during_turn_continues_repl(tmp_path, capsys):
+    """KeyboardInterrupt mid-turn prints a message and continues the REPL."""
+    import mini_minion.minion as minion_mod
+    inputs = iter(["hello", "quit"])
+    with (
+        patch("mini_minion.minion.workspace", tmp_path),
+        patch("mini_minion.agents.session.run_turn", side_effect=KeyboardInterrupt),
+        patch("mini_minion.minion.create_provider", return_value=Mock()),
+        patch("builtins.input", side_effect=inputs),
+    ):
+        minion_mod.main()  # must return without raising
+
+    out = capsys.readouterr().out
+    assert "interrupted" in out.lower()

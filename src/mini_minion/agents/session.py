@@ -70,6 +70,8 @@ Talks to
 
 from __future__ import annotations
 
+import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -80,7 +82,7 @@ from ..providers.base import LLMProvider
 from ..session import SessionStore
 from ..tools import ToolRegistry
 from .definitions import AgentConfig
-from .events import CompactionFailed, CompactionStarted
+from .events import CompactionFailed, CompactionStarted, TurnCompleted
 from .runner import run_turn
 
 # Maximum characters for the user-context block injected into the system prompt.
@@ -248,6 +250,10 @@ class AgentSession:
             Exception: Re-raises any provider exception after rolling back
                 partial history and persisting the user message + error record.
         """
+        _trace_id = str(uuid.uuid4())
+        _start = time.monotonic()
+        _compacted = False
+
         self._history.append({"role": "user", "content": message})
 
         # Build the effective system prompt.
@@ -266,8 +272,14 @@ class AgentSession:
         if self._soul_suffix:
             system += f"\n\n{self._soul_suffix}"
 
-        # Build compaction callbacks.
-        _on_compaction = (lambda: on_event(CompactionStarted())) if on_event else None
+        # Build compaction callbacks. The notify function tracks whether compaction
+        # actually ran so TurnCompleted can report it.
+        def _on_compaction_notify() -> None:
+            nonlocal _compacted
+            _compacted = True
+            if on_event:
+                on_event(CompactionStarted())
+
         _on_compaction_failed = (
             (lambda err: on_event(CompactionFailed(error=err))) if on_event else None
         )
@@ -275,7 +287,7 @@ class AgentSession:
         self._history = self._compactor.compact(
             self._history,
             self._provider,
-            on_compaction=_on_compaction,
+            on_compaction=_on_compaction_notify,
             on_compaction_failed=_on_compaction_failed,
         )
 
@@ -286,7 +298,7 @@ class AgentSession:
         snapshot_len = len(self._history)
 
         try:
-            run_turn(
+            _usage = run_turn(
                 self._provider,
                 self._agent.name,
                 system,
@@ -297,7 +309,7 @@ class AgentSession:
                 stream=stream,
                 max_tool_rounds=self._agent.max_tool_rounds,
             )
-            self._session_store.touch(self._agent_id, increment_turns=True)
+            _session_info = self._session_store.touch(self._agent_id, increment_turns=True)
 
             # Fire background memory extraction from the last exchange.
             # Daemon thread — never blocks the REPL.
@@ -308,6 +320,23 @@ class AgentSession:
                     if m.get("role") in ("user", "assistant") and m.get("content")
                 ]
                 extract_and_save_async(self._long_term, self._provider, _last[-2:])
+
+            # Emit TurnCompleted — ignored by CLI, consumed by structured log handlers.
+            if on_event:
+                _tool_calls_made = sum(
+                    1 for m in self._history[snapshot_len:]
+                    if m.get("role") == "tool"
+                )
+                on_event(TurnCompleted(
+                    agent_name=self._agent.name,
+                    trace_id=_trace_id,
+                    turn_number=_session_info.turn_count,
+                    tool_calls_made=_tool_calls_made,
+                    input_tokens=_usage.input_tokens if _usage else 0,
+                    output_tokens=_usage.output_tokens if _usage else 0,
+                    elapsed_ms=int((time.monotonic() - _start) * 1000),
+                    compacted=_compacted,
+                ))
 
         except Exception as exc:
             del self._history[snapshot_len:]

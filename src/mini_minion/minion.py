@@ -57,6 +57,7 @@ Talks to
 Every module in the package.  This is the integration layer.
 """
 
+import signal
 import sys
 from pathlib import Path
 
@@ -166,6 +167,15 @@ def main() -> None:
 
     use_streaming = streaming.chat_mode
 
+    # Install SIGTERM handler (POSIX only) so `kill <pid>` exits cleanly.
+    # History is already persisted from the last turn's finally block.
+    def _sigterm_handler(signum: int, frame: object) -> None:
+        print("\nShutdown signal received. Goodbye.")
+        sys.exit(0)
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+
     # --- Console event handler ---
     # Tracks whether a streaming response is currently in progress so that the
     # correct newline is printed at the end and FinalAnswer doesn't re-print
@@ -215,7 +225,14 @@ def main() -> None:
             print(f"  {cfg_entry.route_prefix} <message>  → {agent_name}")
 
     while True:
-        user_input = input("\nYou: ").strip()
+        try:
+            user_input = input("\nYou: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C or Ctrl+D at the prompt — exit cleanly.
+            # History was already persisted from the last turn's finally block.
+            print("\nGoodbye.")
+            break
+
         if not user_input:
             continue
         if user_input.lower() in ("exit", "quit", "/quit"):
@@ -227,6 +244,11 @@ def main() -> None:
 
         try:
             sessions[agent_id].send(message, on_event=_on_event, stream=use_streaming)
+        except KeyboardInterrupt:
+            # Ctrl+C during a turn. The finally block in AgentSession.send() already
+            # saved history. Notify the user and continue the REPL.
+            agent_name = AGENTS[agent_id].name
+            print(f"\n  Turn interrupted. {agent_name}'s history has been saved.")
         except Exception as exc:
             agent_name = AGENTS[agent_id].name
             print(f"\n[Error] {agent_name} failed to respond: {exc}", file=sys.stderr)

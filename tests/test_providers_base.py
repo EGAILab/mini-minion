@@ -97,3 +97,19 @@ def test_parse_tool_arguments_non_object_json():
     assert args == {}
     assert err is not None
     assert "JSON object" in err
+
+
+# ---------------------------------------------------------------------------
+# IMP-07: TokenUsage
+# ---------------------------------------------------------------------------
+
+
+def test_token_usage_fields():
+    from mini_minion.providers.base import TokenUsage
+    u = TokenUsage(input_tokens=100, output_tokens=50)
+    assert u.input_tokens == 100
+    assert u.output_tokens == 50
+
+
+def test_llm_response_usage_defaults_none():
+    assert LLMResponse(text="hello").usage is None

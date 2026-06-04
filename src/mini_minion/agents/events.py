@@ -143,6 +143,53 @@ class CompactionStarted:
 
 
 @dataclass
+class ToolCompleted:
+    """Emitted after a tool finishes executing, regardless of success or failure.
+
+    Complements :class:`ToolCalled` (emitted before execution) by providing
+    the outcome and timing.
+
+    Attributes:
+        name:         Tool name, e.g. ``"read"`` or ``"bash"``.
+        elapsed_ms:   Wall-clock milliseconds from execute() call to return.
+        output_chars: Character length of the tool's output string.
+                      Useful for detecting unexpectedly large tool outputs.
+    """
+    name: str
+    elapsed_ms: int
+    output_chars: int
+
+
+@dataclass
+class TurnCompleted:
+    """Emitted after every successful turn.
+
+    Ignored by the interactive CLI — intended for structured log handlers,
+    monitoring dashboards, and cost-tracking systems.
+
+    Attributes:
+        agent_name:      The agent's display name.
+        trace_id:        UUID4 string unique to this turn. Correlates all
+                         events within the same send() call.
+        turn_number:     The session's cumulative turn count after this turn.
+        tool_calls_made: Number of tool-result messages appended during this turn.
+        input_tokens:    Total input tokens across all provider.chat() calls
+                         in the turn. 0 when the provider does not return usage.
+        output_tokens:   Total output tokens across all provider.chat() calls.
+        elapsed_ms:      Wall-clock milliseconds from send() entry to return.
+        compacted:       True if context compaction ran before this turn.
+    """
+    agent_name: str
+    trace_id: str
+    turn_number: int
+    tool_calls_made: int
+    input_tokens: int
+    output_tokens: int
+    elapsed_ms: int
+    compacted: bool
+
+
+@dataclass
 class CompactionFailed:
     """Emitted when the summarisation LLM call during compaction fails.
 

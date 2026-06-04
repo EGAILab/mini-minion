@@ -61,6 +61,7 @@ class GlobTool(Tool):
                 "Find files matching a glob pattern, sorted by modification time (newest first). "
                 "Use ** for recursive matching (e.g. '**/*.py')."
             ),
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {

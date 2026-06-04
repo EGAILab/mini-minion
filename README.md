@@ -230,14 +230,16 @@ AgentSession.send(message, on_event=callback, stream=True/False)
 
 | Event class | Emitted when |
 |---|---|
-| `StreamingStarted(agent_name)` | First token of a streaming response arrives |
-| `TokenStreamed(token)` | Each subsequent streaming token |
-| `ThoughtEmitted(agent_name, text)` | Model produced preamble text before a tool call (non-streaming only) |
-| `FinalAnswer(agent_name, text)` | Model produces a complete (non-tool) response |
-| `ToolCalled(name, args)` | A tool is about to be executed |
-| `MaxRoundsReached(agent_name, message)` | TAO loop hits `max_tool_rounds` cap |
-| `CompactionStarted()` | History compaction is about to run |
-| `CompactionFailed(error)` | Compaction summarisation call failed; history retained unchanged |
+| `StreamingStarted(agent_name)` | First token of a streaming response arrives — signals the caller to print the agent name prefix |
+| `TokenStreamed(token)` | Each subsequent streaming text fragment — print inline without a newline |
+| `ThoughtEmitted(agent_name, text)` | Model produced preamble text before a tool call (non-streaming only — in streaming mode the tokens were already printed) |
+| `FinalAnswer(agent_name, text)` | Model produces its complete response with no more tool calls — the turn is done |
+| `ToolCalled(name, args)` | A tool is about to execute — useful for showing `[tool: name(...)]` status lines |
+| `ToolCompleted(name, elapsed_ms, output_chars)` | A tool finished executing — carries timing and output size for diagnostics |
+| `MaxRoundsReached(agent_name, message)` | TAO loop hit the `max_tool_rounds` cap without a final answer |
+| `CompactionStarted()` | History compaction is about to summarise old messages |
+| `CompactionFailed(error)` | Compaction summarisation call failed; original history is retained unchanged |
+| `TurnCompleted(agent_name, trace_id, turn_number, tool_calls_made, input_tokens, output_tokens, elapsed_ms, compacted)` | Emitted after every successful turn — intended for monitoring, cost-tracking, and structured logging (ignored by the interactive CLI) |
 
 **Message format** is the OpenAI Chat Completions wire format throughout — `{"role": "user"|"assistant"|"tool", "content": "..."}`. Providers that use a different format (Anthropic) convert internally.
 
@@ -470,7 +472,7 @@ When `long_term` is provided, `AgentSession`:
 ```python
 from mini_minion.agents.runner import run_turn
 
-run_turn(
+usage = run_turn(
     provider,              # LLMProvider
     agent_name,            # str — used in event agent_name fields
     system,                # str — system prompt / soul
@@ -481,6 +483,8 @@ run_turn(
     stream=False,          # bool — True to emit streaming token events
     max_tool_rounds=10,    # int — per-agent cap on TAO iterations
 )
+# Returns TokenUsage(input_tokens, output_tokens) summed across all LLM calls
+# in the turn, or None when the provider does not report usage.
 ```
 
 Implements the TAO loop with three reliability features:

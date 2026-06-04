@@ -26,7 +26,7 @@ Talks to
 """
 
 from .anthropic import AnthropicProvider
-from .base import LLMProvider, LLMResponse, ToolCall
+from .base import LLMProvider, LLMResponse, TokenUsage, ToolCall
 from .lmstudio import LMStudioProvider
 from .openai_compatible import OpenAICompatibleProvider
 
@@ -70,6 +70,7 @@ def create_provider(api: str, base_url: str, api_key: str, model: str) -> LLMPro
 __all__ = [
     "LLMProvider",
     "LLMResponse",
+    "TokenUsage",
     "ToolCall",
     "OpenAICompatibleProvider",
     "AnthropicProvider",

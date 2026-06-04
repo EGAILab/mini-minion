@@ -510,3 +510,132 @@ def test_custom_max_tool_rounds():
     max_events = [e for e in events if isinstance(e, MaxRoundsReached)]
     assert len(max_events) == 1
     assert "5" in max_events[0].message
+
+
+# ---------------------------------------------------------------------------
+# IMP-11: ToolCompleted event emission
+# ---------------------------------------------------------------------------
+
+
+def test_tool_completed_event_emitted_in_serial_path():
+    """ToolCompleted must be emitted once per tool call in the serial (default) path."""
+    from mini_minion.agents.events import ToolCompleted
+
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    messages: list[dict] = [{"role": "user", "content": "hi"}]
+    provider = _provider(
+        LLMResponse(
+            text="",
+            tool_calls=[ToolCall(id="a", name="echo", arguments={"text": "x"})],
+            finish_reason="tool_calls",
+        ),
+        LLMResponse(text="done", finish_reason="stop"),
+    )
+    events: list[object] = []
+    run_turn(provider, "Ada", "sys", 100, registry, messages, on_event=events.append)
+
+    completed = [e for e in events if isinstance(e, ToolCompleted)]
+    assert len(completed) == 1
+    assert completed[0].name == "echo"
+    assert completed[0].elapsed_ms >= 0
+    assert completed[0].output_chars == len("x")
+
+
+# ---------------------------------------------------------------------------
+# IMP-12: Read-only concurrent execution
+# ---------------------------------------------------------------------------
+
+
+def test_read_only_tools_run_concurrently():
+    """When all tools in a batch are read-only, they execute concurrently."""
+    import threading
+    import time as _time
+
+    _lock = threading.Lock()
+    _call_times: list[float] = []
+
+    class SlowReadTool(Tool):
+        @property
+        def schema(self) -> ToolSchema:
+            return ToolSchema(
+                "slow_read", "slow",
+                {"type": "object", "properties": {}, "required": []},
+                is_read_only=True,
+            )
+
+        def execute(self, **kwargs: object) -> str:
+            _time.sleep(0.05)  # 50 ms
+            with _lock:
+                _call_times.append(_time.monotonic())
+            return "ok"
+
+    registry = ToolRegistry()
+    registry.register(SlowReadTool())
+
+    messages: list[dict] = [{"role": "user", "content": "hi"}]
+    provider = _provider(
+        LLMResponse(
+            text="",
+            tool_calls=[
+                ToolCall(id="a", name="slow_read", arguments={}),
+                ToolCall(id="b", name="slow_read", arguments={}),
+            ],
+            finish_reason="tool_calls",
+        ),
+        LLMResponse(text="done", finish_reason="stop"),
+    )
+    _start = _time.monotonic()
+    run_turn(provider, "Ada", "sys", 100, registry, messages)
+    _elapsed = _time.monotonic() - _start
+
+    tool_results = [m for m in messages if m.get("role") == "tool"]
+    assert len(tool_results) == 2
+    # Total time should be ~50 ms (concurrent), well under 100 ms (serial).
+    assert _elapsed < 0.09, f"Expected concurrent execution, took {_elapsed:.3f}s"
+
+
+def test_mixed_read_write_batch_runs_serially():
+    """A batch containing a mutating tool must run serially (not concurrently)."""
+    import threading
+
+    _thread_ids: list[int] = []
+
+    class ReadTool2(Tool):
+        @property
+        def schema(self) -> ToolSchema:
+            return ToolSchema("rt", "r", {"type": "object", "properties": {}, "required": []}, is_read_only=True)
+
+        def execute(self, **kwargs: object) -> str:
+            _thread_ids.append(threading.current_thread().ident)
+            return "read"
+
+    class WriteTool2(Tool):
+        @property
+        def schema(self) -> ToolSchema:
+            return ToolSchema("wt", "w", {"type": "object", "properties": {}, "required": []}, is_read_only=False)
+
+        def execute(self, **kwargs: object) -> str:
+            _thread_ids.append(threading.current_thread().ident)
+            return "wrote"
+
+    registry = ToolRegistry()
+    registry.register(ReadTool2())
+    registry.register(WriteTool2())
+
+    messages: list[dict] = [{"role": "user", "content": "hi"}]
+    provider = _provider(
+        LLMResponse(
+            text="",
+            tool_calls=[
+                ToolCall(id="a", name="rt", arguments={}),
+                ToolCall(id="b", name="wt", arguments={}),
+            ],
+            finish_reason="tool_calls",
+        ),
+        LLMResponse(text="done", finish_reason="stop"),
+    )
+    run_turn(provider, "Ada", "sys", 100, registry, messages)
+
+    main_id = threading.main_thread().ident
+    assert all(tid == main_id for tid in _thread_ids)
