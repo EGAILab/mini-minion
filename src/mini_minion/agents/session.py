@@ -76,7 +76,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from ..context import Compactor
+from ..context import Compactor, _estimate_tokens
 from ..memory.long_term import LongTermMemory
 from ..memory.short_term import ShortTermMemory
 from ..providers.base import LLMProvider
@@ -143,6 +143,18 @@ def _format_task_context(task_path: Path | None) -> str:
     else:
         lines.append("All steps complete.")
 
+    # Targeted update-task reminder — architectural replacement for the old
+    # _TASK_SOUL_SUFFIX instruction "call update_task after each step."
+    # Only injected when there is actually an in_progress step, so the model
+    # is never reminded to update a task that doesn't exist or is already done.
+    in_progress = [s for s in steps if s.get("status") == "in_progress"]
+    if in_progress:
+        ip = in_progress[0]
+        lines.append(
+            f"Action: Step {ip.get('id')} is in progress. "
+            "Call update_task when this step is complete to record your progress."
+        )
+
     lines.append("</active_task>")
     return "\n".join(lines)
 
@@ -168,6 +180,42 @@ def _load_user_context(memory: LongTermMemory) -> str:
             + "\n[truncated — keep user_context.md under 1 200 chars]"
         )
     return f"\n\n<user_context>\n{content}\n</user_context>"
+
+
+def _format_budget_context(history: list[dict], compactor: Compactor) -> str:
+    """Return a context-budget warning block when history approaches the compaction threshold.
+
+    Injected proactively once history exceeds 50 % of the usable token budget
+    so the model can be concise *before* the compactor is forced to summarise.
+    Returns an empty string while history is well within budget.
+
+    This is the code-level replacement for the vague soul instruction "be
+    efficient — stop searching when you have enough context."  The warning gives
+    the model a concrete signal rather than asking it to self-regulate blindly.
+
+    The 50 % threshold is intentional: it gives the model at least one full
+    generous response worth of runway before compaction is needed.  The compactor
+    triggers at 100 %; at 80 %+ the model is likely to see compaction within
+    one or two more turns.
+
+    Pattern source: nanobot injects budget state at token-limit detection (runner.py
+    lines 1250-1323).  We apply a proactive variant at the 50 % mark.
+    """
+    usable = compactor._usable_tokens
+    if usable <= 0:
+        return ""
+    total = sum(_estimate_tokens(m) for m in history)
+    ratio = total / usable
+    if ratio < 0.5:
+        return ""
+    pct = min(99, int(ratio * 100))
+    return (
+        f"<context_budget>\n"
+        f"Conversation history is using approximately {pct}% of the available "
+        f"context window. Be concise — the system will automatically summarise "
+        f"older history when the window fills.\n"
+        f"</context_budget>"
+    )
 
 
 def _inject_relevant_memories(
@@ -335,6 +383,13 @@ class AgentSession:
         task_block = _format_task_context(self._task_path)
         if task_block:
             system += f"\n\n{task_block}"
+        # Proactive context-budget warning — injected once history passes 50% of
+        # the usable token window.  Replaces the vague "be efficient" soul
+        # instruction with a concrete, code-computed signal.  Pattern: nanobot
+        # injects budget state reactively; we do it proactively at 50%.
+        budget_block = _format_budget_context(self._history, self._compactor)
+        if budget_block:
+            system += f"\n\n{budget_block}"
         if self._soul_suffix:
             system += f"\n\n{self._soul_suffix}"
 

@@ -59,12 +59,19 @@ class AgentConfig:
 # Kept as a module-level constant so it is easy to locate and update.
 # ---------------------------------------------------------------------------
 _TASK_SOUL_SUFFIX = (
-    # read_task is NO LONGER needed here — AgentSession auto-injects the
-    # active task as an <active_task> block in the system prompt before every
-    # turn, replacing the old "call read_task at session start" instruction.
-    "\nIf you see an <active_task> block above, you are mid-way through a "
-    "multi-step task. After completing each step, call update_task to record "
-    "progress so no work is lost if the session restarts."
+    # Both task instructions are now code-enforced and no longer need to live
+    # in the soul:
+    #
+    # "call read_task at session start" → replaced by AgentSession auto-injecting
+    # an <active_task> block into the system prompt before every turn.
+    #
+    # "call update_task after each step" → replaced by _format_task_context()
+    # appending a targeted "Action: call update_task" line inside <active_task>
+    # whenever a step is currently in_progress — conditional and specific.
+    #
+    # This constant is kept as an empty string so existing code that appends it
+    # continues to compile; its content is intentionally blank.
+    ""
 )
 
 # ---------------------------------------------------------------------------
@@ -83,9 +90,8 @@ AGENTS: dict[str, AgentConfig] = {
             # API development topics, and anything not specifically routed elsewhere.
             "You are Ada, an AI assistant specializing in API development.\n"
             "Be genuinely helpful. Skip the pleasantries. Have opinions.\n"
-            "You have tools — use them proactively but efficiently: once you have "
-            "enough context, stop searching and answer. Don't keep running tools "
-            "when you already know what to say.\n"
+            "You have tools — use them proactively: gather what you need, then "
+            "answer. If you see a <context_budget> warning above, be concise.\n"
             "Relevant memories are automatically injected above — call search_memory "
             "only when you need something specific not already shown there.\n"
             "Use save_memory for structured notes (research findings, key decisions, "

@@ -384,6 +384,153 @@ def test_no_user_context_when_file_absent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Task context auto-injection (B2 architectural fix)
+# ---------------------------------------------------------------------------
+
+def _make_task_file(tasks_dir, agent_id, goal, steps):
+    """Write a minimal task JSON file for testing."""
+    import json
+    path = tasks_dir / f"{agent_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"goal": goal, "steps": steps}), encoding="utf-8")
+    return path
+
+
+def _make_session_with_tasks(tmp_path, tasks_dir, provider=None, agent_id="main"):
+    if provider is None:
+        provider = _mock_provider()
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    return AgentSession(
+        agent_id=agent_id,
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        tasks_dir=tasks_dir,
+    )
+
+
+def test_active_task_injected_into_system_prompt(tmp_path):
+    """When a task file exists, <active_task> block must appear in the system prompt."""
+    tasks_dir = tmp_path / "tasks"
+    _make_task_file(tasks_dir, "main", "Build the API", [
+        {"id": 1, "description": "Design schema", "status": "done"},
+        {"id": 2, "description": "Write endpoints", "status": "pending"},
+    ])
+    provider = _mock_provider()
+    session = _make_session_with_tasks(tmp_path, tasks_dir, provider=provider)
+
+    captured: list[str] = []
+    provider.chat = Mock(side_effect=lambda s, *a, **kw: (captured.append(s), LLMResponse(text="ok", finish_reason="stop"))[1])
+    session.send("hello")
+
+    assert len(captured) == 1
+    assert "<active_task>" in captured[0]
+    assert "Build the API" in captured[0]
+    assert "Design schema" in captured[0]
+
+
+def test_no_active_task_when_file_absent(tmp_path):
+    """When no task file exists, <active_task> must not appear in the system prompt."""
+    tasks_dir = tmp_path / "tasks"  # directory exists but no file inside
+    tasks_dir.mkdir(parents=True)
+    provider = _mock_provider()
+    session = _make_session_with_tasks(tmp_path, tasks_dir, provider=provider)
+
+    captured: list[str] = []
+    provider.chat = Mock(side_effect=lambda s, *a, **kw: (captured.append(s), LLMResponse(text="ok", finish_reason="stop"))[1])
+    session.send("hello")
+
+    assert "<active_task>" not in captured[0]
+
+
+def test_in_progress_step_injects_update_task_reminder(tmp_path):
+    """When a step is in_progress, the <active_task> block must include the update reminder."""
+    tasks_dir = tmp_path / "tasks"
+    _make_task_file(tasks_dir, "main", "Write tests", [
+        {"id": 1, "description": "Set up pytest", "status": "done"},
+        {"id": 2, "description": "Write unit tests", "status": "in_progress"},
+    ])
+    provider = _mock_provider()
+    session = _make_session_with_tasks(tmp_path, tasks_dir, provider=provider)
+
+    captured: list[str] = []
+    provider.chat = Mock(side_effect=lambda s, *a, **kw: (captured.append(s), LLMResponse(text="ok", finish_reason="stop"))[1])
+    session.send("hello")
+
+    assert "update_task" in captured[0]
+    assert "Step 2" in captured[0]
+
+
+def test_no_update_task_reminder_when_no_step_in_progress(tmp_path):
+    """When no step is in_progress, the update reminder must NOT appear in the prompt."""
+    tasks_dir = tmp_path / "tasks"
+    _make_task_file(tasks_dir, "main", "Deploy", [
+        {"id": 1, "description": "Build image", "status": "done"},
+        {"id": 2, "description": "Push image", "status": "pending"},
+    ])
+    provider = _mock_provider()
+    session = _make_session_with_tasks(tmp_path, tasks_dir, provider=provider)
+
+    captured: list[str] = []
+    provider.chat = Mock(side_effect=lambda s, *a, **kw: (captured.append(s), LLMResponse(text="ok", finish_reason="stop"))[1])
+    session.send("hello")
+
+    assert "update_task" not in captured[0]
+
+
+# ---------------------------------------------------------------------------
+# Context budget warning (D1+K1 architectural fix)
+# ---------------------------------------------------------------------------
+
+def test_budget_warning_injected_into_system_prompt(tmp_path):
+    """When _format_budget_context returns a block, send() must include it in the system prompt."""
+    # Test the injection path independently — we patch _format_budget_context to return
+    # a known string so the test doesn't depend on token-counting thresholds.
+    from mini_minion.agents import session as session_module
+
+    provider = _mock_provider()
+    sess = _make_session(tmp_path, provider=provider)
+
+    fake_block = "<context_budget>\nApproximately 65% used.\n</context_budget>"
+    captured: list[str] = []
+
+    with patch.object(session_module, "_format_budget_context", return_value=fake_block):
+        provider.chat = Mock(side_effect=lambda s, *a, **kw: (captured.append(s), LLMResponse(text="ok", finish_reason="stop"))[1])
+        sess.send("hello")
+
+    assert fake_block in captured[0]
+
+
+def test_budget_warning_absent_when_history_small(tmp_path):
+    """<context_budget> must NOT appear when history is well within the usable budget."""
+    from mini_minion.agents.session import _format_budget_context
+
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    tiny_history = [{"role": "user", "content": "hello"}]
+    # usable = 98_000 tokens; tiny history is well below 50% threshold
+    assert _format_budget_context(tiny_history, compactor) == ""
+
+
+def test_budget_warning_function_fires_at_threshold():
+    """_format_budget_context must return a non-empty block when history exceeds 50% usable."""
+    from mini_minion.agents.session import _format_budget_context
+
+    compactor = Compactor(context_window=10_000, preserve_tokens=2_000)
+    # usable = 8_000 tokens; 50% = 4_000.  Fill with enough text (varied content
+    # avoids BPE merging) to exceed the threshold without triggering compaction.
+    large_history = [{"role": "user", "content": f"word{i} " * 300} for i in range(20)]
+    result = _format_budget_context(large_history, compactor)
+    assert "<context_budget>" in result
+    assert "%" in result
+
+
+# ---------------------------------------------------------------------------
 # IMP-08: TurnCompleted event
 # ---------------------------------------------------------------------------
 
