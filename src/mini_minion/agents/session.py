@@ -70,6 +70,7 @@ Talks to
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -93,6 +94,57 @@ _USER_CONTEXT_MAX_CHARS = 1_200
 # 600 tokens × 4 chars ≈ 2 400 chars — raised from 300 because the 262K context
 # window makes this budget freely affordable.
 _DEFAULT_MEMORY_INJECTION_TOKENS = 600
+
+
+_STATUS_ICON = {"done": "✓", "in_progress": "→", "blocked": "✗", "pending": "○"}
+
+
+def _format_task_context(task_path: Path | None) -> str:
+    """Read the agent's task file and return a system-prompt block.
+
+    Called before every turn so the agent sees current task progress without
+    needing to call ``read_task`` explicitly.  Mirrors how ``user_context``
+    and ``relevant_memories`` are auto-injected — this is the architectural
+    alternative to the old ``_TASK_SOUL_SUFFIX`` instruction
+    "call read_task at session start."
+
+    Returns an empty string (and injects nothing) when:
+    - No task file exists (agent has never started a task).
+    - The task file exists but has no goal set.
+    - The file cannot be read (corrupt JSON, permissions, etc.).
+
+    The block is wrapped in ``<active_task>`` tags so the model can identify it
+    in logs and in the system prompt context.
+    """
+    if task_path is None or not task_path.exists():
+        return ""
+    try:
+        data = json.loads(task_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not data or not data.get("goal"):
+        return ""
+
+    goal = data.get("goal", "")
+    steps = data.get("steps", [])
+
+    lines = ["<active_task>", f"Goal: {goal}", "Steps:"]
+    for step in steps:
+        icon = _STATUS_ICON.get(step.get("status", "pending"), "?")
+        desc = step.get("description", "")
+        notes = step.get("notes", "")
+        note_str = f" — {notes}" if notes else ""
+        lines.append(f"  [{icon}] {step.get('id')}. {desc}{note_str}")
+
+    next_steps = [s for s in steps if s.get("status") in ("pending", "in_progress")]
+    if next_steps:
+        ns = next_steps[0]
+        lines.append(f"Next: Step {ns.get('id')} — {ns.get('description', '')}")
+    else:
+        lines.append("All steps complete.")
+
+    lines.append("</active_task>")
+    return "\n".join(lines)
 
 
 def _load_user_context(memory: LongTermMemory) -> str:
@@ -182,6 +234,10 @@ class AgentSession:
         memory_injection_tokens (int): Token budget for proactively injected
             memories per turn.  Defaults to
             :data:`_DEFAULT_MEMORY_INJECTION_TOKENS`.
+        tasks_dir (Path | None): Directory that holds per-agent task JSON files
+            (``{tasks_dir}/{agent_id}.json``).  When provided, the active task
+            is auto-injected into the system prompt before every turn so the
+            agent can orient itself without calling ``read_task`` explicitly.
     """
 
     def __init__(
@@ -198,6 +254,7 @@ class AgentSession:
         soul_suffix: str = "",
         long_term: LongTermMemory | None = None,
         memory_injection_tokens: int = _DEFAULT_MEMORY_INJECTION_TOKENS,
+        tasks_dir: Path | None = None,
     ) -> None:
         self._agent_id = agent_id
         self._agent = agent
@@ -210,6 +267,8 @@ class AgentSession:
         self._soul_suffix = soul_suffix
         self._long_term = long_term
         self._memory_injection_chars = memory_injection_tokens * 4
+        # Path to this agent's task JSON file, or None if tasks are not enabled.
+        self._task_path = tasks_dir / f"{agent_id}.json" if tasks_dir else None
 
         # Load user context once at init — reloaded on next process restart.
         self._user_context_block = (
@@ -269,6 +328,13 @@ class AgentSession:
             )
             if mem_block:
                 system += f"\n\n{mem_block}"
+        # Auto-inject active task context (architectural replacement for the
+        # old "_TASK_SOUL_SUFFIX" instruction "call read_task at session start").
+        # The agent sees current task progress on every turn without needing to
+        # call a tool — same pattern as user_context and relevant_memories.
+        task_block = _format_task_context(self._task_path)
+        if task_block:
+            system += f"\n\n{task_block}"
         if self._soul_suffix:
             system += f"\n\n{self._soul_suffix}"
 

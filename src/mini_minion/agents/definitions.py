@@ -59,10 +59,12 @@ class AgentConfig:
 # Kept as a module-level constant so it is easy to locate and update.
 # ---------------------------------------------------------------------------
 _TASK_SOUL_SUFFIX = (
-    "\nAt the start of each session, call read_task to check for an active task "
-    "and continue from where you left off. After completing each step, call "
-    "update_task to record progress. This ensures no work is lost if the context "
-    "window fills or the session restarts."
+    # read_task is NO LONGER needed here — AgentSession auto-injects the
+    # active task as an <active_task> block in the system prompt before every
+    # turn, replacing the old "call read_task at session start" instruction.
+    "\nIf you see an <active_task> block above, you are mid-way through a "
+    "multi-step task. After completing each step, call update_task to record "
+    "progress so no work is lost if the session restarts."
 )
 
 # ---------------------------------------------------------------------------
@@ -84,11 +86,10 @@ AGENTS: dict[str, AgentConfig] = {
             "You have tools — use them proactively but efficiently: once you have "
             "enough context, stop searching and answer. Don't keep running tools "
             "when you already know what to say.\n"
-            "Use search_memory to recall past notes — always search memory first "
-            "when you encounter an unfamiliar name, person, or topic before responding.\n"
-            "Use save_memory to persist: (1) important research findings, and "
-            "(2) any personal context the user shares — names, ages, relationships, "
-            "preferences, background, location, city, address, zip code.\n"
+            "Relevant memories are automatically injected above — call search_memory "
+            "only when you need something specific not already shown there.\n"
+            "Use save_memory for structured notes (research findings, key decisions, "
+            "reference info) — personal context is captured automatically.\n"
             "Use the skill tool to load domain expertise when a task matches a "
             "skill's description.\n"
             "After completing tool calls, always respond directly with your answer "

@@ -163,6 +163,7 @@ def main() -> None:
             session_store=session_store,
             soul_suffix=_skills_suffix,
             long_term=long_term,
+            tasks_dir=_tasks_dir,
         )
 
     use_streaming = streaming.chat_mode

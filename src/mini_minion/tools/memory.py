@@ -118,11 +118,10 @@ class SearchMemoryTool(Tool):
         return ToolSchema(
             name="search_memory",
             description=(
-                "Search long-term memory for notes matching any keyword in the query. "
-                "Use broad, single keywords for best results — e.g. 'daughter' rather "
-                "than 'Isabella daughter coding'. Returns all notes where any keyword "
-                "appears in the note content or note name. When nothing matches, "
-                "lists available note names so you can refine the search."
+                "Search long-term memory for notes beyond the top results already "
+                "injected into your context. Use broad single keywords — e.g. 'daughter' "
+                "not 'Isabella daughter coding'. Returns matching notes; when nothing "
+                "matches, lists available note names so you can refine the search."
             ),
             is_read_only=True,
             parameters={
