@@ -51,18 +51,17 @@ _log = logging.getLogger("mini_minion.compactor")
 
 # ── Token-budget constants ────────────────────────────────────────────────────
 
+# Absolute floor: any model needs at least 2 000 tokens of output headroom.
 _MIN_PRESERVE = 2_000
-_MAX_PRESERVE = 40_000
+
+# Fallback preserve budget used only when a Compactor is constructed in tests
+# without a preserve_tokens argument.  Production code in minion.py always
+# passes preserve_tokens = model.max_output_tokens, so this default never
+# applies at runtime.
 _DEFAULT_PRESERVE = 4_000
 
-# Hard cap on tool output kept in full (most-recent N results).
-_MAX_TOOL_OUTPUT = 2_000
-
 # Number of recent tool-result messages kept at full content in the tail.
-# Older tool results are microcompacted to one-liners (~15 tokens each).
 _TAIL_KEEP_FULL_RESULTS = 4
-
-_MAX_HEAD_CONTENT = 2_000
 
 _SUMMARY_PROMPT = """\
 You are a conversation summarizer.
@@ -123,9 +122,13 @@ class Compactor:
     Args:
         context_window:        Total token capacity of the model in use.
         preserve_tokens:       Tokens to reserve for the model's response and
-                               protocol overhead.  Clamped to
-                               [``_MIN_PRESERVE``, ``_MAX_PRESERVE``].
-                               Defaults to 4 000.
+                               protocol overhead.  In production, pass
+                               ``model.max_output_tokens`` here so the budget
+                               scales automatically when the model changes.
+                               Clamped to ``[_MIN_PRESERVE, context_window // 2]``
+                               so the usable window is always positive.
+                               Defaults to :data:`_DEFAULT_PRESERVE` (4 000,
+                               used by tests only).
         tail_keep_full_results: Number of recent tool-result messages to keep
                                at full content in the tail.  Older tool results
                                are microcompacted to one-liners.  Defaults to
@@ -139,8 +142,31 @@ class Compactor:
         tail_keep_full_results: int = _TAIL_KEEP_FULL_RESULTS,
     ) -> None:
         self._context_window = context_window
-        self._preserve_tokens = max(_MIN_PRESERVE, min(_MAX_PRESERVE, preserve_tokens))
+        # Ceiling is context_window // 2 so at least half the window is always
+        # usable.  This replaces the old fixed _MAX_PRESERVE = 40_000 constant,
+        # which was wrong for models smaller than ~80K tokens (the ceiling would
+        # exceed half their context window).
+        _max_preserve = max(_MIN_PRESERVE, context_window // 2)
+        self._preserve_tokens = max(_MIN_PRESERVE, min(_max_preserve, preserve_tokens))
         self._tail_keep_full = tail_keep_full_results
+
+        # Derived limits — all proportional to context_window so they scale
+        # automatically when the model is switched.
+        #
+        # Tool output cap (chars): ~2 % of context window, capped at 20 000.
+        # Prevents a single large tool result from monopolising the tail after
+        # compaction.  E.g. 262K → 20 000 chars; 32K → 2 621; 8K → 2 000 (floor).
+        self._max_tool_output: int = max(2_000, min(20_000, context_window * 4 // 50))
+        #
+        # Head content cap (chars): ~1 % of context window, capped at 5 000.
+        # Limits how much any single message contributes to the summary prompt so
+        # a very long user message cannot make the summarisation call itself overflow.
+        self._max_head_content: int = max(500, min(5_000, context_window * 4 // 100))
+        #
+        # Max tokens for the summarisation LLM call.
+        # ~1.5 % of context window, between 500 and 4 000 tokens.
+        # E.g. 262K → 4 000; 32K → 504; 8K → 500.
+        self._summarise_max_tokens: int = max(500, min(4_000, context_window // 65))
 
     @property
     def _usable_tokens(self) -> int:
@@ -249,7 +275,7 @@ class Compactor:
             system=_SUMMARY_PROMPT,
             messages=[{"role": "user", "content": conversation_text}],
             tools=[],
-            max_tokens=2_000,
+            max_tokens=self._summarise_max_tokens,
         )
         return response.text
 
@@ -264,13 +290,13 @@ class Compactor:
                 lines.append(f"[tool result]: {content[:500]}")
             elif role == "assistant":
                 if content:
-                    lines.append(f"[assistant]: {content[:_MAX_HEAD_CONTENT]}")
+                    lines.append(f"[assistant]: {content[:self._max_head_content]}")
                 for tc in msg.get("tool_calls", []):
                     fn = tc.get("function", {})
                     args_preview = fn.get("arguments", "")[:200]
                     lines.append(f"[tool call]: {fn.get('name')}({args_preview})")
             else:
-                lines.append(f"[{role}]: {content[:_MAX_HEAD_CONTENT]}")
+                lines.append(f"[{role}]: {content[:self._max_head_content]}")
 
         return "\n".join(lines)
 
@@ -298,10 +324,10 @@ class Compactor:
                 content = msg.get("content") or ""
                 if i in keep_full:
                     # Recent result — keep in full, apply hard cap if needed.
-                    if len(content) > _MAX_TOOL_OUTPUT:
+                    if len(content) > self._max_tool_output:
                         msg = {
                             **msg,
-                            "content": content[:_MAX_TOOL_OUTPUT]
+                            "content": content[:self._max_tool_output]
                             + "\n[truncated during compaction]",
                         }
                 else:

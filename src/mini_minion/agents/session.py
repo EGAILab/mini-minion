@@ -86,14 +86,12 @@ from .definitions import AgentConfig
 from .events import CompactionFailed, CompactionStarted, TurnCompleted
 from .runner import run_turn
 
-# Maximum characters for the user-context block injected into the system prompt.
-# ~300 tokens at 4 chars/token — small enough not to crowd out conversation history.
-_USER_CONTEXT_MAX_CHARS = 1_200
-
-# Default token budget for proactively injected memory snippets.
-# 600 tokens × 4 chars ≈ 2 400 chars — raised from 300 because the 262K context
-# window makes this budget freely affordable.
-_DEFAULT_MEMORY_INJECTION_TOKENS = 600
+# These limits are now computed per-instance from the model's context window
+# inside AgentSession.__init__ so they scale automatically when the model is
+# switched.  The constants below are kept only as fallbacks for the standalone
+# helper functions that are called before __init__ can compute them.
+_USER_CONTEXT_MAX_CHARS = 1_200       # overridden per-instance in __init__
+_DEFAULT_MEMORY_INJECTION_TOKENS = 600  # overridden per-instance in __init__
 
 
 _STATUS_ICON = {"done": "✓", "in_progress": "→", "blocked": "✗", "pending": "○"}
@@ -159,7 +157,7 @@ def _format_task_context(task_path: Path | None) -> str:
     return "\n".join(lines)
 
 
-def _load_user_context(memory: LongTermMemory) -> str:
+def _load_user_context(memory: LongTermMemory, max_chars: int = _USER_CONTEXT_MAX_CHARS) -> str:
     """Load user_context.md from the memory store and return a prompt block.
 
     The file is expected under the key ``"user_context"`` (i.e.
@@ -167,17 +165,17 @@ def _load_user_context(memory: LongTermMemory) -> str:
 
     The content is wrapped in ``<user_context>`` tags so the model can
     identify it clearly and it appears distinctly in logs.
-    Hard-caps at :data:`_USER_CONTEXT_MAX_CHARS` to stay within the static
-    overhead budget.
+    Hard-caps at ``max_chars`` (proportional to context window, computed per
+    session in :class:`AgentSession.__init__`).
     """
     content = memory.load("user_context")
     if not content:
         return ""
     content = content.strip()
-    if len(content) > _USER_CONTEXT_MAX_CHARS:
+    if len(content) > max_chars:
         content = (
-            content[:_USER_CONTEXT_MAX_CHARS]
-            + "\n[truncated — keep user_context.md under 1 200 chars]"
+            content[:max_chars]
+            + f"\n[truncated — keep user_context.md under {max_chars} chars]"
         )
     return f"\n\n<user_context>\n{content}\n</user_context>"
 
@@ -279,9 +277,6 @@ class AgentSession:
         long_term (LongTermMemory | None): Optional long-term memory backend.
             When provided, enables user-context injection, proactive memory
             injection, and background fact extraction.
-        memory_injection_tokens (int): Token budget for proactively injected
-            memories per turn.  Defaults to
-            :data:`_DEFAULT_MEMORY_INJECTION_TOKENS`.
         tasks_dir (Path | None): Directory that holds per-agent task JSON files
             (``{tasks_dir}/{agent_id}.json``).  When provided, the active task
             is auto-injected into the system prompt before every turn so the
@@ -301,7 +296,6 @@ class AgentSession:
         session_store: SessionStore,
         soul_suffix: str = "",
         long_term: LongTermMemory | None = None,
-        memory_injection_tokens: int = _DEFAULT_MEMORY_INJECTION_TOKENS,
         tasks_dir: Path | None = None,
     ) -> None:
         self._agent_id = agent_id
@@ -314,13 +308,27 @@ class AgentSession:
         self._session_store = session_store
         self._soul_suffix = soul_suffix
         self._long_term = long_term
-        self._memory_injection_chars = memory_injection_tokens * 4
         # Path to this agent's task JSON file, or None if tasks are not enabled.
         self._task_path = tasks_dir / f"{agent_id}.json" if tasks_dir else None
 
+        # Compute injection limits proportionally from the model's context window.
+        # This ensures every budget scales automatically when the model is switched.
+        _ctx = compactor._context_window
+        #
+        # User-context cap: ~1 % of context window in chars (min 600, max 4 000).
+        # E.g. 262K → 4 000 chars; 32K → 1 310; 8K → 600 (floor).
+        self._user_context_max_chars: int = max(600, min(4_000, _ctx // 25))
+        #
+        # Memory injection budget: ~0.4 % of context window in tokens (min 100, max 2 000).
+        # Converts to chars using the standard 4-char ≈ 1 token heuristic.
+        # E.g. 262K → 2 000 tok (8 000 chars); 32K → 252 tok; 8K → 100 tok (floor).
+        _mem_tokens: int = max(100, min(2_000, _ctx // 130))
+        self._memory_injection_chars: int = _mem_tokens * 4
+
         # Load user context once at init — reloaded on next process restart.
         self._user_context_block = (
-            _load_user_context(long_term) if long_term is not None else ""
+            _load_user_context(long_term, max_chars=self._user_context_max_chars)
+            if long_term is not None else ""
         )
 
         # Load prior history from disk so conversation survives restarts.

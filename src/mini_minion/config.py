@@ -342,15 +342,18 @@ class CompactionConfig:
     """Controls when and how conversation history is compacted.
 
     The context window budget is derived per-agent from ``ModelConfig.context_window``
-    rather than stored here. This object only holds the shared token reservation
-    that applies across all agents.
+    rather than stored here.
 
     Attributes:
-        preserve_tokens (int): Tokens to reserve for the model's response and
-            protocol overhead.  Clamped to [2 000, 40 000] at runtime.
-            Defaults to 4 000.
+        preserve_tokens (int | None): Tokens to reserve for the model's response
+            and protocol overhead.  ``None`` (the default when ``config.json``
+            omits the field) means "auto-compute from the model's
+            ``maxOutputTokens``" — ``minion.py`` substitutes
+            ``model.max_output_tokens`` at Compactor construction time.
+            When set explicitly it is used as-is (clamped to
+            ``[_MIN_PRESERVE, context_window // 2]`` inside :class:`Compactor`).
     """
-    preserve_tokens: int
+    preserve_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -464,8 +467,10 @@ def _resolve_compaction() -> CompactionConfig:
         CompactionConfig: Immutable compaction settings.
     """
     raw = _raw.get("compaction", {})
+    pt = raw.get("preserve_tokens")
     return CompactionConfig(
-        preserve_tokens=int(raw.get("preserve_tokens", 4_000)),
+        # None → caller (minion.py) substitutes model.max_output_tokens.
+        preserve_tokens=int(pt) if pt is not None else None,
     )
 
 

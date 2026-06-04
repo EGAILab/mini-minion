@@ -33,7 +33,6 @@
     "chat_mode": true,
     "task_mode": false
   },
-  "compaction": {
-    "preserve_tokens": 32768
-  }
+  "compaction": {}
+
 }

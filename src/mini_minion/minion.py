@@ -148,9 +148,17 @@ def main() -> None:
             api_key=cfg.provider.api_key,
             model=cfg.model.id,
         )
+        # preserve_tokens: use explicit config override when present; otherwise
+        # auto-compute from the model's max_output_tokens so the reservation
+        # scales correctly when the model is switched.
+        _preserve = (
+            compaction_cfg.preserve_tokens
+            if compaction_cfg.preserve_tokens is not None
+            else cfg.model.max_output_tokens
+        )
         compactor = Compactor(
             context_window=cfg.model.context_window,
-            preserve_tokens=compaction_cfg.preserve_tokens,
+            preserve_tokens=_preserve,
         )
         sessions[agent_id] = AgentSession(
             agent_id=agent_id,

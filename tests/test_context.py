@@ -15,7 +15,6 @@ Tests cover:
 import json
 
 from mini_minion.context import (
-    _MAX_TOOL_OUTPUT,
     Compactor,
     _estimate_tokens,
 )
@@ -229,7 +228,7 @@ def test_format_head_handles_none_content():
 
 def test_prune_truncates_long_tool_output():
     compactor = Compactor(context_window=10_000)
-    long_content = "x" * ((_MAX_TOOL_OUTPUT) + 100)
+    long_content = "x" * (compactor._max_tool_output + 100)
     tail = [_tool_result(long_content)]
     pruned = compactor._prune(tail)
     assert len(pruned[0]["content"]) < len(long_content)
@@ -331,7 +330,7 @@ def test_compact_prunes_tool_outputs_in_tail():
     # Find the tool message in the result (skip the summary injection at indices 0-1)
     tool_msgs = [m for m in result if m.get("role") == "tool"]
     if tool_msgs:
-        assert len(tool_msgs[0]["content"]) <= _MAX_TOOL_OUTPUT + len("\n[truncated during compaction]")
+        assert len(tool_msgs[0]["content"]) <= compactor._max_tool_output + len("\n[truncated during compaction]")
 
 
 def test_compact_summary_uses_structured_prompt():
@@ -349,9 +348,10 @@ def test_compact_summary_uses_structured_prompt():
 # ---------------------------------------------------------------------------
 
 def test_compaction_config_loaded_from_config_json():
-    """CompactionConfig is read from config.json; context_window is now per-agent on ModelConfig."""
+    """CompactionConfig is read from config.json; preserve_tokens is None when omitted (auto-compute)."""
     from mini_minion.config import agents, compaction
-    assert compaction.preserve_tokens > 0
+    # preserve_tokens is now optional — None means "use model.max_output_tokens" at runtime.
+    assert compaction.preserve_tokens is None or compaction.preserve_tokens > 0
     # context_window is now per-agent via ModelConfig, not in CompactionConfig
     for cfg in agents.values():
         assert cfg.model.context_window > 0
@@ -364,9 +364,9 @@ def test_compaction_config_preserve_tokens_clamped_low():
 
 
 def test_compaction_config_preserve_tokens_clamped_high():
-    """preserve_tokens above _MAX_PRESERVE is clamped down."""
-    compactor = Compactor(context_window=100_000, preserve_tokens=50_000)
-    assert compactor._preserve_tokens == 40_000  # _MAX_PRESERVE
+    """preserve_tokens above context_window // 2 is clamped to context_window // 2."""
+    compactor = Compactor(context_window=100_000, preserve_tokens=80_000)
+    assert compactor._preserve_tokens == 50_000  # context_window // 2
 
 
 # ---------------------------------------------------------------------------
@@ -374,23 +374,24 @@ def test_compaction_config_preserve_tokens_clamped_high():
 # ---------------------------------------------------------------------------
 
 def test_format_head_truncates_long_assistant_message():
-    from mini_minion.context import _MAX_HEAD_CONTENT
-    compactor = Compactor(context_window=10_000)
-    long_content = "a" * (_MAX_HEAD_CONTENT + 100)
+    # Use a large context window so _max_head_content > 100 chars (testable truncation).
+    compactor = Compactor(context_window=100_000)
+    cap = compactor._max_head_content
+    long_content = "a" * (cap + 100)
     msgs = [_msg("assistant", long_content)]
     result = compactor._format_head(msgs)
-    assert "a" * _MAX_HEAD_CONTENT in result
-    assert "a" * (_MAX_HEAD_CONTENT + 1) not in result
+    assert "a" * cap in result
+    assert "a" * (cap + 1) not in result
 
 
 def test_format_head_truncates_long_user_message():
-    from mini_minion.context import _MAX_HEAD_CONTENT
-    compactor = Compactor(context_window=10_000)
-    long_content = "u" * (_MAX_HEAD_CONTENT + 100)
+    compactor = Compactor(context_window=100_000)
+    cap = compactor._max_head_content
+    long_content = "u" * (cap + 100)
     msgs = [_msg("user", long_content)]
     result = compactor._format_head(msgs)
-    assert "u" * _MAX_HEAD_CONTENT in result
-    assert "u" * (_MAX_HEAD_CONTENT + 1) not in result
+    assert "u" * cap in result
+    assert "u" * (cap + 1) not in result
 
 
 # ---------------------------------------------------------------------------
