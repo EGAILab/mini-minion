@@ -238,6 +238,56 @@ def test_tool_call_arguments_serialised():
     assert json.loads(raw_args) == {"text": "hi"}
 
 
+def test_empty_response_after_tool_uses_targeted_nudge():
+    """After a tool call round, an empty response triggers the targeted nudge (not the generic one)."""
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    messages: list[dict] = []
+
+    provider = _provider(
+        # Round 0: model calls a tool
+        LLMResponse(
+            text="",
+            tool_calls=[ToolCall(id="tc1", name="echo", arguments={"text": "hi"})],
+            finish_reason="tool_calls",
+        ),
+        # Round 1: model returns empty text (forgot to respond to user)
+        LLMResponse(text="", finish_reason="stop"),
+        # Round 2: model responds after nudge
+        LLMResponse(text="Done! The echo returned 'hi'.", finish_reason="stop"),
+    )
+    events: list[object] = []
+    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append)
+
+    # The targeted nudge should have been injected — check message history
+    user_nudges = [m for m in messages if m["role"] == "user" and m.get("content", "").startswith("[System:")]
+    assert len(user_nudges) == 1
+    assert "completed the tool calls" in user_nudges[0]["content"]  # targeted, not generic
+
+    final = next(e for e in events if isinstance(e, FinalAnswer))
+    assert "Done" in final.text
+
+
+def test_empty_response_without_prior_tools_uses_generic_nudge():
+    """Without prior tool calls, an empty response triggers the generic nudge."""
+    messages: list[dict] = []
+    provider = _provider(
+        # Round 0: empty response with no tools
+        LLMResponse(text="", finish_reason="stop"),
+        # Round 1: responds after generic nudge
+        LLMResponse(text="Sorry, here is my answer.", finish_reason="stop"),
+    )
+    events: list[object] = []
+    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages, on_event=events.append)
+
+    user_nudges = [m for m in messages if m["role"] == "user" and m.get("content", "").startswith("[System:")]
+    assert len(user_nudges) == 1
+    assert "No response received" in user_nudges[0]["content"]  # generic nudge
+
+    final = next(e for e in events if isinstance(e, FinalAnswer))
+    assert "Sorry" in final.text
+
+
 def test_empty_response_emits_final_answer_on_last_round():
     """On the final allowed round, an empty response emits FinalAnswer (not a recovery nudge)."""
     messages: list[dict] = []

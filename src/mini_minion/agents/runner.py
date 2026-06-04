@@ -256,6 +256,12 @@ def run_turn(
     _total_output = 0
     _has_usage = False
 
+    # Track whether the PREVIOUS round executed tool calls.  When Recovery A
+    # fires (empty text after tools ran), we use a targeted nudge that asks the
+    # model to acknowledge what it just did — rather than the generic "please
+    # respond or call a tool" which leaves open the choice to do nothing.
+    _prev_round_had_tools = False
+
     # --- TAO loop ---
     for _round in range(max_tool_rounds):
         _header_printed[0] = False
@@ -290,26 +296,52 @@ def run_turn(
 
         # --- Recovery A: empty response ---
         # Some models occasionally return no text and no tool calls — this can
-        # happen when the prompt contains unusual characters, when the model is
-        # uncertain, or when the context is ambiguous.  Rather than silently
-        # failing, we inject a "nudge" message that asks the model to try again.
+        # happen when a thinking model produces only internal reasoning with no
+        # visible output, when the model considers a tool result "enough of an
+        # answer", or when it gets confused by the context.
         #
-        # The nudge is two messages: an empty assistant message (to record in
-        # history that the model said nothing) followed by a system-style user
-        # message asking it to respond.  We only nudge on non-final rounds; on
-        # the last round we let the loop fall through to MaxRoundsReached.
+        # The nudge is two messages: an empty assistant message (to record that
+        # the model said nothing this round) followed by a system-style user
+        # message.  We choose WHICH nudge based on context:
+        #
+        # - After tool calls  → targeted nudge: "tell the user what you just did"
+        #   This closes the most common failure mode where the model writes a file
+        #   or saves to memory, considers the task complete, and returns empty text.
+        #   The generic nudge ("please respond or call a tool") leaves open the
+        #   option to do nothing again; the targeted nudge removes that option.
+        #
+        # - No prior tools    → generic nudge: "please respond or call a tool"
+        #   The model simply didn't say anything on its first response — the
+        #   prompt may have been ambiguous.  Ask it to try again.
+        #
+        # We only nudge on non-final rounds; on the last round we fall through
+        # to MaxRoundsReached.
         if not response.text and not response.tool_calls:
             if _round < max_tool_rounds - 1:
-                _log.debug("Empty response on round %d — injecting recovery nudge.", _round)
+                _log.debug(
+                    "Empty response on round %d (prev_had_tools=%s) — injecting recovery nudge.",
+                    _round,
+                    _prev_round_had_tools,
+                )
                 messages.append({"role": "assistant", "content": ""})
-                messages.append({
-                    "role": "user",
-                    "content": (
+                if _prev_round_had_tools:
+                    # Targeted nudge: the model ran tools but didn't tell the user anything.
+                    # Ask it to acknowledge what was done and provide details (e.g. file path).
+                    nudge = (
+                        "[System: You completed the tool calls but did not respond to "
+                        "the user. Please tell the user what was accomplished — include "
+                        "the file path if a file was written, or a brief summary of the "
+                        "result.]"
+                    )
+                else:
+                    # Generic nudge: no tools ran, model just said nothing.
+                    nudge = (
                         "[System: No response received. "
                         "Please respond to the user's message or call a tool to proceed.]"
-                    ),
-                })
-                continue  # skip the rest of the loop body and call the LLM again
+                    )
+                messages.append({"role": "user", "content": nudge})
+                _prev_round_had_tools = False  # this round executed no tools
+                continue  # re-enter THINK with the nudge in history
             # Last round with still-empty response — fall through to MaxRoundsReached.
 
         # --- Recovery B: truncated response (model hit max_tokens mid-sentence) ---
@@ -350,6 +382,7 @@ def run_turn(
         if response.finish_reason != "tool_calls":
             if on_event:
                 on_event(FinalAnswer(agent_name=agent_name, text=response.text or ""))
+            _prev_round_had_tools = False  # not needed after return, but keeps state consistent
             return TokenUsage(_total_input, _total_output) if _has_usage else None
 
         # --- Show preamble text that preceded the tool call (non-streaming only) ---
@@ -422,6 +455,10 @@ def run_turn(
                     on_event(ToolCompleted(name=tc.name, elapsed_ms=_elapsed_ms, output_chars=len(_output)))
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": _output})
 
+            # Mark that this round executed tools — Recovery A will use a targeted nudge
+            # next round if the model returns empty text without responding to the user.
+            _prev_round_had_tools = True
+
         else:
             # --- Serial execution (write tools, single tool, or parse errors) ---
             # Execute each tool call one at a time in the order the model requested.
@@ -447,6 +484,10 @@ def run_turn(
                 # The result becomes part of the conversation history so the model
                 # can see what the tool returned on the next Think step.
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+
+            # Mark that this round executed tools — Recovery A will use a targeted nudge
+            # next round if the model returns empty text without responding to the user.
+            _prev_round_had_tools = True
 
     # Cap reached without a final answer.
     _limit_msg = (
