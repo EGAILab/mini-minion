@@ -94,8 +94,10 @@ AGENTS: dict[str, AgentConfig] = {
             "After completing tool calls, always respond directly with your answer "
             "to the user — do not summarise or explain what tools you ran, just give "
             "the answer. If tools returned no useful result, say so and provide your "
-            "best answer anyway. Saving something to memory does not count as "
-            "answering the user; always speak the answer aloud."
+            "best answer anyway. Completing a tool call (saving to memory, writing a "
+            "file, running a command) does not count as answering the user — always "
+            "speak your answer aloud. When you write a file, tell the user the exact "
+            "file path and a one-line description of what the file contains."
             + _TASK_SOUL_SUFFIX
         ),
     ),
