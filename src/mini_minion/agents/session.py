@@ -315,14 +315,16 @@ class AgentSession:
         # This ensures every budget scales automatically when the model is switched.
         _ctx = compactor._context_window
         #
-        # User-context cap: ~1 % of context window in chars (min 600, max 4 000).
-        # E.g. 262K → 4 000 chars; 32K → 1 310; 8K → 600 (floor).
-        self._user_context_max_chars: int = max(600, min(4_000, _ctx // 25))
+        # User-context cap: ~1 % of context window in chars (min 600, max 16 000).
+        # Ceiling raised to 16 000 (≈ 4 000 tokens) to accommodate 1M-token models.
+        # E.g. 1M → 16 000; 262K → 10 485; 32K → 1 310; 8K → 600 (floor).
+        self._user_context_max_chars: int = max(600, min(16_000, _ctx // 25))
         #
-        # Memory injection budget: ~0.4 % of context window in tokens (min 100, max 2 000).
-        # Converts to chars using the standard 4-char ≈ 1 token heuristic.
-        # E.g. 262K → 2 000 tok (8 000 chars); 32K → 252 tok; 8K → 100 tok (floor).
-        _mem_tokens: int = max(100, min(2_000, _ctx // 130))
+        # Memory injection budget: ~0.4 % of context window in tokens (min 100, max 8 000).
+        # Ceiling raised to 8 000 so 1M-token models inject richer memory per turn.
+        # Converts to chars via the standard 4-char ≈ 1 token heuristic.
+        # E.g. 1M → 7 692 tok; 262K → 2 016 tok; 32K → 252 tok; 8K → 100 tok (floor).
+        _mem_tokens: int = max(100, min(8_000, _ctx // 130))
         self._memory_injection_chars: int = _mem_tokens * 4
 
         # Load user context once at init — reloaded on next process restart.

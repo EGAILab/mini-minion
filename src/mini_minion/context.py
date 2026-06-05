@@ -153,20 +153,24 @@ class Compactor:
         # Derived limits — all proportional to context_window so they scale
         # automatically when the model is switched.
         #
-        # Tool output cap (chars): ~2 % of context window, capped at 20 000.
+        # Tool output cap (chars): ~2 % of context window, capped at 100 000.
         # Prevents a single large tool result from monopolising the tail after
-        # compaction.  E.g. 262K → 20 000 chars; 32K → 2 621; 8K → 2 000 (floor).
-        self._max_tool_output: int = max(2_000, min(20_000, context_window * 4 // 50))
+        # compaction.  Ceiling raised to 100 000 to accommodate 1M-token models
+        # (2% of 1M = 80 000 chars ≈ 20 000 tokens).
+        # E.g. 1M → 80 000; 262K → 20 971; 32K → 2 621; 8K → 2 000 (floor).
+        self._max_tool_output: int = max(2_000, min(100_000, context_window * 4 // 50))
         #
-        # Head content cap (chars): ~1 % of context window, capped at 5 000.
+        # Head content cap (chars): ~1 % of context window, capped at 20 000.
         # Limits how much any single message contributes to the summary prompt so
         # a very long user message cannot make the summarisation call itself overflow.
-        self._max_head_content: int = max(500, min(5_000, context_window * 4 // 100))
+        # E.g. 1M → 20 000; 262K → 10 485; 32K → 1 310; 8K → 500 (floor).
+        self._max_head_content: int = max(500, min(20_000, context_window * 4 // 100))
         #
-        # Max tokens for the summarisation LLM call.
-        # ~1.5 % of context window, between 500 and 4 000 tokens.
-        # E.g. 262K → 4 000; 32K → 504; 8K → 500.
-        self._summarise_max_tokens: int = max(500, min(4_000, context_window // 65))
+        # Max tokens for the summarisation LLM call: ~1.5 % of context window,
+        # between 500 and 16 000 tokens.  Ceiling raised to 16 000 so that
+        # 1M-token histories get a sufficiently detailed summary.
+        # E.g. 1M → 15 384; 262K → 4 033; 32K → 504; 8K → 500 (floor).
+        self._summarise_max_tokens: int = max(500, min(16_000, context_window // 65))
 
     @property
     def _usable_tokens(self) -> int:
