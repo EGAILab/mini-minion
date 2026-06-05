@@ -75,7 +75,7 @@ from .agents.events import (
 from .config import agents as agents_cfg
 from .config import compaction as compaction_cfg
 from .config import streaming, workspace
-from .context import Compactor
+from .context import Compactor, _SNIP_SAFETY_BUFFER
 from .memory import LongTermMemory, ShortTermMemory
 from .providers import create_provider
 from .session import SessionStore
@@ -149,12 +149,14 @@ def main() -> None:
             model=cfg.model.id,
         )
         # preserve_tokens: use explicit config override when present; otherwise
-        # auto-compute from the model's max_output_tokens so the reservation
-        # scales correctly when the model is switched.
+        # auto-compute as max_output_tokens + _SNIP_SAFETY_BUFFER.
+        # The safety buffer (1 024 tokens, from nanobot's _SNIP_SAFETY_BUFFER)
+        # covers system-prompt tokens, tool-definition JSON overhead, and token-
+        # estimation inaccuracies that raw max_output_tokens does not account for.
         _preserve = (
             compaction_cfg.preserve_tokens
             if compaction_cfg.preserve_tokens is not None
-            else cfg.model.max_output_tokens
+            else cfg.model.max_output_tokens + _SNIP_SAFETY_BUFFER
         )
         compactor = Compactor(
             context_window=cfg.model.context_window,

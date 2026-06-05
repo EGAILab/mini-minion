@@ -56,9 +56,24 @@ _MIN_PRESERVE = 2_000
 
 # Fallback preserve budget used only when a Compactor is constructed in tests
 # without a preserve_tokens argument.  Production code in minion.py always
-# passes preserve_tokens = model.max_output_tokens, so this default never
-# applies at runtime.
+# passes preserve_tokens = model.max_output_tokens + _SNIP_SAFETY_BUFFER,
+# so this default never applies at runtime.
 _DEFAULT_PRESERVE = 4_000
+
+# Extra tokens added on top of max_output_tokens when auto-computing the
+# preserve budget (pattern: nanobot runner.py _SNIP_SAFETY_BUFFER = 1024).
+# Accounts for system prompt tokens, tool-definition JSON overhead, and
+# token-count estimation inaccuracies that the raw max_output_tokens value
+# does not cover.
+_SNIP_SAFETY_BUFFER = 1_024
+
+# Practical maximum for a single tool result kept in the tail after compaction.
+# Both nanobot (max_tool_result_chars=16_000) and OpenHarness
+# (DEFAULT_TOOL_OUTPUT_INLINE_CHARS=16_000) independently converged on 16 000 chars
+# as the upper limit of useful information in one tool response — beyond that,
+# the model gains little from additional tokens.  We keep a proportional floor
+# for small-context models and cap at this reference value.
+_TOOL_OUTPUT_REFERENCE_CAP = 16_000
 
 # Number of recent tool-result messages kept at full content in the tail.
 _TAIL_KEEP_FULL_RESULTS = 4
@@ -153,24 +168,37 @@ class Compactor:
         # Derived limits — all proportional to context_window so they scale
         # automatically when the model is switched.
         #
-        # Tool output cap (chars): ~2 % of context window, capped at 100 000.
-        # Prevents a single large tool result from monopolising the tail after
-        # compaction.  Ceiling raised to 100 000 to accommodate 1M-token models
-        # (2% of 1M = 80 000 chars ≈ 20 000 tokens).
-        # E.g. 1M → 80 000; 262K → 20 971; 32K → 2 621; 8K → 2 000 (floor).
-        self._max_tool_output: int = max(2_000, min(100_000, context_window * 4 // 50))
+        # Tool output cap (chars): proportional floor for small models, capped at
+        # 16 000 chars — the value independently chosen by both nanobot and
+        # OpenHarness as the practical upper limit of useful information in one
+        # tool response.  Keeping the proportional floor (2% of context window)
+        # ensures tiny models still get a sensible minimum.
+        # E.g. 1M → 16 000 (cap); 262K → 16 000 (cap); 32K → 2 621; 8K → 2 000.
+        self._max_tool_output: int = max(
+            2_000, min(_TOOL_OUTPUT_REFERENCE_CAP, context_window * 4 // 50)
+        )
         #
         # Head content cap (chars): ~1 % of context window, capped at 20 000.
         # Limits how much any single message contributes to the summary prompt so
         # a very long user message cannot make the summarisation call itself overflow.
+        # Unlike the reference implementations (which keep whole messages), we cap
+        # per-message to prevent the summary prompt itself from overflowing on models
+        # with very verbose exchanges.
         # E.g. 1M → 20 000; 262K → 10 485; 32K → 1 310; 8K → 500 (floor).
         self._max_head_content: int = max(500, min(20_000, context_window * 4 // 100))
         #
-        # Max tokens for the summarisation LLM call: ~1.5 % of context window,
-        # between 500 and 16 000 tokens.  Ceiling raised to 16 000 so that
-        # 1M-token histories get a sufficiently detailed summary.
-        # E.g. 1M → 15 384; 262K → 4 033; 32K → 504; 8K → 500 (floor).
-        self._summarise_max_tokens: int = max(500, min(16_000, context_window // 65))
+        # Summarisation LLM call budget — formula from Pi (harness/compaction.ts):
+        #   maxTokens = min(0.8 × reserveTokens, model.maxTokens)
+        # We use preserve_tokens as the "reserve" (which already equals
+        # max_output_tokens + safety buffer).  This ties the summary budget to the
+        # response reservation rather than the full context window — semantically,
+        # the summary is "setup for the next response" so its budget should scale
+        # with the response budget.  Capped at 16 000 to prevent runaway costs on
+        # high-output models (128K output × 0.8 = 102 400 would be far too large).
+        # E.g. 32K preserve → 26 214 → capped 16 000; 4K preserve → 3 276; 2K → 1 638.
+        self._summarise_max_tokens: int = max(
+            500, min(16_000, int(self._preserve_tokens * 0.8))
+        )
 
     @property
     def _usable_tokens(self) -> int:
