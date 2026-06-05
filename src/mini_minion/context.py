@@ -157,45 +157,83 @@ class Compactor:
         tail_keep_full_results: int = _TAIL_KEEP_FULL_RESULTS,
     ) -> None:
         self._context_window = context_window
-        # Ceiling is context_window // 2 so at least half the window is always
-        # usable.  This replaces the old fixed _MAX_PRESERVE = 40_000 constant,
-        # which was wrong for models smaller than ~80K tokens (the ceiling would
-        # exceed half their context window).
+
+        # ── Preserve-token clamping ───────────────────────────────────────────
+        # The preserve budget is the slice of the context window reserved for the
+        # model's response + protocol overhead.  It must satisfy two constraints:
+        #
+        #   (1) At least _MIN_PRESERVE tokens — any model needs some output room.
+        #   (2) At most context_window // 2 — so at least HALF the window stays
+        #       usable for conversation history.  A fixed cap like the old 40 000
+        #       broke on small models: a 32K-window model with 40K preserve would
+        #       have NEGATIVE usable budget.  Dynamic ceiling solves this.
+        #
+        # In production minion.py always passes preserve = max_output_tokens + 1024,
+        # so the clamp is a safety net for misconfiguration, not the normal path.
         _max_preserve = max(_MIN_PRESERVE, context_window // 2)
         self._preserve_tokens = max(_MIN_PRESERVE, min(_max_preserve, preserve_tokens))
         self._tail_keep_full = tail_keep_full_results
 
-        # Derived limits — all proportional to context_window so they scale
-        # automatically when the model is switched.
+        # ── Proportional derived limits ───────────────────────────────────────
+        # All four limits below are computed FROM context_window (and, for the
+        # summary budget, from preserve_tokens).  This means they automatically
+        # adjust when the model is switched — no manual config changes needed.
         #
-        # Tool output cap (chars): proportional floor for small models, capped at
-        # 16 000 chars — the value independently chosen by both nanobot and
-        # OpenHarness as the practical upper limit of useful information in one
-        # tool response.  Keeping the proportional floor (2% of context window)
-        # ensures tiny models still get a sensible minimum.
-        # E.g. 1M → 16 000 (cap); 262K → 16 000 (cap); 32K → 2 621; 8K → 2 000.
+        # Design principle:
+        #   floor  = absolute minimum that makes the feature useful at all
+        #   cap    = practical maximum beyond which there is diminishing return
+        #   ratio  = the "natural" value when context_window is in a normal range
+        #
+        # ── (A) Tool output cap ───────────────────────────────────────────────
+        # How much of a single tool result to keep in full during tail pruning.
+        #
+        # Formula:  context_window × 4 ÷ 50  = context_window ÷ 12.5
+        #         ≈ 2 % of context window in CHARS  (4 chars ≈ 1 token)
+        #
+        # Why 2 %?  A single tool result > 2 % of the window is unusual and
+        # would dominate the tail.  Reference: both nanobot and OpenHarness
+        # independently chose 16 000 chars as the practical maximum (floor
+        # ensures tiny models still get a sensible minimum).
+        #
+        # Example outputs:  1M → 16 000 (cap); 262K → 16 000 (cap);
+        #                   32K → 2 621; 8K → 2 000 (floor).
         self._max_tool_output: int = max(
             2_000, min(_TOOL_OUTPUT_REFERENCE_CAP, context_window * 4 // 50)
         )
         #
-        # Head content cap (chars): ~1 % of context window, capped at 20 000.
-        # Limits how much any single message contributes to the summary prompt so
-        # a very long user message cannot make the summarisation call itself overflow.
-        # Unlike the reference implementations (which keep whole messages), we cap
-        # per-message to prevent the summary prompt itself from overflowing on models
-        # with very verbose exchanges.
-        # E.g. 1M → 20 000; 262K → 10 485; 32K → 1 310; 8K → 500 (floor).
+        # ── (B) Head content cap ─────────────────────────────────────────────
+        # How much of any single message is included when rendering the "head"
+        # (the old messages) for the summarisation prompt.
+        #
+        # Formula:  context_window × 4 ÷ 100  = context_window ÷ 25
+        #         ≈ 1 % of context window in CHARS
+        #
+        # Why cap per-message?  Unlike nanobot/Pi (which keep whole messages),
+        # we truncate per message to prevent a single very long user message
+        # from making the summarisation prompt itself overflow the context.
+        #
+        # Example outputs:  1M → 20 000 (cap); 262K → 10 485;
+        #                   32K → 1 310; 8K → 500 (floor).
         self._max_head_content: int = max(500, min(20_000, context_window * 4 // 100))
         #
-        # Summarisation LLM call budget — formula from Pi (harness/compaction.ts):
+        # ── (C) Summarisation LLM call budget ────────────────────────────────
+        # How many tokens the model may use when writing the compaction summary.
+        #
+        # Formula (from Pi harness/compaction.ts):
         #   maxTokens = min(0.8 × reserveTokens, model.maxTokens)
-        # We use preserve_tokens as the "reserve" (which already equals
-        # max_output_tokens + safety buffer).  This ties the summary budget to the
-        # response reservation rather than the full context window — semantically,
-        # the summary is "setup for the next response" so its budget should scale
-        # with the response budget.  Capped at 16 000 to prevent runaway costs on
-        # high-output models (128K output × 0.8 = 102 400 would be far too large).
-        # E.g. 32K preserve → 26 214 → capped 16 000; 4K preserve → 3 276; 2K → 1 638.
+        #
+        # Why 0.8 × preserve?  The summary is "setup for the NEXT response", so
+        # its budget should scale with the response budget (preserve_tokens),
+        # not the entire context window.  Using 0.8 leaves a 20 % headroom for
+        # the model's actual response after reading the summary.
+        #
+        # Why cap at 16 000?  Without a cap, a 128K-output model would get
+        # 0.8 × 128 000 = 102 400 tokens for a summary — wasteful and slow.
+        # 16 000 tokens is sufficient to capture any practical conversation.
+        #
+        # Example outputs:  128K preserve → 102 400 → capped 16 000;
+        #                   32K preserve → 26 214 → capped 16 000;
+        #                   4K preserve → 3 276; 2K preserve → 1 638.
         self._summarise_max_tokens: int = max(
             500, min(16_000, int(self._preserve_tokens * 0.8))
         )

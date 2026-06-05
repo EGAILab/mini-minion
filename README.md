@@ -142,9 +142,7 @@ mini-minion/
     "chat_mode": true,
     "task_mode": false
   },
-  "compaction": {
-    "preserve_tokens": 32768
-  }
+  "compaction": {}
 }
 ```
 
@@ -162,7 +160,7 @@ mini-minion/
 | `streaming.task_mode` | `true` to stream tokens in programmatic/task invocations; `false` by default |
 | `models.providers.<name>.models[].contextWindow` | The model's total token capacity; used per-agent as the compaction budget |
 | `models.providers.<name>.models[].maxOutputTokens` | Maximum tokens the model may generate per response; sent to the API as `max_tokens` |
-| `compaction.preserve_tokens` | Tokens reserved for the next response and overhead; clamped to `[2 000, 40 000]` |
+| `compaction.preserve_tokens` | *(Optional override)* Tokens reserved for response + overhead. Omit to auto-compute as `maxOutputTokens + 1 024`. Clamped to `[2 000, contextWindow ÷ 2]` at runtime so at least half the window is always usable for history. |
 
 ### `.env`
 
@@ -317,7 +315,9 @@ class StreamingConfig:
 
 @dataclass(frozen=True)
 class CompactionConfig:
-    preserve_tokens: int   # tokens reserved for response + overhead; clamped to [2k, 40k]
+    preserve_tokens: int | None = None
+    # None  → minion.py auto-computes as max_output_tokens + _SNIP_SAFETY_BUFFER (1 024)
+    # int   → explicit override, clamped to [2 000, context_window ÷ 2] at runtime
     # context_window is per-agent, stored in ModelConfig.context_window
 ```
 
@@ -717,7 +717,9 @@ from mini_minion.context import Compactor
 
 compactor = Compactor(
     context_window=262_144,
-    preserve_tokens=32_768,
+    # preserve_tokens defaults to _DEFAULT_PRESERVE (4 000) in direct calls.
+    # minion.py always passes max_output_tokens + _SNIP_SAFETY_BUFFER (1 024).
+    preserve_tokens=33_792,     # 32 768 max_output + 1 024 safety buffer
     tail_keep_full_results=4,   # keep last 4 tool results in full (default)
 )
 
@@ -737,10 +739,34 @@ messages = compactor.compact(
 1. Scans from history start to find the largest prefix that fits (the **head**).
 2. Calls the provider with a structured summarisation prompt.
 3. Returns `[summary_message] + pruned_tail` where the tail is **microcompacted**:
-   - The last `tail_keep_full_results` (default 4) tool results are kept in full (capped at 2 000 chars each).
+   - The last `tail_keep_full_results` (default 4) tool results are kept in full (capped at `_max_tool_output` chars).
    - Older tool results are replaced with a one-liner `[result: N chars — use tools to re-read if needed]`, costing ~15 tokens instead of ~300+.
 
 If summarisation fails, `on_compaction_failed` is called and the original history is returned unchanged — the session continues without interruption.
+
+**All budget limits are proportional to `context_window`** — switching the model in `config.json` adjusts them automatically:
+
+| Derived limit | Formula | 8K | 32K | 262K | 1M |
+|---|---|---|---|---|---|
+| `preserve_tokens` (auto) | `maxOutputTokens + 1 024` | varies | varies | 33 792 | 129 024 |
+| `_max_tool_output` (chars) | `max(2k, min(16k, ctx×4÷50))` | 2 000▼ | 2 621 | 16 000■ | 16 000■ |
+| `_max_head_content` (chars) | `max(500, min(20k, ctx×4÷100))` | 500▼ | 1 310 | 10 485 | 20 000■ |
+| `_summarise_max_tokens` | `max(500, min(16k, preserve×0.8))` | 500▼ | varies | 16 000■ | 16 000■ |
+| Preserve ceiling | `context_window ÷ 2` | 4 096 | 16 384 | 131 072 | 500 000 |
+
+▼ = floor constant applies · ■ = cap constant applies · `ctx` = `context_window`
+
+**`_SNIP_SAFETY_BUFFER = 1 024`** (from nanobot) is the extra token margin added on top of `maxOutputTokens` when auto-computing `preserve_tokens`. It covers system-prompt tokens, tool-definition JSON overhead, and token-estimation inaccuracies that the raw `maxOutputTokens` value does not account for.
+
+**Per-turn injection budgets** (also proportional to `context_window`, computed in `AgentSession`):
+
+| Budget | Formula | 8K | 32K | 262K | 1M |
+|---|---|---|---|---|---|
+| User context (chars) | `max(600, min(16k, ctx÷25))` | 600▼ | 1 310 | 10 485 | 16 000■ |
+| Memory injection (tokens) | `max(100, min(8k, ctx÷130))` | 100▼ | 252 | 2 016 | 7 692 |
+| Budget warning threshold | 50 % of usable tokens | — | — | — | — |
+
+**Budget warning:** when conversation history exceeds 50 % of the usable token window (`context_window − preserve_tokens`), a `<context_budget>` block is injected into the system prompt telling the model to be concise before compaction is forced.
 
 ---
 

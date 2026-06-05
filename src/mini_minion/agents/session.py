@@ -315,14 +315,28 @@ class AgentSession:
         # This ensures every budget scales automatically when the model is switched.
         _ctx = compactor._context_window
         #
-        # User-context cap: ~1 % of context window in chars (min 600, max 16 000).
-        # Ceiling raised to 16 000 (≈ 4 000 tokens) to accommodate 1M-token models.
-        # E.g. 1M → 16 000; 262K → 10 485; 32K → 1 310; 8K → 600 (floor).
+        # User-context cap (chars): ~1 % of context window.
+        #
+        # How the formula works:
+        #   _ctx                  = context window in tokens (e.g. 262 144)
+        #   _ctx // 25            = _ctx × 4 // 100  ← "÷100 to get 1 %, ×4 to get chars"
+        #                        → result is chars representing 1 % of the context
+        # Example check for 262K:  262 144 // 25 = 10 485 chars ≈ 2 621 tokens ≈ 1 % of 262 144 ✓
+        #
+        # Floor 600 chars  — minimum useful context paragraph for any model.
+        # Ceiling 16 000 chars (≈ 4 000 tokens) — generous for 1M-token models.
+        # E.g. 1M → 16 000 (cap); 262K → 10 485; 32K → 1 310; 8K → 600 (floor).
         self._user_context_max_chars: int = max(600, min(16_000, _ctx // 25))
         #
-        # Memory injection budget: ~0.4 % of context window in tokens (min 100, max 8 000).
-        # Ceiling raised to 8 000 so 1M-token models inject richer memory per turn.
-        # Converts to chars via the standard 4-char ≈ 1 token heuristic.
+        # Memory injection budget (tokens): ~0.77 % of context window.
+        #
+        # How the formula works:
+        #   _ctx // 130  = context_window / 130 ≈ 0.769 % of context window in tokens
+        # Example check for 262K:  262 144 // 130 = 2 016 tokens ≈ 0.77 % of 262 144 ✓
+        #
+        # Result is in TOKENS; multiplied by 4 below to get chars (4-char heuristic).
+        # Floor 100 tok  — minimum for any model (~ 2 short snippets).
+        # Ceiling 8 000 tok — prevents injecting half the context as "memories".
         # E.g. 1M → 7 692 tok; 262K → 2 016 tok; 32K → 252 tok; 8K → 100 tok (floor).
         _mem_tokens: int = max(100, min(8_000, _ctx // 130))
         self._memory_injection_chars: int = _mem_tokens * 4
