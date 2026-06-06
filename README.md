@@ -93,6 +93,7 @@ mini-minion/
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
 │   │   ├── task.py              # ReadTaskTool, UpdateTaskTool — long-running task progress
+│   │   ├── web_search.py        # WebSearchTool — DuckDuckGo web search, no API key
 │   │   └── __init__.py          # default_registry() factory
 │   ├── memory/                  # Persistent memory storage
 │   │   ├── short_term.py        # JSONL conversation history (atomic writes)
@@ -544,6 +545,7 @@ registry.execute("tool_name", {"arg": "value"})  # str
 | `SkillTool` | `skill` | Load a skill's instructions into context by name. Only registered when skills are discovered at startup. |
 | `ReadTaskTool` | `read_task` | Read the current task progress file — goal, steps, status, notes, and context. |
 | `UpdateTaskTool` | `update_task` | Create a new task (goal + steps) or update an existing one (step status, notes, context, or clear). |
+| `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `duckduckgo-search` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. |
 
 **`ReadTaskTool` / `UpdateTaskTool`** implement the **Ralph Loop** pattern for long-running tasks that span multiple sessions or context windows. The agent calls `read_task` at the start of each session to orient itself, and `update_task` after completing each step so progress survives any restart. The task file is stored at `{workspace}/tasks/{agent_id}.json` — outside the project workspace so file tools cannot accidentally modify it.
 

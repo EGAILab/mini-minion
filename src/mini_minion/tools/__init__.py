@@ -38,6 +38,7 @@ from .read import ReadTool
 from .registry import ToolRegistry
 from .skill import SkillTool
 from .task import ReadTaskTool, UpdateTaskTool
+from .web_search import WebSearchTool
 from .write import WriteTool
 
 
@@ -77,6 +78,9 @@ def default_registry(
         WriteTool(root),
         GlobTool(root),
         BashTool(confirm=bash_confirm, cwd=root),
+        # WebSearchTool has no external dependencies at construction time; it
+        # fails gracefully at execute() if duckduckgo-search is not installed.
+        WebSearchTool(),
     ]:
         registry.register(tool)
 

@@ -5,7 +5,7 @@ from mini_minion.tools import default_registry
 
 def test_default_registry_has_expected_tools():
     names = {d["function"]["name"] for d in default_registry().definitions}
-    assert names == {"read", "write", "glob", "bash"}
+    assert names == {"read", "write", "glob", "bash", "web_search"}
 
 
 def test_default_registry_tool_names_are_unique():
