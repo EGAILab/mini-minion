@@ -46,6 +46,7 @@ import logging
 from collections.abc import Callable
 
 from mini_minion.providers.base import LLMProvider
+from mini_minion.messages import content_to_summary_text
 
 _log = logging.getLogger("mini_minion.compactor")
 
@@ -107,17 +108,59 @@ def _make_token_estimator():
     Falls back to a 4-char-per-token heuristic when tiktoken is not installed.
     ``ensure_ascii=False`` keeps CJK characters as single chars rather than
     ``\\uXXXX`` escape sequences, which would inflate the char count 7×.
+
+    Multimodal safety:
+    ------------------
+    When a message has list content containing image blocks, estimating by
+    json.dumps() would count the "path" and metadata strings rather than the
+    actual image cost.  Instead we:
+    - Count chars across all text blocks (same 4-char heuristic).
+    - Add _IMAGE_TOKENS_ESTIMATE per image block (OpenAI's ~85 "base" tiles for
+      a low-detail image — a reasonable worst-case for token budgeting).
+    - Never attempt to base64-encode the file here; that would be extremely slow
+      and would make the compactor load image data just to count tokens.
     """
+    # Approximate token cost for one image attachment in the context window.
+    # OpenAI vision pricing: 85 base tokens per image (low-detail).
+    # Anthropic is similar.  We use this as a conservative estimate.
+    _IMAGE_TOKENS_ESTIMATE = 85
+
+    def _multimodal_estimate(content) -> int:
+        """Count tokens for a content value that may be a list of blocks."""
+        if isinstance(content, list):
+            total = 0
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    # 4 chars ≈ 1 token (standard LLM heuristic).
+                    total += max(1, len(block.get("text", "")) // 4)
+                elif block.get("type") == "image":
+                    # Fixed cost per image — don't read bytes from disk.
+                    total += _IMAGE_TOKENS_ESTIMATE
+            return max(1, total)
+        # Plain string or other content: fall through to caller's method.
+        return None  # type: ignore[return-value]
+
     try:
         import tiktoken
         _enc = tiktoken.get_encoding("cl100k_base")
 
         def _estimate(msg: dict) -> int:
+            content = msg.get("content", "")
+            multimodal = _multimodal_estimate(content)
+            if multimodal is not None:
+                # Account for role overhead (~4 tokens) same as tiktoken would.
+                return multimodal + 4
             return max(1, len(_enc.encode(json.dumps(msg, ensure_ascii=False))))
 
         return _estimate
     except ImportError:
         def _estimate(msg: dict) -> int:
+            content = msg.get("content", "")
+            multimodal = _multimodal_estimate(content)
+            if multimodal is not None:
+                return multimodal + 4
             return max(1, len(json.dumps(msg, ensure_ascii=False)) // 4)
 
         return _estimate
@@ -254,6 +297,7 @@ class Compactor:
         provider: LLMProvider,
         on_compaction: "Callable[[], None] | None" = None,
         on_compaction_failed: "Callable[[str], None] | None" = None,
+        force: bool = False,
     ) -> list[dict]:
         """Return a compacted version of ``messages``, or the original list unchanged.
 
@@ -277,12 +321,17 @@ class Compactor:
             on_compaction_failed: One-argument callback invoked with an error
                                   description string when summarisation fails.
                                   ``None`` for silent fallback.
+            force:                When ``True``, skip the ``needs_compaction()``
+                                  budget check and compact immediately. Used by
+                                  the ``/compact`` REPL command to let the user
+                                  manually trigger compaction. Still requires at
+                                  least 2 messages (enforced by ``_select``).
 
         Returns:
             Compacted message list, or the original list if compaction was not
             needed or summarisation failed.
         """
-        if not self.needs_compaction(messages):
+        if not force and not self.needs_compaction(messages):
             return messages
 
         head, tail = self._select(messages)
@@ -350,11 +399,18 @@ class Compactor:
         return response.text
 
     def _format_head(self, head: list[dict]) -> str:
-        """Render the head message list as plain text for the summary prompt."""
+        """Render the head message list as plain text for the summary prompt.
+
+        Uses content_to_summary_text() to handle multimodal content blocks
+        (images are represented as metadata labels, never as base64 data).
+        This keeps the summarization prompt small even when images were sent.
+        """
         lines: list[str] = []
         for msg in head:
             role = msg.get("role", "unknown")
-            content = msg.get("content") or ""
+            # content_to_summary_text handles both strings and block lists safely.
+            content_raw = msg.get("content") or ""
+            content = content_to_summary_text(content_raw)
 
             if role == "tool":
                 lines.append(f"[tool result]: {content[:500]}")
@@ -391,7 +447,10 @@ class Compactor:
         result: list[dict] = []
         for i, msg in enumerate(tail):
             if msg.get("role") == "tool":
-                content = msg.get("content") or ""
+                # Tool results are always string content in practice, but guard
+                # against list content to be multimodal-safe.
+                raw_content = msg.get("content") or ""
+                content = raw_content if isinstance(raw_content, str) else str(raw_content)
                 if i in keep_full:
                     # Recent result — keep in full, apply hard cap if needed.
                     if len(content) > self._max_tool_output:

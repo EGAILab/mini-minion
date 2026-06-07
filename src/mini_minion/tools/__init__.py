@@ -27,8 +27,14 @@ Talks to
   TAO loop.
 """
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..mcp.client import McpClientManager
 
 from .base import Tool, ToolSchema
 from .bash import BashTool
@@ -49,6 +55,7 @@ def default_registry(
     skills: "SkillRegistry | None" = None,
     tasks_dir: Path | None = None,
     agent_id: str | None = None,
+    mcp_manager: "McpClientManager | None" = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` with all standard tools registered.
 
@@ -66,6 +73,8 @@ def default_registry(
                      :class:`ReadTaskTool` + :class:`UpdateTaskTool`.
         agent_id:    The agent's ID, used to build the task file path
                      ``{tasks_dir}/{agent_id}.json``.
+        mcp_manager: If provided, registers MCP status/resource tools and
+                     one :class:`McpToolAdapter` per connected MCP tool.
 
     Returns:
         :class:`ToolRegistry` populated and ready to pass to :func:`run_turn`.
@@ -98,6 +107,24 @@ def default_registry(
         task_path = Path(tasks_dir) / f"{agent_id}.json"
         registry.register(ReadTaskTool(task_path))
         registry.register(UpdateTaskTool(task_path))
+
+    # MCP tools — only when a manager is provided.
+    # Import here to avoid a circular import (mcp.types imports from config).
+    if mcp_manager is not None:
+        from .mcp import (
+            ListMcpResourcesTool,
+            McpToolAdapter,
+            McpStatusTool,
+            ReadMcpResourceTool,
+        )
+        # Always register the three management tools so the agent can inspect
+        # server status and browse resources without knowing tool names up front.
+        registry.register(McpStatusTool(mcp_manager))
+        registry.register(ListMcpResourcesTool(mcp_manager))
+        registry.register(ReadMcpResourceTool(mcp_manager))
+        # Register one adapter per tool discovered from connected servers.
+        for tool_info in mcp_manager.list_tools():
+            registry.register(McpToolAdapter(tool_info, mcp_manager))
 
     return registry
 

@@ -53,6 +53,7 @@ import json
 from collections.abc import Callable
 
 from .base import LLMResponse, TokenUsage, ToolCall
+from ..messages import content_has_images, materialize_image_data
 
 
 class AnthropicProvider:
@@ -223,6 +224,58 @@ class AnthropicProvider:
         )
 
 
+def _convert_user_content_for_anthropic(content: str | list) -> str | list:
+    """Convert internal content blocks to Anthropic Messages wire format.
+
+    WHY HERE (same reason as OpenAI): base64 is materialized just before the
+    API call so JSONL history never stores raw image bytes. See the comment on
+    _prepare_messages_for_openai() in openai_compatible.py for the full rationale.
+
+    Anthropic's image block format differs from OpenAI's:
+      OpenAI:    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+      Anthropic: {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
+
+    Anthropic also REQUIRES at least one text block in every user message with
+    images (unlike OpenAI which accepts image-only content). We insert a default
+    text block when the user sent only images and no text.
+
+    Args:
+        content: Either a plain string or a list of internal content blocks.
+
+    Returns:
+        The input string unchanged (text-only), or a list of Anthropic-format
+        content blocks (multimodal).
+    """
+    if isinstance(content, str):
+        return content
+
+    if not content_has_images(content):
+        # Text-only block list — flatten to string (Anthropic accepts either).
+        text = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
+        return text
+
+    # Mixed content: convert each block to Anthropic format.
+    blocks = []
+    for block in content:
+        if block.get("type") == "text":
+            blocks.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            # Read bytes from disk and encode as base64.
+            data = materialize_image_data(block)
+            mime = block.get("media_type", "image/png")
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": data},
+            })
+
+    # Anthropic requires at least one text block in every user message.
+    # If somehow no text block exists, prepend a default so the API doesn't reject it.
+    if not any(b.get("type") == "text" for b in blocks):
+        blocks.insert(0, {"type": "text", "text": "Please analyze the attached image."})
+
+    return blocks
+
+
 def _to_anthropic_messages(messages: list[dict]) -> list[dict]:
     """Convert OpenAI-format messages to Anthropic's messages format.
 
@@ -231,6 +284,7 @@ def _to_anthropic_messages(messages: list[dict]) -> list[dict]:
     - Regular user/assistant messages: straightforward conversion.
     - Assistant messages with tool calls: converted to content blocks.
     - Tool result messages: must be wrapped in a user role with tool_result blocks.
+    - User messages with multimodal content: converted via _convert_user_content_for_anthropic.
 
     Args:
         messages (list[dict]): Messages in OpenAI chat completions format.
@@ -245,8 +299,9 @@ def _to_anthropic_messages(messages: list[dict]) -> list[dict]:
         tool_calls = msg.get("tool_calls", [])
 
         if role == "user":
-            # Plain user message: direct conversion.
-            result.append({"role": "user", "content": content})
+            # Convert multimodal content blocks if present; plain strings pass through.
+            converted = _convert_user_content_for_anthropic(content)
+            result.append({"role": "user", "content": converted})
 
         elif role == "assistant":
             if tool_calls:

@@ -65,7 +65,8 @@ Raises
 import difflib
 import json
 import os
-from dataclasses import dataclass
+import re as _re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -186,6 +187,19 @@ def _validate(raw: dict) -> list[ConfigIssue]:
                         issues.append(ConfigIssue(f"{mpath}.{field}", "Required field missing."))
                     elif not isinstance(val, int) or val <= 0:
                         issues.append(ConfigIssue(f"{mpath}.{field}", f"Expected positive integer, got {val!r}."))
+                # Validate inputModalities when present — omitting it is fine (defaults to ["text"]).
+                _VALID_MODALITIES = frozenset({"text", "image", "audio", "video"})
+                modalities = mraw.get("inputModalities")
+                if modalities is not None:
+                    if not isinstance(modalities, list):
+                        issues.append(ConfigIssue(f"{mpath}.inputModalities", "Expected a list of strings."))
+                    else:
+                        for mod in modalities:
+                            if mod not in _VALID_MODALITIES:
+                                issues.append(ConfigIssue(
+                                    f"{mpath}.inputModalities",
+                                    f"Unknown modality {mod!r}. Valid: {sorted(_VALID_MODALITIES)}.",
+                                ))
 
     # --- agents ---
     agents_raw: dict = raw.get("agents", {})
@@ -269,6 +283,52 @@ def _validate(raw: dict) -> list[ConfigIssue]:
         if pt is not None and (not isinstance(pt, int) or pt <= 0):
             issues.append(ConfigIssue("compaction.preserve_tokens", f"Expected positive integer, got {pt!r}."))
 
+    # --- mcp ---
+    mcp_raw = raw.get("mcp", {})
+    if mcp_raw and not isinstance(mcp_raw, dict):
+        issues.append(ConfigIssue("mcp", "Expected an object."))
+    elif isinstance(mcp_raw, dict):
+        servers_raw = mcp_raw.get("servers", {})
+        if not isinstance(servers_raw, dict):
+            issues.append(ConfigIssue("mcp.servers", "Expected an object mapping server names to configs."))
+        else:
+            for sname, sraw in servers_raw.items():
+                spath = f"mcp.servers.{sname}"
+                if not _SERVER_NAME_RE.match(sname):
+                    issues.append(ConfigIssue(spath, f"Server name must match [A-Za-z0-9][A-Za-z0-9_-]{{0,63}}, got {sname!r}."))
+                if not isinstance(sraw, dict):
+                    issues.append(ConfigIssue(spath, "Expected an object."))
+                    continue
+                # Normalize and validate transport
+                transport = sraw.get("transport", "")
+                transport = _TRANSPORT_ALIASES.get(transport, transport)
+                if transport not in _VALID_TRANSPORTS:
+                    issues.append(ConfigIssue(f"{spath}.transport", f"Expected one of {sorted(_VALID_TRANSPORTS)}, got {transport!r}."))
+                elif transport == "stdio":
+                    if not sraw.get("command"):
+                        issues.append(ConfigIssue(f"{spath}.command", "Required non-empty string for stdio transport."))
+                elif transport in ("sse", "streamableHttp"):
+                    if not sraw.get("url"):
+                        issues.append(ConfigIssue(f"{spath}.url", f"Required non-empty string for {transport} transport."))
+                # Validate env is dict[str, str]
+                env_raw = sraw.get("env", {})
+                if not isinstance(env_raw, dict):
+                    issues.append(ConfigIssue(f"{spath}.env", "Expected an object mapping strings to strings."))
+                else:
+                    for k, v in env_raw.items():
+                        if not isinstance(v, str):
+                            issues.append(ConfigIssue(f"{spath}.env.{k}", f"Expected string value, got {type(v).__name__}."))
+                        if k.upper() in _DANGEROUS_ENV_KEYS:
+                            issues.append(ConfigIssue(f"{spath}.env.{k}", f"Env key {k!r} is dangerous and not allowed."))
+                # Validate headers is dict[str, str]
+                headers_raw = sraw.get("headers", {})
+                if not isinstance(headers_raw, dict):
+                    issues.append(ConfigIssue(f"{spath}.headers", "Expected an object mapping strings to strings."))
+                else:
+                    for k, v in headers_raw.items():
+                        if not isinstance(v, str):
+                            issues.append(ConfigIssue(f"{spath}.headers.{k}", f"Expected string value, got {type(v).__name__}."))
+
     return issues
 
 
@@ -311,10 +371,18 @@ class ModelConfig:
         max_output_tokens (int): The maximum tokens the model may generate
             in a single response. Sent directly to the API as ``max_tokens``.
             Comes from ``maxOutputTokens`` in config.json.
+        input_modalities (tuple[str, ...]): Media types this model can accept
+            as input.  ``"text"`` is always included.  Vision-capable models
+            also list ``"image"``.  Comes from ``inputModalities`` in
+            config.json; defaults to ``("text",)`` when omitted.
+            Valid values: "text", "image", "audio", "video".
     """
     id: str
     context_window: int
     max_output_tokens: int
+    # Fields with defaults must come AFTER fields without defaults (Python rule).
+    # input_modalities defaults to text-only so existing configs work unchanged.
+    input_modalities: tuple[str, ...] = ("text",)
 
 
 @dataclass(frozen=True)
@@ -335,6 +403,34 @@ class AgentModelConfig:
     provider: ProviderConfig
     model: ModelConfig
     route_prefix: str | None = None  # None → default/fallback agent; field with default must come last
+
+
+@dataclass(frozen=True)
+class McpServerConfig:
+    """One MCP server entry from the config.json 'mcp.servers' section.
+
+    Fields map 1:1 to the JSON config shape validated in _validate_mcp().
+    All fields are immutable (frozen=True) because config is read-only at runtime.
+    """
+    name: str                              # server key e.g. "context7"
+    transport: str                         # "stdio", "sse", or "streamableHttp"
+    # stdio fields
+    command: str = ""                      # e.g. "npx"
+    args: tuple[str, ...] = ()            # e.g. ("-y", "@upstash/context7-mcp@latest")
+    env: dict[str, str] = field(default_factory=dict)
+    cwd: str = ""
+    # network fields
+    url: str = ""                          # for sse/streamableHttp
+    headers: dict[str, str] = field(default_factory=dict)
+    # shared
+    enabled_tools: tuple[str, ...] = ("*",)  # allowlist; "*" = all
+    tool_timeout: int = 30                 # seconds, clamped to [5, 600]
+
+
+@dataclass(frozen=True)
+class McpConfig:
+    """All MCP servers configured for this mini-minion instance."""
+    servers: tuple[McpServerConfig, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -389,6 +485,30 @@ class StreamingConfig:
 
 
 # ---------------------------------------------------------------------------
+# MCP validation constants
+# ---------------------------------------------------------------------------
+
+# Valid server name format: starts with alphanumeric, allows alphanumeric/underscore/hyphen.
+_SERVER_NAME_RE = _re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
+
+# Transport aliases allow friendlier spellings in config.json.
+# They are normalized to the canonical form before building McpServerConfig.
+_TRANSPORT_ALIASES: dict[str, str] = {
+    "http": "streamableHttp",
+    "streamable-http": "streamableHttp",
+}
+_VALID_TRANSPORTS = frozenset({"stdio", "sse", "streamableHttp"})
+
+# Env var keys known to affect interpreter or shell startup in dangerous ways.
+# Rejecting them prevents MCP server config from being used to inject code
+# into Python, Node.js, Ruby, Perl, or the shell itself.
+_DANGEROUS_ENV_KEYS = frozenset({
+    "NODE_OPTIONS", "PYTHONPATH", "PYTHONSTARTUP", "RUBYOPT",
+    "PERL5OPT", "SHELLOPTS", "PS4", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES",
+})
+
+
+# ---------------------------------------------------------------------------
 # Private helper functions — only used at module startup, not exported.
 # ---------------------------------------------------------------------------
 
@@ -412,6 +532,10 @@ def _resolve_provider(provider_name: str, model_id: str) -> AgentModelConfig:
     # so the failure is loud rather than silently passing an empty credential.
     api_key = os.environ.get(f"{provider_name.upper()}_API_KEY", "")
 
+    # Read inputModalities from config; default to ["text"] when absent so
+    # existing configs work unchanged and text-only providers need no changes.
+    input_modalities = tuple(model_raw.get("inputModalities", ["text"]))
+
     return AgentModelConfig(
         provider=ProviderConfig(
             name=provider_name,
@@ -423,6 +547,7 @@ def _resolve_provider(provider_name: str, model_id: str) -> AgentModelConfig:
             id=model_id,
             context_window=model_raw.get("contextWindow", 32_768),
             max_output_tokens=model_raw.get("maxOutputTokens", 4_096),
+            input_modalities=input_modalities,
         ),
     )
 
@@ -472,6 +597,97 @@ def _resolve_compaction() -> CompactionConfig:
         # None → caller (minion.py) substitutes model.max_output_tokens.
         preserve_tokens=int(pt) if pt is not None else None,
     )
+
+
+def _expand_env_vars(value: str) -> str:
+    """Expand ${VAR} references in a string using os.environ.
+
+    Only expands ${VAR} syntax (not $VAR without braces) to avoid accidentally
+    expanding single-dollar signs that appear in URLs or commands.
+    """
+    return _re.sub(r'\$\{([^}]+)\}', lambda m: os.environ.get(m.group(1), m.group(0)), value)
+
+
+def _resolve_mcp() -> McpConfig:
+    """Read the 'mcp' section from config.json and build an McpConfig.
+
+    Normalizes transport aliases, clamps tool_timeout to [5, 600], and
+    expands ${VAR} references in env/headers/url values.
+
+    Returns:
+        McpConfig: Immutable MCP configuration; empty servers tuple if section absent.
+    """
+    mcp_raw = _raw.get("mcp", {})
+    if not isinstance(mcp_raw, dict):
+        return McpConfig()
+
+    servers_raw = mcp_raw.get("servers", {})
+    if not isinstance(servers_raw, dict):
+        return McpConfig()
+
+    server_list = []
+    for sname, sraw in servers_raw.items():
+        if not isinstance(sraw, dict):
+            continue
+
+        transport = sraw.get("transport", "stdio")
+        # Normalize transport aliases (e.g. "http" → "streamableHttp")
+        transport = _TRANSPORT_ALIASES.get(transport, transport)
+
+        # Expand ${VAR} in url and string values
+        url = _expand_env_vars(sraw.get("url", ""))
+
+        # Expand env values
+        env_raw = sraw.get("env", {})
+        env = {k: _expand_env_vars(v) for k, v in env_raw.items() if isinstance(v, str)}
+
+        # Expand header values
+        headers_raw = sraw.get("headers", {})
+        headers = {k: _expand_env_vars(v) for k, v in headers_raw.items() if isinstance(v, str)}
+
+        # Clamp tool_timeout to [5, 600] seconds
+        raw_timeout = sraw.get("tool_timeout", 30)
+        tool_timeout = max(5, min(600, int(raw_timeout) if isinstance(raw_timeout, (int, float)) else 30))
+
+        # enabled_tools: default to ["*"] (all tools)
+        enabled_raw = sraw.get("enabled_tools", ["*"])
+        enabled_tools: tuple[str, ...] = tuple(enabled_raw) if isinstance(enabled_raw, list) else ("*",)
+
+        # Expand ${VAR} in args so config.json can reference environment variables.
+        #
+        # Why only ${VAR} syntax (not $VAR)?
+        #   The _expand_env_vars function only matches ${...} braces, not bare $VAR.
+        #   This prevents accidentally expanding things like "$5" in shell scripts
+        #   or "$?" in command output. See _expand_env_vars() in this file for details.
+        #
+        # Practical use cases:
+        #   --output-dir ${USERPROFILE}\.mini-minion\playwright-output  (Windows)
+        #   --output-dir ${HOME}/.mini-minion/playwright-output         (Linux/Mac)
+        #   --storage-state ${HOME}/.mini-minion/playwright-session.json
+        #
+        # If a variable is NOT set in the environment, ${VAR} is left as-is
+        # (not replaced with empty string) so the user gets a visible clue that
+        # the expansion failed rather than a cryptic "path not found" error.
+        raw_args = sraw.get("args", [])
+        args = tuple(
+            _expand_env_vars(a) if isinstance(a, str) else str(a)
+            for a in raw_args
+        )
+
+        server_list.append(McpServerConfig(
+            name=sname,
+            transport=transport,
+            command=sraw.get("command", ""),
+            args=args,
+            env=env,
+            cwd=sraw.get("cwd", ""),
+            url=url,
+            headers=headers,
+            enabled_tools=enabled_tools,
+            tool_timeout=tool_timeout,
+        ))
+
+    return McpConfig(servers=tuple(server_list))
 
 
 def _resolve_streaming() -> StreamingConfig:
@@ -527,3 +743,7 @@ streaming: StreamingConfig = _resolve_streaming()
 # compaction: controls when conversation history is summarised to free context window.
 # Read from the "compaction" section of config.json; defaults to 4 000 if absent.
 compaction: CompactionConfig = _resolve_compaction()
+
+# mcp: all configured MCP servers. Empty servers tuple when section absent from config.
+# Built once at import time from the "mcp.servers" section of config.json.
+mcp: McpConfig = _resolve_mcp()

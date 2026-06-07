@@ -10,6 +10,9 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 - [Project Structure](#project-structure)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
+- [Slash Commands](#slash-commands)
+- [Image Attachments](#image-attachments)
+- [MCP Servers](#mcp-servers)
 - [Module Reference](#module-reference)
   - [config](#config)
   - [providers](#providers)
@@ -50,10 +53,11 @@ At the prompt:
 ```
 You: explain async/await in Python
 You: /research latest benchmarks for Qwen 3.5
+You: /help
 You: exit
 ```
 
-`/research <message>` routes to Elizabeth (researcher). Everything else goes to Ada (main).
+`/research <message>` routes to Elizabeth (researcher). Everything else goes to Ada (main). Type `/help` for a list of all slash commands.
 
 ---
 
@@ -61,13 +65,17 @@ You: exit
 
 ```
 mini-minion/
-├── config.json                  # Provider, model, agent, routing, and workspace config
+├── config.json                  # Provider, model, agent, routing, workspace, and MCP config
 ├── .env                         # API keys (never commit)
 ├── pyproject.toml               # Package metadata and dependencies
 ├── src/mini_minion/
 │   ├── minion.py                # Entry point — interactive REPL
 │   ├── config.py                # Config loader (config.json + .env)
 │   ├── context.py               # Context window overflow detection and history compaction
+│   ├── cli_input.py             # PromptReader — Up/Down arrow key prompt history via prompt_toolkit
+│   ├── commands.py              # Slash command dispatcher and built-in commands
+│   ├── messages.py              # Provider-neutral content block helpers (text/image)
+│   ├── media.py                 # File-backed attachment ingestion with MIME/size validation
 │   ├── providers/               # LLM API adapters
 │   │   ├── base.py              # Protocol, ToolCall, LLMResponse types
 │   │   ├── openai_compatible.py # OpenAI Chat Completions adapter
@@ -81,6 +89,11 @@ mini-minion/
 │   │   ├── runner.py            # TAO loop (run_turn) with retry and recovery
 │   │   ├── session.py           # AgentSession — headless per-agent execution unit
 │   │   └── __init__.py
+│   ├── mcp/                     # MCP (Model Context Protocol) client package
+│   │   ├── types.py             # MCP type definitions
+│   │   ├── schema.py            # MCP schema helpers
+│   │   ├── client.py            # MCP client — stdio, sse, streamableHttp transports
+│   │   └── __init__.py
 │   ├── skills/                  # Agent skills (SKILL.md files with YAML frontmatter)
 │   │   └── __init__.py          # discover_skills(), format_skills_prompt(), SkillInfo
 │   ├── tools/                   # Executable tools for agents
@@ -91,9 +104,10 @@ mini-minion/
 │   │   ├── glob.py              # GlobTool — file pattern search
 │   │   ├── bash.py              # BashTool — shell commands (PowerShell/bash)
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
+│   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
 │   │   ├── task.py              # ReadTaskTool, UpdateTaskTool — long-running task progress
-│   │   ├── web_search.py        # WebSearchTool — DuckDuckGo web search, no API key
+│   │   ├── web_search.py        # WebSearchTool — DuckDuckGo web search via ddgs, no API key
 │   │   └── __init__.py          # default_registry() factory
 │   ├── memory/                  # Persistent memory storage
 │   │   ├── short_term.py        # JSONL conversation history (atomic writes)
@@ -103,7 +117,7 @@ mini-minion/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       └── __init__.py
-└── tests/                       # pytest test suite (352 tests, 1 skipped)
+└── tests/                       # pytest test suite (668 tests, 3 skipped)
 ```
 
 ---
@@ -129,6 +143,12 @@ mini-minion/
         "models": [
           {"id": "glm-5", "name": "glm-5", "contextWindow": 128000, "maxOutputTokens": 4096}
         ]
+      },
+      "anthropic": {
+        "api": "anthropic",
+        "models": [
+          {"id": "claude-sonnet-4-5", "name": "Claude Sonnet", "contextWindow": 200000, "maxOutputTokens": 8096, "inputModalities": ["text", "image"]}
+        ]
       }
     }
   },
@@ -143,7 +163,20 @@ mini-minion/
     "chat_mode": true,
     "task_mode": false
   },
-  "compaction": {}
+  "compaction": {},
+  "mcp": {
+    "servers": {
+      "filesystem": {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+      },
+      "myserver": {
+        "transport": "sse",
+        "url": "http://localhost:8000/sse"
+      }
+    }
+  }
 }
 ```
 
@@ -154,6 +187,7 @@ mini-minion/
 | `models.providers.<name>.baseUrl` | API base URL for the provider |
 | `models.providers.<name>.api` | Adapter type: `openai-completions`, `lmstudio`, or `anthropic` |
 | `models.providers.<name>.models` | List of available models with `id`, `contextWindow`, and `maxOutputTokens` |
+| `models.providers.<name>.models[].inputModalities` | *(Optional)* List of supported input types. Include `"image"` to enable vision/attachment support for that model. Defaults to `["text"]`. |
 | `agents.<id>.model` | `"<provider>/<model-id>"` — which model each agent uses |
 | `agents.<id>.route_prefix` | Optional command prefix that routes to this agent (e.g. `"/research"`). Omit for the default fallback agent. |
 | `workspace.path` | Root directory for persisted history and memory (tilde-expanded) |
@@ -162,6 +196,10 @@ mini-minion/
 | `models.providers.<name>.models[].contextWindow` | The model's total token capacity; used per-agent as the compaction budget |
 | `models.providers.<name>.models[].maxOutputTokens` | Maximum tokens the model may generate per response; sent to the API as `max_tokens` |
 | `compaction.preserve_tokens` | *(Optional override)* Tokens reserved for response + overhead. Omit to auto-compute as `maxOutputTokens + 1 024`. Clamped to `[2 000, contextWindow ÷ 2]` at runtime so at least half the window is always usable for history. |
+| `mcp.servers.<name>.transport` | MCP transport type: `stdio`, `sse`, or `streamableHttp` |
+| `mcp.servers.<name>.command` | *(stdio only)* Executable to launch the MCP server |
+| `mcp.servers.<name>.args` | *(stdio only)* Arguments passed to the server command |
+| `mcp.servers.<name>.url` | *(sse / streamableHttp only)* URL of the MCP server endpoint |
 
 ### `.env`
 
@@ -260,13 +298,164 @@ AgentSession.send(message, on_event=callback, stream=True/False)
 ├── tasks/
 │   ├── main.json         ← Ada's active task progress file (created on demand)
 │   └── researcher.json   ← Elizabeth's active task progress file
+├── attachments/          ← staged image/media files (organised by date)
+│   └── 2024-01-15/
+│       └── <sha256>-screenshot.png
 ├── skills/               ← global skills (available to all agents)
 │   └── my-skill/
 │       └── SKILL.md
+├── prompt_history.txt    ← REPL input history for Up/Down arrow navigation
 └── sessions.json         ← session metadata (turn counts, timestamps)
 ```
 
 Project-level skills live at `.mini-minion/skills/` relative to the working directory and override global skills with the same name.
+
+---
+
+## Slash Commands
+
+The REPL recognises slash commands that start with `/`. Type `/help` to print the command list at any time.
+
+| Command | Description |
+|---|---|
+| `/help` | Print a summary of all available commands |
+| `/commands` | Alias for `/help` |
+| `/quit` | Exit the REPL |
+| `/exit` | Alias for `/quit` |
+| `/new` | Clear all agent sessions (history, attachments) and start fresh |
+| `/new all` | Alias for `/new` |
+| `/clear` | Alias for `/new` |
+| `/reset` | Alias for `/new` |
+| `/compact` | Force immediate context compaction for all agents |
+| `/status` | Show session metadata (turn counts, last active) for each agent |
+| `/attach <path>` | Stage a local file (image) as an attachment for the next message |
+| `/attachments` | List currently staged attachments |
+| `/clear-attachments` | Remove all staged attachments without sending |
+| `/research <message>` | Route the message to Elizabeth (researcher) |
+
+Route-targeted commands work on individual agent sessions. For example, `/research /new` clears only Elizabeth's session.
+
+---
+
+## Image Attachments
+
+Vision-capable models (those with `"inputModalities": ["text", "image"]` in `config.json`) can receive image files alongside text prompts.
+
+**Workflow:**
+
+```
+You: /attach /home/user/screenshot.png
+[Attached: screenshot.png (342 KB, image/png)]
+
+You: what is shown in this image?
+Ada: The screenshot shows ...
+```
+
+**Details:**
+- Use `/attach <path>` to stage a file. The file is copied to `{workspace}/attachments/YYYY-MM-DD/<sha256>-<name>`.
+- Use `/attachments` to list currently staged files.
+- Use `/clear-attachments` to drop staged files without sending them.
+- Attachments are automatically cleared after each successful send.
+- Maximum image size: 15 MB. Maximum images per turn: 4.
+- Unsupported MIME types or oversized files are rejected with an error message.
+- The OpenAI provider converts images to base64 `image_url` data URLs. The Anthropic provider uses its native base64 image block format.
+
+---
+
+## MCP Servers
+
+mini-minion supports the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). Configure MCP servers in `config.json` under `"mcp"`:
+
+```json
+"mcp": {
+  "servers": {
+    "playwright": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"],
+      "tool_timeout": 60
+    },
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "myserver": {
+      "transport": "sse",
+      "url": "http://localhost:8000/sse"
+    }
+  }
+}
+```
+
+**Transports:** `stdio` (subprocess), `sse` (server-sent events), `streamableHttp`.
+
+**How it works:**
+- At startup, mini-minion connects to each configured MCP server.
+- Tools exposed by MCP servers are registered in the tool registry as `mcp__<server>__<tool>` (e.g. `mcp__playwright__browser_navigate`).
+- The agents can call MCP tools like any built-in tool.
+- Three built-in management tools are always registered when MCP is configured: `mcp_status`, `list_mcp_resources`, and `read_mcp_resource`.
+- `${VAR}` references in `args`, `env`, `headers`, and `url` are expanded from environment variables at startup.
+
+Use the `/status` command or ask the agent to call `mcp_status` to check server connectivity.
+
+### Playwright MCP (browser automation)
+
+Playwright MCP gives agents full browser control — navigate, click, fill forms, take screenshots, and inspect page accessibility trees.
+
+**Prerequisites:**
+
+```bash
+# Install the Playwright MCP browser (chrome-for-testing)
+npx @playwright/mcp install-browser chrome-for-testing
+```
+
+**Config (already in `config.json`):**
+
+```json
+"playwright": {
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["@playwright/mcp@latest"],
+  "tool_timeout": 60
+}
+```
+
+**Available tools (23 total):**
+
+| Tool | Description |
+|---|---|
+| `mcp__playwright__browser_navigate` | Navigate to a URL |
+| `mcp__playwright__browser_snapshot` | Capture accessibility tree of current page (text-based, best for agents) |
+| `mcp__playwright__browser_click` | Click on an element |
+| `mcp__playwright__browser_type` | Type text into a field |
+| `mcp__playwright__browser_fill_form` | Fill multiple form fields at once |
+| `mcp__playwright__browser_take_screenshot` | Take a screenshot (saved to `{workspace}/playwright-output/`) |
+| `mcp__playwright__browser_evaluate` | Run JavaScript on the page |
+| `mcp__playwright__browser_press_key` | Press a keyboard key |
+| `mcp__playwright__browser_tabs` | List, create, close, or switch browser tabs |
+| `mcp__playwright__browser_wait_for` | Wait for text to appear or a timeout |
+| `mcp__playwright__browser_console_messages` | Get all browser console messages |
+| `mcp__playwright__browser_network_requests` | List network requests since page load |
+| … and 11 more (use `mcp_status` to see the full list) |
+
+**Recommended workflow for agents:**
+
+```
+You: go to https://news.ycombinator.com and summarize the top 5 stories
+
+Ada: [tool: mcp__playwright__browser_navigate({'url': 'https://news.ycombinator.com'})]
+     [tool: mcp__playwright__browser_snapshot({})]
+     Based on the page snapshot:
+     1. ...
+```
+
+**Screenshots** are automatically saved to `~/.mini-minion/playwright-output/screenshot-<timestamp>.png` when the agent calls `browser_take_screenshot`. The agent receives the file path in the tool result.
+
+**Notes:**
+- The browser opens as a visible window by default (headed mode). You can watch the agent browse.
+- Use `browser_snapshot` (accessibility tree) for page analysis — it works with all text models. Use `browser_take_screenshot` only with vision-capable models.
+- Add `"--headless"` to `args` to run without a visible window: `"args": ["@playwright/mcp@latest", "--headless"]`.
 
 ---
 
@@ -302,6 +491,7 @@ class ModelConfig:
     id: str              # e.g. "qwen-qwen3.5-9b"
     context_window: int  # total token capacity; used as compaction budget for this agent
     max_output_tokens: int  # generation limit sent to the API as max_tokens
+    input_modalities: tuple[str, ...] = ("text",)  # e.g. ("text", "image") for vision models
 
 @dataclass(frozen=True)
 class AgentModelConfig:
@@ -461,6 +651,9 @@ text = session.send("What is REST?")
 # With event callback
 events = []
 text = session.send("What is REST?", on_event=events.append, stream=True)
+
+# With image attachments (model must support "image" in input_modalities)
+text = session.send("What is in this image?", attachments=[Path("/tmp/screenshot.png")])
 ```
 
 When `long_term` is provided, `AgentSession`:
@@ -545,7 +738,11 @@ registry.execute("tool_name", {"arg": "value"})  # str
 | `SkillTool` | `skill` | Load a skill's instructions into context by name. Only registered when skills are discovered at startup. |
 | `ReadTaskTool` | `read_task` | Read the current task progress file — goal, steps, status, notes, and context. |
 | `UpdateTaskTool` | `update_task` | Create a new task (goal + steps) or update an existing one (step status, notes, context, or clear). |
-| `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `duckduckgo-search` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. |
+| `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `ddgs` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. |
+| `McpStatusTool` | `mcp_status` | List all configured MCP servers and their connection status. |
+| `ListMcpResourcesTool` | `list_mcp_resources` | List resources available on a connected MCP server. |
+| `ReadMcpResourceTool` | `read_mcp_resource` | Read a specific resource from a connected MCP server. Output capped at 8 000 chars. |
+| `McpToolAdapter` | `mcp__<server>__<tool>` | Dynamically registered tool that proxies a call to a specific tool on an MCP server. One adapter is created per tool exposed by each connected MCP server. |
 
 **`ReadTaskTool` / `UpdateTaskTool`** implement the **Ralph Loop** pattern for long-running tasks that span multiple sessions or context windows. The agent calls `read_task` at the start of each session to orient itself, and `update_task` after completing each step so progress survives any restart. The task file is stored at `{workspace}/tasks/{agent_id}.json` — outside the project workspace so file tools cannot accidentally modify it.
 
@@ -593,6 +790,11 @@ reg = default_registry(
     tasks_dir=Path("~/.mini-minion/tasks").expanduser(),
     agent_id="main",
 )
+
+# With MCP servers
+reg = default_registry(
+    mcp_manager=mcp_manager,  # McpManager instance loaded from config
+)
 ```
 
 | Parameter | Type | Default | Description |
@@ -603,6 +805,7 @@ reg = default_registry(
 | `skills` | `SkillRegistry \| None` | `None` | If non-empty, registers the `skill` tool |
 | `tasks_dir` | `Path \| None` | `None` | Task file directory. Required alongside `agent_id` to register task tools. |
 | `agent_id` | `str \| None` | `None` | Agent ID used to build the task file path `{tasks_dir}/{agent_id}.json`. |
+| `mcp_manager` | `McpManager \| None` | `None` | If provided, registers `mcp_status`, `list_mcp_resources`, `read_mcp_resource`, and one `mcp__<server>__<tool>` adapter per tool exposed by connected MCP servers. |
 
 ---
 
@@ -888,7 +1091,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **352 cases** across all modules (352 passed, 1 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed.
+The test suite covers **668 cases** across all modules (668 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
 
 ```bash
 uv add anthropic

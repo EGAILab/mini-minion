@@ -33,6 +33,16 @@
     "chat_mode": true,
     "task_mode": false
   },
-  "compaction": {}
-
+  "compaction": {},
+  "mcp": {
+    "servers": {
+      "playwright": {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["@playwright/mcp@latest"],
+        "tool_timeout": 60,
+        "enabled_tools": ["*"]
+      }
+    }
+  }
 }

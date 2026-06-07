@@ -62,6 +62,9 @@ import sys
 from pathlib import Path
 
 from .agents import AGENTS, AgentSession, resolve
+from .cli_input import PromptReader
+from .commands import CommandContext, dispatch_command, parse_command
+from .media import MediaAttachment, describe_attachment, stage_attachment
 from .agents.events import (
     CompactionFailed,
     CompactionStarted,
@@ -74,7 +77,9 @@ from .agents.events import (
 )
 from .config import agents as agents_cfg
 from .config import compaction as compaction_cfg
+from .config import mcp as mcp_cfg
 from .config import streaming, workspace
+from .mcp import McpClientManager
 from .context import Compactor, _SNIP_SAFETY_BUFFER
 from .memory import LongTermMemory, ShortTermMemory
 from .providers import create_provider
@@ -130,6 +135,26 @@ def main() -> None:
         print(f"\n[bash] {command}")
         return input("Run this command? [y/N]: ").strip().lower() == "y"
 
+    # --- MCP setup — one shared manager for all agents ---
+    # The manager owns a background asyncio loop and keeps sessions open for the
+    # lifetime of the process. All agents share the same manager so they don't
+    # open duplicate connections to the same MCP server.
+    mcp_manager: McpClientManager | None = None
+    if mcp_cfg.servers:
+        # output_dir: where MCP image content (e.g. Playwright screenshots) is saved.
+        # McpClientManager creates this directory the first time a screenshot
+        # is taken, so we don't need to pre-create it here.
+        # The path is workspace-relative so it's automatically namespaced per user
+        # and doesn't collide with other mini-minion workspaces.
+        # Example: ~/.mini-minion/playwright-output/screenshot-1718123456789.png
+        _mcp_output_dir = workspace / "playwright-output"
+        mcp_manager = McpClientManager(list(mcp_cfg.servers), output_dir=_mcp_output_dir)
+        print("Connecting to MCP servers...")
+        mcp_manager.connect_all_sync()
+        for status in mcp_manager.list_statuses():
+            state_str = "OK" if status.state == "connected" else f"FAILED: {status.detail}"
+            print(f"  MCP [{status.name}]: {state_str}")
+
     # --- Session setup — one AgentSession per agent ---
     sessions: dict[str, AgentSession] = {}
     for agent_id, cfg in agents_cfg.items():
@@ -141,6 +166,7 @@ def main() -> None:
             skills=skills,
             tasks_dir=_tasks_dir,
             agent_id=agent_id,
+            mcp_manager=mcp_manager,
         )
         provider = create_provider(
             api=cfg.provider.api,
@@ -178,10 +204,31 @@ def main() -> None:
 
     use_streaming = streaming.chat_mode
 
+    # --- Attachment state ---
+    # Per-agent staging area for files added with /attach but not yet sent.
+    # Cleared after each send() call so attachments are tied to one message.
+    _media_dir = workspace / "attachments"
+    pending_attachments: dict[str, list[MediaAttachment]] = {
+        aid: [] for aid in sessions
+    }
+    # Track which agent the user last interacted with, for targeting /attach etc.
+    # Defaults to the first agent in config (the non-routed fallback).
+    _default_agent_id = next(iter(sessions))
+    active_agent_id: str = _default_agent_id
+
+    # --- Prompt history reader (Plan 13) ---
+    # PromptReader wraps prompt_toolkit for Up/Down arrow history navigation.
+    # Falls back to plain input() automatically when not in a TTY (e.g. tests,
+    # piped input), so no existing code paths break.
+    prompt_reader = PromptReader(workspace / "prompt_history.txt")
+
     # Install SIGTERM handler (POSIX only) so `kill <pid>` exits cleanly.
     # History is already persisted from the last turn's finally block.
     def _sigterm_handler(signum: int, frame: object) -> None:
         print("\nShutdown signal received. Goodbye.")
+        # Close MCP sessions before exiting so subprocess stdio transports shut down
+        if mcp_manager is not None:
+            mcp_manager.close_sync()
         sys.exit(0)
 
     if hasattr(signal, "SIGTERM"):
@@ -229,41 +276,140 @@ def main() -> None:
                 print(f"\n  [Warning] Compaction failed: {event.error}")
 
     # --- REPL loop ---
-    print("Mini-Minion ready. Type 'exit' or '/quit' to quit.")
+    print("Mini-Minion ready. Type /help for commands, /quit to quit.")
     for agent_id, cfg_entry in agents_cfg.items():
         if cfg_entry.route_prefix:
             agent_name = AGENTS[agent_id].name
             print(f"  {cfg_entry.route_prefix} <message>  → {agent_name}")
 
-    while True:
-        try:
-            user_input = input("\nYou: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            # Ctrl+C or Ctrl+D at the prompt — exit cleanly.
-            # History was already persisted from the last turn's finally block.
-            print("\nGoodbye.")
-            break
+    try:
+        while True:
+            try:
+                user_input = prompt_reader.read().strip()
+            except (KeyboardInterrupt, EOFError):
+                # Ctrl+C or Ctrl+D at the prompt — exit cleanly.
+                # History was already persisted from the last turn's finally block.
+                print("\nGoodbye.")
+                break
 
-        if not user_input:
-            continue
-        if user_input.lower() in ("exit", "quit", "/quit"):
-            break
+            if not user_input:
+                continue
 
-        agent_id, message = resolve(user_input)
+            # Plain exit/quit (no slash) — kept for muscle-memory compatibility.
+            if user_input.lower() in ("exit", "quit"):
+                print("Goodbye.")
+                break
 
-        _streaming_active = False
+            # --- Attachment commands (handled before routing and command dispatcher) ---
+            # These need direct access to pending_attachments and _media_dir, which
+            # are not available in the CommandContext, so they live here in the REPL.
 
-        try:
-            sessions[agent_id].send(message, on_event=_on_event, stream=use_streaming)
-        except KeyboardInterrupt:
-            # Ctrl+C during a turn. The finally block in AgentSession.send() already
-            # saved history. Notify the user and continue the REPL.
-            agent_name = AGENTS[agent_id].name
-            print(f"\n  Turn interrupted. {agent_name}'s history has been saved.")
-        except Exception as exc:
-            agent_name = AGENTS[agent_id].name
-            print(f"\n[Error] {agent_name} failed to respond: {exc}", file=sys.stderr)
-            print("  Your message was kept. Try again or rephrase.", file=sys.stderr)
+            # /attach <path> [path2 ...] — stage files for the next message.
+            # We check for "/attach " (with space) to avoid matching "/attachments".
+            if user_input.lower().startswith("/attach "):
+                paths_str = user_input[len("/attach "):].strip()
+                paths = paths_str.split()
+                for p in paths:
+                    try:
+                        att = stage_attachment(Path(p), _media_dir)
+                        pending_attachments[active_agent_id].append(att)
+                        print(f"  Attached: {describe_attachment(att)}")
+                    except (ValueError, FileNotFoundError) as e:
+                        print(f"  Error: {e}")
+                continue
+
+            # /attachments — list what's staged for the active agent.
+            if user_input.strip().lower() == "/attachments":
+                atts = pending_attachments.get(active_agent_id, [])
+                if atts:
+                    print(f"Pending attachments for {active_agent_id}:")
+                    for i, a in enumerate(atts, 1):
+                        print(f"  [{i}] {describe_attachment(a)}")
+                else:
+                    print("No pending attachments.")
+                continue
+
+            # /clear-attachments — discard staged files without sending.
+            if user_input.strip().lower() == "/clear-attachments":
+                pending_attachments[active_agent_id] = []
+                print("Cleared pending attachments.")
+                continue
+
+            # --- Slash command dispatch (Plan 14) ---
+            # Resolve routing first so "/research /new" targets the researcher agent.
+            # Then check if the routed payload (or the full input) is a slash command.
+            agent_id, message = resolve(user_input)
+
+            # Determine the text to examine for slash commands.
+            # If routing stripped a prefix, examine the remaining payload; otherwise
+            # examine the full input (handles "/new", "/help", etc. without a prefix).
+            cmd_text = message if message.startswith("/") else user_input
+
+            parsed = parse_command(cmd_text)
+            if parsed is not None:
+                cmd_token, cmd_args = parsed
+
+                # Check whether this slash token is actually a route prefix used
+                # as a standalone word (e.g. "/research" with no trailing message).
+                # In that case it is NOT a command — it's an incomplete route.
+                _is_lone_route_prefix = any(
+                    user_input.strip() == cfg.route_prefix
+                    for cfg in agents_cfg.values()
+                    if cfg.route_prefix
+                )
+
+                if not _is_lone_route_prefix:
+                    ctx = CommandContext(
+                        raw=user_input,
+                        command=cmd_token,
+                        args=cmd_args,
+                        target_agent_id=agent_id,
+                        sessions=sessions,
+                        agents_cfg=agents_cfg,
+                    )
+                    result = dispatch_command(ctx)
+                    if result.handled:
+                        if result.message:
+                            print(result.message)
+                        if result.should_exit:
+                            break
+                        continue
+                    else:
+                        # Unknown slash command — warn the user instead of forwarding
+                        # to the LLM, which would treat "/typo" as a message.
+                        print(f"Unknown command '{cmd_token}'. Type /help for commands.")
+                        continue
+
+            # --- Normal agent routing ---
+            _streaming_active = False
+            # Track which agent handled this message so /attach targets the right session.
+            active_agent_id = agent_id
+
+            # Collect any staged attachments for this agent and clear the queue.
+            # Attachments are one-shot: they go with the next send() and are then cleared.
+            _atts = pending_attachments.get(agent_id, [])
+            pending_attachments[agent_id] = []
+
+            try:
+                sessions[agent_id].send(
+                    message,
+                    attachments=_atts or None,
+                    on_event=_on_event,
+                    stream=use_streaming,
+                )
+            except KeyboardInterrupt:
+                # Ctrl+C during a turn. The finally block in AgentSession.send() already
+                # saved history. Notify the user and continue the REPL.
+                agent_name = AGENTS[agent_id].name
+                print(f"\n  Turn interrupted. {agent_name}'s history has been saved.")
+            except Exception as exc:
+                agent_name = AGENTS[agent_id].name
+                print(f"\n[Error] {agent_name} failed to respond: {exc}", file=sys.stderr)
+                print("  Your message was kept. Try again or rephrase.", file=sys.stderr)
+    finally:
+        # Always close MCP sessions on exit — cleans up subprocess stdio transports.
+        if mcp_manager is not None:
+            mcp_manager.close_sync()
 
 
 if __name__ == "__main__":

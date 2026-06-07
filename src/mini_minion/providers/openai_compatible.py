@@ -37,6 +37,79 @@ from collections.abc import Callable
 from openai import OpenAI
 
 from .base import LLMResponse, TokenUsage, ToolCall
+from ..messages import content_has_images, materialize_image_data
+
+
+def _convert_content_for_openai(content: str | list) -> str | list:
+    """Convert internal content blocks to OpenAI Chat Completions wire format.
+
+    Internal image blocks become {"type": "image_url", "image_url": {"url": "data:..."}}.
+    Text blocks become {"type": "text", "text": "..."}.
+    String content is returned unchanged (preserves text-only behavior exactly).
+
+    Base64 is materialized here — just before the API call — so JSONL history
+    files never contain raw bytes.
+
+    Args:
+        content: Either a plain string or a list of internal content blocks.
+
+    Returns:
+        The input string unchanged, or a list of OpenAI-format content blocks.
+    """
+    if isinstance(content, str):
+        return content
+
+    if not content_has_images(content):
+        # Text-only block list — flatten to a single string for compatibility
+        # with providers that don't accept a list when there are no images.
+        texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+        return " ".join(t for t in texts if t) or ""
+
+    # Mixed content: convert each block to OpenAI format.
+    result = []
+    for block in content:
+        if block.get("type") == "text":
+            result.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            # Read bytes from disk and encode as base64 data URL.
+            data = materialize_image_data(block)
+            mime = block.get("media_type", "image/png")
+            result.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{data}"},
+            })
+    return result
+
+
+def _prepare_messages_for_openai(messages: list[dict]) -> list[dict]:
+    """Convert internal content blocks to OpenAI wire format for all messages.
+
+    WHY WE CONVERT HERE (not in session.py or messages.py):
+    --------------------------------------------------------
+    The internal history stores images as {"type": "image", "path": "...", ...}.
+    Base64 is materialized from disk RIGHT HERE, just before the API call, because:
+    1. session.py persists history to JSONL — we don't want raw base64 in those files.
+    2. Different providers need different wire formats (OpenAI vs Anthropic).
+    3. Image data only needs to exist in memory for the duration of one API call.
+
+    Only messages whose content is a list (multimodal) are touched.  Plain
+    string content (all existing text-only turns) passes through unchanged —
+    this guarantees zero behavior change for text-only conversations.
+
+    Args:
+        messages: Conversation history in mini-minion's internal format.
+
+    Returns:
+        New list of messages ready to pass to the OpenAI SDK.
+    """
+    prepared = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # Only multimodal messages need conversion — string content is unchanged.
+            content = _convert_content_for_openai(content)
+        prepared.append({**msg, "content": content})
+    return prepared
 
 
 def _parse_tool_arguments(raw: str, tool_name: str) -> tuple[dict, str | None]:
@@ -106,12 +179,17 @@ class OpenAICompatibleProvider:
             LLMResponse: Parsed response. ``was_streamed`` is ``True`` if at
                 least one text token was delivered via ``on_token``.
         """
+        # Convert any multimodal content blocks to OpenAI wire format before
+        # building the request.  Plain string content is unchanged by this call,
+        # so text-only conversations are completely unaffected in performance.
+        prepared = _prepare_messages_for_openai(messages)
+
         # Build the base request parameters shared by both modes.
         kwargs: dict = {
             "model": self._model,
             "max_tokens": max_tokens,
             # Prepend the system prompt as the first message in the conversation.
-            "messages": [{"role": "system", "content": system}, *messages],
+            "messages": [{"role": "system", "content": system}, *prepared],
         }
         # Only include the "tools" field if there are tools to offer.
         # Some providers reject an empty tools list, so we omit it entirely.

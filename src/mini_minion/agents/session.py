@@ -79,6 +79,7 @@ from pathlib import Path
 from ..context import Compactor, _estimate_tokens
 from ..memory.long_term import LongTermMemory
 from ..memory.short_term import ShortTermMemory
+from ..messages import content_text, make_user_content, strip_media_data
 from ..providers.base import LLMProvider
 from ..session import SessionStore
 from ..tools import ToolRegistry
@@ -360,16 +361,21 @@ class AgentSession:
     def send(
         self,
         message: str,
+        attachments: list | None = None,
         on_event: Callable[[object], None] | None = None,
         stream: bool = False,
     ) -> str | None:
-        """Send a user message and return the agent's text response.
+        """Send a user message (with optional media attachments) and return the agent's text response.
 
         This is the primary public method.  Non-interactive callers call this
         directly; ``minion.py`` calls it from the REPL loop.
 
         Args:
             message (str): The user's message text.
+            attachments (list | None): Optional list of MediaAttachment objects
+                from media.py.  When provided, the user message is built as a
+                multimodal content block list (text + images).  The history
+                persisted to JSONL uses path references, not base64 bytes.
             on_event (Callable | None): Optional callback for structured events.
             stream (bool): If ``True`` and ``on_event`` is set, stream tokens.
 
@@ -385,7 +391,15 @@ class AgentSession:
         _start = time.monotonic()
         _compacted = False
 
-        self._history.append({"role": "user", "content": message})
+        if attachments:
+            # Build multimodal content: text block + image blocks.
+            user_content = make_user_content(message, attachments)
+            # Strip inline "data" fields before persisting — JSONL stores
+            # path references only; base64 is re-read on demand by providers.
+            stored_content = strip_media_data(user_content)
+            self._history.append({"role": "user", "content": stored_content})
+        else:
+            self._history.append({"role": "user", "content": message})
 
         # Build the effective system prompt.
         # Order: soul → user context → relevant memories → skills suffix.
@@ -495,3 +509,38 @@ class AgentSession:
             if msg.get("role") == "assistant" and msg.get("content"):
                 return msg["content"]
         return None
+
+    def reset(self) -> None:
+        """Clear this agent's in-memory and persisted conversation history.
+
+        Leaves long-term memory and task files untouched — only the current
+        conversation context is cleared, starting the agent fresh.
+
+        Called by the /new command in minion.py via the slash command dispatcher.
+        """
+        self._history = []
+        self._short_term.clear(self._agent_id)
+
+    def compact_now(self) -> bool:
+        """Manually trigger history compaction regardless of current size.
+
+        Uses the same Compactor as auto-compaction but with force=True so
+        it runs even when history is under the normal overflow threshold.
+
+        Returns True if compaction actually changed the history, False if
+        the history was too short to split into head and tail (Compactor
+        needs at least 2 messages to produce a meaningful summary).
+
+        Called by the /compact command in minion.py via the slash command dispatcher.
+        """
+        before = list(self._history)
+        self._history = self._compactor.compact(
+            self._history,
+            self._provider,
+            force=True,
+        )
+        changed = self._history != before
+        if changed:
+            # Persist the compacted history so it survives restarts.
+            self._short_term.save(self._agent_id, self._history)
+        return changed
