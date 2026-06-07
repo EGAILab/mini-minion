@@ -74,6 +74,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 
 from ..context import Compactor, _estimate_tokens
@@ -402,10 +403,12 @@ class AgentSession:
             self._history.append({"role": "user", "content": message})
 
         # Build the effective system prompt.
-        # Order: soul → user context → relevant memories → skills suffix.
+        # Order: today's date → soul → user context → relevant memories → skills suffix.
         # Important instructions are placed first (high priority) and last
         # (Lost in the Middle mitigation) for small models.
-        system = self._agent.soul
+        # The date is prepended first so the model never defaults to its training-data
+        # cutoff year when constructing time-sensitive queries (e.g. web searches).
+        system = f"Today's date: {date.today().isoformat()}\n\n{self._agent.soul}"
         if self._user_context_block:
             system += self._user_context_block
         if self._long_term is not None:
