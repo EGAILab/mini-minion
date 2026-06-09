@@ -202,3 +202,45 @@ class CompactionFailed:
                ``"TimeoutError: provider did not respond"``.
     """
     error: str
+
+
+# ---------------------------------------------------------------------------
+# Hook event objects — used by ToolRegistry's plugin-facing hook system.
+# ---------------------------------------------------------------------------
+# These are distinct from ToolCalled/ToolCompleted (which are emitted through
+# the on_event stream to callers like minion.py). Hook events are passed
+# directly to registered hook callables in the registry, giving plugins a
+# structured object to inspect rather than a positional argument list.
+
+@dataclass
+class ToolPreExecuteHookEvent:
+    """Passed to before-execute hooks registered on the ToolRegistry.
+
+    Hooks receive this before the tool's execute() is called.  The hook
+    cannot cancel or modify execution in the current implementation — it is
+    purely observational (logging, metrics, audit trails).
+
+    Attributes:
+        name:      Tool name, e.g. ``"edit"`` or ``"bash"``.
+        arguments: The argument dict the tool will be called with.
+    """
+    name: str
+    arguments: dict
+
+
+@dataclass
+class ToolPostExecuteHookEvent:
+    """Passed to after-execute hooks registered on the ToolRegistry.
+
+    Hooks receive this after the tool's execute() returns.
+
+    Attributes:
+        name:       Tool name, e.g. ``"edit"`` or ``"bash"``.
+        arguments:  The argument dict the tool was called with.
+        output:     The string the tool returned (may be an error message).
+        elapsed_ms: Wall-clock time the tool took to execute.
+    """
+    name: str
+    arguments: dict
+    output: str
+    elapsed_ms: int

@@ -61,7 +61,7 @@ from .schema import (
     normalize_windows_command,
     redact_secret_text,
 )
-from .types import McpConnectionStatus, McpResourceInfo, McpServerConfig, McpToolInfo
+from .types import McpConnectionStatus, McpPromptInfo, McpResourceInfo, McpServerConfig, McpToolInfo
 
 # MCP SDK — installed via pyproject.toml as "mcp>=1.0.0".
 # The try/except allows the rest of mini-minion to import cleanly even if
@@ -260,6 +260,29 @@ class McpClientManager:
             except Exception:
                 pass  # resources/list is optional in the MCP spec
 
+            # Discover prompts — optional, many servers don't implement this
+            prompts: list[McpPromptInfo] = []
+            try:
+                prompts_response = await session.list_prompts()
+                prompts = [
+                    McpPromptInfo(
+                        server_name=server.name,
+                        name=p.name,
+                        description=p.description or "",
+                        arguments=[
+                            {
+                                "name": a.name,
+                                "description": a.description or "",
+                                "required": getattr(a, "required", False),
+                            }
+                            for a in (p.arguments or [])
+                        ],
+                    )
+                    for p in (prompts_response.prompts if prompts_response else [])
+                ]
+            except Exception:
+                pass  # prompts/list is optional in the MCP spec
+
             self._sessions[server.name] = session
             self._stacks[server.name] = stack
             # Lock must be created in the event loop that will use it
@@ -268,7 +291,11 @@ class McpClientManager:
             status.state = "connected"
             status.tools = tools
             status.resources = resources
-            status.detail = f"{len(tools)} tool(s), {len(resources)} resource(s)"
+            status.prompts = prompts
+            status.detail = (
+                f"{len(tools)} tool(s), {len(resources)} resource(s), "
+                f"{len(prompts)} prompt(s)"
+            )
 
         except Exception as exc:
             status.state = "failed"
@@ -429,6 +456,128 @@ class McpClientManager:
                 if server_name is None or status.name == server_name:
                     resources.extend(status.resources)
         return resources
+
+    def list_prompts(self, server_name: str | None = None) -> list[McpPromptInfo]:
+        """Return all prompts from connected servers, optionally filtered by server.
+
+        Args:
+            server_name: When provided, only prompts from this server are returned.
+
+        Returns:
+            List of :class:`McpPromptInfo` instances.  Empty when no servers
+            expose prompts or when none are connected.
+        """
+        prompts = []
+        for status in self._statuses.values():
+            if status.state == "connected":
+                if server_name is None or status.name == server_name:
+                    prompts.extend(status.prompts)
+        return prompts
+
+    def get_prompt_sync(
+        self,
+        server_name: str,
+        prompt_name: str,
+        arguments: dict | None = None,
+        timeout: float = 30.0,
+    ) -> str:
+        """Fetch a rendered MCP prompt from a server and return its text.
+
+        MCP prompts are message templates defined by the server.  ``get_prompt``
+        asks the server to render the template with the supplied arguments and
+        returns the resulting message text — typically a system or user message
+        the agent can prepend to the conversation.
+
+        Args:
+            server_name:  The MCP server that owns this prompt.
+            prompt_name:  The prompt identifier (from list_prompts).
+            arguments:    Dict of argument values the server needs to render
+                          the prompt.  Omit for prompts with no required args.
+            timeout:      Seconds to wait for the server response.
+
+        Returns:
+            Rendered prompt text, or an error string if the call failed.
+        """
+        status = self._statuses.get(server_name)
+        if status is None or status.state != "connected":
+            state = status.state if status else "unknown"
+            return f"[MCP error: server '{server_name}' is {state}]"
+
+        try:
+            return self._run_sync(
+                self._get_prompt_async(server_name, prompt_name, arguments or {}),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            return f"[MCP error: prompt '{prompt_name}' timed out after {timeout:.0f}s]"
+        except Exception as exc:
+            return f"[MCP error getting prompt: {type(exc).__name__}: {exc}]"
+
+    async def _get_prompt_async(
+        self, server_name: str, prompt_name: str, arguments: dict
+    ) -> str:
+        """Async implementation — fetches and formats a prompt from the server."""
+        session = self._sessions[server_name]
+        lock = self._locks[server_name]
+        async with lock:
+            result = await session.get_prompt(prompt_name, arguments=arguments or None)
+
+        if result is None:
+            return "(no prompt content)"
+
+        # MCP GetPromptResult has a messages list; concatenate their text content.
+        messages = getattr(result, "messages", None) or []
+        parts: list[str] = []
+        for msg in messages:
+            role = getattr(msg, "role", "")
+            content = getattr(msg, "content", None)
+            if content is None:
+                continue
+            # Content may be a TextContent object or plain string.
+            text = getattr(content, "text", None) or str(content)
+            if text.strip():
+                parts.append(f"[{role}]: {text}" if role else text)
+
+        return "\n\n".join(parts) if parts else "(empty prompt)"
+
+    # -------------------------------------------------------------------------
+    # Hot reload
+    # -------------------------------------------------------------------------
+
+    def reconnect_all_sync(self, timeout: float = 120.0) -> None:
+        """Close all connections and reconnect all configured servers.
+
+        Used by the ``/mcp-reload`` command to pick up config changes without
+        restarting the mini-minion process.
+
+        Steps:
+        1. Close all existing MCP sessions (releases stdio subprocesses, HTTP
+           connections, etc.)
+        2. Reset all statuses to ``"pending"`` with empty tool/resource/prompt lists.
+        3. Call ``connect_all_sync()`` to reconnect and rediscover.
+
+        After this call, ``list_tools()``, ``list_resources()``, and
+        ``list_prompts()`` return fresh data from the servers.
+
+        Args:
+            timeout: Total seconds allowed for the reconnect operation.
+        """
+        # Step 1: close everything
+        try:
+            self._run_sync(self._close_all_async(), timeout=10.0)
+        except Exception:
+            pass  # don't let cleanup failures prevent reconnect
+
+        # Step 2: reset state so connect_all_sync() can re-enter cleanly
+        for status in self._statuses.values():
+            status.state = "pending"
+            status.tools = []
+            status.resources = []
+            status.prompts = []
+            status.detail = ""
+
+        # Step 3: reconnect
+        self._run_sync(self._connect_all_async(), timeout=timeout)
 
     # -------------------------------------------------------------------------
     # Shutdown

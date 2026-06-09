@@ -547,3 +547,57 @@ class AgentSession:
             # Persist the compacted history so it survives restarts.
             self._short_term.save(self._agent_id, self._history)
         return changed
+
+    def refresh_mcp_adapters(self, manager: object) -> int:
+        """Remove stale MCP adapters and register fresh ones from a reconnected manager.
+
+        Called by the ``/mcp-reload`` command after
+        :meth:`McpClientManager.reconnect_all_sync` completes.  This keeps the
+        agent's tool registry in sync with the MCP servers' current tool sets
+        without requiring a full process restart.
+
+        The method removes all previously registered MCP tools (any tool whose
+        name starts with ``"mcp__"`` and the five MCP management tools), then
+        re-registers them from the supplied manager.
+
+        Args:
+            manager: A :class:`McpClientManager` instance after reconnect.
+
+        Returns:
+            int: Number of MCP tool adapters newly registered.
+        """
+        # Remove all MCP-related tools from the registry.
+        # mcp__server__tool adapters use the "mcp__" prefix.
+        # The five management tools have known fixed names.
+        _MCP_MGMT_TOOLS = {
+            "mcp_status",
+            "list_mcp_resources",
+            "read_mcp_resource",
+            "list_mcp_prompts",
+            "get_mcp_prompt",
+        }
+        self._tools.unregister_prefix("mcp__")
+        for name in _MCP_MGMT_TOOLS:
+            self._tools.unregister(name)
+
+        # Re-register from the freshly connected manager.
+        from ..tools.mcp import (
+            GetMcpPromptTool,
+            ListMcpPromptsTool,
+            ListMcpResourcesTool,
+            McpStatusTool,
+            McpToolAdapter,
+            ReadMcpResourceTool,
+        )
+        self._tools.register(McpStatusTool(manager))
+        self._tools.register(ListMcpResourcesTool(manager))
+        self._tools.register(ReadMcpResourceTool(manager))
+        self._tools.register(ListMcpPromptsTool(manager))
+        self._tools.register(GetMcpPromptTool(manager))
+
+        adapter_count = 0
+        for tool_info in manager.list_tools():
+            self._tools.register(McpToolAdapter(tool_info, manager))
+            adapter_count += 1
+
+        return adapter_count

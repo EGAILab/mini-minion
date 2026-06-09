@@ -38,12 +38,16 @@ if TYPE_CHECKING:
 
 from .base import Tool, ToolSchema
 from .bash import BashTool
+from .edit import EditTool
 from .glob import GlobTool
+from .grep import GrepTool
 from .memory import SaveMemoryTool, SearchMemoryTool
+from .policy import PermissionPolicy
 from .read import ReadTool
 from .registry import ToolRegistry
 from .skill import SkillTool
 from .task import ReadTaskTool, UpdateTaskTool
+from .web_fetch import WebFetchTool
 from .web_search import WebSearchTool
 from .write import WriteTool
 
@@ -56,6 +60,7 @@ def default_registry(
     tasks_dir: Path | None = None,
     agent_id: str | None = None,
     mcp_manager: "McpClientManager | None" = None,
+    policy: "PermissionPolicy | None" = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` with all standard tools registered.
 
@@ -75,10 +80,19 @@ def default_registry(
                      ``{tasks_dir}/{agent_id}.json``.
         mcp_manager: If provided, registers MCP status/resource tools and
                      one :class:`McpToolAdapter` per connected MCP tool.
+        policy:      Optional :class:`PermissionPolicy` injected into edit,
+                     grep, and web_fetch tools.  When ``None`` a default
+                     policy is built from ``root`` (so path restrictions still
+                     apply even when the caller omits this argument).
 
     Returns:
         :class:`ToolRegistry` populated and ready to pass to :func:`run_turn`.
     """
+    # Build a PermissionPolicy from root when the caller didn't supply one.
+    # This ensures EditTool/GrepTool/WebFetchTool always have a workspace
+    # boundary even when minion.py doesn't pass an explicit policy object.
+    _policy = policy or PermissionPolicy.default(workspace=root)
+
     registry = ToolRegistry()
 
     # Core file-system and shell tools — always registered.
@@ -90,6 +104,10 @@ def default_registry(
         # WebSearchTool has no external dependencies at construction time; it
         # fails gracefully at execute() if duckduckgo-search is not installed.
         WebSearchTool(),
+        # New coding-agent tools — use PermissionPolicy for path/URL checks.
+        EditTool(_policy),
+        GrepTool(_policy),
+        WebFetchTool(_policy),
     ]:
         registry.register(tool)
 
@@ -112,16 +130,21 @@ def default_registry(
     # Import here to avoid a circular import (mcp.types imports from config).
     if mcp_manager is not None:
         from .mcp import (
+            GetMcpPromptTool,
+            ListMcpPromptsTool,
             ListMcpResourcesTool,
             McpToolAdapter,
             McpStatusTool,
             ReadMcpResourceTool,
         )
-        # Always register the three management tools so the agent can inspect
-        # server status and browse resources without knowing tool names up front.
+        # Always register the five management tools so the agent can inspect
+        # server status and browse the full MCP capability triad:
+        # tools / resources / prompts.
         registry.register(McpStatusTool(mcp_manager))
         registry.register(ListMcpResourcesTool(mcp_manager))
         registry.register(ReadMcpResourceTool(mcp_manager))
+        registry.register(ListMcpPromptsTool(mcp_manager))
+        registry.register(GetMcpPromptTool(mcp_manager))
         # Register one adapter per tool discovered from connected servers.
         for tool_info in mcp_manager.list_tools():
             registry.register(McpToolAdapter(tool_info, mcp_manager))
@@ -133,6 +156,10 @@ __all__ = [
     "Tool",
     "ToolSchema",
     "ToolRegistry",
+    "PermissionPolicy",
+    "EditTool",
+    "GrepTool",
+    "WebFetchTool",
     "SkillTool",
     "ReadTaskTool",
     "UpdateTaskTool",

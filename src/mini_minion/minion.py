@@ -78,6 +78,7 @@ from .agents.events import (
 from .config import agents as agents_cfg
 from .config import compaction as compaction_cfg
 from .config import mcp as mcp_cfg
+from .plugins import load_plugins
 from .config import streaming, workspace
 from .mcp import McpClientManager
 from .context import Compactor, _SNIP_SAFETY_BUFFER
@@ -168,6 +169,12 @@ def main() -> None:
             agent_id=agent_id,
             mcp_manager=mcp_manager,
         )
+        # Load user-defined tools from plugins.json manifests.
+        # Done after default_registry() so plugins can override built-in tools
+        # by registering a tool with the same name.
+        _plugin_count = load_plugins(tools, workspace)
+        if _plugin_count:
+            print(f"  Loaded {_plugin_count} plugin tool(s) for agent '{agent_id}'.")
         provider = create_provider(
             api=cfg.provider.api,
             base_url=cfg.provider.base_url,
@@ -366,11 +373,16 @@ def main() -> None:
                         target_agent_id=agent_id,
                         sessions=sessions,
                         agents_cfg=agents_cfg,
+                        session_store=session_store,
+                        mcp_manager=mcp_manager,
                     )
                     result = dispatch_command(ctx)
                     if result.handled:
                         if result.message:
                             print(result.message)
+                        # /resume sets activate_agent_id to switch the default agent.
+                        if result.activate_agent_id:
+                            active_agent_id = result.activate_agent_id
                         if result.should_exit:
                             break
                         continue

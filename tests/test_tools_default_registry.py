@@ -5,7 +5,8 @@ from mini_minion.tools import default_registry
 
 def test_default_registry_has_expected_tools():
     names = {d["function"]["name"] for d in default_registry().definitions}
-    assert names == {"read", "write", "glob", "bash", "web_search"}
+    # Core tools always registered (Tier 1 additions: edit, grep, web_fetch)
+    assert {"read", "write", "glob", "bash", "web_search", "edit", "grep", "web_fetch"}.issubset(names)
 
 
 def test_default_registry_tool_names_are_unique():

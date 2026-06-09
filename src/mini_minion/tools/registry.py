@@ -38,16 +38,24 @@ class ToolRegistry:
     """A container for a set of tools, with LLM-friendly definitions and dispatch.
 
     Args:
-        before_execute: Optional hook called before each tool execution.
+        before_execute: Optional legacy hook called before each tool execution.
             Signature: ``(name: str, arguments: dict) -> None``.
             Exceptions from this hook are silently swallowed so they never
-            crash the tool loop.
-        after_execute: Optional hook called after each tool execution.
+            crash the tool loop.  Prefer :meth:`add_before_hook` for new code.
+        after_execute: Optional legacy hook called after each tool execution.
             Signature: ``(name: str, arguments: dict, output: str, elapsed_ms: int) -> None``.
-            Exceptions are silently swallowed.
+            Exceptions are silently swallowed.  Prefer :meth:`add_after_hook`.
 
     Attributes:
         _tools (dict[str, Tool]): Internal mapping of tool name → Tool instance.
+
+    Plugin hooks
+    ------------
+    Plugins loaded from the local plugin manifest can register hooks by
+    calling :meth:`add_before_hook` and :meth:`add_after_hook`.  Each hook
+    receives a structured event object (:class:`ToolPreExecuteHookEvent` or
+    :class:`ToolPostExecuteHookEvent`) rather than positional arguments.
+    Multiple hooks may be registered; they are called in registration order.
     """
 
     def __init__(
@@ -56,8 +64,65 @@ class ToolRegistry:
         after_execute: "Callable[[str, dict, str, int], None] | None" = None,
     ) -> None:
         self._tools: dict[str, Tool] = {}
+        # Legacy single-callback hooks (backwards compatible).
         self._before_execute = before_execute
         self._after_execute = after_execute
+        # Multi-hook lists for the plugin-facing API.
+        # Each callable receives a ToolPreExecuteHookEvent / ToolPostExecuteHookEvent.
+        self._before_hooks: list[Callable] = []
+        self._after_hooks: list[Callable] = []
+
+    def add_before_hook(self, hook: Callable) -> None:
+        """Register a hook to run before every tool execution.
+
+        The hook is called with a :class:`ToolPreExecuteHookEvent` instance.
+        Exceptions from the hook are silently swallowed — hooks must never
+        crash the tool execution loop.
+
+        Example (in a plugin module)::
+
+            def my_hook(event: ToolPreExecuteHookEvent) -> None:
+                print(f"[plugin] About to call: {event.name}")
+
+            registry.add_before_hook(my_hook)
+
+        Args:
+            hook: Callable that accepts a :class:`ToolPreExecuteHookEvent`.
+        """
+        self._before_hooks.append(hook)
+
+    def add_after_hook(self, hook: Callable) -> None:
+        """Register a hook to run after every tool execution.
+
+        The hook is called with a :class:`ToolPostExecuteHookEvent` instance
+        that includes the tool output and elapsed time.
+
+        Args:
+            hook: Callable that accepts a :class:`ToolPostExecuteHookEvent`.
+        """
+        self._after_hooks.append(hook)
+
+    def unregister(self, name: str) -> None:
+        """Remove a tool from the registry by name.
+
+        No-op if the name is not found.  Used by hot-reload to remove stale
+        MCP adapters before registering fresh ones.
+
+        Args:
+            name: Tool name to remove, e.g. ``"mcp__playwright__screenshot"``.
+        """
+        self._tools.pop(name, None)
+
+    def unregister_prefix(self, prefix: str) -> int:
+        """Remove all tools whose names start with ``prefix``.
+
+        Returns:
+            int: Number of tools removed.
+        """
+        to_remove = [n for n in self._tools if n.startswith(prefix)]
+        for n in to_remove:
+            del self._tools[n]
+        return len(to_remove)
 
     def register(self, tool: Tool) -> None:
         """Add a tool to the registry.
@@ -122,11 +187,22 @@ class ToolRegistry:
             # this and potentially correct the tool name on the next iteration.
             return f"Unknown tool: {name!r}"
 
+        # --- Pre-execute hooks ---
         if self._before_execute is not None:
             try:
                 self._before_execute(name, arguments)
             except Exception:
                 pass  # hooks must never crash the tool loop
+
+        if self._before_hooks:
+            # Import lazily to avoid a circular import at module level.
+            from ..agents.events import ToolPreExecuteHookEvent
+            pre_event = ToolPreExecuteHookEvent(name=name, arguments=arguments)
+            for hook in self._before_hooks:
+                try:
+                    hook(pre_event)
+                except Exception:
+                    pass
 
         _start = _time.monotonic()
         try:
@@ -138,11 +214,23 @@ class ToolRegistry:
 
         elapsed_ms = int((_time.monotonic() - _start) * 1000)
 
+        # --- Post-execute hooks ---
         if self._after_execute is not None:
             try:
                 self._after_execute(name, arguments, output, elapsed_ms)
             except Exception:
                 pass  # hooks must never crash the tool loop
+
+        if self._after_hooks:
+            from ..agents.events import ToolPostExecuteHookEvent
+            post_event = ToolPostExecuteHookEvent(
+                name=name, arguments=arguments, output=output, elapsed_ms=elapsed_ms
+            )
+            for hook in self._after_hooks:
+                try:
+                    hook(post_event)
+                except Exception:
+                    pass
 
         return output
 

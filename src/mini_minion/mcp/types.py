@@ -15,7 +15,14 @@ from typing import Any
 # while having one source of truth for the config dataclass.
 from ..config import McpServerConfig
 
-__all__ = ["McpServerConfig", "McpToolInfo", "McpResourceInfo", "McpConnectionStatus", "McpServerNotConnectedError"]
+__all__ = [
+    "McpServerConfig",
+    "McpToolInfo",
+    "McpResourceInfo",
+    "McpPromptInfo",
+    "McpConnectionStatus",
+    "McpServerNotConnectedError",
+]
 
 
 @dataclass
@@ -38,13 +45,34 @@ class McpResourceInfo:
 
 
 @dataclass
+class McpPromptInfo:
+    """Metadata for one prompt discovered from an MCP server.
+
+    MCP prompts are server-defined message templates.  The server provides
+    the prompt name, a description, and an optional list of input arguments
+    the caller must supply when fetching the rendered prompt text.
+
+    Attributes:
+        server_name: The server this prompt belongs to.
+        name:        Prompt identifier used in ``get_prompt`` calls.
+        description: Human-readable description of what the prompt does.
+        arguments:   List of argument descriptors, each a dict with keys
+                     ``name``, ``description``, and optionally ``required``.
+    """
+    server_name: str
+    name: str
+    description: str
+    arguments: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class McpConnectionStatus:
     """Live connection state for one MCP server.
 
     Updated by McpClientManager.connect_all_sync() and stored in manager._statuses.
     State transitions:
       "pending"   → initial state before connect_all_sync() completes
-      "connected" → session initialized and tools/resources discovered
+      "connected" → session initialized and tools/resources/prompts discovered
       "failed"    → connection or initialization raised an exception
       "disabled"  → not yet used (reserved for future config-level enable/disable)
     """
@@ -54,6 +82,7 @@ class McpConnectionStatus:
     detail: str = ""    # human-readable status line / redacted error message
     tools: list[McpToolInfo] = field(default_factory=list)
     resources: list[McpResourceInfo] = field(default_factory=list)
+    prompts: list[McpPromptInfo] = field(default_factory=list)
 
 
 class McpServerNotConnectedError(Exception):

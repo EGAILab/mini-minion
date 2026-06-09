@@ -10,6 +10,10 @@ Supported commands:
   /new [all]         — clear conversation history for the active (or all) agent(s)
   /compact           — manually compact the active agent's history
   /status            — show current agent/model info
+  /sessions          — list all known sessions with turn counts and last-active time
+  /resume [agent_id] — switch the default routing target to the given agent
+  /diagnose          — show provider configuration and API key status for all agents
+  /mcp-reload        — close and reconnect all MCP servers, refresh tool adapters
 
 Route-aware targeting:
   /research /new     — target the researcher agent specifically
@@ -45,6 +49,8 @@ class CommandContext:
     target_agent_id: str              # which agent this command targets
     sessions: dict                    # dict[str, AgentSession] — keyed by agent_id
     agents_cfg: dict                  # dict[str, AgentModelConfig] from config
+    session_store: object = None      # SessionStore instance (optional, for /sessions)
+    mcp_manager: object = None        # McpClientManager instance (optional, for /mcp-reload)
 
 
 @dataclass
@@ -53,6 +59,7 @@ class CommandResult:
     handled: bool        # True = input was consumed, skip normal routing
     should_exit: bool = False    # True = break out of the REPL loop
     message: str | None = None  # text to print to the user (None = print nothing)
+    activate_agent_id: str | None = None  # non-None → switch the REPL's active agent
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +91,23 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec(
         name="/status",
         description="Show active agent, model, and history information.",
+    ),
+    CommandSpec(
+        name="/sessions",
+        description="List all known agent sessions with turn counts and last-active timestamps.",
+    ),
+    CommandSpec(
+        name="/resume",
+        description="Switch the default routing target to the given agent for the current session.",
+        arg_hint="[agent_id]",
+    ),
+    CommandSpec(
+        name="/diagnose",
+        description="Show provider configuration and API key status for all configured agents.",
+    ),
+    CommandSpec(
+        name="/mcp-reload",
+        description="Close and reconnect all MCP servers, then refresh the tool adapters in every session.",
     ),
 ]
 
@@ -220,6 +244,86 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                     f"  [{aid}]{prefix}  model={cfg.model.id}  history={hist_len} messages"
                 )
             lines.append(f"  Streaming: {'on' if _streaming_cfg.chat_mode else 'off'}")
+            return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /sessions ---
+        if spec.name == "/sessions":
+            if ctx.session_store is None:
+                return CommandResult(handled=True, message="Session store not available.")
+            sessions_list = ctx.session_store.list_sessions()
+            if not sessions_list:
+                return CommandResult(handled=True, message="No sessions recorded yet.")
+            # Sort by most recently active first.
+            sessions_list = sorted(sessions_list, key=lambda s: s.last_active, reverse=True)
+            lines = [f"Sessions ({len(sessions_list)}):"]
+            for s in sessions_list:
+                # Trim microseconds from ISO timestamp for readability.
+                last = s.last_active[:19].replace("T", " ")
+                lines.append(
+                    f"  [{s.agent_id}]  turns={s.turn_count}  last_active={last}"
+                )
+            return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /resume ---
+        if spec.name == "/resume":
+            # Resolve the target agent: use the argument if given, fall back to
+            # the currently targeted agent (no-op switch, still prints confirmation).
+            target = ctx.args.strip().lower() or ctx.target_agent_id
+            if target not in ctx.sessions:
+                known = ", ".join(sorted(ctx.sessions))
+                return CommandResult(
+                    handled=True,
+                    message=f"Unknown agent '{target}'. Known agents: {known}",
+                )
+            return CommandResult(
+                handled=True,
+                activate_agent_id=target,
+                message=(
+                    f"Switched active agent to '{target}'. "
+                    f"Messages now go to {target} by default."
+                ),
+            )
+
+        # --- /diagnose ---
+        if spec.name == "/diagnose":
+            lines = ["Provider diagnostics:"]
+            for aid, cfg in ctx.agents_cfg.items():
+                has_key = bool(cfg.provider.api_key) or cfg.provider.api == "lmstudio"
+                endpoint = cfg.provider.base_url or "(SDK default)"
+                key_hint = (
+                    f"{cfg.provider.name.upper()}_API_KEY"
+                    if cfg.provider.api != "lmstudio"
+                    else "no key needed (local)"
+                )
+                status = "OK" if has_key else f"MISSING ({key_hint})"
+                lines.append(f"\n  [{aid}]")
+                lines.append(f"    Provider : {cfg.provider.name}  ({cfg.provider.api})")
+                lines.append(f"    Model    : {cfg.model.id}")
+                lines.append(f"    Endpoint : {endpoint}")
+                lines.append(f"    Auth     : {status}")
+            return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /mcp-reload ---
+        if spec.name == "/mcp-reload":
+            if ctx.mcp_manager is None:
+                return CommandResult(
+                    handled=True,
+                    message="No MCP manager configured. Add 'mcp.servers' to config.json first.",
+                )
+            # Close and reconnect all MCP servers.
+            ctx.mcp_manager.reconnect_all_sync()
+
+            # Refresh each session's tool adapters with the new connection state.
+            refreshed = 0
+            for session in ctx.sessions.values():
+                refreshed += session.refresh_mcp_adapters(ctx.mcp_manager)
+
+            # Build a status summary.
+            lines = ["MCP servers reconnected:"]
+            for status in ctx.mcp_manager.list_statuses():
+                state_str = "OK" if status.state == "connected" else f"FAILED: {status.detail}"
+                lines.append(f"  [{status.name}]: {state_str}")
+            lines.append(f"Refreshed {refreshed} MCP tool adapter(s) across all sessions.")
             return CommandResult(handled=True, message="\n".join(lines))
 
     # No built-in command matched — let the caller decide what to do.

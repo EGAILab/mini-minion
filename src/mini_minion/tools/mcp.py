@@ -3,9 +3,10 @@
 Each MCP server tool is wrapped as an McpToolAdapter so it appears in the
 registry under a provider-safe name like mcp__server__tool_name.
 
-The three management tools (McpStatusTool, ListMcpResourcesTool,
-ReadMcpResourceTool) are always registered when an MCP manager is present,
-giving the agent visibility into what MCP servers are available.
+The five management tools (McpStatusTool, ListMcpResourcesTool,
+ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool) are always
+registered when an MCP manager is present, giving the agent full visibility
+into the MCP capability triad: tools / resources / prompts.
 """
 from __future__ import annotations
 from typing import TYPE_CHECKING
@@ -168,3 +169,104 @@ class ReadMcpResourceTool(Tool):
         if not server or not uri:
             return "Error: 'server' and 'uri' are required."
         return self._manager.read_resource_sync(server, uri)
+
+
+class ListMcpPromptsTool(Tool):
+    """Lists all prompt templates exposed by connected MCP servers.
+
+    MCP prompts are server-defined message templates.  This tool shows
+    which prompts are available and what arguments they require.  Use
+    get_mcp_prompt to fetch the rendered text of a specific prompt.
+    """
+
+    def __init__(self, manager: "McpClientManager") -> None:
+        self._manager = manager
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="list_mcp_prompts",
+            description=(
+                "List prompt templates available from connected MCP servers. "
+                "Prompts are server-defined message templates you can render "
+                "with get_mcp_prompt."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "Filter to one server name (optional).",
+                    }
+                },
+            },
+            is_read_only=True,
+        )
+
+    def execute(self, **kwargs: object) -> str:
+        server_filter = str(kwargs.get("server", "")) or None
+        prompts = self._manager.list_prompts(server_name=server_filter)
+        if not prompts:
+            return "No MCP prompts available."
+        lines = [f"MCP prompts ({len(prompts)}):"]
+        for p in prompts:
+            args_str = ""
+            if p.arguments:
+                req = [a["name"] for a in p.arguments if a.get("required")]
+                opt = [a["name"] for a in p.arguments if not a.get("required")]
+                parts = [f"required: {req}" if req else "", f"optional: {opt}" if opt else ""]
+                args_str = "  args: " + ", ".join(x for x in parts if x)
+            lines.append(f"  {p.server_name}  {p.name}  {p.description or ''}")
+            if args_str:
+                lines.append(f"    {args_str}")
+        return "\n".join(lines)
+
+
+class GetMcpPromptTool(Tool):
+    """Fetches and renders a prompt template from an MCP server.
+
+    The server renders the template with the supplied arguments and returns
+    the resulting message text, which the agent can use as context or
+    prepend to the conversation.
+    """
+
+    def __init__(self, manager: "McpClientManager") -> None:
+        self._manager = manager
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="get_mcp_prompt",
+            description=(
+                "Fetch and render a prompt template from an MCP server. "
+                "Use list_mcp_prompts to see available prompts and their arguments."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "MCP server name.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Prompt name (from list_mcp_prompts).",
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Key-value arguments required by the prompt (optional).",
+                    },
+                },
+                "required": ["server", "name"],
+            },
+            is_read_only=True,
+        )
+
+    def execute(self, **kwargs: object) -> str:
+        server = str(kwargs.get("server", "")).strip()
+        name = str(kwargs.get("name", "")).strip()
+        if not server or not name:
+            return "Error: 'server' and 'name' are required."
+        arguments = kwargs.get("arguments")
+        args_dict = dict(arguments) if isinstance(arguments, dict) else {}
+        return self._manager.get_prompt_sync(server, name, args_dict)
