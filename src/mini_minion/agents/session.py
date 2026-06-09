@@ -283,6 +283,11 @@ class AgentSession:
             (``{tasks_dir}/{agent_id}.json``).  When provided, the active task
             is auto-injected into the system prompt before every turn so the
             agent can orient itself without calling ``read_task`` explicitly.
+        enable_memory_extraction (bool): When ``True`` (default), background
+            fact extraction fires after each successful turn (one extra
+            ``provider.chat()`` call per turn).  Set to ``False`` when using
+            expensive models where the extra call is undesirable, or when
+            ``config.json`` has ``"memory": {"enable_extraction": false}``.
     """
 
     def __init__(
@@ -299,6 +304,7 @@ class AgentSession:
         soul_suffix: str = "",
         long_term: LongTermMemory | None = None,
         tasks_dir: Path | None = None,
+        enable_memory_extraction: bool = True,
     ) -> None:
         self._agent_id = agent_id
         self._agent = agent
@@ -312,6 +318,9 @@ class AgentSession:
         self._long_term = long_term
         # Path to this agent's task JSON file, or None if tasks are not enabled.
         self._task_path = tasks_dir / f"{agent_id}.json" if tasks_dir else None
+        # When False, skip the background memory extraction call after each turn.
+        # Controlled by config.json "memory.enable_extraction".
+        self._enable_memory_extraction = enable_memory_extraction
 
         # Compute injection limits proportionally from the model's context window.
         # This ensures every budget scales automatically when the model is switched.
@@ -485,7 +494,9 @@ class AgentSession:
 
             # Fire background memory extraction from the last exchange.
             # Daemon thread — never blocks the REPL.
-            if self._long_term is not None:
+            # Skipped when enable_memory_extraction=False (e.g. expensive models,
+            # config.json "memory": {"enable_extraction": false}).
+            if self._long_term is not None and self._enable_memory_extraction:
                 from ..memory.extractor import extract_and_save_async
                 _last = [
                     m for m in self._history[-6:]
@@ -522,6 +533,22 @@ class AgentSession:
             if msg.get("role") == "assistant" and msg.get("content"):
                 return msg["content"]
         return None
+
+    def reload(self) -> None:
+        """Reload conversation history from disk, discarding in-memory state.
+
+        Useful when:
+        - The ``/resume`` command switches to this agent after it may have been
+          active in a previous process run.
+        - An external tool modified the JSONL file.
+        - The user wants to restore history after clearing it with ``/new``.
+
+        Long-term memory, task files, and the session store are NOT affected —
+        only ``_history`` (the in-memory message list) is replaced.
+
+        Called by the ``/resume`` command via :func:`dispatch_command`.
+        """
+        self._history = self._short_term.load(self._agent_id)
 
     def reset(self) -> None:
         """Clear this agent's in-memory and persisted conversation history.

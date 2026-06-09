@@ -25,6 +25,13 @@ Safety: path guard
 All path checks are delegated to :class:`PermissionPolicy`, which blocks
 credential files and paths outside the workspace root.
 
+Human confirmation
+------------------
+``EditTool`` accepts an optional ``confirm`` callback with the same signature
+as :class:`WriteTool`: ``(description: str) -> bool``.  Called before applying
+the edit; ``False`` cancels without writing.  ``None`` (default) means no
+confirmation required.
+
 Talks to
 --------
 - ``policy.py`` — :class:`PermissionPolicy` for path validation.
@@ -34,6 +41,7 @@ Talks to
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from .base import Tool, ToolSchema
@@ -45,12 +53,24 @@ class EditTool(Tool):
 
     Safer than WriteTool for partial file changes because it never rewrites
     sections that weren't meant to change.
+
+    Args:
+        policy: Optional :class:`PermissionPolicy` for path and read_only_mode
+            checks.  ``default_registry()`` always passes a policy.
+        confirm: Optional human approval callback.  Called with a one-line
+            description before writing; ``False`` cancels the edit.  ``None``
+            (default) means automatic writes.
     """
 
-    def __init__(self, policy: PermissionPolicy | None = None) -> None:
+    def __init__(
+        self,
+        policy: PermissionPolicy | None = None,
+        confirm: Callable[[str], bool] | None = None,
+    ) -> None:
         # Use the supplied policy or a default (unrestricted) policy.
         # default_registry() always passes a policy with the workspace root set.
         self._policy = policy or PermissionPolicy()
+        self._confirm = confirm
 
     @property
     def schema(self) -> ToolSchema:
@@ -145,6 +165,14 @@ class EditTool(Tool):
 
         # Replace: -1 means "replace all", 1 means "replace first only".
         new_content = content.replace(old_string, new_string, -1 if replace_all else 1)
+
+        # Human confirmation step (optional) — called after all validation so
+        # the user only sees the prompt for edits that would actually succeed.
+        if self._confirm is not None:
+            replaced = count if replace_all else 1
+            desc = f"Edit {path}: replace {replaced} occurrence(s) of {old_string[:60]!r}"
+            if not self._confirm(desc):
+                return "Edit cancelled by user."
 
         try:
             path.write_text(new_content, encoding="utf-8")

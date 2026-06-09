@@ -115,7 +115,7 @@ mini-minion/
 │   │   ├── apply_patch.py       # ApplyPatchTool — apply a unified diff patch via git apply
 │   │   ├── find_definition.py   # FindDefinitionTool — AST-based symbol lookup across .py files
 │   │   ├── todo.py              # TodoWriteTool, TodoReadTool — session-scoped todo list
-│   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
+│   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool, NoteTool
 │   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
 │   │   ├── task.py              # ReadTaskTool, UpdateTaskTool — long-running task progress
@@ -130,7 +130,7 @@ mini-minion/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       └── __init__.py
-└── tests/                       # pytest test suite (845 tests, 3 skipped)
+└── tests/                       # pytest test suite (894 tests, 3 skipped)
 ```
 
 ---
@@ -213,6 +213,8 @@ mini-minion/
 | `mcp.servers.<name>.command` | *(stdio only)* Executable to launch the MCP server |
 | `mcp.servers.<name>.args` | *(stdio only)* Arguments passed to the server command |
 | `mcp.servers.<name>.url` | *(sse / streamableHttp only)* URL of the MCP server endpoint |
+| `memory.enable_extraction` | *(Optional, default `true`)* Set to `false` to disable the background fact-extraction API call fired after each turn. Useful for expensive models where the extra call doubles token costs. |
+| `extra_plugin_manifests` | *(Optional)* List of additional `plugins.json` file paths to load beyond the two fixed locations (`~/.mini-minion/plugins.json` and `.mini-minion/plugins.json`). Paths support `~` expansion. |
 
 ### `.env`
 
@@ -503,12 +505,14 @@ Ada: [tool: mcp__playwright__browser_navigate({'url': 'https://news.ycombinator.
 Loads `config.json` and `.env` at import time. Exposes four module-level values:
 
 ```python
-from mini_minion.config import agents, workspace, streaming, compaction
+from mini_minion.config import agents, workspace, streaming, compaction, memory, extra_plugin_manifests
 
-agents     # dict[str, AgentModelConfig] — one entry per agent in config.json
-workspace  # Path — resolved workspace directory
-streaming  # StreamingConfig — whether to stream in each execution mode
-compaction # CompactionConfig — shared token reservation (context_window is per-agent on ModelConfig)
+agents                  # dict[str, AgentModelConfig] — one entry per agent in config.json
+workspace               # Path — resolved workspace directory
+streaming               # StreamingConfig — whether to stream in each execution mode
+compaction              # CompactionConfig — shared token reservation (context_window is per-agent on ModelConfig)
+memory                  # MemoryConfig — controls background fact extraction
+extra_plugin_manifests  # tuple[str, ...] — extra plugins.json paths beyond the two fixed locations
 ```
 
 **Types:**
@@ -545,6 +549,12 @@ class CompactionConfig:
     # None  → minion.py auto-computes as max_output_tokens + _SNIP_SAFETY_BUFFER (1 024)
     # int   → explicit override, clamped to [2 000, context_window ÷ 2] at runtime
     # context_window is per-agent, stored in ModelConfig.context_window
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    enable_extraction: bool = True
+    # True  → background fact extraction fires after each turn (default)
+    # False → skip the extra API call; useful for expensive models
 ```
 
 API key resolution: set `{PROVIDER_NAME_UPPERCASE}_API_KEY` in `.env`. Inline `apiKey` fields in `config.json` are not supported — the validator flags them to prevent accidental commits.
@@ -675,9 +685,10 @@ session = AgentSession(
     compactor=compactor,
     short_term=short_term,
     session_store=session_store,
-    soul_suffix="",             # optional skills block appended each turn
-    long_term=long_term,        # enables memory injection and background extraction
+    soul_suffix="",              # optional skills block appended each turn
+    long_term=long_term,         # enables memory injection and background extraction
     memory_injection_tokens=600, # token budget for proactive memory injection (default 600)
+    enable_memory_extraction=True,  # False to suppress the background extraction API call
 )
 
 # Headless (returns text, no output)
@@ -694,7 +705,11 @@ text = session.send("What is in this image?", attachments=[Path("/tmp/screenshot
 When `long_term` is provided, `AgentSession`:
 - Loads `user_context.md` from the memory directory at init and injects it into the system prompt on every turn as a `<user_context>` block.
 - Searches long-term memory before each turn and injects the top-5 matching snippets as a `<relevant_memories>` block (capped at `memory_injection_tokens * 4` characters).
-- Fires background fact extraction after each successful turn (daemon thread — never blocks the REPL).
+- Fires background fact extraction after each successful turn (daemon thread — never blocks the REPL). Can be disabled via `enable_memory_extraction=False` (or `config.json` `"memory": {"enable_extraction": false}`).
+
+**`session.reload()`** — reloads conversation history from disk, replacing in-memory state. Called automatically by the `/resume` command to ensure the history is current after switching agents. Does not affect long-term memory, task files, or session metadata.
+
+**`session.reset()`** — clears in-memory and persisted conversation history (used by `/new`). Does not affect long-term memory or task files.
 
 #### Runner (`runner.py`)
 
@@ -786,8 +801,9 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `WriteTool` | `write` | Write content to a file, creating parent directories as needed. Paths outside the workspace root are rejected. |
 | `GlobTool` | `glob` | Find files matching a glob pattern, sorted newest-first. Skips `.git`/`.venv`/`__pycache__`/etc. Caps at 200 results. |
 | `BashTool` | `bash` | Run a shell command — PowerShell on Windows, bash on Unix. Calls the injected `confirm` callable before executing; pass `None` to skip confirmation. |
-| `SaveMemoryTool` | `save_memory` | Save a Markdown note to long-term memory under a given key. |
-| `SearchMemoryTool` | `search_memory` | Keyword search across long-term memory. Results ranked by term frequency and recency. Capped at 20. |
+| `SaveMemoryTool` | `save_memory` | Save a Markdown note to long-term memory under a given key. Blocked by `read_only_mode`. |
+| `NoteTool` | `note` | Append a quick timestamped bullet to today's daily log in memory (`_notes_YYYY-MM-DD.md`). No key needed — great for ephemeral observations. Blocked by `read_only_mode`. |
+| `SearchMemoryTool` | `search_memory` | Keyword search across long-term memory. Results ranked by term frequency and recency. Capped at 20. `is_read_only=True`. |
 | `SkillTool` | `skill` | Load a skill's instructions into context by name. Only registered when skills are discovered at startup. |
 | `ReadTaskTool` | `read_task` | Read the current task progress file — goal, steps, status, notes, and context. |
 | `UpdateTaskTool` | `update_task` | Create a new task (goal + steps) or update an existing one (step status, notes, context, or clear). |
@@ -799,7 +815,7 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `TodoWriteTool` | `todo_write` | Replace the current session todo list with a new array of items. Pass an empty list to clear. Blocked by `read_only_mode`. |
 | `TodoReadTool` | `todo_read` | Read the current session todo list as a numbered list. `is_read_only=True`. |
 | `WebFetchTool` | `web_fetch` | Fetch a URL and return its text content. Strips HTML tags (skips `<script>`, `<style>`, `<head>`), collapses whitespace, and truncates at `max_chars` (default 8 000). Blocks SSRF targets (AWS metadata, GCP metadata). `is_read_only=True`. |
-| `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `ddgs` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. |
+| `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `ddgs` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. Query string is checked against SSRF markers when a policy is injected. |
 | `AskUserTool` | `ask_user` | Pause the agent and ask the human operator a question. Returns the human's typed response. When no `ask_user_fn` is provided (headless mode), returns an error instructing the agent to proceed without input. |
 | `GitStatusTool` | `git_status` | Show git working-tree status (`git status --short --branch`): branch name, staged, modified, and untracked files. `is_read_only=True`. |
 | `GitDiffTool` | `git_diff` | Show a unified diff of changes. Optional `staged=true` for staged changes; optional `path` to limit to a file. `is_read_only=True`. |
@@ -875,6 +891,7 @@ reg = default_registry(
 | `policy` | `PermissionPolicy \| None` | `None` | Safety rules injected into all I/O tools (`read`, `write`, `glob`, `bash`, `edit`, `grep`, `web_fetch`, `patch_preview`, `apply_patch`, `find_definition`, `todo_write`, git tools). Defaults to `PermissionPolicy.default(workspace=root)` when omitted. Also set as `registry.policy` for `/plan`/`/auto` toggling. |
 | `mcp_manager` | `McpManager \| None` | `None` | If provided, registers `mcp_status`, `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, `get_mcp_prompt`, and one `mcp__<server>__<tool>` adapter per tool exposed by connected MCP servers. |
 | `ask_user_fn` | `Callable[[str], str] \| None` | `None` | Callback for `ask_user` tool. Called with the agent's question; returns the human's response. `None` = headless mode (tool returns an error instead of blocking). |
+| `write_confirm` | `Callable[[str], bool] \| None` | `None` | Human approval callback passed to `WriteTool` and `EditTool`. Called with a one-line description before each write (e.g. `"Write 120 chars to /path/to/foo.py"`). Return `False` to cancel. `None` = automatic writes without prompting. |
 
 ---
 
@@ -975,7 +992,39 @@ AFTER_HOOKS = [log_after]
 
 **`"skills"` section** — directory paths scanned for `SKILL.md` files; discovered skills are merged into the runtime skill registry.
 
+**`"commands"` section** — register custom slash commands available in the REPL:
+
+```json
+"commands": [
+  {
+    "name": "/my-command",
+    "description": "Does something useful.",
+    "handler": "./handlers/my_command.py"
+  }
+]
+```
+
+The `handler` path points to a Python file that must expose a `handle(ctx) -> CommandResult` function:
+
+```python
+from mini_minion.commands import CommandResult
+
+def handle(ctx):
+    return CommandResult(handled=True, message="Plugin command ran!")
+```
+
+Plugin commands appear in `/help` output under "Plugin commands:" and are dispatched by the same `dispatch_command()` mechanism as built-in commands.
+
 **`"trust"` field** — `"trusted"` (default, your own code) or `"external"` (third-party code). External plugins print a warning at load time; no other runtime effect.
+
+**`extra_plugin_manifests` config key** — register additional manifest files beyond the two fixed locations. Set in `config.json`:
+
+```json
+"extra_plugin_manifests": [
+  "/absolute/path/to/custom-plugins.json",
+  "~/shared/plugins.json"
+]
+```
 
 **Priority:** project-local manifest (`.mini-minion/plugins.json`) loads after global (`~/.mini-minion/plugins.json`), so local tools override global ones with the same name.
 
@@ -1265,7 +1314,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **783 cases** across all modules (783 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
+The test suite covers **894 cases** across all modules (894 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
 
 ```bash
 uv add anthropic

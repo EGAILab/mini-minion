@@ -283,6 +283,31 @@ def _validate(raw: dict) -> list[ConfigIssue]:
         if pt is not None and (not isinstance(pt, int) or pt <= 0):
             issues.append(ConfigIssue("compaction.preserve_tokens", f"Expected positive integer, got {pt!r}."))
 
+    # --- memory ---
+    memory_raw = raw.get("memory", {})
+    if memory_raw and not isinstance(memory_raw, dict):
+        issues.append(ConfigIssue("memory", "Expected an object."))
+    elif isinstance(memory_raw, dict):
+        ee = memory_raw.get("enable_extraction")
+        if ee is not None and not isinstance(ee, bool):
+            issues.append(ConfigIssue(
+                "memory.enable_extraction",
+                f"Expected boolean (true/false), got {ee!r}.",
+            ))
+
+    # --- extra_plugin_manifests ---
+    # Optional list of additional plugins.json paths to load, on top of the
+    # two fixed locations (~/.mini-minion/plugins.json + .mini-minion/plugins.json).
+    epm = raw.get("extra_plugin_manifests")
+    if epm is not None:
+        if not isinstance(epm, list):
+            issues.append(ConfigIssue("extra_plugin_manifests", "Expected a list of file paths."))
+        else:
+            for i, p in enumerate(epm):
+                if not isinstance(p, str):
+                    issues.append(ConfigIssue(f"extra_plugin_manifests[{i}]", f"Expected string path, got {type(p).__name__}."))
+
+
     # --- mcp ---
     mcp_raw = raw.get("mcp", {})
     if mcp_raw and not isinstance(mcp_raw, dict):
@@ -434,6 +459,21 @@ class McpConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    """Controls optional memory subsystem behaviour.
+
+    Attributes:
+        enable_extraction (bool): When ``True`` (default), a background daemon
+            thread runs after each successful turn to extract 0–3 short facts
+            from the last exchange and append them to ``_auto_extracted.md``.
+            Each extraction triggers one extra provider ``chat()`` call, which
+            adds API cost.  Set to ``false`` in ``config.json`` under
+            ``"memory": {"enable_extraction": false}`` to disable.
+    """
+    enable_extraction: bool = True
+
+
+@dataclass(frozen=True)
 class CompactionConfig:
     """Controls when and how conversation history is compacted.
 
@@ -580,6 +620,19 @@ def _resolve_all() -> dict[str, AgentModelConfig]:
             route_prefix=route_prefix,
         )
     return result
+
+
+def _resolve_memory() -> MemoryConfig:
+    """Read the ``"memory"`` section from config.json and build a MemoryConfig.
+
+    Returns:
+        MemoryConfig: Immutable memory settings; defaults apply when section absent.
+    """
+    raw = _raw.get("memory", {})
+    return MemoryConfig(
+        # Default True so existing configs work unchanged.
+        enable_extraction=raw.get("enable_extraction", True),
+    )
 
 
 def _resolve_compaction() -> CompactionConfig:
@@ -747,3 +800,15 @@ compaction: CompactionConfig = _resolve_compaction()
 # mcp: all configured MCP servers. Empty servers tuple when section absent from config.
 # Built once at import time from the "mcp.servers" section of config.json.
 mcp: McpConfig = _resolve_mcp()
+
+# memory: controls the optional background memory extraction subsystem.
+# Read from "memory" section; defaults to enable_extraction=True if absent.
+memory: MemoryConfig = _resolve_memory()
+
+# extra_plugin_manifests: additional plugins.json paths to load beyond the two
+# fixed locations (~/.mini-minion/plugins.json and .mini-minion/plugins.json).
+# Declared in config.json as: "extra_plugin_manifests": ["/path/to/plugins.json"]
+# Paths are resolved at startup; ~ is expanded.
+extra_plugin_manifests: tuple[str, ...] = tuple(
+    _raw.get("extra_plugin_manifests", [])
+)

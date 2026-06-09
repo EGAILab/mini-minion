@@ -77,7 +77,9 @@ from .agents.events import (
 )
 from .config import agents as agents_cfg
 from .config import compaction as compaction_cfg
+from .config import extra_plugin_manifests
 from .config import mcp as mcp_cfg
+from .config import memory as memory_cfg
 from .plugins import load_plugins
 from .config import streaming, workspace
 from .mcp import McpClientManager
@@ -178,7 +180,8 @@ def main() -> None:
         # Load user-defined tools from plugins.json manifests.
         # Done after default_registry() so plugins can override built-in tools
         # by registering a tool with the same name.
-        _plugin_count = load_plugins(tools, workspace)
+        # extra_plugin_manifests: additional paths from config.json "extra_plugin_manifests".
+        _plugin_count = load_plugins(tools, workspace, skills=skills, extra_manifests=extra_plugin_manifests)
         if _plugin_count:
             print(f"  Loaded {_plugin_count} plugin tool(s) for agent '{agent_id}'.")
         provider = create_provider(
@@ -213,6 +216,9 @@ def main() -> None:
             soul_suffix=_skills_suffix,
             long_term=long_term,
             tasks_dir=_tasks_dir,
+            # Respect config.json "memory.enable_extraction": false to suppress
+            # the background API call that extracts facts after each turn.
+            enable_memory_extraction=memory_cfg.enable_extraction,
         )
 
     use_streaming = streaming.chat_mode

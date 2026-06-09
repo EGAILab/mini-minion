@@ -102,3 +102,17 @@ def test_apply_patch_check_only_allowed_in_read_only_mode(tmp_path):
     result = tool.execute(patch="invalid patch", check_only=True)
     # Should reach git, not be blocked by policy.
     assert "read-only" not in result.lower()
+
+
+def test_apply_patch_git_not_found_returns_error(monkeypatch):
+    """When git is not on PATH, execute() returns a clear error before touching any file."""
+    import mini_minion.tools.apply_patch as ap_module
+    # Pretend git is missing from PATH.
+    monkeypatch.setattr(ap_module, "_GIT_PATH", None)
+    # Also make shutil.which return None so the runtime re-check agrees.
+    monkeypatch.setattr(ap_module.shutil, "which", lambda _: None)
+
+    tool = ApplyPatchTool()
+    result = tool.execute(patch="--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n")
+    assert "git" in result.lower()
+    assert "Error" in result or "error" in result.lower()

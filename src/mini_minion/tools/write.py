@@ -14,6 +14,15 @@ Design decisions
 - **UTF-8**: Always writes as UTF-8. This is the safe universal default for
   text content.
 
+Human confirmation
+------------------
+``WriteTool`` accepts an optional ``confirm`` callback with signature
+``(description: str) -> bool``.  When provided it is called before every write
+with a human-readable description (e.g. ``"Write 120 chars to /tmp/foo.py"``).
+Returning ``False`` cancels the write.  ``None`` (default) means no
+confirmation — the write proceeds automatically.  This mirrors the confirmation
+model used by :class:`BashTool` and :class:`GitCommitTool`.
+
 Talks to
 --------
 - ``base.py`` — extends :class:`Tool`, returns :class:`ToolSchema`.
@@ -26,6 +35,7 @@ Talks to
 from __future__ import annotations
 
 import pathlib
+from collections.abc import Callable
 from pathlib import Path
 
 from .base import Tool, ToolSchema, _is_sensitive, _within
@@ -37,14 +47,31 @@ class WriteTool(Tool):
 
     The agent calls this with a path and the content to write. If the path's
     parent directories don't exist, they are created automatically.
+
+    Args:
+        root: Workspace root — writes outside this directory are rejected.
+        policy: Optional :class:`PermissionPolicy` for path and read_only_mode
+            checks.  Falls back to inline ``_within`` + ``_is_sensitive`` when
+            ``None``.
+        confirm: Optional human approval callback.  Called with a one-line
+            description before every write; returning ``False`` cancels the
+            write.  ``None`` (default) means no confirmation required.
     """
 
-    def __init__(self, root: Path | None = None, *, policy: PermissionPolicy | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        policy: PermissionPolicy | None = None,
+        confirm: Callable[[str], bool] | None = None,
+    ) -> None:
         # root=None means unrestricted; set to the project directory at startup.
         self._root = root.resolve() if root else None
-        # When a policy is provided, check_path() replaces the inline checks.
+        # When a policy is provided, check_write() replaces the inline checks.
         # policy=None keeps legacy behaviour for callers that pass only root.
         self._policy = policy
+        # confirm=None means no approval prompt (automatic writes).
+        self._confirm = confirm
 
     @property
     def schema(self) -> ToolSchema:
@@ -96,6 +123,14 @@ class WriteTool(Tool):
             if self._root and not _within(path, self._root):
                 return f"Error: '{path}' is outside the workspace root '{self._root}'"
         content = str(kwargs["content"])
+
+        # Human confirmation step (optional).  Called after policy check so we
+        # don't prompt for writes that would be rejected anyway.
+        if self._confirm is not None:
+            description = f"Write {len(content):,} chars to {path}"
+            if not self._confirm(description):
+                return "Write cancelled by user."
+
         try:
             # Create all missing parent directories (equivalent to `mkdir -p`).
             # exist_ok=True means it won't fail if the directories already exist.

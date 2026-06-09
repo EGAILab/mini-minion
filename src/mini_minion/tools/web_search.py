@@ -21,15 +21,32 @@ Web searches never mutate local state (no files written, no memory saved).
 Marking the tool read-only allows the runner to batch multiple simultaneous
 web search calls concurrently when the model requests them in the same turn.
 
+SSRF policy
+-----------
+:class:`WebSearchTool` accepts an optional :class:`PermissionPolicy`.  When
+provided, the query string is checked against the policy's SSRF marker list
+before executing.  This is a defense-in-depth measure consistent with how
+:class:`BashTool` checks command strings: it prevents adversarial prompts from
+using the tool to probe or surface cloud metadata endpoint addresses.
+
+Note: ``read_only_mode`` does NOT block this tool — it is explicitly read-only
+by design and should remain accessible even in planning mode.
+
 Talks to
 --------
 - ``tools/__init__.py`` — registers :class:`WebSearchTool` in ``default_registry()``.
+- ``policy.py`` — :class:`PermissionPolicy` for SSRF marker checks.
 - ``ddgs`` (external) — provides the ``DDGS`` client class.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from .base import Tool, ToolSchema
+
+if TYPE_CHECKING:
+    from .policy import PermissionPolicy
 
 # ── Conditional import of the ddgs library ───────────────────────────────────
 #
@@ -103,12 +120,16 @@ class WebSearchTool(Tool):
         self,
         max_results: int = _DEFAULT_MAX_RESULTS,
         timeout: int = 20,
+        policy: "PermissionPolicy | None" = None,
     ) -> None:
         # Clamp here (not just in execute) so that a badly-configured tool
         # instance cannot silently request more results than DuckDuckGo handles
         # reliably.  max(1, min(CAP, x)) is a compact "clamp to [1, CAP]".
         self._max_results = max(1, min(_MAX_RESULTS_HARD_CAP, max_results))
         self._timeout = timeout  # HTTP socket timeout in seconds
+        # policy=None means no SSRF check.  When provided, the query string is
+        # scanned for cloud metadata markers before the search executes.
+        self._policy = policy
 
     @property
     def schema(self) -> ToolSchema:
@@ -188,6 +209,19 @@ class WebSearchTool(Tool):
         query = str(kwargs["query"]).strip()
         if not query:
             return "Error: 'query' must be a non-empty string."
+
+        # SSRF defense-in-depth: block queries that contain cloud metadata endpoint
+        # addresses.  The DuckDuckGo library always contacts DuckDuckGo's servers
+        # (not arbitrary endpoints), so this is not a true SSRF vector.  However,
+        # consistent policy application prevents adversarial prompts from using the
+        # search tool to surface or probe restricted endpoint addresses.
+        if self._policy is not None:
+            for marker in self._policy.ssrf_markers:
+                if marker in query:
+                    return (
+                        f"Error: web_search query blocked — contains a restricted "
+                        f"address ({marker!r}). Use a different search term."
+                    )
 
         # Clamp user-supplied max_results to the allowed range.
         raw_max = kwargs.get("max_results")

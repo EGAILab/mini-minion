@@ -26,6 +26,7 @@ Route-aware targeting:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 
@@ -132,19 +133,67 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Plugin command registry
+# ---------------------------------------------------------------------------
+# Populated by plugins.py when a manifest declares a "commands" section.
+# Each entry is a (CommandSpec, handler) pair.  The spec drives /help output;
+# the handler is called by dispatch_command() after all built-in commands.
+#
+# This list is module-level mutable state — intentionally so, because plugins
+# register commands at import time and the REPL loop reads the list on each
+# dispatch.  Tests should clear this list in teardown to avoid cross-test
+# pollution.
+
+_PLUGIN_COMMAND_REGISTRY: list[tuple["CommandSpec", Callable]] = []
+
+
+def register_plugin_command(spec: "CommandSpec", handler: Callable) -> None:
+    """Register a plugin-provided slash command.
+
+    Called by ``plugins.py`` when loading a manifest's ``"commands"`` section.
+    The registered command is then available in the REPL alongside built-in
+    commands and appears in ``/help`` output.
+
+    Args:
+        spec:    A :class:`CommandSpec` describing the command (name, description,
+                 optional arg_hint and aliases).
+        handler: A callable with signature ``(ctx: CommandContext) -> CommandResult``.
+                 Receives the same :class:`CommandContext` as built-in handlers.
+    """
+    # Avoid duplicates: if a command with the same name was registered before
+    # (e.g. the plugin was reloaded), replace the old entry rather than adding
+    # a second one that would shadow the first.
+    for i, (existing_spec, _) in enumerate(_PLUGIN_COMMAND_REGISTRY):
+        if existing_spec.name == spec.name:
+            _PLUGIN_COMMAND_REGISTRY[i] = (spec, handler)
+            return
+    _PLUGIN_COMMAND_REGISTRY.append((spec, handler))
+
+
 def _all_names(spec: CommandSpec) -> tuple[str, ...]:
     """Return the canonical name plus all aliases for a command spec."""
     return (spec.name,) + spec.aliases
 
 
 def format_help(agents_cfg: dict) -> str:
-    """Generate a human-readable /help text from BUILTIN_COMMANDS."""
+    """Generate a human-readable /help text from BUILTIN_COMMANDS and plugin commands."""
     lines = ["Built-in commands:"]
     for spec in BUILTIN_COMMANDS:
         names = ", ".join(_all_names(spec))
         hint = f" {spec.arg_hint}" if spec.arg_hint else ""
         lines.append(f"  {names}{hint}")
         lines.append(f"      {spec.description}")
+
+    # Append plugin commands when any are registered.
+    if _PLUGIN_COMMAND_REGISTRY:
+        lines.append("")
+        lines.append("Plugin commands:")
+        for spec, _ in _PLUGIN_COMMAND_REGISTRY:
+            names = ", ".join(_all_names(spec))
+            hint = f" {spec.arg_hint}" if spec.arg_hint else ""
+            lines.append(f"  {names}{hint}")
+            lines.append(f"      {spec.description}")
 
     # Show route-targeting examples if there are multiple agents configured
     # with route prefixes (e.g. /research).
@@ -295,11 +344,15 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                     handled=True,
                     message=f"Unknown agent '{target}'. Known agents: {known}",
                 )
+            # Reload the target agent's history from disk before switching.
+            # This ensures /resume reflects any turns that happened in previous
+            # process runs and picks up the latest state after /new was used.
+            ctx.sessions[target].reload()
             return CommandResult(
                 handled=True,
                 activate_agent_id=target,
                 message=(
-                    f"Switched active agent to '{target}'. "
+                    f"Switched active agent to '{target}' and reloaded history from disk. "
                     f"Messages now go to {target} by default."
                 ),
             )
@@ -421,6 +474,20 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                 lines.append(f"    Endpoint : {endpoint}")
             return CommandResult(handled=True, message="\n".join(lines))
 
-    # No built-in command matched — let the caller decide what to do.
+    # --- Plugin commands ---
+    # Check plugin-registered commands after all built-ins.  Plugins can shadow
+    # built-ins only if they register a command with the same name, which is
+    # intentional (a plugin can override /status with a richer implementation).
+    for plugin_spec, plugin_handler in _PLUGIN_COMMAND_REGISTRY:
+        if cmd in _all_names(plugin_spec):
+            try:
+                return plugin_handler(ctx)
+            except Exception as exc:
+                return CommandResult(
+                    handled=True,
+                    message=f"Error in plugin command '{plugin_spec.name}': {exc}",
+                )
+
+    # No built-in or plugin command matched — let the caller decide what to do.
     # Returning handled=False means the input falls through to normal routing.
     return CommandResult(handled=False)

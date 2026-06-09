@@ -45,7 +45,7 @@ from .find_definition import FindDefinitionTool
 from .git import GitCommitTool, GitDiffTool, GitStatusTool
 from .glob import GlobTool
 from .grep import GrepTool
-from .memory import SaveMemoryTool, SearchMemoryTool
+from .memory import NoteTool, SaveMemoryTool, SearchMemoryTool
 from .patch import PatchPreviewTool
 from .policy import PermissionPolicy
 from .read import ReadTool
@@ -68,32 +68,38 @@ def default_registry(
     mcp_manager: "McpClientManager | None" = None,
     policy: "PermissionPolicy | None" = None,
     ask_user_fn: "Callable[[str], str] | None" = None,
+    write_confirm: "Callable[[str], bool] | None" = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` with all standard tools registered.
 
     Args:
-        long_term:   If provided, also registers memory tools with this backend.
-        root:        Workspace root path. File tools reject paths outside this
-                     boundary.  Pass ``None`` to disable path restriction.
+        long_term:    If provided, also registers memory tools with this backend.
+        root:         Workspace root path. File tools reject paths outside this
+                      boundary.  Pass ``None`` to disable path restriction.
         bash_confirm: Optional callable passed to :class:`BashTool`.  Called
-                     with the command string before execution; returns ``True``
-                     to proceed.  ``None`` runs without asking (headless).
-        skills:      Optional skill registry.  When non-empty, also registers
-                     a :class:`SkillTool`.
-        tasks_dir:   Directory for per-agent task JSON files.  When provided
-                     alongside ``agent_id``, registers
-                     :class:`ReadTaskTool` + :class:`UpdateTaskTool`.
-        agent_id:    The agent's ID, used to build the task file path
-                     ``{tasks_dir}/{agent_id}.json``.
-        mcp_manager: If provided, registers MCP status/resource tools and
-                     one :class:`McpToolAdapter` per connected MCP tool.
-        policy:      Optional :class:`PermissionPolicy` injected into all I/O
-                     tools (read, write, glob, edit, grep, web_fetch).  When
-                     ``None`` a default policy is built from ``root``.
-        ask_user_fn: Optional callable for :class:`AskUserTool`.  Called with
-                     the agent's question string; returns the human's answer.
-                     ``None`` registers the tool in headless mode (returns an
-                     error when the agent calls it).
+                      with the command string before execution; returns ``True``
+                      to proceed.  ``None`` runs without asking (headless).
+        skills:       Optional skill registry.  When non-empty, also registers
+                      a :class:`SkillTool`.
+        tasks_dir:    Directory for per-agent task JSON files.  When provided
+                      alongside ``agent_id``, registers
+                      :class:`ReadTaskTool` + :class:`UpdateTaskTool`.
+        agent_id:     The agent's ID, used to build the task file path
+                      ``{tasks_dir}/{agent_id}.json``.
+        mcp_manager:  If provided, registers MCP status/resource tools and
+                      one :class:`McpToolAdapter` per connected MCP tool.
+        policy:       Optional :class:`PermissionPolicy` injected into all I/O
+                      tools (read, write, glob, edit, grep, web_fetch).  When
+                      ``None`` a default policy is built from ``root``.
+        ask_user_fn:  Optional callable for :class:`AskUserTool`.  Called with
+                      the agent's question string; returns the human's answer.
+                      ``None`` registers the tool in headless mode (returns an
+                      error when the agent calls it).
+        write_confirm: Optional human approval callback passed to
+                      :class:`WriteTool` and :class:`EditTool`.  Called with
+                      a one-line description before each write; returning
+                      ``False`` cancels the operation.  ``None`` (default)
+                      means automatic writes without prompting.
 
     Returns:
         :class:`ToolRegistry` populated and ready to pass to :func:`run_turn`.
@@ -110,15 +116,15 @@ def default_registry(
     # path safety checks stay in sync with the centralised PermissionPolicy.
     for tool in [
         ReadTool(root, policy=_policy),
-        WriteTool(root, policy=_policy),
+        WriteTool(root, policy=_policy, confirm=write_confirm),
         GlobTool(root, policy=_policy),
         # BashTool now accepts policy so SSRF and read_only_mode checks are centralised.
         BashTool(confirm=bash_confirm, cwd=root, policy=_policy),
-        # WebSearchTool has no external dependencies at construction time; it
-        # fails gracefully at execute() if duckduckgo-search is not installed.
-        WebSearchTool(),
+        # WebSearchTool: policy enables SSRF marker checks on the query string.
+        WebSearchTool(policy=_policy),
         # Coding-agent tools — use PermissionPolicy for path/URL checks.
-        EditTool(_policy),
+        # write_confirm callback lets the caller (e.g. REPL) gate each edit on user approval.
+        EditTool(_policy, confirm=write_confirm),
         GrepTool(_policy),
         WebFetchTool(_policy),
         PatchPreviewTool(_policy),
@@ -139,9 +145,13 @@ def default_registry(
         registry.register(tool)
 
     # Memory tools — only when a backend is provided.
+    # SaveMemoryTool and NoteTool receive policy so /plan read-only mode blocks writes.
+    # Note: only read_only_mode is checked (not check_write) because memory files
+    # live at ~/.mini-minion/memory/ which is outside the workspace boundary.
     if long_term is not None:
-        registry.register(SaveMemoryTool(long_term))
+        registry.register(SaveMemoryTool(long_term, policy=_policy))
         registry.register(SearchMemoryTool(long_term))
+        registry.register(NoteTool(long_term, policy=_policy))
 
     # Skill tool — only when at least one skill was discovered.
     if skills:
@@ -201,7 +211,10 @@ __all__ = [
     "GitDiffTool",
     "GitStatusTool",
     "GrepTool",
+    "NoteTool",
     "PatchPreviewTool",
+    "SaveMemoryTool",
+    "SearchMemoryTool",
     "TodoReadTool",
     "TodoWriteTool",
     "WebFetchTool",

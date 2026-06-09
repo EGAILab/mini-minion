@@ -567,3 +567,116 @@ def test_turn_completed_not_emitted_on_failure(tmp_path):
     except RuntimeError:
         pass
     assert not any(isinstance(e, TurnCompleted) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# reload() — restores history from disk
+# ---------------------------------------------------------------------------
+
+def test_reload_restores_history_from_disk(tmp_path):
+    """reload() must replace in-memory history with what is on disk."""
+    session = _make_session(tmp_path)
+    session.send("persisted message")
+
+    # Corrupt the in-memory history to simulate drift.
+    session._history = []
+    assert session.history == []
+
+    session.reload()
+
+    # After reload, history should match what send() persisted.
+    assert any(m["content"] == "persisted message" for m in session.history)
+
+
+def test_reload_on_empty_disk_clears_history(tmp_path):
+    """reload() on a session that was never sent clears in-memory history too."""
+    session = _make_session(tmp_path)
+    # Inject some in-memory history without persisting it.
+    session._history = [{"role": "user", "content": "phantom"}]
+
+    session.reload()
+
+    # Nothing was ever persisted, so reload loads empty history.
+    assert session.history == []
+
+
+def test_reload_is_idempotent(tmp_path):
+    """Calling reload() twice returns the same result both times."""
+    session = _make_session(tmp_path)
+    session.send("hello")
+
+    session.reload()
+    h1 = list(session.history)
+    session.reload()
+    h2 = list(session.history)
+
+    assert h1 == h2
+
+
+# ---------------------------------------------------------------------------
+# enable_memory_extraction=False — suppresses background extraction
+# ---------------------------------------------------------------------------
+
+def test_enable_memory_extraction_false_suppresses_extraction(tmp_path):
+    """When enable_memory_extraction=False, the extraction daemon thread is never started."""
+    long_term = LongTermMemory(tmp_path / "memory")
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    provider = _mock_provider()
+
+    session = AgentSession(
+        agent_id="main",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        long_term=long_term,
+        enable_memory_extraction=False,
+    )
+
+    extraction_calls: list[bool] = []
+
+    def fake_extract(*args, **kwargs):
+        extraction_calls.append(True)
+
+    with patch("mini_minion.memory.extractor.extract_and_save_async", side_effect=fake_extract):
+        session.send("hello")
+
+    # The extraction function must NOT have been called.
+    assert not extraction_calls
+
+
+def test_enable_memory_extraction_true_allows_extraction(tmp_path):
+    """When enable_memory_extraction=True (default), extraction is triggered after a turn."""
+    long_term = LongTermMemory(tmp_path / "memory")
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    provider = _mock_provider()
+
+    session = AgentSession(
+        agent_id="main",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        long_term=long_term,
+        enable_memory_extraction=True,
+    )
+
+    extraction_calls: list[bool] = []
+
+    def fake_extract(*args, **kwargs):
+        extraction_calls.append(True)
+
+    with patch("mini_minion.memory.extractor.extract_and_save_async", side_effect=fake_extract):
+        session.send("hello")
+
+    assert extraction_calls

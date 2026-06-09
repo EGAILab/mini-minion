@@ -85,6 +85,27 @@ Each entry is a path to a directory that contains ``SKILL.md`` files.  The
 loader passes these paths to :func:`~mini_minion.skills.discover_skills` and
 merges any discovered skills into the optional skill registry argument.
 
+``"commands"`` section
+----------------------
+Each entry declares a new slash command that the plugin provides:
+
+.. code-block:: json
+
+    "commands": [
+        {
+            "name": "/my-command",
+            "description": "Do something useful.",
+            "handler": "./handlers/my_command.py"
+        }
+    ]
+
+The ``handler`` path points to a Python file that must expose a function::
+
+    def handle(ctx: CommandContext) -> CommandResult: ...
+
+Loaded commands are registered via :func:`~mini_minion.commands.register_plugin_command`
+and are available in the REPL alongside built-in commands.
+
 ``"trust"`` field
 -----------------
 Optional string: ``"trusted"`` (default, for your own plugins) or
@@ -104,8 +125,9 @@ Talks to
 - ``tools/base.py`` — uses :class:`Tool` to identify tool subclasses.
 - ``tools/registry.py`` — calls :meth:`ToolRegistry.register` + hook methods.
 - ``skills/__init__.py`` — calls :func:`discover_skills` for skill paths.
+- ``commands.py`` — calls :func:`register_plugin_command` for each ``"commands"`` entry.
 - ``minion.py`` — calls :func:`load_plugins` after ``default_registry()``
-  to extend the tool set with user-defined tools, hooks, and skills.
+  to extend the tool set with user-defined tools, hooks, skills, and commands.
 """
 
 from __future__ import annotations
@@ -125,30 +147,37 @@ def load_plugins(
     registry: "ToolRegistry",
     workspace: Path,
     skills: "SkillRegistry | None" = None,
+    extra_manifests: tuple[str, ...] = (),
 ) -> int:
-    """Load plugins from manifest files and register their tools, hooks, and skills.
+    """Load plugins from manifest files and register their tools, hooks, skills, and commands.
 
-    Searches two manifest locations (in order):
+    Searches manifest locations in order:
 
     1. ``{workspace}/plugins.json`` — user-global plugins.
     2. ``.mini-minion/plugins.json`` — project-local plugins (cwd-relative).
+    3. Any paths in ``extra_manifests`` (from config.json ``"extra_plugin_manifests"``).
 
-    Project-local tools are registered after global ones so a local plugin
-    with the same name as a global plugin silently overrides it.
+    Later manifests are loaded after earlier ones so project-local or explicitly
+    listed plugins can override global ones with the same tool name.
 
     Args:
-        registry: The :class:`ToolRegistry` to register loaded tools and hooks into.
-        workspace: The user's workspace root (typically ``~/.mini-minion``).
-        skills:    Optional mutable :data:`SkillRegistry` dict.  When provided,
-                   skills discovered from manifest ``"skills"`` paths are merged in.
+        registry:        The :class:`ToolRegistry` to register loaded tools and hooks into.
+        workspace:       The user's workspace root (typically ``~/.mini-minion``).
+        skills:          Optional mutable :data:`SkillRegistry` dict.  When provided,
+                         skills discovered from manifest ``"skills"`` paths are merged in.
+        extra_manifests: Additional manifest file paths from config.json
+                         ``"extra_plugin_manifests"``.  ``~`` is expanded.
 
     Returns:
         int: Total number of tools registered from all manifests.
     """
-    manifest_paths = [
+    manifest_paths: list[Path] = [
         workspace / "plugins.json",
         Path.cwd() / ".mini-minion" / "plugins.json",
     ]
+    # Expand user-provided extra manifest paths (~ expansion, str → Path).
+    for extra in extra_manifests:
+        manifest_paths.append(Path(extra).expanduser())
 
     total = 0
     for manifest_path in manifest_paths:
@@ -238,7 +267,66 @@ def _load_manifest(
             if merged:
                 print(f"  [plugins] Loaded {merged} skill(s) from manifest skill paths.")
 
+    # --- commands section ---
+    # Each entry: {"name": "/cmd", "description": "...", "handler": "./handler.py"}
+    # The handler file must expose handle(ctx: CommandContext) -> CommandResult.
+    for cmd_entry in raw.get("commands", []):
+        if not isinstance(cmd_entry, dict):
+            print(f"  [plugins] Warning: command entry must be an object, got {type(cmd_entry).__name__}.")
+            continue
+        cmd_name = cmd_entry.get("name", "").strip()
+        cmd_desc = cmd_entry.get("description", "")
+        handler_str = cmd_entry.get("handler", "")
+        if not cmd_name or not handler_str:
+            print(f"  [plugins] Warning: command entry missing 'name' or 'handler': {cmd_entry!r}.")
+            continue
+
+        handler_path = Path(handler_str).expanduser()
+        if not handler_path.is_absolute():
+            handler_path = (manifest_path.parent / handler_path).resolve()
+
+        _load_command_handler(cmd_name, cmd_desc, handler_path)
+
     return count
+
+
+def _load_command_handler(name: str, description: str, module_path: Path) -> None:
+    """Dynamically import a command handler and register it as a plugin command.
+
+    The handler module must expose a ``handle(ctx) -> CommandResult`` function.
+    Registration is via :func:`~mini_minion.commands.register_plugin_command`.
+
+    Args:
+        name:        The slash command name, e.g. ``"/my-command"``.
+        description: Short description shown in ``/help``.
+        module_path: Absolute path to the handler Python file.
+    """
+    if not module_path.exists():
+        print(f"  [plugins] Warning: command handler not found: {module_path}")
+        return
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            f"mini_minion_cmd_{module_path.stem}",
+            module_path,
+        )
+        if spec is None or spec.loader is None:
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception as exc:
+        print(f"  [plugins] Warning: could not import command handler {module_path}: {exc}")
+        return
+
+    handler = getattr(module, "handle", None)
+    if handler is None or not callable(handler):
+        print(f"  [plugins] Warning: {module_path.name} has no callable 'handle' function.")
+        return
+
+    from .commands import CommandSpec, register_plugin_command
+    spec_obj = CommandSpec(name=name, description=description)
+    register_plugin_command(spec_obj, handler)
+    print(f"  [plugins] Registered plugin command '{name}' from {module_path.name}")
 
 
 def _load_hook_module(registry: "ToolRegistry", module_path: Path) -> None:

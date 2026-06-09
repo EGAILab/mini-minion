@@ -25,12 +25,17 @@ Talks to
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 from .base import Tool, ToolSchema
 from .policy import PermissionPolicy
+
+# Cached result of shutil.which("git") so we don't re-run it on every call.
+# None means git is not on PATH; a non-None string is the full path to the binary.
+_GIT_PATH: str | None = shutil.which("git")
 
 _DEFAULT_TIMEOUT = 30  # seconds
 
@@ -93,6 +98,15 @@ class ApplyPatchTool(Tool):
         """
         patch_text = str(kwargs["patch"])
         check_only = bool(kwargs.get("check_only", False))
+
+        # Fail fast if git is not available — avoid creating a temp file just to
+        # hit a FileNotFoundError inside subprocess.run.  shutil.which() was
+        # called at import time and cached; re-check so tests can monkeypatch it.
+        if _GIT_PATH is None and shutil.which("git") is None:
+            return (
+                "Error: ApplyPatchTool requires git to be installed and on PATH. "
+                "Install git or use WriteTool + EditTool for individual file edits."
+            )
 
         # Policy check: writing to disk requires a non-read-only policy.
         # check_only is read-only — skip the check in that case.
