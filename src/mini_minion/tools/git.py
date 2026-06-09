@@ -43,6 +43,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .base import Tool, ToolSchema
+from .policy import PermissionPolicy
 
 _DEFAULT_TIMEOUT = 30  # seconds
 
@@ -84,10 +85,13 @@ class GitStatusTool(Tool):
     of staged, modified, and untracked files, plus the current branch name.
     """
 
-    def __init__(self, cwd: Path | None = None) -> None:
+    def __init__(self, cwd: Path | None = None, policy: PermissionPolicy | None = None) -> None:
         # cwd: repository root.  None inherits from the parent process (usually
         # the mini-minion workspace root, set by default_registry()).
         self._cwd = cwd
+        # policy: currently unused for read-only status; reserved for future
+        # workspace-boundary checks on the cwd path.
+        self._policy = policy
 
     @property
     def schema(self) -> ToolSchema:
@@ -118,8 +122,10 @@ class GitDiffTool(Tool):
     can be limited to a single file or directory via the ``path`` parameter.
     """
 
-    def __init__(self, cwd: Path | None = None) -> None:
+    def __init__(self, cwd: Path | None = None, policy: PermissionPolicy | None = None) -> None:
         self._cwd = cwd
+        # policy: reserved for future workspace-boundary checks on the cwd/path args.
+        self._policy = policy
 
     @property
     def schema(self) -> ToolSchema:
@@ -180,12 +186,16 @@ class GitCommitTool(Tool):
         self,
         cwd: Path | None = None,
         confirm: Callable[[str], bool] | None = None,
+        policy: PermissionPolicy | None = None,
     ) -> None:
         self._cwd = cwd
         # confirm: called with a human-readable summary of the git operations
         # before they run.  Returns True to proceed, False to cancel.
         # None means run without asking (headless/batch mode).
         self._confirm = confirm
+        # policy: when provided, check_write() is called before committing so
+        # read_only_mode and workspace-boundary rules also block git commits.
+        self._policy = policy
 
     @property
     def schema(self) -> ToolSchema:
@@ -232,6 +242,13 @@ class GitCommitTool(Tool):
         """
         message = str(kwargs["message"])
         files: list[str] = [str(f) for f in (kwargs.get("files") or [])]
+
+        # Policy check: read_only_mode blocks commits; workspace check uses cwd.
+        if self._policy is not None:
+            cwd_path = self._cwd or Path.cwd()
+            error = self._policy.check_write(cwd_path)
+            if error:
+                return error
 
         # Build a human-readable preview of the operations about to run.
         lines = []

@@ -355,6 +355,16 @@ class AgentSession:
         session_store.get_or_create(agent_id)
 
     @property
+    def registry(self) -> "ToolRegistry":
+        """The agent's tool registry.
+
+        Exposed so commands like ``/plan`` and ``/auto`` can toggle
+        ``registry.policy.read_only_mode`` without accessing the private
+        ``_tools`` attribute.
+        """
+        return self._tools
+
+    @property
     def history(self) -> list[dict]:
         """Snapshot of the current conversation history (defensive copy)."""
         return list(self._history)

@@ -29,8 +29,10 @@ Safety and limitations
 Talks to
 --------
 - ``base.py`` — extends :class:`Tool`, returns :class:`ToolSchema`.
-- ``policy.py`` — imports :data:`DEFAULT_SSRF_MARKERS` so the SSRF block list
-  stays in sync with :class:`PermissionPolicy` used by other tools.
+- ``policy.py`` — accepts an optional :class:`PermissionPolicy` kwarg.  When
+  provided, ``check_command()`` handles SSRF and read-only checks in one call.
+  Falls back to importing :data:`DEFAULT_SSRF_MARKERS` directly when no policy
+  is supplied so existing callers that omit the kwarg keep working.
 - ``registry.py`` — registered via ``default_registry()`` in ``__init__.py``.
 - Python's ``subprocess`` module for process execution.
 - Python's ``platform`` module to detect Windows vs. Unix.
@@ -44,7 +46,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .base import Tool, ToolSchema
-from .policy import DEFAULT_SSRF_MARKERS
+from .policy import DEFAULT_SSRF_MARKERS, PermissionPolicy
 
 # Detect once at import time; doesn't change during execution.
 _IS_WINDOWS = platform.system() == "Windows"
@@ -91,6 +93,7 @@ class BashTool(Tool):
         self,
         confirm: Callable[[str], bool] | None = None,
         cwd: Path | None = None,
+        policy: PermissionPolicy | None = None,
     ) -> None:
         # confirm: called with the command string before execution; returns True
         # to proceed, False to cancel.  None means run without asking (headless).
@@ -100,6 +103,9 @@ class BashTool(Tool):
         # parent process.  Set to the workspace root so shell commands start
         # in a predictable location.
         self._cwd = cwd
+        # policy: when provided, SSRF and read_only_mode checks are delegated
+        # to policy.check_command() instead of the inline DEFAULT_SSRF_MARKERS scan.
+        self._policy = policy
 
     @property
     def schema(self) -> ToolSchema:
@@ -140,8 +146,13 @@ class BashTool(Tool):
         command = str(kwargs["command"])
         timeout = int(kwargs.get("timeout") or _DEFAULT_TIMEOUT)
 
-        # SSRF guard: block requests to cloud metadata endpoints.
-        if any(marker in command for marker in DEFAULT_SSRF_MARKERS):
+        # Safety check: delegate to policy when injected (covers SSRF + read_only_mode),
+        # otherwise fall back to the inline DEFAULT_SSRF_MARKERS scan for backwards compat.
+        if self._policy is not None:
+            error = self._policy.check_command(command)
+            if error:
+                return error
+        elif any(marker in command for marker in DEFAULT_SSRF_MARKERS):
             return (
                 "Error: command blocked — requests to cloud instance metadata "
                 "endpoints (169.254.169.254 and equivalents) are not permitted."

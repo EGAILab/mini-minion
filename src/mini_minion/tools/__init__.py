@@ -36,10 +36,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..mcp.client import McpClientManager
 
+from .apply_patch import ApplyPatchTool
 from .ask_user import AskUserTool
 from .base import Tool, ToolSchema
 from .bash import BashTool
 from .edit import EditTool
+from .find_definition import FindDefinitionTool
 from .git import GitCommitTool, GitDiffTool, GitStatusTool
 from .glob import GlobTool
 from .grep import GrepTool
@@ -50,6 +52,7 @@ from .read import ReadTool
 from .registry import ToolRegistry
 from .skill import SkillTool
 from .task import ReadTaskTool, UpdateTaskTool
+from .todo import TodoReadTool, TodoWriteTool
 from .web_fetch import WebFetchTool
 from .web_search import WebSearchTool
 from .write import WriteTool
@@ -109,7 +112,8 @@ def default_registry(
         ReadTool(root, policy=_policy),
         WriteTool(root, policy=_policy),
         GlobTool(root, policy=_policy),
-        BashTool(confirm=bash_confirm, cwd=root),
+        # BashTool now accepts policy so SSRF and read_only_mode checks are centralised.
+        BashTool(confirm=bash_confirm, cwd=root, policy=_policy),
         # WebSearchTool has no external dependencies at construction time; it
         # fails gracefully at execute() if duckduckgo-search is not installed.
         WebSearchTool(),
@@ -118,14 +122,19 @@ def default_registry(
         GrepTool(_policy),
         WebFetchTool(_policy),
         PatchPreviewTool(_policy),
+        # ApplyPatchTool: companion to PatchPreviewTool that actually applies the diff.
+        ApplyPatchTool(cwd=root, policy=_policy),
+        # FindDefinitionTool: AST-based symbol lookup across all .py files.
+        FindDefinitionTool(root=root, policy=_policy),
         # Human-interaction tool — always registered; headless mode (ask_user_fn=None)
         # returns an informative error rather than hanging.
         AskUserTool(ask_user_fn),
         # Git tools — structured git interface without needing a shell.
         # GitCommitTool reuses bash_confirm so the user approves commits the same way.
-        GitStatusTool(cwd=root),
-        GitDiffTool(cwd=root),
-        GitCommitTool(cwd=root, confirm=bash_confirm),
+        # All three now accept policy so read_only_mode and workspace rules apply.
+        GitStatusTool(cwd=root, policy=_policy),
+        GitDiffTool(cwd=root, policy=_policy),
+        GitCommitTool(cwd=root, confirm=bash_confirm, policy=_policy),
     ]:
         registry.register(tool)
 
@@ -143,6 +152,15 @@ def default_registry(
         task_path = Path(tasks_dir) / f"{agent_id}.json"
         registry.register(ReadTaskTool(task_path))
         registry.register(UpdateTaskTool(task_path))
+        # TodoWriteTool / TodoReadTool: per-agent session-scoped todo list.
+        # Stored at tasks_dir/<agent_id>-todos.json (separate from the structured plan).
+        todo_path = Path(tasks_dir) / f"{agent_id}-todos.json"
+        registry.register(TodoWriteTool(todo_path, policy=_policy))
+        registry.register(TodoReadTool(todo_path))
+
+    # Expose the shared policy on the registry so /plan and /auto can toggle
+    # read_only_mode at runtime without re-building the registry.
+    registry.policy = _policy
 
     # MCP tools — only when a manager is provided.
     # Import here to avoid a circular import (mcp.types imports from config).
@@ -175,13 +193,17 @@ __all__ = [
     "ToolSchema",
     "ToolRegistry",
     "PermissionPolicy",
+    "ApplyPatchTool",
     "AskUserTool",
     "EditTool",
+    "FindDefinitionTool",
     "GitCommitTool",
     "GitDiffTool",
     "GitStatusTool",
     "GrepTool",
     "PatchPreviewTool",
+    "TodoReadTool",
+    "TodoWriteTool",
     "WebFetchTool",
     "SkillTool",
     "ReadTaskTool",

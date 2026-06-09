@@ -14,6 +14,10 @@ Supported commands:
   /resume [agent_id] — switch the default routing target to the given agent
   /diagnose          — show provider configuration and API key status for all agents
   /mcp-reload        — close and reconnect all MCP servers, refresh tool adapters
+  /mcp-list          — list connected MCP servers and their available tools
+  /plan              — enable read-only mode (agent can plan but not write/execute)
+  /auto              — disable read-only mode (agent runs with full tool access)
+  /providers         — list configured LLM provider and model info for all agents
 
 Route-aware targeting:
   /research /new     — target the researcher agent specifically
@@ -108,6 +112,22 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec(
         name="/mcp-reload",
         description="Close and reconnect all MCP servers, then refresh the tool adapters in every session.",
+    ),
+    CommandSpec(
+        name="/mcp-list",
+        description="List connected MCP servers and their available tools.",
+    ),
+    CommandSpec(
+        name="/plan",
+        description="Enable read-only mode — agent can reason and plan but not write files or run commands.",
+    ),
+    CommandSpec(
+        name="/auto",
+        description="Disable read-only mode — restore full tool access (write, bash, git commit).",
+    ),
+    CommandSpec(
+        name="/providers",
+        description="Show LLM provider and model configuration for all configured agents.",
     ),
 ]
 
@@ -324,6 +344,81 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                 state_str = "OK" if status.state == "connected" else f"FAILED: {status.detail}"
                 lines.append(f"  [{status.name}]: {state_str}")
             lines.append(f"Refreshed {refreshed} MCP tool adapter(s) across all sessions.")
+            return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /mcp-list ---
+        if spec.name == "/mcp-list":
+            if ctx.mcp_manager is None:
+                return CommandResult(
+                    handled=True,
+                    message="No MCP manager configured. Add 'mcp.servers' to config.json first.",
+                )
+            statuses = ctx.mcp_manager.list_statuses()
+            if not statuses:
+                return CommandResult(handled=True, message="No MCP servers configured.")
+            lines = ["MCP servers:"]
+            for status in statuses:
+                state_str = "connected" if status.state == "connected" else f"FAILED: {status.detail}"
+                lines.append(f"\n  [{status.name}]  {state_str}")
+            # List tools available from connected servers.
+            tools = ctx.mcp_manager.list_tools()
+            if tools:
+                lines.append(f"\nAvailable tools ({len(tools)}):")
+                for t in tools:
+                    lines.append(f"  {t.name}")
+            else:
+                lines.append("\nNo tools available (no servers connected).")
+            return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /plan ---
+        if spec.name == "/plan":
+            # Enable read-only mode on the active agent's PermissionPolicy.
+            # This blocks write/bash/commit tools while still allowing reads and reasoning.
+            session = ctx.sessions.get(ctx.target_agent_id)
+            if session is None:
+                return CommandResult(handled=True, message=f"Unknown agent: {ctx.target_agent_id}")
+            policy = session.registry.policy
+            if policy is None:
+                return CommandResult(handled=True, message="No permission policy configured for this agent.")
+            policy.read_only_mode = True
+            return CommandResult(
+                handled=True,
+                message=(
+                    f"Read-only mode enabled for '{ctx.target_agent_id}'. "
+                    "The agent can read and reason but write/bash/git-commit are blocked. "
+                    "Use /auto to re-enable full access."
+                ),
+            )
+
+        # --- /auto ---
+        if spec.name == "/auto":
+            # Disable read-only mode, restoring full tool access.
+            session = ctx.sessions.get(ctx.target_agent_id)
+            if session is None:
+                return CommandResult(handled=True, message=f"Unknown agent: {ctx.target_agent_id}")
+            policy = session.registry.policy
+            if policy is None:
+                return CommandResult(handled=True, message="No permission policy configured for this agent.")
+            policy.read_only_mode = False
+            return CommandResult(
+                handled=True,
+                message=(
+                    f"Read-only mode disabled for '{ctx.target_agent_id}'. "
+                    "Full tool access restored (write, bash, git commit)."
+                ),
+            )
+
+        # --- /providers ---
+        if spec.name == "/providers":
+            lines = ["Configured providers:"]
+            for aid, cfg in ctx.agents_cfg.items():
+                lines.append(f"\n  [{aid}]")
+                lines.append(f"    Provider : {cfg.provider.name}  (api={cfg.provider.api})")
+                lines.append(f"    Model    : {cfg.model.id}")
+                lines.append(f"    Context  : {cfg.model.context_window:,} tokens")
+                lines.append(f"    Max out  : {cfg.model.max_output_tokens:,} tokens")
+                endpoint = cfg.provider.base_url or "(SDK default)"
+                lines.append(f"    Endpoint : {endpoint}")
             return CommandResult(handled=True, message="\n".join(lines))
 
     # No built-in command matched — let the caller decide what to do.

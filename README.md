@@ -100,25 +100,28 @@ mini-minion/
 │   │   └── __init__.py          # discover_skills(), format_skills_prompt(), SkillInfo
 │   ├── tools/                   # Executable tools for agents
 │   │   ├── base.py              # Tool ABC, ToolSchema, _within() path guard
-│   │   ├── policy.py            # PermissionPolicy — centralised path/URL safety rules
-│   │   ├── registry.py          # ToolRegistry — dispatch, schema export, hook support
+│   │   ├── policy.py            # PermissionPolicy — centralised path/URL/command safety rules + read_only_mode
+│   │   ├── registry.py          # ToolRegistry — dispatch, schema export, hook support; exposes .policy
 │   │   ├── read.py              # ReadTool — file/directory reading with pagination
 │   │   ├── write.py             # WriteTool — file writing
 │   │   ├── glob.py              # GlobTool — file pattern search
-│   │   ├── bash.py              # BashTool — shell commands (PowerShell/bash); imports SSRF markers from policy.py
+│   │   ├── bash.py              # BashTool — shell commands (PowerShell/bash); policy-aware SSRF + read_only checks
 │   │   ├── ask_user.py          # AskUserTool — pause agent and prompt human for input
-│   │   ├── git.py               # GitStatusTool, GitDiffTool, GitCommitTool — structured git interface
+│   │   ├── git.py               # GitStatusTool, GitDiffTool, GitCommitTool — structured git interface; policy-aware
 │   │   ├── edit.py              # EditTool — exact-string file editing with unique-match guard
 │   │   ├── grep.py              # GrepTool — regex file search with context lines
 │   │   ├── web_fetch.py         # WebFetchTool — fetch a URL, strip HTML, SSRF protection
 │   │   ├── patch.py             # PatchPreviewTool — unified diff preview without writing
+│   │   ├── apply_patch.py       # ApplyPatchTool — apply a unified diff patch via git apply
+│   │   ├── find_definition.py   # FindDefinitionTool — AST-based symbol lookup across .py files
+│   │   ├── todo.py              # TodoWriteTool, TodoReadTool — session-scoped todo list
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
 │   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
 │   │   ├── task.py              # ReadTaskTool, UpdateTaskTool — long-running task progress
 │   │   ├── web_search.py        # WebSearchTool — DuckDuckGo web search via ddgs, no API key
-│   │   └── __init__.py          # default_registry() factory
-│   ├── plugins.py               # Plugin manifest loader — discovers Tool subclasses from plugins.json
+│   │   └── __init__.py          # default_registry() factory; registers all tools; sets registry.policy
+│   ├── plugins.py               # Plugin manifest loader — tools, hooks, skills, and trust from plugins.json
 │   ├── memory/                  # Persistent memory storage
 │   │   ├── short_term.py        # JSONL conversation history (atomic writes)
 │   │   ├── long_term.py         # Markdown notes store (ranked keyword search)
@@ -127,7 +130,7 @@ mini-minion/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       └── __init__.py
-└── tests/                       # pytest test suite (783 tests, 3 skipped)
+└── tests/                       # pytest test suite (845 tests, 3 skipped)
 ```
 
 ---
@@ -342,9 +345,30 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/resume [agent_id]` | Switch the active agent (e.g. `/resume researcher`); defaults to current agent |
 | `/diagnose` | Check each agent's provider configuration and API key status |
 | `/mcp-reload` | Reconnect all MCP servers and refresh tool adapters in every session |
+| `/mcp-list` | List connected MCP servers and their available tools |
+| `/plan` | Enable read-only mode — agent can reason but not write files or run commands |
+| `/auto` | Disable read-only mode — restore full tool access (write, bash, git commit) |
+| `/providers` | Show LLM provider and model configuration for all configured agents |
 | `/research <message>` | Route the message to Elizabeth (researcher) |
 
 Route-targeted commands work on individual agent sessions. For example, `/research /new` clears only Elizabeth's session.
+
+### Read-only mode (`/plan` / `/auto`)
+
+`/plan` enables **read-only mode** on the active agent's `PermissionPolicy`.  While active, the agent can read files, search code, and reason — but any attempt to write files, run shell commands, or create git commits returns an error message instead.
+
+`/auto` disables read-only mode and restores full tool access.
+
+```
+You: /plan
+Read-only mode enabled for 'main'. ...
+You: write a refactoring plan for src/foo.py
+Ada: [reads files, reasons, proposes plan — does not edit anything]
+You: /auto
+Full tool access restored.
+You: apply the refactoring
+Ada: [edits files, runs tests, commits]
+```
 
 ---
 
@@ -770,6 +794,10 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `EditTool` | `edit` | Edit a file by replacing an exact string match. Requires the `old_string` to appear exactly once in the file (unless `replace_all=True`). Paths outside the workspace root or sensitive system paths are rejected. |
 | `GrepTool` | `grep` | Search files for a regex pattern and return matching lines with filename, line number, and optional context lines. Supports include glob filter, case-insensitive mode, and truncation at `max_results`. `is_read_only=True`. |
 | `PatchPreviewTool` | `patch_preview` | Preview what an `edit` would produce as a unified diff, without applying it. Same `path`/`old_string`/`new_string`/`replace_all` parameters as `EditTool`. Never writes to disk. `is_read_only=True`. |
+| `ApplyPatchTool` | `apply_patch` | Apply a unified diff patch string to one or more files using `git apply`. Supports `check_only=True` for a dry run. Blocked by `read_only_mode`. |
+| `FindDefinitionTool` | `find_definition` | Search `.py` files in the workspace for the definition of a named symbol (function, class, or variable) using Python's `ast` module. Returns `path:lineno: snippet` lines. `is_read_only=True`. |
+| `TodoWriteTool` | `todo_write` | Replace the current session todo list with a new array of items. Pass an empty list to clear. Blocked by `read_only_mode`. |
+| `TodoReadTool` | `todo_read` | Read the current session todo list as a numbered list. `is_read_only=True`. |
 | `WebFetchTool` | `web_fetch` | Fetch a URL and return its text content. Strips HTML tags (skips `<script>`, `<style>`, `<head>`), collapses whitespace, and truncates at `max_chars` (default 8 000). Blocks SSRF targets (AWS metadata, GCP metadata). `is_read_only=True`. |
 | `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `ddgs` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. |
 | `AskUserTool` | `ask_user` | Pause the agent and ask the human operator a question. Returns the human's typed response. When no `ask_user_fn` is provided (headless mode), returns an error instructing the agent to proceed without input. |
@@ -844,7 +872,7 @@ reg = default_registry(
 | `skills` | `SkillRegistry \| None` | `None` | If non-empty, registers the `skill` tool |
 | `tasks_dir` | `Path \| None` | `None` | Task file directory. Required alongside `agent_id` to register task tools. |
 | `agent_id` | `str \| None` | `None` | Agent ID used to build the task file path `{tasks_dir}/{agent_id}.json`. |
-| `policy` | `PermissionPolicy \| None` | `None` | Safety rules injected into all I/O tools (`read`, `write`, `glob`, `edit`, `grep`, `web_fetch`, `patch_preview`). Defaults to `PermissionPolicy.default(workspace=root)` when omitted. |
+| `policy` | `PermissionPolicy \| None` | `None` | Safety rules injected into all I/O tools (`read`, `write`, `glob`, `bash`, `edit`, `grep`, `web_fetch`, `patch_preview`, `apply_patch`, `find_definition`, `todo_write`, git tools). Defaults to `PermissionPolicy.default(workspace=root)` when omitted. Also set as `registry.policy` for `/plan`/`/auto` toggling. |
 | `mcp_manager` | `McpManager \| None` | `None` | If provided, registers `mcp_status`, `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, `get_mcp_prompt`, and one `mcp__<server>__<tool>` adapter per tool exposed by connected MCP servers. |
 | `ask_user_fn` | `Callable[[str], str] \| None` | `None` | Callback for `ask_user` tool. Called with the agent's question; returns the human's response. `None` = headless mode (tool returns an error instead of blocking). |
 
@@ -852,7 +880,7 @@ reg = default_registry(
 
 ### `PermissionPolicy` (`tools/policy.py`)
 
-`PermissionPolicy` is a centralised safety dataclass injected into `EditTool`, `GrepTool`, and `WebFetchTool`. Rather than each tool implementing its own path/URL checks, they all delegate to one policy object.
+`PermissionPolicy` is a centralised safety dataclass injected into all I/O tools. Rather than each tool implementing its own path/URL/command checks, they all delegate to one shared policy object.
 
 ```python
 from mini_minion.tools.policy import PermissionPolicy
@@ -864,9 +892,14 @@ policy = PermissionPolicy.default(workspace=Path.cwd())
 # Custom: extra SSRF domains, no workspace boundary
 policy = PermissionPolicy(ssrf_markers=frozenset({"internal.corp", "169.254.169.254"}))
 
-# Use in a tool
-error = policy.check_path(Path("/etc/passwd"))   # returns error string or None
-error = policy.check_url("http://169.254.169.254/latest/")  # returns error string or None
+# Enable read-only mode (also toggled by /plan and /auto slash commands)
+policy.read_only_mode = True
+
+# Checks (each returns None if allowed, or an error string if denied)
+error = policy.check_path(Path("/etc/passwd"))              # path read check
+error = policy.check_write(Path("/etc/passwd"))             # path write check + read_only_mode
+error = policy.check_url("http://169.254.169.254/latest/")  # URL / SSRF check
+error = policy.check_command("curl 169.254.169.254")        # command / SSRF + read_only check
 ```
 
 `PermissionPolicy.default(workspace)` builds a policy that:
@@ -874,30 +907,40 @@ error = policy.check_url("http://169.254.169.254/latest/")  # returns error stri
 - Rejects sensitive system paths (SSH keys, `.env`, credential files)
 - Blocks known SSRF targets: AWS EC2 metadata (`169.254.169.254`), GCP metadata (`metadata.google.internal`), ECS credentials (`169.254.170.2`), IPv6 EC2 metadata (`fd00:ec2::254`)
 
-`default_registry()` auto-creates a `PermissionPolicy.default(workspace=root)` and injects it into all I/O tools (`read`, `write`, `glob`, `edit`, `grep`, `web_fetch`, `patch_preview`) unless you pass an explicit `policy=` argument. `BashTool` also uses `DEFAULT_SSRF_MARKERS` imported from `policy.py`, so all SSRF checks share a single source of truth.
+`default_registry()` auto-creates a `PermissionPolicy.default(workspace=root)`, injects it into all I/O tools, and also sets `registry.policy = policy` so `/plan` and `/auto` can toggle `read_only_mode` at runtime.
+
+| Method | Used by | Blocks when |
+|---|---|---|
+| `check_path(path)` | ReadTool, GlobTool, GrepTool, FindDefinitionTool | Path is sensitive or outside workspace |
+| `check_write(path)` | WriteTool, EditTool, GitCommitTool | Same as `check_path` + `read_only_mode=True` |
+| `check_url(url)` | WebFetchTool | URL contains an SSRF marker |
+| `check_command(cmd)` | BashTool | Command contains an SSRF marker, or `read_only_mode=True` |
 
 ---
 
 ### Plugin System (`plugins.py`)
 
-The plugin system lets you extend the tool registry with custom `Tool` subclasses loaded from Python files on disk — no changes to mini-minion source required.
+The plugin system lets you extend mini-minion with custom tools, registry hooks, and skills — no source edits required.
 
-**Manifest format** (`~/.mini-minion/plugins.json` or `{workspace}/.mini-minion/plugins.json`):
+**Manifest format** (`~/.mini-minion/plugins.json` or `.mini-minion/plugins.json`):
 
 ```json
 {
+  "trust": "trusted",
   "tools": [
     "/home/user/my-tools/custom_tool.py",
     "~/plugins/another_tool.py"
+  ],
+  "hooks": [
+    "./hooks/logging_hook.py"
+  ],
+  "skills": [
+    "./custom-skills/"
   ]
 }
 ```
 
-Each path points to a Python file that either:
-- Exports a `TOOLS` list of instantiated `Tool` objects (preferred), **or**
-- Contains `Tool` subclasses that are auto-discovered via `inspect.getmembers()`
-
-**Example tool file:**
+**`"tools"` section** — paths to Python files that either export a `TOOLS` list (preferred) or contain auto-discoverable `Tool` subclasses:
 
 ```python
 from mini_minion.tools.base import Tool, ToolSchema
@@ -917,7 +960,24 @@ class MyCustomTool(Tool):
 TOOLS = [MyCustomTool()]
 ```
 
-**Priority:** the project-local manifest (`{workspace}/.mini-minion/plugins.json`) loads after the global manifest (`~/.mini-minion/plugins.json`), so local tools override global ones with the same name.
+**`"hooks"` section** — paths to Python files that expose `BEFORE_HOOKS` and/or `AFTER_HOOKS` lists:
+
+```python
+def log_before(event):   # event is ToolPreExecuteHookEvent
+    print(f"→ {event.name}({event.arguments})")
+
+def log_after(event):    # event is ToolPostExecuteHookEvent
+    print(f"← {event.name} in {event.elapsed_ms}ms ({event.output_chars} chars)")
+
+BEFORE_HOOKS = [log_before]
+AFTER_HOOKS = [log_after]
+```
+
+**`"skills"` section** — directory paths scanned for `SKILL.md` files; discovered skills are merged into the runtime skill registry.
+
+**`"trust"` field** — `"trusted"` (default, your own code) or `"external"` (third-party code). External plugins print a warning at load time; no other runtime effect.
+
+**Priority:** project-local manifest (`.mini-minion/plugins.json`) loads after global (`~/.mini-minion/plugins.json`), so local tools override global ones with the same name.
 
 **Security note:** plugin files are executed with `importlib`. Only add paths to files you trust.
 

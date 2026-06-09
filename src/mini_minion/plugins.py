@@ -1,9 +1,9 @@
 """Local plugin manifest loader.
 
-This module allows users to extend mini-minion with custom tools and registry
-hooks without editing the core package source.  Extension points are declared
-in a ``plugins.json`` manifest file that lives in the user's workspace or in
-the project's ``.mini-minion/`` directory.
+This module allows users to extend mini-minion with custom tools, registry
+hooks, and skills without editing the core package source.  Extension points
+are declared in a ``plugins.json`` manifest file that lives in the user's
+workspace or in the project's ``.mini-minion/`` directory.
 
 Why a file-based manifest?
 ---------------------------
@@ -33,14 +33,23 @@ global tools so a local plugin can override a global one with the same name.
 Example ``plugins.json``::
 
     {
+        "trust": "trusted",
         "tools": [
             "~/.mini-minion/tools/my_grep_tool.py",
             "./tools/project_specific_tool.py"
+        ],
+        "hooks": [
+            "./hooks/logging_hook.py"
+        ],
+        "skills": [
+            "./custom-skills/"
         ]
     }
 
-Each entry in ``"tools"`` is a path to a Python module file.  The module
-must expose its tools in one of two ways:
+``"tools"`` section
+-------------------
+Each entry is a path to a Python module file.  The module must expose its
+tools in one of two ways:
 
 1. **Explicit list** (preferred)::
 
@@ -59,6 +68,30 @@ must expose its tools in one of two ways:
    the loader scans for concrete subclasses of :class:`Tool` (non-abstract,
    instantiable with no constructor arguments) and instantiates them.
 
+``"hooks"`` section
+--------------------
+Each entry is a path to a Python module file.  The module may expose:
+
+- ``BEFORE_HOOKS``: list of callables registered via
+  :meth:`ToolRegistry.add_before_hook`.  Each callable receives a
+  :class:`ToolPreExecuteHookEvent`.
+- ``AFTER_HOOKS``: list of callables registered via
+  :meth:`ToolRegistry.add_after_hook`.  Each callable receives a
+  :class:`ToolPostExecuteHookEvent`.
+
+``"skills"`` section
+---------------------
+Each entry is a path to a directory that contains ``SKILL.md`` files.  The
+loader passes these paths to :func:`~mini_minion.skills.discover_skills` and
+merges any discovered skills into the optional skill registry argument.
+
+``"trust"`` field
+-----------------
+Optional string: ``"trusted"`` (default, for your own plugins) or
+``"external"`` (plugins installed from a third party).  External plugins
+print a warning at load time as a reminder that untrusted code is running.
+The field has no runtime enforcement effect — it is metadata for the user.
+
 Security
 --------
 Only paths explicitly listed in the manifest are imported.  No automatic
@@ -69,9 +102,10 @@ manifest was written on one machine and is used on another.
 Talks to
 --------
 - ``tools/base.py`` — uses :class:`Tool` to identify tool subclasses.
-- ``tools/registry.py`` — calls :meth:`ToolRegistry.register` to add tools.
+- ``tools/registry.py`` — calls :meth:`ToolRegistry.register` + hook methods.
+- ``skills/__init__.py`` — calls :func:`discover_skills` for skill paths.
 - ``minion.py`` — calls :func:`load_plugins` after ``default_registry()``
-  to extend the tool set with user-defined tools.
+  to extend the tool set with user-defined tools, hooks, and skills.
 """
 
 from __future__ import annotations
@@ -83,11 +117,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .skills import SkillRegistry
     from .tools.registry import ToolRegistry
 
 
-def load_plugins(registry: "ToolRegistry", workspace: Path) -> int:
-    """Load plugins from manifest files and register their tools.
+def load_plugins(
+    registry: "ToolRegistry",
+    workspace: Path,
+    skills: "SkillRegistry | None" = None,
+) -> int:
+    """Load plugins from manifest files and register their tools, hooks, and skills.
 
     Searches two manifest locations (in order):
 
@@ -98,8 +137,10 @@ def load_plugins(registry: "ToolRegistry", workspace: Path) -> int:
     with the same name as a global plugin silently overrides it.
 
     Args:
-        registry: The :class:`ToolRegistry` to register loaded tools into.
+        registry: The :class:`ToolRegistry` to register loaded tools and hooks into.
         workspace: The user's workspace root (typically ``~/.mini-minion``).
+        skills:    Optional mutable :data:`SkillRegistry` dict.  When provided,
+                   skills discovered from manifest ``"skills"`` paths are merged in.
 
     Returns:
         int: Total number of tools registered from all manifests.
@@ -113,16 +154,21 @@ def load_plugins(registry: "ToolRegistry", workspace: Path) -> int:
     for manifest_path in manifest_paths:
         if not manifest_path.exists():
             continue
-        total += _load_manifest(registry, manifest_path)
+        total += _load_manifest(registry, manifest_path, skills)
     return total
 
 
-def _load_manifest(registry: "ToolRegistry", manifest_path: Path) -> int:
-    """Load one manifest file and register the tools it declares.
+def _load_manifest(
+    registry: "ToolRegistry",
+    manifest_path: Path,
+    skills: "SkillRegistry | None" = None,
+) -> int:
+    """Load one manifest file and register the tools, hooks, and skills it declares.
 
     Args:
-        registry:      The tool registry to register tools into.
+        registry:      The tool registry to register tools and hooks into.
         manifest_path: Absolute path to the ``plugins.json`` file.
+        skills:        Optional skill registry to merge discovered skills into.
 
     Returns:
         int: Number of tools registered from this manifest.
@@ -137,7 +183,17 @@ def _load_manifest(registry: "ToolRegistry", manifest_path: Path) -> int:
         print(f"  [plugins] Warning: {manifest_path} must be a JSON object.")
         return 0
 
+    # Trust metadata: warn when loading external plugins so the user is aware.
+    trust = raw.get("trust", "trusted")
+    if trust == "external":
+        print(
+            f"  [plugins] Warning: loading EXTERNAL plugin manifest {manifest_path}. "
+            "Only load external plugins from sources you trust."
+        )
+
     count = 0
+
+    # --- tools section ---
     for tool_path_str in raw.get("tools", []):
         # Resolve relative paths against the manifest file's directory, then
         # expand ~ for home-directory paths.
@@ -155,7 +211,82 @@ def _load_manifest(registry: "ToolRegistry", manifest_path: Path) -> int:
             count += 1
             print(f"  [plugins] Registered tool '{tool.schema.name}' from {tool_path.name}")
 
+    # --- hooks section ---
+    for hook_path_str in raw.get("hooks", []):
+        hook_path = Path(hook_path_str).expanduser()
+        if not hook_path.is_absolute():
+            hook_path = (manifest_path.parent / hook_path).resolve()
+
+        _load_hook_module(registry, hook_path)
+
+    # --- skills section ---
+    if skills is not None:
+        _skill_paths: list[Path] = []
+        for skill_path_str in raw.get("skills", []):
+            skill_path = Path(skill_path_str).expanduser()
+            if not skill_path.is_absolute():
+                skill_path = (manifest_path.parent / skill_path).resolve()
+            _skill_paths.append(skill_path)
+
+        if _skill_paths:
+            from .skills import discover_skills
+            extra = discover_skills(_skill_paths)
+            merged = 0
+            for name, info in extra.items():
+                skills[name] = info
+                merged += 1
+            if merged:
+                print(f"  [plugins] Loaded {merged} skill(s) from manifest skill paths.")
+
     return count
+
+
+def _load_hook_module(registry: "ToolRegistry", module_path: Path) -> None:
+    """Dynamically import a Python file and register its hooks into the registry.
+
+    Looks for ``BEFORE_HOOKS`` and ``AFTER_HOOKS`` list attributes in the module.
+    Each callable in those lists is registered via :meth:`ToolRegistry.add_before_hook`
+    and :meth:`ToolRegistry.add_after_hook` respectively.
+
+    Args:
+        registry:    The tool registry to add hooks to.
+        module_path: Absolute path to the ``.py`` hook module file.
+    """
+    if not module_path.exists():
+        print(f"  [plugins] Warning: hook module not found: {module_path}")
+        return
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            f"mini_minion_hook_{module_path.stem}",
+            module_path,
+        )
+        if spec is None or spec.loader is None:
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception as exc:
+        print(f"  [plugins] Warning: could not import hook module {module_path}: {exc}")
+        return
+
+    before_count = 0
+    after_count = 0
+
+    for hook in getattr(module, "BEFORE_HOOKS", []):
+        registry.add_before_hook(hook)
+        before_count += 1
+
+    for hook in getattr(module, "AFTER_HOOKS", []):
+        registry.add_after_hook(hook)
+        after_count += 1
+
+    if before_count or after_count:
+        print(
+            f"  [plugins] Registered {before_count} before-hook(s) and "
+            f"{after_count} after-hook(s) from {module_path.name}"
+        )
+    else:
+        print(f"  [plugins] Warning: no hooks (BEFORE_HOOKS/AFTER_HOOKS) found in {module_path}")
 
 
 def _load_tool_module(module_path: Path) -> list:

@@ -83,7 +83,8 @@ class WriteTool(Tool):
         """
         path = pathlib.Path(str(kwargs["path"]))
         if self._policy is not None:
-            error = self._policy.check_path(path)
+            # check_write: covers sensitive paths, workspace boundary, AND read_only_mode.
+            error = self._policy.check_write(path)
             if error:
                 return error
         else:

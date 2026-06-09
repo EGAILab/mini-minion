@@ -114,8 +114,8 @@ class EditTool(Tool):
         new_string = str(kwargs["new_string"])
         replace_all = bool(kwargs.get("replace_all", False))
 
-        # Check path safety before touching the filesystem.
-        error = self._policy.check_path(path)
+        # check_write: covers sensitive paths, workspace boundary, AND read_only_mode.
+        error = self._policy.check_write(path)
         if error:
             return error
 

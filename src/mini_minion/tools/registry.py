@@ -24,14 +24,20 @@ Talks to
   available, and ``registry.execute()`` to run tool calls.
 - ``__init__.py`` — the ``default_registry()`` factory creates and populates
   a registry with all standard tools.
+- ``commands.py`` — the ``/plan`` and ``/auto`` commands read and toggle
+  ``registry.policy.read_only_mode`` to switch the agent between plan and auto modes.
 """
 
 from __future__ import annotations
 
 import time as _time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from .base import Tool
+
+if TYPE_CHECKING:
+    from .policy import PermissionPolicy
 
 
 class ToolRegistry:
@@ -71,6 +77,10 @@ class ToolRegistry:
         # Each callable receives a ToolPreExecuteHookEvent / ToolPostExecuteHookEvent.
         self._before_hooks: list[Callable] = []
         self._after_hooks: list[Callable] = []
+        # Shared PermissionPolicy for this registry.  Set by default_registry() after
+        # construction so /plan and /auto can toggle policy.read_only_mode at runtime.
+        # None until default_registry() assigns it.
+        self.policy: "PermissionPolicy | None" = None
 
     def add_before_hook(self, hook: Callable) -> None:
         """Register a hook to run before every tool execution.
