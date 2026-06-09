@@ -177,6 +177,7 @@ def test_bash_tool_cwd_is_used(tmp_path):
 
 from pathlib import Path as _Path
 from mini_minion.tools.base import _is_sensitive
+from mini_minion.tools.policy import PermissionPolicy
 
 
 class TestSensitivePaths:
@@ -233,3 +234,85 @@ class TestSSRF:
         result = tool.execute(command="curl https://example.com")
         assert "blocked" not in result.lower()
         assert "cancelled" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# IMP-02: PermissionPolicy threading into legacy tools
+# ---------------------------------------------------------------------------
+
+
+class TestPolicyThreading:
+    """Read/Write/GlobTool accept an optional policy kwarg and use it for
+    path safety checks when provided, keeping existing root-only callers working.
+    """
+
+    def test_read_with_policy_blocks_outside_root(self, tmp_path):
+        policy = PermissionPolicy(workspace=tmp_path / "project")
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+
+        result = ReadTool(policy=policy).execute(path=str(outside))
+
+        assert "outside the workspace root" in result
+
+    def test_read_without_policy_still_works(self, tmp_path):
+        f = tmp_path / "file.txt"
+        f.write_text("hello", encoding="utf-8")
+
+        result = ReadTool(root=tmp_path).execute(path=str(f))
+
+        assert "1: hello" in result
+
+    def test_write_with_policy_blocks_outside_root(self, tmp_path):
+        policy = PermissionPolicy(workspace=tmp_path / "project")
+        outside = tmp_path / "evil.txt"
+
+        result = WriteTool(policy=policy).execute(path=str(outside), content="bad")
+
+        assert "outside the workspace root" in result
+        assert not outside.exists()
+
+    def test_write_without_policy_still_works(self, tmp_path):
+        target = tmp_path / "out.txt"
+
+        result = WriteTool(root=tmp_path).execute(path=str(target), content="ok")
+
+        assert "Wrote" in result
+
+    def test_glob_with_policy_blocks_outside_root(self, tmp_path):
+        project = tmp_path / "project"
+        project.mkdir()
+        outside = tmp_path / "other"
+        outside.mkdir()
+        policy = PermissionPolicy(workspace=project)
+
+        result = GlobTool(project, policy=policy).execute(pattern="*", path=str(outside))
+
+        assert "outside the workspace root" in result
+
+    def test_glob_without_policy_still_works(self, tmp_path):
+        root = tmp_path / "project"
+        root.mkdir()
+        (root / "a.py").write_text("", encoding="utf-8")
+
+        result = GlobTool(root).execute(pattern="*.py", path=str(root))
+
+        assert "a.py" in result
+
+    def test_read_policy_blocks_sensitive_path(self, tmp_path):
+        policy = PermissionPolicy.default(workspace=tmp_path)
+
+        result = ReadTool(policy=policy).execute(
+            path=str(_Path("~/.ssh/id_rsa").expanduser())
+        )
+
+        assert "protected" in result.lower() or "permitted" in result.lower()
+
+    def test_write_policy_blocks_sensitive_path(self, tmp_path):
+        policy = PermissionPolicy.default(workspace=tmp_path)
+
+        result = WriteTool(policy=policy).execute(
+            path=str(_Path("~/.ssh/id_rsa").expanduser()), content="evil"
+        )
+
+        assert "protected" in result.lower() or "permitted" in result.lower()

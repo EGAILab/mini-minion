@@ -36,12 +36,15 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..mcp.client import McpClientManager
 
+from .ask_user import AskUserTool
 from .base import Tool, ToolSchema
 from .bash import BashTool
 from .edit import EditTool
+from .git import GitCommitTool, GitDiffTool, GitStatusTool
 from .glob import GlobTool
 from .grep import GrepTool
 from .memory import SaveMemoryTool, SearchMemoryTool
+from .patch import PatchPreviewTool
 from .policy import PermissionPolicy
 from .read import ReadTool
 from .registry import ToolRegistry
@@ -61,6 +64,7 @@ def default_registry(
     agent_id: str | None = None,
     mcp_manager: "McpClientManager | None" = None,
     policy: "PermissionPolicy | None" = None,
+    ask_user_fn: "Callable[[str], str] | None" = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` with all standard tools registered.
 
@@ -80,10 +84,13 @@ def default_registry(
                      ``{tasks_dir}/{agent_id}.json``.
         mcp_manager: If provided, registers MCP status/resource tools and
                      one :class:`McpToolAdapter` per connected MCP tool.
-        policy:      Optional :class:`PermissionPolicy` injected into edit,
-                     grep, and web_fetch tools.  When ``None`` a default
-                     policy is built from ``root`` (so path restrictions still
-                     apply even when the caller omits this argument).
+        policy:      Optional :class:`PermissionPolicy` injected into all I/O
+                     tools (read, write, glob, edit, grep, web_fetch).  When
+                     ``None`` a default policy is built from ``root``.
+        ask_user_fn: Optional callable for :class:`AskUserTool`.  Called with
+                     the agent's question string; returns the human's answer.
+                     ``None`` registers the tool in headless mode (returns an
+                     error when the agent calls it).
 
     Returns:
         :class:`ToolRegistry` populated and ready to pass to :func:`run_turn`.
@@ -96,18 +103,29 @@ def default_registry(
     registry = ToolRegistry()
 
     # Core file-system and shell tools — always registered.
+    # Legacy tools (read/write/glob) now accept an optional policy so their
+    # path safety checks stay in sync with the centralised PermissionPolicy.
     for tool in [
-        ReadTool(root),
-        WriteTool(root),
-        GlobTool(root),
+        ReadTool(root, policy=_policy),
+        WriteTool(root, policy=_policy),
+        GlobTool(root, policy=_policy),
         BashTool(confirm=bash_confirm, cwd=root),
         # WebSearchTool has no external dependencies at construction time; it
         # fails gracefully at execute() if duckduckgo-search is not installed.
         WebSearchTool(),
-        # New coding-agent tools — use PermissionPolicy for path/URL checks.
+        # Coding-agent tools — use PermissionPolicy for path/URL checks.
         EditTool(_policy),
         GrepTool(_policy),
         WebFetchTool(_policy),
+        PatchPreviewTool(_policy),
+        # Human-interaction tool — always registered; headless mode (ask_user_fn=None)
+        # returns an informative error rather than hanging.
+        AskUserTool(ask_user_fn),
+        # Git tools — structured git interface without needing a shell.
+        # GitCommitTool reuses bash_confirm so the user approves commits the same way.
+        GitStatusTool(cwd=root),
+        GitDiffTool(cwd=root),
+        GitCommitTool(cwd=root, confirm=bash_confirm),
     ]:
         registry.register(tool)
 
@@ -157,8 +175,13 @@ __all__ = [
     "ToolSchema",
     "ToolRegistry",
     "PermissionPolicy",
+    "AskUserTool",
     "EditTool",
+    "GitCommitTool",
+    "GitDiffTool",
+    "GitStatusTool",
     "GrepTool",
+    "PatchPreviewTool",
     "WebFetchTool",
     "SkillTool",
     "ReadTaskTool",

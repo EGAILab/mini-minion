@@ -29,6 +29,8 @@ Safety and limitations
 Talks to
 --------
 - ``base.py`` — extends :class:`Tool`, returns :class:`ToolSchema`.
+- ``policy.py`` — imports :data:`DEFAULT_SSRF_MARKERS` so the SSRF block list
+  stays in sync with :class:`PermissionPolicy` used by other tools.
 - ``registry.py`` — registered via ``default_registry()`` in ``__init__.py``.
 - Python's ``subprocess`` module for process execution.
 - Python's ``platform`` module to detect Windows vs. Unix.
@@ -42,21 +44,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .base import Tool, ToolSchema
+from .policy import DEFAULT_SSRF_MARKERS
 
 # Detect once at import time; doesn't change during execution.
 _IS_WINDOWS = platform.system() == "Windows"
 
 _DEFAULT_TIMEOUT = 30  # seconds
-
-# Known cloud instance metadata endpoints and link-local addresses.
-# String scan catches the most common attack vectors. Not exhaustive —
-# a numeric IP like 0xa9fea9fe would bypass it. See docs for limitations.
-_SSRF_MARKERS = frozenset({
-    "169.254.169.254",          # AWS/GCP/Azure instance metadata
-    "metadata.google.internal", # GCP metadata DNS alias
-    "169.254.170.2",            # ECS task metadata endpoint
-    "fd00:ec2::254",            # AWS IMDSv2 IPv6
-})
 
 # The description is platform-specific so the model uses the right shell syntax.
 _DESCRIPTION = (
@@ -148,7 +141,7 @@ class BashTool(Tool):
         timeout = int(kwargs.get("timeout") or _DEFAULT_TIMEOUT)
 
         # SSRF guard: block requests to cloud metadata endpoints.
-        if any(marker in command for marker in _SSRF_MARKERS):
+        if any(marker in command for marker in DEFAULT_SSRF_MARKERS):
             return (
                 "Error: command blocked — requests to cloud instance metadata "
                 "endpoints (169.254.169.254 and equivalents) are not permitted."

@@ -17,6 +17,9 @@ Design decisions
 Talks to
 --------
 - ``base.py`` — extends :class:`Tool`, returns :class:`ToolSchema`.
+- ``policy.py`` — accepts an optional :class:`PermissionPolicy` to centralise
+  path safety checks.  Falls back to ``_within`` + ``_is_sensitive`` when no
+  policy is supplied.
 - ``registry.py`` — registered via ``default_registry()`` in ``__init__.py``.
 """
 
@@ -26,6 +29,7 @@ import pathlib
 from pathlib import Path
 
 from .base import Tool, ToolSchema, _is_sensitive, _within
+from .policy import PermissionPolicy
 
 
 class WriteTool(Tool):
@@ -35,9 +39,12 @@ class WriteTool(Tool):
     parent directories don't exist, they are created automatically.
     """
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(self, root: Path | None = None, *, policy: PermissionPolicy | None = None) -> None:
         # root=None means unrestricted; set to the project directory at startup.
         self._root = root.resolve() if root else None
+        # When a policy is provided, check_path() replaces the inline checks.
+        # policy=None keeps legacy behaviour for callers that pass only root.
+        self._policy = policy
 
     @property
     def schema(self) -> ToolSchema:
@@ -75,13 +82,18 @@ class WriteTool(Tool):
                 On error: a human-readable error message.
         """
         path = pathlib.Path(str(kwargs["path"]))
-        if _is_sensitive(path):
-            return (
-                f"Error: '{path}' is a protected system path and cannot be written. "
-                "Writing to credential files and secret directories is not permitted."
-            )
-        if self._root and not _within(path, self._root):
-            return f"Error: '{path}' is outside the workspace root '{self._root}'"
+        if self._policy is not None:
+            error = self._policy.check_path(path)
+            if error:
+                return error
+        else:
+            if _is_sensitive(path):
+                return (
+                    f"Error: '{path}' is a protected system path and cannot be written. "
+                    "Writing to credential files and secret directories is not permitted."
+                )
+            if self._root and not _within(path, self._root):
+                return f"Error: '{path}' is outside the workspace root '{self._root}'"
         content = str(kwargs["content"])
         try:
             # Create all missing parent directories (equivalent to `mkdir -p`).

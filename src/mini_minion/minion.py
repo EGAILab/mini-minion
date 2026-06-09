@@ -129,12 +129,17 @@ def main() -> None:
     # --- Console callbacks (the only two places that call print/input) ---
 
     def _console_confirm(command: str) -> bool:
-        """Called by BashTool before running a shell command.
+        """Called by BashTool and GitCommitTool before running a command.
 
         Prints the command, prompts for y/N, returns True only on "y".
         """
         print(f"\n[bash] {command}")
         return input("Run this command? [y/N]: ").strip().lower() == "y"
+
+    def _console_ask_user(question: str) -> str:
+        """Called by AskUserTool when the agent needs a human response."""
+        print(f"\n[ask_user] {question}")
+        return input("Your answer: ").strip()
 
     # --- MCP setup — one shared manager for all agents ---
     # The manager owns a background asyncio loop and keeps sessions open for the
@@ -168,6 +173,7 @@ def main() -> None:
             tasks_dir=_tasks_dir,
             agent_id=agent_id,
             mcp_manager=mcp_manager,
+            ask_user_fn=_console_ask_user,
         )
         # Load user-defined tools from plugins.json manifests.
         # Done after default_registry() so plugins can override built-in tools

@@ -19,6 +19,10 @@ Design decisions
 Talks to
 --------
 - ``base.py`` — extends :class:`Tool`, returns :class:`ToolSchema`.
+- ``policy.py`` — accepts an optional :class:`PermissionPolicy` to centralise
+  path safety checks (sensitive-path and workspace-boundary).  Falls back to
+  the ``_within`` + ``_is_sensitive`` checks from ``base.py`` when no policy
+  is supplied, so existing callers that pass only ``root`` keep working.
 - ``registry.py`` — registered via ``default_registry()`` in ``__init__.py``.
 """
 
@@ -29,6 +33,7 @@ import pathlib
 from pathlib import Path
 
 from .base import Tool, ToolSchema, _is_sensitive, _within
+from .policy import PermissionPolicy
 
 _DEFAULT_LIMIT = 200   # maximum lines returned per call if no limit is specified
 _MAX_BYTES = 50 * 1024  # stop streaming beyond 50 KB to bound memory and context usage
@@ -51,9 +56,13 @@ class ReadTool(Tool):
     listing, or an error message.
     """
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(self, root: Path | None = None, *, policy: PermissionPolicy | None = None) -> None:
         # root=None means unrestricted; set to the project directory at startup.
         self._root = root.resolve() if root else None
+        # When a policy is provided, check_path() replaces the inline checks below.
+        # policy=None keeps the legacy _within + _is_sensitive behaviour so callers
+        # that pass only root continue to work without changes.
+        self._policy = policy
 
     @property
     def schema(self) -> ToolSchema:
@@ -98,15 +107,20 @@ class ReadTool(Tool):
                 On error: a human-readable error message.
         """
         path = pathlib.Path(str(kwargs["path"]))
-        # Sensitive-path check runs before workspace-root check so it cannot
-        # be bypassed by passing root=None.
-        if _is_sensitive(path):
-            return (
-                f"Error: '{path}' is a protected system path and cannot be read. "
-                "Access to credential files and secret directories is not permitted."
-            )
-        if self._root and not _within(path, self._root):
-            return f"Error: '{path}' is outside the workspace root '{self._root}'"
+        if self._policy is not None:
+            error = self._policy.check_path(path)
+            if error:
+                return error
+        else:
+            # Legacy path: sensitive-path check runs before workspace-root check
+            # so it cannot be bypassed by passing root=None.
+            if _is_sensitive(path):
+                return (
+                    f"Error: '{path}' is a protected system path and cannot be read. "
+                    "Access to credential files and secret directories is not permitted."
+                )
+            if self._root and not _within(path, self._root):
+                return f"Error: '{path}' is outside the workspace root '{self._root}'"
 
         # Clamp offset and limit to at least 1 to avoid nonsensical values.
         offset = max(1, int(kwargs.get("offset") or 1))

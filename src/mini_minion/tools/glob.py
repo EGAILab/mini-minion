@@ -24,6 +24,9 @@ Design decisions
 Talks to
 --------
 - ``base.py`` — extends :class:`Tool`, returns :class:`ToolSchema`.
+- ``policy.py`` — accepts an optional :class:`PermissionPolicy` to centralise
+  the workspace-boundary check on the explicit ``path`` parameter.  Falls back
+  to the ``_within`` check from ``base.py`` when no policy is supplied.
 - ``registry.py`` — registered via ``default_registry()`` in ``__init__.py``.
 """
 
@@ -34,6 +37,7 @@ import os
 from pathlib import Path
 
 from .base import Tool, ToolSchema, _within
+from .policy import PermissionPolicy
 
 _MAX_RESULTS = 200  # cap to avoid flooding the context window with thousands of paths
 # Directories to exclude from results — traversed by glob but noisy and rarely useful.
@@ -47,10 +51,14 @@ class GlobTool(Tool):
     Results are sorted newest-first by modification time.
     """
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(self, root: Path | None = None, *, policy: PermissionPolicy | None = None) -> None:
         # root is the workspace boundary and the default search base.
         # root=None means unrestricted, defaulting search base to cwd.
         self._root = root.resolve() if root else None
+        # When a policy is provided, check_path() replaces the inline _within
+        # check on the explicit path parameter.  self._root is still used as the
+        # default search root when no path is given.
+        self._policy = policy
 
     @property
     def schema(self) -> ToolSchema:
@@ -93,7 +101,11 @@ class GlobTool(Tool):
         pattern = str(kwargs["pattern"])
         if kwargs.get("path"):
             root = Path(str(kwargs["path"]))
-            if self._root and not _within(root, self._root):
+            if self._policy is not None:
+                error = self._policy.check_path(root)
+                if error:
+                    return error
+            elif self._root and not _within(root, self._root):
                 return f"Error: '{root}' is outside the workspace root '{self._root}'"
         else:
             # Default to workspace root when set; fall back to cwd otherwise.

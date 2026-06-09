@@ -105,10 +105,13 @@ mini-minion/
 │   │   ├── read.py              # ReadTool — file/directory reading with pagination
 │   │   ├── write.py             # WriteTool — file writing
 │   │   ├── glob.py              # GlobTool — file pattern search
-│   │   ├── bash.py              # BashTool — shell commands (PowerShell/bash)
+│   │   ├── bash.py              # BashTool — shell commands (PowerShell/bash); imports SSRF markers from policy.py
+│   │   ├── ask_user.py          # AskUserTool — pause agent and prompt human for input
+│   │   ├── git.py               # GitStatusTool, GitDiffTool, GitCommitTool — structured git interface
 │   │   ├── edit.py              # EditTool — exact-string file editing with unique-match guard
 │   │   ├── grep.py              # GrepTool — regex file search with context lines
 │   │   ├── web_fetch.py         # WebFetchTool — fetch a URL, strip HTML, SSRF protection
+│   │   ├── patch.py             # PatchPreviewTool — unified diff preview without writing
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
 │   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
@@ -124,7 +127,7 @@ mini-minion/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       └── __init__.py
-└── tests/                       # pytest test suite (737 tests, 3 skipped)
+└── tests/                       # pytest test suite (783 tests, 3 skipped)
 ```
 
 ---
@@ -766,8 +769,13 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `UpdateTaskTool` | `update_task` | Create a new task (goal + steps) or update an existing one (step status, notes, context, or clear). |
 | `EditTool` | `edit` | Edit a file by replacing an exact string match. Requires the `old_string` to appear exactly once in the file (unless `replace_all=True`). Paths outside the workspace root or sensitive system paths are rejected. |
 | `GrepTool` | `grep` | Search files for a regex pattern and return matching lines with filename, line number, and optional context lines. Supports include glob filter, case-insensitive mode, and truncation at `max_results`. `is_read_only=True`. |
+| `PatchPreviewTool` | `patch_preview` | Preview what an `edit` would produce as a unified diff, without applying it. Same `path`/`old_string`/`new_string`/`replace_all` parameters as `EditTool`. Never writes to disk. `is_read_only=True`. |
 | `WebFetchTool` | `web_fetch` | Fetch a URL and return its text content. Strips HTML tags (skips `<script>`, `<style>`, `<head>`), collapses whitespace, and truncates at `max_chars` (default 8 000). Blocks SSRF targets (AWS metadata, GCP metadata). `is_read_only=True`. |
 | `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `ddgs` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. |
+| `AskUserTool` | `ask_user` | Pause the agent and ask the human operator a question. Returns the human's typed response. When no `ask_user_fn` is provided (headless mode), returns an error instructing the agent to proceed without input. |
+| `GitStatusTool` | `git_status` | Show git working-tree status (`git status --short --branch`): branch name, staged, modified, and untracked files. `is_read_only=True`. |
+| `GitDiffTool` | `git_diff` | Show a unified diff of changes. Optional `staged=true` for staged changes; optional `path` to limit to a file. `is_read_only=True`. |
+| `GitCommitTool` | `git_commit` | Stage files (optional `files` list) and create a git commit with the given `message`. Calls the `bash_confirm` callback before executing, same as `BashTool`. |
 | `McpStatusTool` | `mcp_status` | List all configured MCP servers and their connection status. |
 | `ListMcpResourcesTool` | `list_mcp_resources` | List resources available on a connected MCP server. |
 | `ReadMcpResourceTool` | `read_mcp_resource` | Read a specific resource from a connected MCP server. Output capped at 8 000 chars. |
@@ -836,8 +844,9 @@ reg = default_registry(
 | `skills` | `SkillRegistry \| None` | `None` | If non-empty, registers the `skill` tool |
 | `tasks_dir` | `Path \| None` | `None` | Task file directory. Required alongside `agent_id` to register task tools. |
 | `agent_id` | `str \| None` | `None` | Agent ID used to build the task file path `{tasks_dir}/{agent_id}.json`. |
-| `policy` | `PermissionPolicy \| None` | `None` | Safety rules injected into `edit`, `grep`, and `web_fetch`. Defaults to `PermissionPolicy.default(workspace=root)` when omitted. |
+| `policy` | `PermissionPolicy \| None` | `None` | Safety rules injected into all I/O tools (`read`, `write`, `glob`, `edit`, `grep`, `web_fetch`, `patch_preview`). Defaults to `PermissionPolicy.default(workspace=root)` when omitted. |
 | `mcp_manager` | `McpManager \| None` | `None` | If provided, registers `mcp_status`, `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, `get_mcp_prompt`, and one `mcp__<server>__<tool>` adapter per tool exposed by connected MCP servers. |
+| `ask_user_fn` | `Callable[[str], str] \| None` | `None` | Callback for `ask_user` tool. Called with the agent's question; returns the human's response. `None` = headless mode (tool returns an error instead of blocking). |
 
 ---
 
@@ -865,7 +874,7 @@ error = policy.check_url("http://169.254.169.254/latest/")  # returns error stri
 - Rejects sensitive system paths (SSH keys, `.env`, credential files)
 - Blocks known SSRF targets: AWS EC2 metadata (`169.254.169.254`), GCP metadata (`metadata.google.internal`), ECS credentials (`169.254.170.2`), IPv6 EC2 metadata (`fd00:ec2::254`)
 
-`default_registry()` auto-creates a `PermissionPolicy.default(workspace=root)` and injects it into `edit`, `grep`, and `web_fetch` unless you pass an explicit `policy=` argument.
+`default_registry()` auto-creates a `PermissionPolicy.default(workspace=root)` and injects it into all I/O tools (`read`, `write`, `glob`, `edit`, `grep`, `web_fetch`, `patch_preview`) unless you pass an explicit `policy=` argument. `BashTool` also uses `DEFAULT_SSRF_MARKERS` imported from `policy.py`, so all SSRF checks share a single source of truth.
 
 ---
 
@@ -1196,7 +1205,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **737 cases** across all modules (737 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
+The test suite covers **783 cases** across all modules (783 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
 
 ```bash
 uv add anthropic

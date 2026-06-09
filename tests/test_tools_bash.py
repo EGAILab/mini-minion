@@ -76,3 +76,15 @@ def test_bash_schema_description_matches_os():
         assert "powershell" in desc
     else:
         assert "bash" in desc
+
+
+def test_bash_ssrf_markers_are_policy_markers():
+    """BashTool must import DEFAULT_SSRF_MARKERS from policy, not define its own.
+
+    This ensures the SSRF block list cannot drift between bash.py and policy.py.
+    Importing the same object (``is``) rather than just equal values (``==``)
+    proves there is a single source of truth.
+    """
+    from mini_minion.tools.bash import DEFAULT_SSRF_MARKERS as bash_markers
+    from mini_minion.tools.policy import DEFAULT_SSRF_MARKERS as policy_markers
+    assert bash_markers is policy_markers
