@@ -18,6 +18,8 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
   - [providers](#providers)
   - [agents](#agents)
   - [tools](#tools)
+  - [PermissionPolicy](#permissionpolicy-toolspolicypy)
+  - [Plugin System](#plugin-system-pluginspy)
   - [skills](#skills)
   - [memory](#memory)
   - [session](#session)
@@ -98,17 +100,22 @@ mini-minion/
 │   │   └── __init__.py          # discover_skills(), format_skills_prompt(), SkillInfo
 │   ├── tools/                   # Executable tools for agents
 │   │   ├── base.py              # Tool ABC, ToolSchema, _within() path guard
-│   │   ├── registry.py          # ToolRegistry — dispatch and schema export
+│   │   ├── policy.py            # PermissionPolicy — centralised path/URL safety rules
+│   │   ├── registry.py          # ToolRegistry — dispatch, schema export, hook support
 │   │   ├── read.py              # ReadTool — file/directory reading with pagination
 │   │   ├── write.py             # WriteTool — file writing
 │   │   ├── glob.py              # GlobTool — file pattern search
 │   │   ├── bash.py              # BashTool — shell commands (PowerShell/bash)
+│   │   ├── edit.py              # EditTool — exact-string file editing with unique-match guard
+│   │   ├── grep.py              # GrepTool — regex file search with context lines
+│   │   ├── web_fetch.py         # WebFetchTool — fetch a URL, strip HTML, SSRF protection
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
-│   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool
+│   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
 │   │   ├── task.py              # ReadTaskTool, UpdateTaskTool — long-running task progress
 │   │   ├── web_search.py        # WebSearchTool — DuckDuckGo web search via ddgs, no API key
 │   │   └── __init__.py          # default_registry() factory
+│   ├── plugins.py               # Plugin manifest loader — discovers Tool subclasses from plugins.json
 │   ├── memory/                  # Persistent memory storage
 │   │   ├── short_term.py        # JSONL conversation history (atomic writes)
 │   │   ├── long_term.py         # Markdown notes store (ranked keyword search)
@@ -117,7 +124,7 @@ mini-minion/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       └── __init__.py
-└── tests/                       # pytest test suite (668 tests, 3 skipped)
+└── tests/                       # pytest test suite (737 tests, 3 skipped)
 ```
 
 ---
@@ -328,9 +335,10 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/reset` | Alias for `/new` |
 | `/compact` | Force immediate context compaction for all agents |
 | `/status` | Show session metadata (turn counts, last active) for each agent |
-| `/attach <path>` | Stage a local file (image) as an attachment for the next message |
-| `/attachments` | List currently staged attachments |
-| `/clear-attachments` | Remove all staged attachments without sending |
+| `/sessions` | List all agent sessions with turn counts and last-active timestamps |
+| `/resume [agent_id]` | Switch the active agent (e.g. `/resume researcher`); defaults to current agent |
+| `/diagnose` | Check each agent's provider configuration and API key status |
+| `/mcp-reload` | Reconnect all MCP servers and refresh tool adapters in every session |
 | `/research <message>` | Route the message to Elizabeth (researcher) |
 
 Route-targeted commands work on individual agent sessions. For example, `/research /new` clears only Elizabeth's session.
@@ -394,7 +402,7 @@ mini-minion supports the [Model Context Protocol](https://modelcontextprotocol.i
 - At startup, mini-minion connects to each configured MCP server.
 - Tools exposed by MCP servers are registered in the tool registry as `mcp__<server>__<tool>` (e.g. `mcp__playwright__browser_navigate`).
 - The agents can call MCP tools like any built-in tool.
-- Three built-in management tools are always registered when MCP is configured: `mcp_status`, `list_mcp_resources`, and `read_mcp_resource`.
+- Five built-in management tools are always registered when MCP is configured: `mcp_status`, `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, and `get_mcp_prompt`.
 - `${VAR}` references in `args`, `env`, `headers`, and `url` are expanded from environment variables at startup.
 
 Use the `/status` command or ask the agent to call `mcp_status` to check server connectivity.
@@ -725,6 +733,24 @@ registry.execute("tool_name", {"arg": "value"})  # str
 
 `definitions` returns the OpenAI `tools` array ready to pass to any provider. Registering a tool with a name that already exists overwrites it silently.
 
+**Hook support:** plugins can attach callbacks that run before or after every tool execution:
+
+```python
+from mini_minion.agents.events import ToolPreExecuteHookEvent, ToolPostExecuteHookEvent
+
+registry.add_before_hook(lambda event: print(f"→ {event.name}({event.arguments})"))
+registry.add_after_hook(lambda event: print(f"← {event.name} in {event.elapsed_ms}ms"))
+```
+
+`add_before_hook(fn)` / `add_after_hook(fn)` accept any callable that receives a `ToolPreExecuteHookEvent` or `ToolPostExecuteHookEvent` dataclass. Multiple hooks can be registered.
+
+**Unregistration** (for MCP hot-reload):
+
+```python
+registry.unregister("mcp__playwright__browser_navigate")   # remove one tool by name
+registry.unregister_prefix("mcp__playwright__")            # remove all tools for a server
+```
+
 #### Built-in tools
 
 | Tool class | Name | Description |
@@ -738,10 +764,15 @@ registry.execute("tool_name", {"arg": "value"})  # str
 | `SkillTool` | `skill` | Load a skill's instructions into context by name. Only registered when skills are discovered at startup. |
 | `ReadTaskTool` | `read_task` | Read the current task progress file — goal, steps, status, notes, and context. |
 | `UpdateTaskTool` | `update_task` | Create a new task (goal + steps) or update an existing one (step status, notes, context, or clear). |
+| `EditTool` | `edit` | Edit a file by replacing an exact string match. Requires the `old_string` to appear exactly once in the file (unless `replace_all=True`). Paths outside the workspace root or sensitive system paths are rejected. |
+| `GrepTool` | `grep` | Search files for a regex pattern and return matching lines with filename, line number, and optional context lines. Supports include glob filter, case-insensitive mode, and truncation at `max_results`. `is_read_only=True`. |
+| `WebFetchTool` | `web_fetch` | Fetch a URL and return its text content. Strips HTML tags (skips `<script>`, `<style>`, `<head>`), collapses whitespace, and truncates at `max_chars` (default 8 000). Blocks SSRF targets (AWS metadata, GCP metadata). `is_read_only=True`. |
 | `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `ddgs` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. |
 | `McpStatusTool` | `mcp_status` | List all configured MCP servers and their connection status. |
 | `ListMcpResourcesTool` | `list_mcp_resources` | List resources available on a connected MCP server. |
 | `ReadMcpResourceTool` | `read_mcp_resource` | Read a specific resource from a connected MCP server. Output capped at 8 000 chars. |
+| `ListMcpPromptsTool` | `list_mcp_prompts` | List prompt templates available on connected MCP servers. Shows each prompt's name, description, and arguments. |
+| `GetMcpPromptTool` | `get_mcp_prompt` | Retrieve and render a named prompt template from an MCP server, optionally passing argument values. Returns the filled prompt text. |
 | `McpToolAdapter` | `mcp__<server>__<tool>` | Dynamically registered tool that proxies a call to a specific tool on an MCP server. One adapter is created per tool exposed by each connected MCP server. |
 
 **`ReadTaskTool` / `UpdateTaskTool`** implement the **Ralph Loop** pattern for long-running tasks that span multiple sessions or context windows. The agent calls `read_task` at the start of each session to orient itself, and `update_task` after completing each step so progress survives any restart. The task file is stored at `{workspace}/tasks/{agent_id}.json` — outside the project workspace so file tools cannot accidentally modify it.
@@ -800,12 +831,86 @@ reg = default_registry(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `long_term` | `LongTermMemory \| None` | `None` | If provided, registers `save_memory` and `search_memory` |
-| `root` | `Path \| None` | `None` | Workspace root — `read`/`write`/`glob` reject paths outside this boundary |
+| `root` | `Path \| None` | `None` | Workspace root — `read`/`write`/`glob`/`edit`/`grep` reject paths outside this boundary |
 | `bash_confirm` | `Callable[[str], bool] \| None` | `None` | Called before every bash command; `None` = no confirmation |
 | `skills` | `SkillRegistry \| None` | `None` | If non-empty, registers the `skill` tool |
 | `tasks_dir` | `Path \| None` | `None` | Task file directory. Required alongside `agent_id` to register task tools. |
 | `agent_id` | `str \| None` | `None` | Agent ID used to build the task file path `{tasks_dir}/{agent_id}.json`. |
-| `mcp_manager` | `McpManager \| None` | `None` | If provided, registers `mcp_status`, `list_mcp_resources`, `read_mcp_resource`, and one `mcp__<server>__<tool>` adapter per tool exposed by connected MCP servers. |
+| `policy` | `PermissionPolicy \| None` | `None` | Safety rules injected into `edit`, `grep`, and `web_fetch`. Defaults to `PermissionPolicy.default(workspace=root)` when omitted. |
+| `mcp_manager` | `McpManager \| None` | `None` | If provided, registers `mcp_status`, `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, `get_mcp_prompt`, and one `mcp__<server>__<tool>` adapter per tool exposed by connected MCP servers. |
+
+---
+
+### `PermissionPolicy` (`tools/policy.py`)
+
+`PermissionPolicy` is a centralised safety dataclass injected into `EditTool`, `GrepTool`, and `WebFetchTool`. Rather than each tool implementing its own path/URL checks, they all delegate to one policy object.
+
+```python
+from mini_minion.tools.policy import PermissionPolicy
+from pathlib import Path
+
+# Default: workspace boundary + standard SSRF markers
+policy = PermissionPolicy.default(workspace=Path.cwd())
+
+# Custom: extra SSRF domains, no workspace boundary
+policy = PermissionPolicy(ssrf_markers=frozenset({"internal.corp", "169.254.169.254"}))
+
+# Use in a tool
+error = policy.check_path(Path("/etc/passwd"))   # returns error string or None
+error = policy.check_url("http://169.254.169.254/latest/")  # returns error string or None
+```
+
+`PermissionPolicy.default(workspace)` builds a policy that:
+- Rejects file paths outside `workspace` (via `_within()` from `tools/base.py`)
+- Rejects sensitive system paths (SSH keys, `.env`, credential files)
+- Blocks known SSRF targets: AWS EC2 metadata (`169.254.169.254`), GCP metadata (`metadata.google.internal`), ECS credentials (`169.254.170.2`), IPv6 EC2 metadata (`fd00:ec2::254`)
+
+`default_registry()` auto-creates a `PermissionPolicy.default(workspace=root)` and injects it into `edit`, `grep`, and `web_fetch` unless you pass an explicit `policy=` argument.
+
+---
+
+### Plugin System (`plugins.py`)
+
+The plugin system lets you extend the tool registry with custom `Tool` subclasses loaded from Python files on disk — no changes to mini-minion source required.
+
+**Manifest format** (`~/.mini-minion/plugins.json` or `{workspace}/.mini-minion/plugins.json`):
+
+```json
+{
+  "tools": [
+    "/home/user/my-tools/custom_tool.py",
+    "~/plugins/another_tool.py"
+  ]
+}
+```
+
+Each path points to a Python file that either:
+- Exports a `TOOLS` list of instantiated `Tool` objects (preferred), **or**
+- Contains `Tool` subclasses that are auto-discovered via `inspect.getmembers()`
+
+**Example tool file:**
+
+```python
+from mini_minion.tools.base import Tool, ToolSchema
+
+class MyCustomTool(Tool):
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="my_tool",
+            description="Does something custom.",
+            parameters={"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]},
+        )
+
+    def execute(self, **kwargs) -> str:
+        return f"Custom result: {kwargs['input']}"
+
+TOOLS = [MyCustomTool()]
+```
+
+**Priority:** the project-local manifest (`{workspace}/.mini-minion/plugins.json`) loads after the global manifest (`~/.mini-minion/plugins.json`), so local tools override global ones with the same name.
+
+**Security note:** plugin files are executed with `importlib`. Only add paths to files you trust.
 
 ---
 
@@ -1091,7 +1196,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **668 cases** across all modules (668 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
+The test suite covers **737 cases** across all modules (737 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
 
 ```bash
 uv add anthropic
