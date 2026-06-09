@@ -21,9 +21,12 @@ Custom policies (e.g. for tests with a temp directory) are easy to build::
 
     policy = PermissionPolicy(workspace=tmp_path)
 
-Existing tools (ReadTool, WriteTool, GlobTool, BashTool) continue to use
-``_within()`` and ``_is_sensitive()`` from ``base.py`` directly — they are
-unchanged for backwards compatibility.  New tools take a PermissionPolicy.
+``ReadTool``, ``WriteTool``, and ``GlobTool`` accept an optional ``policy``
+kwarg; when provided they delegate to ``policy.check_path()`` instead of their
+inline ``_within`` + ``_is_sensitive`` checks, which are still used as a
+fallback so existing callers that only pass ``root`` keep working.
+``BashTool`` does not accept a policy instance — it imports
+``DEFAULT_SSRF_MARKERS`` directly and performs its own inline string check.
 
 Talks to
 --------
