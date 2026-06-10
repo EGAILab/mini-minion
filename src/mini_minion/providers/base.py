@@ -102,7 +102,8 @@ class LLMResponse:
     finish_reason: str = "stop"
     # Streaming flag: set by the provider when on_token was called at least once.
     was_streamed: bool = False
-    # None means the provider didn't return usage data (e.g. streaming on OpenAI-compatible).
+    # None when the provider doesn't return usage data (e.g. local LM Studio models
+    # that don't support stream_options and don't emit a final usage chunk).
     usage: "TokenUsage | None" = None
 
 

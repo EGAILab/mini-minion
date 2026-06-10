@@ -252,17 +252,27 @@ class OpenAICompatibleProvider:
         are accumulated per tool-call index and assembled into :class:`ToolCall`
         objects once the stream is exhausted.
 
+        Usage tracking: ``stream_options={"include_usage": True}`` asks the API
+        to append a final empty chunk (``choices=[]``) containing the token counts.
+        Older or non-OpenAI-compatible providers that don't support this field
+        simply ignore it — usage remains ``None`` rather than raising an error.
+
         Args:
-            kwargs (dict): Pre-built request parameters. ``stream=True`` is
-                added internally before the SDK call.
+            kwargs (dict): Pre-built request parameters. ``stream=True`` and
+                ``stream_options`` are added internally before the SDK call.
             on_token (Callable[[str], None]): Called once per text token chunk.
 
         Returns:
             LLMResponse: Complete response. ``was_streamed=True`` if at least
                 one text token was delivered. ``text`` contains the full
-                concatenated text regardless of streaming.
+                concatenated text regardless of streaming. ``usage`` is
+                populated when the provider supports ``stream_options``.
         """
-        kwargs = {**kwargs, "stream": True}  # copy to avoid mutating the caller's dict
+        # Copy to avoid mutating the caller's dict.
+        # stream_options asks the API to include a final usage-only chunk after
+        # all content chunks have been delivered.  Not all providers honour this,
+        # but those that don't will simply send no final chunk — usage stays None.
+        kwargs = {**kwargs, "stream": True, "stream_options": {"include_usage": True}}
 
         text_parts: list[str] = []
         # Accumulate tool-call fragments keyed by their position index.
@@ -270,9 +280,19 @@ class OpenAICompatibleProvider:
         # arguments JSON string character-by-character.
         tool_accumulators: dict[int, dict] = {}
         finish_reason = "stop"
+        # Captured from the final empty chunk when stream_options.include_usage is set.
+        _raw_usage = None
 
         stream = self._client.chat.completions.create(**kwargs)
         for chunk in stream:
+            # When include_usage is set, the API appends one final chunk where
+            # choices is empty and usage is populated.  Skip normal delta processing
+            # for that chunk, but capture the usage object.
+            if not chunk.choices:
+                if hasattr(chunk, "usage") and chunk.usage is not None:
+                    _raw_usage = chunk.usage
+                continue
+
             choice = chunk.choices[0]
             delta = choice.delta
 
@@ -310,6 +330,14 @@ class OpenAICompatibleProvider:
             args, err = _parse_tool_arguments(acc["arguments"], acc["name"])
             tool_calls.append(ToolCall(id=acc["id"], name=acc["name"], arguments=args, error=err))
 
+        # Build usage from the final chunk when available.
+        _usage = None
+        if _raw_usage is not None:
+            _usage = TokenUsage(
+                input_tokens=_raw_usage.prompt_tokens,
+                output_tokens=_raw_usage.completion_tokens,
+            )
+
         text = "".join(text_parts)
         return LLMResponse(
             text=text,
@@ -319,4 +347,5 @@ class OpenAICompatibleProvider:
             # meaning the terminal already shows the text. The runner uses this flag
             # to avoid printing the text a second time.
             was_streamed=len(text_parts) > 0,
+            usage=_usage,
         )

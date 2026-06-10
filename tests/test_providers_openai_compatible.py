@@ -221,3 +221,59 @@ def test_blocking_populates_usage_when_api_returns_it():
     assert isinstance(result.usage, TokenUsage)
     assert result.usage.input_tokens == 80
     assert result.usage.output_tokens == 30
+
+
+def _stream_usage_chunk(prompt_tokens: int, completion_tokens: int):
+    """Create a final usage-only chunk (choices=[]) sent when stream_options is set."""
+    usage = Mock()
+    usage.prompt_tokens = prompt_tokens
+    usage.completion_tokens = completion_tokens
+    chunk = Mock()
+    chunk.choices = []  # empty — signals this is the final usage chunk
+    chunk.usage = usage
+    return chunk
+
+
+def test_streaming_populates_usage_from_final_chunk():
+    """stream_options=include_usage causes a final empty chunk with usage data."""
+    from mini_minion.providers.base import TokenUsage
+    p = _provider()
+    chunks = [
+        _stream_chunk(content="Hi"),
+        _stream_chunk(finish_reason="stop"),
+        _stream_usage_chunk(prompt_tokens=50, completion_tokens=10),
+    ]
+    p._client.chat.completions.create.return_value = iter(chunks)
+
+    result = p._chat_streaming({}, on_token=lambda t: None)
+
+    assert isinstance(result.usage, TokenUsage)
+    assert result.usage.input_tokens == 50
+    assert result.usage.output_tokens == 10
+
+
+def test_streaming_usage_is_none_when_no_usage_chunk():
+    """Providers that don't send a usage chunk leave usage=None (no error)."""
+    p = _provider()
+    chunks = [
+        _stream_chunk(content="Hi"),
+        _stream_chunk(finish_reason="stop"),
+    ]
+    p._client.chat.completions.create.return_value = iter(chunks)
+
+    result = p._chat_streaming({}, on_token=lambda t: None)
+
+    assert result.usage is None
+
+
+def test_streaming_sends_stream_options_in_request():
+    """_chat_streaming must include stream_options.include_usage in the API request."""
+    p = _provider()
+    p._client.chat.completions.create.return_value = iter([
+        _stream_chunk(finish_reason="stop"),
+    ])
+
+    p._chat_streaming({}, on_token=lambda t: None)
+
+    call_kwargs = p._client.chat.completions.create.call_args[1]
+    assert call_kwargs.get("stream_options") == {"include_usage": True}
