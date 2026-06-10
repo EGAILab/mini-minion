@@ -98,6 +98,70 @@ _DEFAULT_MEMORY_INJECTION_TOKENS = 600  # overridden per-instance in __init__
 
 _STATUS_ICON = {"done": "✓", "in_progress": "→", "blocked": "✗", "pending": "○"}
 
+# Tools that mutate the filesystem or shell state.  The verification loop
+# checks for these in the history slice appended by run_turn() so it knows
+# whether to call verify_fn.
+_WRITE_TOOLS: frozenset[str] = frozenset({"write", "edit", "apply_patch", "bash"})
+
+
+def _had_write_call(history_slice: list[dict]) -> bool:
+    """Return True if any write-type tool was requested in the history slice.
+
+    Checks assistant messages for tool_calls whose function.name is in
+    _WRITE_TOOLS.  Used by the verification loop to decide whether to call
+    verify_fn after a turn.
+    """
+    for msg in history_slice:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []):
+            if tc.get("function", {}).get("name", "") in _WRITE_TOOLS:
+                return True
+    return False
+
+
+def _export_md(history: list[dict], agent_name: str) -> str:
+    """Render conversation history as a Markdown transcript.
+
+    Only includes user and assistant text messages; tool calls and tool
+    results are omitted for a clean human-readable export.
+    """
+    lines = [f"# Conversation with {agent_name}\n"]
+    for msg in history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user" and isinstance(content, str):
+            lines.append(f"**User:** {content}\n")
+        elif role == "assistant" and isinstance(content, str) and content:
+            lines.append(f"**{agent_name}:** {content}\n")
+    return "\n".join(lines)
+
+
+def _export_html(history: list[dict], agent_name: str) -> str:
+    """Render conversation history as a minimal HTML document."""
+    import html as _html_mod
+    parts = [
+        "<!DOCTYPE html>",
+        "<html><head><meta charset='utf-8'>",
+        f"<title>Conversation with {_html_mod.escape(agent_name)}</title>",
+        "<style>body{font-family:sans-serif;max-width:800px;margin:2em auto}"
+        "p{margin:.5em 0}b{color:#333}</style>",
+        "</head><body>",
+        f"<h1>Conversation with {_html_mod.escape(agent_name)}</h1>",
+    ]
+    for msg in history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user" and isinstance(content, str):
+            parts.append(f"<p><b>User:</b> {_html_mod.escape(content)}</p>")
+        elif role == "assistant" and isinstance(content, str) and content:
+            parts.append(
+                f"<p><b>{_html_mod.escape(agent_name)}:</b> "
+                f"{_html_mod.escape(content)}</p>"
+            )
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
 
 def _format_task_context(task_path: Path | None) -> str:
     """Read the agent's task file and return a system-prompt block.
@@ -364,6 +428,11 @@ class AgentSession:
         session_store.get_or_create(agent_id)
 
     @property
+    def provider(self) -> "LLMProvider":
+        """The agent's LLM provider.  Exposed for the ``/provider test`` command."""
+        return self._provider
+
+    @property
     def registry(self) -> "ToolRegistry":
         """The agent's tool registry.
 
@@ -384,6 +453,7 @@ class AgentSession:
         attachments: list | None = None,
         on_event: Callable[[object], None] | None = None,
         stream: bool = False,
+        verify_fn: Callable[[], str] | None = None,
     ) -> str | None:
         """Send a user message (with optional media attachments) and return the agent's text response.
 
@@ -398,6 +468,12 @@ class AgentSession:
                 persisted to JSONL uses path references, not base64 bytes.
             on_event (Callable | None): Optional callback for structured events.
             stream (bool): If ``True`` and ``on_event`` is set, stream tokens.
+            verify_fn (Callable[[], str] | None): Optional verification callback.
+                Called after each turn in which a write tool (write, edit,
+                apply_patch, bash) was used.  Its return value is injected as a
+                user message so the agent sees the verification result at the
+                start of the next turn.  Useful for test runners or linters that
+                confirm whether changes applied correctly.
 
         Returns:
             str | None: The agent's final response text, or ``None`` if the
@@ -521,6 +597,17 @@ class AgentSession:
                     compacted=_compacted,
                 ))
 
+            # Verification loop (IMP-17): after a turn that used write tools,
+            # call verify_fn() and inject the result as a user message.  The
+            # agent will see it at the start of the next turn without needing
+            # an extra API round now.
+            if verify_fn is not None and _had_write_call(self._history[snapshot_len:]):
+                _verification = verify_fn()
+                if _verification:
+                    self._history.append(
+                        {"role": "user", "content": f"[verification]\n{_verification}"}
+                    )
+
         except Exception as exc:
             del self._history[snapshot_len:]
             error_text = f"[Provider error: {exc.__class__.__name__}: {exc}]"
@@ -638,3 +725,38 @@ class AgentSession:
             adapter_count += 1
 
         return adapter_count
+
+    def fork(self, new_agent_id: str) -> None:
+        """Copy this session's history to a new agent ID.
+
+        Creates a new JSONL history file and session record with the same
+        history as the current session.  Use ``/resume <new_agent_id>`` to
+        interact with the forked session.
+
+        The fork is a snapshot — subsequent turns on either session are
+        independent.  The new session's :attr:`SessionInfo.parent_id` is set
+        to this agent's ID so the lineage is visible in ``/sessions``.
+
+        Args:
+            new_agent_id (str): The ID to assign to the forked session.
+                Must not already exist in the session store.
+        """
+        self._short_term.save(new_agent_id, list(self._history))
+        self._session_store.get_or_create(new_agent_id, parent_id=self._agent_id)
+
+    def export(self, format: str = "md") -> str:
+        """Export the conversation history as a Markdown or HTML transcript.
+
+        Only includes user and assistant text messages.  Tool calls, tool
+        results, and multimodal content blocks are omitted so the export is
+        readable by non-technical users.
+
+        Args:
+            format (str): ``"md"`` (default) for Markdown, ``"html"`` for HTML.
+
+        Returns:
+            str: The rendered transcript.
+        """
+        if format == "html":
+            return _export_html(self._history, self._agent.name)
+        return _export_md(self._history, self._agent.name)

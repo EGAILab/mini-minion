@@ -55,11 +55,15 @@ class SessionInfo:
             Updated by :meth:`SessionStore.touch` after every turn.
         turn_count (int): Total number of completed conversation turns (user
             message → agent response) since the session was created.
+        parent_id (str | None): Agent ID of the session this was forked from,
+            or ``None`` if this is an original (not forked) session.
+            Set by :meth:`SessionStore.get_or_create` when ``parent_id`` is passed.
     """
     agent_id: str
     created_at: str
     last_active: str
     turn_count: int
+    parent_id: str | None = None
 
 
 class SessionStore:
@@ -113,14 +117,19 @@ class SessionStore:
         os.replace(tmp, self._path)
         self._cache = data  # keep cache in sync with what was just written
 
-    def get_or_create(self, agent_id: str) -> SessionInfo:
+    def get_or_create(
+        self, agent_id: str, parent_id: str | None = None
+    ) -> SessionInfo:
         """Return the session for an agent, creating it if it doesn't exist.
 
         If this is the first time this agent has been seen, a new session record
         is created with the current timestamp and turn_count=0.
 
         Args:
-            agent_id (str): The agent to look up, e.g. ``"main"``.
+            agent_id (str):           The agent to look up, e.g. ``"main"``.
+            parent_id (str | None):   When creating a new session, record it as
+                                      forked from this agent ID.  Ignored when
+                                      the session already exists.
 
         Returns:
             SessionInfo: The existing or newly-created session record.
@@ -133,6 +142,7 @@ class SessionStore:
                 created_at=now,
                 last_active=now,
                 turn_count=0,
+                parent_id=parent_id,
             ))
             self._save(data)
         return SessionInfo(**data[agent_id])

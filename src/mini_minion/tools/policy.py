@@ -52,6 +52,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .audit import AuditEntry, AuditLog, _utcnow
 from .base import _is_sensitive, _within
 
 # Cloud instance metadata endpoints — same set as BashTool's _SSRF_MARKERS.
@@ -80,6 +81,19 @@ class PermissionPolicy:
     workspace: Path | None = None
     ssrf_markers: frozenset[str] = field(default_factory=lambda: DEFAULT_SSRF_MARKERS)
     read_only_mode: bool = False
+    # Audit log for this policy instance.  Created by default_registry(); records
+    # all allow and deny decisions so the user can review them with /audit.
+    audit_log: AuditLog = field(default_factory=AuditLog)
+
+    def _record_deny(self, tool_name: str, args_repr: str, reason: str) -> None:
+        """Append a denied-action entry to the audit log."""
+        self.audit_log.record(AuditEntry(
+            timestamp=_utcnow(),
+            tool_name=tool_name,
+            args_repr=args_repr,
+            decision="denied",
+            reason=reason,
+        ))
 
     def check_path(self, path: Path) -> str | None:
         """Check a file path against the policy.
@@ -98,12 +112,16 @@ class PermissionPolicy:
             None if the path is allowed, or an error message string.
         """
         if _is_sensitive(path):
-            return (
+            error = (
                 f"Error: '{path}' is a protected credential path and cannot be "
                 "accessed. Reading or writing credential files is not permitted."
             )
+            self._record_deny("file", str(path)[:120], "sensitive credential path")
+            return error
         if self.workspace is not None and not _within(path, self.workspace):
-            return f"Error: '{path}' is outside the workspace root '{self.workspace}'"
+            error = f"Error: '{path}' is outside the workspace root '{self.workspace}'"
+            self._record_deny("file", str(path)[:120], "outside workspace boundary")
+            return error
         return None
 
     def check_url(self, url: str) -> str | None:
@@ -120,10 +138,12 @@ class PermissionPolicy:
         """
         for marker in self.ssrf_markers:
             if marker in url:
-                return (
+                error = (
                     f"Error: URL blocked — requests to cloud instance metadata "
                     f"endpoints ({marker!r}) are not permitted."
                 )
+                self._record_deny("url", url[:120], f"SSRF marker: {marker}")
+                return error
         return None
 
     def check_write(self, path: Path) -> str | None:
@@ -143,7 +163,9 @@ class PermissionPolicy:
         if error:
             return error
         if self.read_only_mode:
-            return "Error: read-only mode is active — write operations are not permitted. Use /auto to disable."
+            error = "Error: read-only mode is active — write operations are not permitted. Use /auto to disable."
+            self._record_deny("write", str(path)[:120], "read-only mode")
+            return error
         return None
 
     def check_command(self, command: str) -> str | None:
@@ -161,12 +183,16 @@ class PermissionPolicy:
         """
         for marker in self.ssrf_markers:
             if marker in command:
-                return (
+                error = (
                     f"Error: Command blocked — contains a cloud instance metadata "
                     f"endpoint ({marker!r}) which is not permitted."
                 )
+                self._record_deny("bash", command[:120], f"SSRF marker: {marker}")
+                return error
         if self.read_only_mode:
-            return "Error: read-only mode is active — shell commands are not permitted. Use /auto to disable."
+            error = "Error: read-only mode is active — shell commands are not permitted. Use /auto to disable."
+            self._record_deny("bash", command[:120], "read-only mode")
+            return error
         return None
 
     @classmethod

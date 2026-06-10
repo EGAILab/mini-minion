@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 from .apply_patch import ApplyPatchTool
 from .ask_user import AskUserTool
+from .audit import ApprovalDecision, AuditLog
 from .base import Tool, ToolSchema
 from .bash import BashTool
 from .edit import EditTool
@@ -50,6 +51,7 @@ from .patch import PatchPreviewTool
 from .policy import PermissionPolicy
 from .read import ReadTool
 from .registry import ToolRegistry
+from .sandbox import LocalSandboxBackend, SandboxBackend
 from .skill import SkillTool
 from .task import ReadTaskTool, UpdateTaskTool
 from .todo import TodoReadTool, TodoWriteTool
@@ -62,6 +64,7 @@ def default_registry(
     long_term: "LongTermMemory | None" = None,
     root: Path | None = None,
     bash_confirm: "Callable[[str], bool] | None" = None,
+    bash_approval: "Callable[[str], ApprovalDecision] | None" = None,
     skills: "SkillRegistry | None" = None,
     tasks_dir: Path | None = None,
     agent_id: str | None = None,
@@ -91,6 +94,11 @@ def default_registry(
         policy:       Optional :class:`PermissionPolicy` injected into all I/O
                       tools (read, write, glob, edit, grep, web_fetch).  When
                       ``None`` a default policy is built from ``root``.
+        bash_approval: Optional 4-option approval callback for :class:`BashTool`.
+                      Called with the command string; returns an
+                      :class:`ApprovalDecision`.  Takes priority over
+                      ``bash_confirm`` when both are provided.  The CLI wires
+                      this to a menu that records decisions to the audit log.
         ask_user_fn:  Optional callable for :class:`AskUserTool`.  Called with
                       the agent's question string; returns the human's answer.
                       ``None`` registers the tool in headless mode (returns an
@@ -118,8 +126,9 @@ def default_registry(
         ReadTool(root, policy=_policy),
         WriteTool(root, policy=_policy, confirm=write_confirm),
         GlobTool(root, policy=_policy),
-        # BashTool now accepts policy so SSRF and read_only_mode checks are centralised.
-        BashTool(confirm=bash_confirm, cwd=root, policy=_policy),
+        # BashTool: policy handles SSRF + read_only_mode; approval_fn provides the
+        # 4-option confirm menu; confirm is the simpler bool fallback.
+        BashTool(confirm=bash_confirm, cwd=root, policy=_policy, approval_fn=bash_approval),
         # WebSearchTool: policy enables SSRF marker checks on the query string.
         WebSearchTool(policy=_policy),
         # Coding-agent tools — use PermissionPolicy for path/URL checks.
@@ -203,6 +212,10 @@ __all__ = [
     "ToolSchema",
     "ToolRegistry",
     "PermissionPolicy",
+    "ApprovalDecision",
+    "AuditLog",
+    "SandboxBackend",
+    "LocalSandboxBackend",
     "ApplyPatchTool",
     "AskUserTool",
     "EditTool",

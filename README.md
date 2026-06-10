@@ -130,7 +130,7 @@ mini-minion/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       └── __init__.py
-└── tests/                       # pytest test suite (897 tests, 3 skipped)
+└── tests/                       # pytest test suite (966 tests, 3 skipped)
 ```
 
 ---
@@ -351,6 +351,13 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/plan` | Enable read-only mode — agent can reason but not write files or run commands |
 | `/auto` | Disable read-only mode — restore full tool access (write, bash, git commit) |
 | `/providers` | Show LLM provider and model configuration for all configured agents |
+| `/provider test [agent_id]` | Send a minimal API call to verify provider connectivity and latency |
+| `/audit [n]` | Show the last *n* permission decisions (allowed/denied) from the audit log (default 20) |
+| `/fork <new_id>` | Copy the active session's history into a new session with the given ID |
+| `/export [--md\|--html] <path>` | Export the active session's conversation transcript to a file |
+| `/mcp-enable <server>` | Reconnect a disabled MCP server and refresh its tool adapters |
+| `/mcp-disable <server>` | Disconnect an MCP server and remove its tools for this session |
+| `/plugin list` | List all tool names registered in the active agent's tool registry |
 | `/research <message>` | Route the message to Elizabeth (researcher) |
 
 Route-targeted commands work on individual agent sessions. For example, `/research /new` clears only Elizabeth's session.
@@ -700,6 +707,15 @@ text = session.send("What is REST?", on_event=events.append, stream=True)
 
 # With image attachments (model must support "image" in input_modalities)
 text = session.send("What is in this image?", attachments=[Path("/tmp/screenshot.png")])
+
+# With verification loop (IMP-17) — called after turns that used write tools
+text = session.send("Refactor foo.py", verify_fn=lambda: subprocess.run(["pytest"], capture_output=True).stdout.decode())
+
+# Fork history to a new session (NEW-04)
+session.fork("backup")   # copies history to "backup" agent_id
+
+# Export transcript (NEW-04)
+md = session.export(format="md")   # "md" (default) or "html"
 ```
 
 When `long_term` is provided, `AgentSession`:
@@ -884,7 +900,8 @@ reg = default_registry(
 |---|---|---|---|
 | `long_term` | `LongTermMemory \| None` | `None` | If provided, registers `save_memory` and `search_memory` |
 | `root` | `Path \| None` | `None` | Workspace root — `read`/`write`/`glob`/`edit`/`grep` reject paths outside this boundary |
-| `bash_confirm` | `Callable[[str], bool] \| None` | `None` | Called before every bash command; `None` = no confirmation |
+| `bash_confirm` | `Callable[[str], bool] \| None` | `None` | Simple bool callback called before every bash command; `None` = no confirmation |
+| `bash_approval` | `Callable[[str], ApprovalDecision] \| None` | `None` | Rich 4-option approval callback (ALLOW_ONCE, ALLOW_SESSION, DENY, ALWAYS_DENY). Takes priority over `bash_confirm` when both are set. The CLI wires this to a menu that also records decisions to the policy's audit log. |
 | `skills` | `SkillRegistry \| None` | `None` | If non-empty, registers the `skill` tool |
 | `tasks_dir` | `Path \| None` | `None` | Task file directory. Required alongside `agent_id` to register task tools. |
 | `agent_id` | `str \| None` | `None` | Agent ID used to build the task file path `{tasks_dir}/{agent_id}.json`. |
@@ -1314,7 +1331,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **897 cases** across all modules (897 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
+The test suite covers **966 cases** across all modules (966 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
 
 ```bash
 uv add anthropic

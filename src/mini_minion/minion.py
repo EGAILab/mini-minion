@@ -131,12 +131,36 @@ def main() -> None:
     # --- Console callbacks (the only two places that call print/input) ---
 
     def _console_confirm(command: str) -> bool:
-        """Called by BashTool and GitCommitTool before running a command.
+        """Called by GitCommitTool before running a commit.
 
         Prints the command, prompts for y/N, returns True only on "y".
         """
-        print(f"\n[bash] {command}")
+        print(f"\n[git] {command}")
         return input("Run this command? [y/N]: ").strip().lower() == "y"
+
+    def _console_approve(command: str) -> "ApprovalDecision":
+        """Called by BashTool — shows a 4-option approval menu.
+
+        Options:
+          1 / Enter — Allow once (default)
+          2         — Allow for this session (no re-prompting for same command)
+          3         — Deny once
+          4         — Always deny for this session
+
+        The decision is recorded to the policy's audit log by BashTool so
+        the user can review it with /audit.
+        """
+        from .tools.audit import ApprovalDecision
+        print(f"\n[bash] {command}")
+        print("  [1] Allow once   [2] Allow session   [3] Deny   [4] Always deny")
+        choice = input("Choice [1]: ").strip()
+        if choice == "2":
+            return ApprovalDecision.ALLOW_SESSION
+        if choice == "3":
+            return ApprovalDecision.DENY
+        if choice == "4":
+            return ApprovalDecision.ALWAYS_DENY
+        return ApprovalDecision.ALLOW_ONCE
 
     def _console_ask_user(question: str) -> str:
         """Called by AskUserTool when the agent needs a human response."""
@@ -171,6 +195,7 @@ def main() -> None:
             long_term=long_term,
             root=_tool_root,
             bash_confirm=_console_confirm,
+            bash_approval=_console_approve,
             skills=skills,
             tasks_dir=_tasks_dir,
             agent_id=agent_id,

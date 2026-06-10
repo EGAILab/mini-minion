@@ -5,19 +5,26 @@ a CommandResult indicating whether the input was consumed (handled=True) so
 minion.py can skip normal agent routing.
 
 Supported commands:
-  /help, /commands   — show command list
-  /quit, /exit       — exit the REPL
-  /new [all]         — clear conversation history for the active (or all) agent(s)
-  /compact           — manually compact the active agent's history
-  /status            — show current agent/model info
-  /sessions          — list all known sessions with turn counts and last-active time
-  /resume [agent_id] — switch the default routing target to the given agent
-  /diagnose          — show provider configuration and API key status for all agents
-  /mcp-reload        — close and reconnect all MCP servers, refresh tool adapters
-  /mcp-list          — list connected MCP servers and their available tools
-  /plan              — enable read-only mode (agent can plan but not write/execute)
-  /auto              — disable read-only mode (agent runs with full tool access)
-  /providers         — list configured LLM provider and model info for all agents
+  /help, /commands           — show command list
+  /quit, /exit               — exit the REPL
+  /new [all]                 — clear conversation history for the active (or all) agent(s)
+  /compact                   — manually compact the active agent's history
+  /status                    — show current agent/model info
+  /sessions                  — list all known sessions with turn counts and last-active time
+  /resume [agent_id]         — switch the default routing target to the given agent
+  /diagnose                  — show provider configuration and API key status for all agents
+  /mcp-reload                — close and reconnect all MCP servers, refresh tool adapters
+  /mcp-list                  — list connected MCP servers and their available tools
+  /mcp-enable <server>       — reconnect a disabled MCP server
+  /mcp-disable <server>      — disconnect an MCP server for this session
+  /plan                      — enable read-only mode (agent can plan but not write/execute)
+  /auto                      — disable read-only mode (agent runs with full tool access)
+  /providers                 — list configured LLM provider and model info for all agents
+  /provider test [agent_id]  — test provider connectivity with a minimal API call
+  /audit [n]                 — show last n permission decisions from the audit log
+  /fork <new_id>             — fork active session history to a new session
+  /export [--md|--html] path — export session transcript to a file
+  /plugin list               — list all registered tool names
 
 Route-aware targeting:
   /research /new     — target the researcher agent specifically
@@ -129,6 +136,41 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec(
         name="/providers",
         description="Show LLM provider and model configuration for all configured agents.",
+    ),
+    CommandSpec(
+        name="/provider",
+        description="Test provider connectivity for an agent with a minimal API call.",
+        arg_hint="test [agent_id]",
+    ),
+    CommandSpec(
+        name="/audit",
+        description="Show recent permission decisions (allowed/denied tool calls) from the audit log.",
+        arg_hint="[n]",
+    ),
+    CommandSpec(
+        name="/fork",
+        description="Fork the active session's history into a new session with a given ID.",
+        arg_hint="<new_id>",
+    ),
+    CommandSpec(
+        name="/export",
+        description="Export the active session's conversation history to a file.",
+        arg_hint="[--md|--html] <path>",
+    ),
+    CommandSpec(
+        name="/mcp-enable",
+        description="Reconnect a disabled MCP server and refresh its tool adapters.",
+        arg_hint="<server>",
+    ),
+    CommandSpec(
+        name="/mcp-disable",
+        description="Disconnect an MCP server and mark it disabled for this session.",
+        arg_hint="<server>",
+    ),
+    CommandSpec(
+        name="/plugin",
+        description="Manage plugins. Use 'list' to show all registered tools and their sources.",
+        arg_hint="list",
     ),
 ]
 
@@ -472,6 +514,197 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                 lines.append(f"    Max out  : {cfg.model.max_output_tokens:,} tokens")
                 endpoint = cfg.provider.base_url or "(SDK default)"
                 lines.append(f"    Endpoint : {endpoint}")
+            return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /provider test ---
+        if spec.name == "/provider":
+            # Only "test" sub-command is supported for now.
+            subcmd, _, sub_args = ctx.args.partition(" ")
+            if subcmd.strip().lower() != "test":
+                return CommandResult(
+                    handled=True,
+                    message="Usage: /provider test [agent_id]",
+                )
+            target = sub_args.strip().lower() or ctx.target_agent_id
+            if target not in ctx.sessions:
+                known = ", ".join(sorted(ctx.sessions))
+                return CommandResult(
+                    handled=True,
+                    message=f"Unknown agent '{target}'. Known agents: {known}",
+                )
+            import time as _time
+            session = ctx.sessions[target]
+            _start_ms = _time.monotonic()
+            try:
+                # Minimal "hello" call — 5 output tokens is enough to confirm connectivity.
+                resp = session.provider.chat(
+                    system="You are a connectivity test.",
+                    messages=[{"role": "user", "content": "Reply with one word: ok"}],
+                    tools=[],
+                    max_tokens=5,
+                )
+                _elapsed = int((_time.monotonic() - _start_ms) * 1000)
+                _cfg_entry = ctx.agents_cfg.get(target)
+                model_id = _cfg_entry.model.id if _cfg_entry else "(unknown)"
+                return CommandResult(
+                    handled=True,
+                    message=(
+                        f"Provider test for '{target}': OK ({_elapsed} ms)\n"
+                        f"  Model: {model_id}\n"
+                        f"  Response: {resp.text!r}"
+                    ),
+                )
+            except Exception as exc:
+                _elapsed = int((_time.monotonic() - _start_ms) * 1000)
+                return CommandResult(
+                    handled=True,
+                    message=f"Provider test for '{target}': FAILED ({_elapsed} ms)\n  Error: {exc}",
+                )
+
+        # --- /audit ---
+        if spec.name == "/audit":
+            session = ctx.sessions.get(ctx.target_agent_id)
+            if session is None:
+                return CommandResult(handled=True, message=f"Unknown agent: {ctx.target_agent_id}")
+            policy = session.registry.policy
+            if policy is None:
+                return CommandResult(handled=True, message="No permission policy configured.")
+            # Parse optional count argument; default to 20.
+            try:
+                count = int(ctx.args.strip()) if ctx.args.strip() else 20
+            except ValueError:
+                count = 20
+            entries = policy.audit_log.entries[-count:]
+            if not entries:
+                return CommandResult(handled=True, message="Audit log is empty.")
+            lines = [f"Audit log (last {len(entries)} entries):"]
+            for e in entries:
+                ts = e.timestamp[:19].replace("T", " ")
+                reason = f"  ({e.reason})" if e.reason else ""
+                lines.append(f"  [{ts}] {e.decision:7s} {e.tool_name}: {e.args_repr}{reason}")
+            return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /fork ---
+        if spec.name == "/fork":
+            new_id = ctx.args.strip()
+            if not new_id:
+                return CommandResult(
+                    handled=True, message="Usage: /fork <new_session_id>"
+                )
+            if new_id in ctx.sessions:
+                return CommandResult(
+                    handled=True,
+                    message=f"Session '{new_id}' already exists. Choose a different ID.",
+                )
+            session = ctx.sessions.get(ctx.target_agent_id)
+            if session is None:
+                return CommandResult(handled=True, message=f"Unknown agent: {ctx.target_agent_id}")
+            session.fork(new_id)
+            return CommandResult(
+                handled=True,
+                message=(
+                    f"Forked '{ctx.target_agent_id}' → '{new_id}' "
+                    f"({len(session.history)} messages copied).\n"
+                    f"Use /resume {new_id} to switch to the forked session."
+                ),
+            )
+
+        # --- /export ---
+        if spec.name == "/export":
+            session = ctx.sessions.get(ctx.target_agent_id)
+            if session is None:
+                return CommandResult(handled=True, message=f"Unknown agent: {ctx.target_agent_id}")
+            parts = ctx.args.split()
+            fmt = "md"
+            path_parts = parts
+            if parts and parts[0] in ("--md", "--html"):
+                fmt = parts[0][2:]   # strip "--"
+                path_parts = parts[1:]
+            if not path_parts:
+                return CommandResult(
+                    handled=True,
+                    message="Usage: /export [--md|--html] <file_path>",
+                )
+            from pathlib import Path as _Path
+            out_path = _Path(path_parts[0]).expanduser()
+            content = session.export(format=fmt)
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(content, encoding="utf-8")
+                return CommandResult(
+                    handled=True,
+                    message=f"Exported {len(session.history)} messages to {out_path}",
+                )
+            except OSError as exc:
+                return CommandResult(handled=True, message=f"Export failed: {exc}")
+
+        # --- /mcp-enable ---
+        if spec.name == "/mcp-enable":
+            if ctx.mcp_manager is None:
+                return CommandResult(
+                    handled=True,
+                    message="No MCP manager configured. Add 'mcp.servers' to config.json first.",
+                )
+            server_name = ctx.args.strip()
+            if not server_name:
+                return CommandResult(handled=True, message="Usage: /mcp-enable <server_name>")
+            try:
+                ctx.mcp_manager.connect_server_sync(server_name)
+                # Refresh tool adapters in all sessions.
+                refreshed = sum(
+                    s.refresh_mcp_adapters(ctx.mcp_manager) for s in ctx.sessions.values()
+                )
+                status = next(
+                    (st for st in ctx.mcp_manager.list_statuses() if st.name == server_name),
+                    None,
+                )
+                state_str = (status.state if status else "unknown")
+                return CommandResult(
+                    handled=True,
+                    message=(
+                        f"MCP server '{server_name}': {state_str}\n"
+                        f"Refreshed {refreshed} tool adapter(s)."
+                    ),
+                )
+            except Exception as exc:
+                return CommandResult(handled=True, message=f"Failed to enable '{server_name}': {exc}")
+
+        # --- /mcp-disable ---
+        if spec.name == "/mcp-disable":
+            if ctx.mcp_manager is None:
+                return CommandResult(
+                    handled=True,
+                    message="No MCP manager configured. Add 'mcp.servers' to config.json first.",
+                )
+            server_name = ctx.args.strip()
+            if not server_name:
+                return CommandResult(handled=True, message="Usage: /mcp-disable <server_name>")
+            try:
+                ctx.mcp_manager.disconnect_server_sync(server_name)
+                # Remove adapters for the disabled server from all sessions.
+                for session in ctx.sessions.values():
+                    session.registry.unregister_prefix(f"mcp__{server_name}__")
+                return CommandResult(
+                    handled=True,
+                    message=f"MCP server '{server_name}' disconnected and its tools removed.",
+                )
+            except Exception as exc:
+                return CommandResult(handled=True, message=f"Failed to disable '{server_name}': {exc}")
+
+        # --- /plugin ---
+        if spec.name == "/plugin":
+            subcmd = ctx.args.strip().lower()
+            if subcmd != "list":
+                return CommandResult(handled=True, message="Usage: /plugin list")
+            session = ctx.sessions.get(ctx.target_agent_id)
+            if session is None:
+                return CommandResult(handled=True, message=f"Unknown agent: {ctx.target_agent_id}")
+            tool_names = sorted(
+                t.schema.name for t in session.registry._tools.values()
+            )
+            lines = [f"Registered tools for '{ctx.target_agent_id}' ({len(tool_names)}):"]
+            for name in tool_names:
+                lines.append(f"  {name}")
             return CommandResult(handled=True, message="\n".join(lines))
 
     # --- Plugin commands ---

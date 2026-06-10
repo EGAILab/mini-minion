@@ -143,3 +143,49 @@ def test_cache_write_through_persists_to_disk(tmp_path):
     # New instance reads fresh from disk.
     store2 = SessionStore(tmp_path / "sessions.json")
     assert store2.get_or_create("main").turn_count == 2
+
+
+# ---------------------------------------------------------------------------
+# NEW-04: parent_id (session fork lineage)
+# ---------------------------------------------------------------------------
+
+
+def test_get_or_create_with_parent_id_stores_lineage(tmp_path):
+    """get_or_create with parent_id must record the fork lineage."""
+    store = SessionStore(tmp_path / "sessions.json")
+    store.get_or_create("main")
+    child = store.get_or_create("child", parent_id="main")
+    assert child.parent_id == "main"
+
+
+def test_get_or_create_without_parent_id_defaults_none(tmp_path):
+    store = SessionStore(tmp_path / "sessions.json")
+    info = store.get_or_create("main")
+    assert info.parent_id is None
+
+
+def test_parent_id_persists_across_reload(tmp_path):
+    """parent_id must survive a serialize/deserialize round-trip."""
+    path = tmp_path / "sessions.json"
+    store1 = SessionStore(path)
+    store1.get_or_create("parent")
+    store1.get_or_create("child", parent_id="parent")
+
+    store2 = SessionStore(path)
+    records = {r.agent_id: r for r in store2.list_sessions()}
+    assert records["child"].parent_id == "parent"
+    assert records["parent"].parent_id is None
+
+
+def test_existing_session_parent_id_not_overwritten(tmp_path):
+    """Calling get_or_create again on an existing session must not change parent_id."""
+    store = SessionStore(tmp_path / "sessions.json")
+    store.get_or_create("child", parent_id="original-parent")
+    # Second call with a different parent_id — must be ignored.
+    info = store.get_or_create("child", parent_id="different-parent")
+    assert info.parent_id == "original-parent"
+
+
+def test_session_info_parent_id_defaults_none():
+    info = SessionInfo(agent_id="x", created_at="t1", last_active="t2", turn_count=0)
+    assert info.parent_id is None

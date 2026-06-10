@@ -579,6 +579,76 @@ class McpClientManager:
         # Step 3: reconnect
         self._run_sync(self._connect_all_async(), timeout=timeout)
 
+    def connect_server_sync(self, name: str, timeout: float = 60.0) -> None:
+        """Connect (or reconnect) a single named MCP server.
+
+        Resets that server's status to ``"pending"`` and calls
+        :meth:`_connect_one_async` for it.  Used by the ``/mcp-enable`` command.
+
+        Args:
+            name:    Server name as declared in ``config.json``.
+            timeout: Maximum seconds to wait for the connection.
+
+        Raises:
+            ValueError: When no server with the given name exists.
+        """
+        server = next((s for s in self._servers if s.name == name), None)
+        if server is None:
+            raise ValueError(
+                f"No MCP server named '{name}'. "
+                f"Known servers: {[s.name for s in self._servers]}"
+            )
+        # Reset status so connect_one_async can re-enter cleanly.
+        if name in self._statuses:
+            self._statuses[name].state = "pending"
+            self._statuses[name].tools = []
+            self._statuses[name].resources = []
+            self._statuses[name].prompts = []
+            self._statuses[name].detail = ""
+        # Close the old session if one exists.
+        try:
+            self._run_sync(self._disconnect_one_async(name), timeout=5.0)
+        except Exception:
+            pass
+        self._run_sync(self._connect_one_async(server), timeout=timeout)
+
+    def disconnect_server_sync(self, name: str) -> None:
+        """Disconnect a single named MCP server and mark it disabled.
+
+        After this call the server's status is ``"disabled"`` and its tools
+        are no longer visible.  Use :meth:`connect_server_sync` to re-enable.
+
+        Used by the ``/mcp-disable`` command.
+
+        Args:
+            name: Server name as declared in ``config.json``.
+
+        Raises:
+            ValueError: When no server with the given name exists.
+        """
+        if name not in self._statuses:
+            raise ValueError(
+                f"No MCP server named '{name}'. "
+                f"Known servers: {list(self._statuses)}"
+            )
+        try:
+            self._run_sync(self._disconnect_one_async(name), timeout=5.0)
+        except Exception:
+            pass
+        self._statuses[name].state = "disabled"
+        self._statuses[name].tools = []
+        self._statuses[name].detail = "disabled by user"
+
+    async def _disconnect_one_async(self, name: str) -> None:
+        """Close and remove the session for a single server."""
+        stack = self._stacks.pop(name, None)
+        self._sessions.pop(name, None)
+        if stack:
+            try:
+                await stack.__aexit__(None, None, None)
+            except Exception:
+                pass
+
     # -------------------------------------------------------------------------
     # Shutdown
     # -------------------------------------------------------------------------

@@ -220,6 +220,39 @@ def _load_manifest(
             "Only load external plugins from sources you trust."
         )
 
+    # --- Manifest v2 metadata ---
+    # These fields are informational; missing fields are silently ignored so
+    # v1 manifests continue to load without change.
+    plugin_version = raw.get("version")
+    min_version = raw.get("min_mini_minion_version")
+    permissions = raw.get("permissions", [])
+    dependencies = raw.get("dependencies", [])
+    mcp_server_configs = raw.get("mcp_servers", [])
+
+    if plugin_version:
+        print(f"  [plugins] Loading plugin v{plugin_version} from {manifest_path.name}")
+
+    # Warn when required permissions are declared so the user can review them.
+    if permissions:
+        print(
+            f"  [plugins] Plugin '{manifest_path.name}' requests permissions: "
+            + ", ".join(str(p) for p in permissions)
+        )
+
+    # Warn when declared dependencies are missing from the manifest search path.
+    if dependencies:
+        print(
+            f"  [plugins] Plugin '{manifest_path.name}' depends on: "
+            + ", ".join(str(d) for d in dependencies)
+        )
+
+    # Inform when a manifest bundles MCP server definitions.
+    if mcp_server_configs:
+        print(
+            f"  [plugins] Plugin '{manifest_path.name}' declares {len(mcp_server_configs)}"
+            " MCP server(s). Add them to config.json 'mcp.servers' to activate."
+        )
+
     count = 0
 
     # --- tools section ---
@@ -236,6 +269,13 @@ def _load_manifest(
             continue
 
         for tool in tools:
+            # Conflict detection: warn when overriding an already-registered tool.
+            # This surfaces naming collisions before they silently change behaviour.
+            if tool.schema.name in registry._tools:
+                print(
+                    f"  [plugins] Warning: tool '{tool.schema.name}' from "
+                    f"{tool_path.name} overrides an existing tool with the same name."
+                )
             registry.register(tool)
             count += 1
             print(f"  [plugins] Registered tool '{tool.schema.name}' from {tool_path.name}")
