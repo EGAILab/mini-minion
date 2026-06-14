@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_minion.tools.policy import DEFAULT_SSRF_MARKERS, PermissionPolicy
+from minion_assistant.tools.policy import DEFAULT_SSRF_MARKERS, PermissionPolicy
 
 
 # ---------------------------------------------------------------------------

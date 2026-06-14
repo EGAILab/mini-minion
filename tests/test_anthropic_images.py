@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_minion.providers.anthropic import (
+from minion_assistant.providers.anthropic import (
     _convert_user_content_for_anthropic,
     _to_anthropic_messages,
 )

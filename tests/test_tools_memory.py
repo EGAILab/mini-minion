@@ -1,7 +1,7 @@
 """Tests for SaveMemoryTool and SearchMemoryTool."""
 
-from mini_minion.memory.long_term import LongTermMemory
-from mini_minion.tools.memory import SaveMemoryTool, SearchMemoryTool
+from minion_assistant.memory.long_term import LongTermMemory
+from minion_assistant.tools.memory import SaveMemoryTool, SearchMemoryTool
 
 
 def test_save_memory_tool_schema():
@@ -70,7 +70,7 @@ def test_search_memory_multi_term_finds_note(tmp_path):
 
 
 def test_default_registry_with_long_term_has_memory_tools(tmp_path):
-    from mini_minion.tools import default_registry
+    from minion_assistant.tools import default_registry
 
     mem = LongTermMemory(tmp_path)
     reg = default_registry(long_term=mem)
@@ -80,7 +80,7 @@ def test_default_registry_with_long_term_has_memory_tools(tmp_path):
 
 
 def test_default_registry_without_long_term_has_no_memory_tools():
-    from mini_minion.tools import default_registry
+    from minion_assistant.tools import default_registry
 
     reg = default_registry()
     names = {d["function"]["name"] for d in reg.definitions}
@@ -90,7 +90,7 @@ def test_default_registry_without_long_term_has_no_memory_tools():
 
 def test_search_memory_cap_note_shown_when_limit_hit(tmp_path):
     """SearchMemoryTool output must include a cap hint when _SEARCH_MAX_RESULTS notes match."""
-    from mini_minion.memory.long_term import _SEARCH_MAX_RESULTS
+    from minion_assistant.memory.long_term import _SEARCH_MAX_RESULTS
 
     mem = LongTermMemory(tmp_path)
     for i in range(_SEARCH_MAX_RESULTS + 5):

@@ -4,7 +4,7 @@ import copy
 
 import pytest
 
-from mini_minion.config import ConfigError, ConfigIssue, _validate
+from minion_assistant.config import ConfigError, ConfigIssue, _validate
 
 # ---------------------------------------------------------------------------
 # Minimal valid config used as a base; deep-copied per test before mutation.

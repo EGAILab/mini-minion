@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from mini_minion.tools.audit import AuditLog
-from mini_minion.tools.policy import PermissionPolicy
+from minion_assistant.tools.audit import AuditLog
+from minion_assistant.tools.policy import PermissionPolicy
 
 
 def test_policy_has_audit_log_by_default():

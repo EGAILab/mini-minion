@@ -2,10 +2,10 @@
 
 import subprocess
 
-from mini_minion.tools.audit import ApprovalDecision, AuditLog
-from mini_minion.tools.bash import BashTool
-from mini_minion.tools.policy import PermissionPolicy
-from mini_minion.tools.sandbox import LocalSandboxBackend, SandboxBackend
+from minion_assistant.tools.audit import ApprovalDecision, AuditLog
+from minion_assistant.tools.bash import BashTool
+from minion_assistant.tools.policy import PermissionPolicy
+from minion_assistant.tools.sandbox import LocalSandboxBackend, SandboxBackend
 
 
 # ---------------------------------------------------------------------------

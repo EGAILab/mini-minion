@@ -1,6 +1,6 @@
 """Tests for WriteTool."""
 
-from mini_minion.tools.write import WriteTool
+from minion_assistant.tools.write import WriteTool
 
 
 def test_write_creates_file(tmp_path):

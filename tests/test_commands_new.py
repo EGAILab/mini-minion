@@ -2,9 +2,9 @@
 
 from unittest.mock import MagicMock
 
-from mini_minion.commands import CommandContext, BUILTIN_COMMANDS, dispatch_command
-from mini_minion.tools.policy import PermissionPolicy
-from mini_minion.tools.registry import ToolRegistry
+from minion_assistant.commands import CommandContext, BUILTIN_COMMANDS, dispatch_command
+from minion_assistant.tools.policy import PermissionPolicy
+from minion_assistant.tools.registry import ToolRegistry
 
 
 # ---------------------------------------------------------------------------

@@ -21,13 +21,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from mini_minion.tools.mcp import (
+from minion_assistant.tools.mcp import (
     ListMcpResourcesTool,
     McpStatusTool,
     McpToolAdapter,
     ReadMcpResourceTool,
 )
-from mini_minion.mcp.types import McpConnectionStatus, McpResourceInfo, McpToolInfo
+from minion_assistant.mcp.types import McpConnectionStatus, McpResourceInfo, McpToolInfo
 
 
 # ---------------------------------------------------------------------------
@@ -252,8 +252,8 @@ class TestReadMcpResourceTool:
 
 class TestDefaultRegistryMcpIntegration:
     def test_mcp_tools_registered_when_manager_provided(self):
-        from mini_minion.tools import default_registry
-        from mini_minion.mcp.types import McpToolInfo
+        from minion_assistant.tools import default_registry
+        from minion_assistant.mcp.types import McpToolInfo
 
         mgr = _make_manager()
         mgr.list_tools.return_value = [
@@ -272,14 +272,14 @@ class TestDefaultRegistryMcpIntegration:
         assert "mcp__srv__do_thing" in names
 
     def test_no_mcp_tools_without_manager(self):
-        from mini_minion.tools import default_registry
+        from minion_assistant.tools import default_registry
         reg = default_registry()
         names = {d["function"]["name"] for d in reg.definitions}
         assert "mcp_status" not in names
         assert "mcp__" not in "".join(names)
 
     def test_existing_tools_preserved_with_mcp_manager(self):
-        from mini_minion.tools import default_registry
+        from minion_assistant.tools import default_registry
         mgr = _make_manager()
         reg = default_registry(mcp_manager=mgr)
         names = {d["function"]["name"] for d in reg.definitions}

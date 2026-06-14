@@ -28,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mini_minion.mcp.client import (
+from minion_assistant.mcp.client import (
     McpClientManager,
     _MCP_AVAILABLE,
     _format_tool_result,
@@ -36,7 +36,7 @@ from mini_minion.mcp.client import (
     _handle_image_content,
     _tool_allowed,
 )
-from mini_minion.mcp.types import McpConnectionStatus, McpServerConfig
+from minion_assistant.mcp.types import McpConnectionStatus, McpServerConfig
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +247,7 @@ class TestHandleImageContent:
     def test_no_output_dir_returns_descriptor_without_path(self):
         """Without output_dir, image content must describe size but not save.
 
-        This covers the case where mini-minion is used without a workspace
+        This covers the case where minion-assistant is used without a workspace
         or when image saving is explicitly disabled. The agent still receives
         useful information (mime type, size) instead of a silent empty string.
         """

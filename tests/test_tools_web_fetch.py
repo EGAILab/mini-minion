@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mini_minion.tools.policy import PermissionPolicy
-from mini_minion.tools.web_fetch import WebFetchTool, _extract_text
+from minion_assistant.tools.policy import PermissionPolicy
+from minion_assistant.tools.web_fetch import WebFetchTool, _extract_text
 
 
 # ---------------------------------------------------------------------------

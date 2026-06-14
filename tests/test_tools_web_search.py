@@ -25,8 +25,8 @@ sees the fake regardless of how the import was written.
 import pytest
 from unittest.mock import MagicMock, patch
 
-import mini_minion.tools.web_search as ws_module
-from mini_minion.tools.web_search import (
+import minion_assistant.tools.web_search as ws_module
+from minion_assistant.tools.web_search import (
     WebSearchTool,
     _format_results,
     _DEFAULT_MAX_RESULTS,
@@ -394,7 +394,7 @@ def test_web_search_registered_in_default_registry():
     WebSearchTool is not registered here, the agent's system prompt won't list
     the tool and the LLM will never know it can search the web.
     """
-    from mini_minion.tools import default_registry
+    from minion_assistant.tools import default_registry
     registry = default_registry()
     assert "web_search" in {t.schema.name for t in registry._tools.values()}
 
@@ -406,6 +406,6 @@ def test_web_search_is_read_only_in_registry():
     batch of tool calls can run in parallel.  If this returns False for
     web_search, the runner will serialize search calls that could be concurrent.
     """
-    from mini_minion.tools import default_registry
+    from minion_assistant.tools import default_registry
     registry = default_registry()
     assert registry.is_read_only("web_search") is True

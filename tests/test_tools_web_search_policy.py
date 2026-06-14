@@ -7,9 +7,9 @@ that try to use the search tool to surface internal network addresses.
 
 from unittest.mock import MagicMock
 
-import mini_minion.tools.web_search as ws_module
-from mini_minion.tools.policy import PermissionPolicy
-from mini_minion.tools.web_search import WebSearchTool
+import minion_assistant.tools.web_search as ws_module
+from minion_assistant.tools.policy import PermissionPolicy
+from minion_assistant.tools.web_search import WebSearchTool
 
 
 # ---------------------------------------------------------------------------

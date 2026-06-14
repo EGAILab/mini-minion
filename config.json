@@ -27,7 +27,7 @@
     }
   },
   "workspace": {
-    "path": "~/.mini-minion"
+    "path": "~/.minion-assistant"
   },
   "streaming": {
     "chat_mode": true,

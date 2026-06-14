@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
-from mini_minion.commands import (
+from minion_assistant.commands import (
     CommandContext,
     CommandResult,
     CommandSpec,
@@ -289,7 +289,7 @@ def test_dispatch_compact_reports_nothing_to_compact():
 def test_dispatch_status_is_handled():
     # Patch at the config module level because /status imports streaming lazily
     # inside the function body with `from .config import streaming as _streaming_cfg`.
-    with patch("mini_minion.config.streaming") as mock_streaming:
+    with patch("minion_assistant.config.streaming") as mock_streaming:
         mock_streaming.chat_mode = False
         result = dispatch_command(_make_ctx("/status"))
     assert result.handled is True
@@ -297,7 +297,7 @@ def test_dispatch_status_is_handled():
 
 def test_dispatch_status_message_contains_agent_id():
     """Status output must mention the active agent."""
-    with patch("mini_minion.config.streaming") as mock_streaming:
+    with patch("minion_assistant.config.streaming") as mock_streaming:
         mock_streaming.chat_mode = True
         result = dispatch_command(_make_ctx("/status", target="main"))
     assert "main" in result.message
@@ -305,7 +305,7 @@ def test_dispatch_status_message_contains_agent_id():
 
 def test_dispatch_status_message_contains_model():
     """Status output must include the model ID."""
-    with patch("mini_minion.config.streaming") as mock_streaming:
+    with patch("minion_assistant.config.streaming") as mock_streaming:
         mock_streaming.chat_mode = False
         result = dispatch_command(_make_ctx("/status"))
     assert "test-model" in result.message
@@ -313,7 +313,7 @@ def test_dispatch_status_message_contains_model():
 
 def test_dispatch_status_shows_streaming_on():
     """Status must report 'on' when streaming.chat_mode is True."""
-    with patch("mini_minion.config.streaming") as mock_streaming:
+    with patch("minion_assistant.config.streaming") as mock_streaming:
         mock_streaming.chat_mode = True
         result = dispatch_command(_make_ctx("/status"))
     assert "on" in result.message

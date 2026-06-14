@@ -65,7 +65,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 Every code change in this project must satisfy all four of the following before it is considered done:
 
 - **Code comments**: Add or update comments alongside new code to explain non-obvious behavior, constraints, or design decisions.
-- **Documentation**: Update all relevant files in `mini-minion-documents/` to reflect the change.
+- **Documentation**: Update all relevant files in `minion-assistant-documents/` to reflect the change.
 - **README**: Update `README.md` if the change affects public API, configuration, project structure, or test count.
 - **Tests**: Add or update test cases for the new behavior and ensure the full test suite passes (`256 passed, 1 skipped` or better).
 

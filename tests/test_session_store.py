@@ -2,7 +2,7 @@
 
 import os
 
-from mini_minion.session.store import SessionInfo, SessionStore
+from minion_assistant.session.store import SessionInfo, SessionStore
 
 
 def test_get_or_create_new_session(tmp_path):

@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from mini_minion.tools.find_definition import FindDefinitionTool
-from mini_minion.tools.policy import PermissionPolicy
+from minion_assistant.tools.find_definition import FindDefinitionTool
+from minion_assistant.tools.policy import PermissionPolicy
 
 
 def _write(path: Path, content: str) -> Path:

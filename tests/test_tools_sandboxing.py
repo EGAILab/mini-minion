@@ -1,9 +1,9 @@
 """Tests for tool workspace-root sandboxing and bash confirmation callable."""
 
-from mini_minion.tools.bash import BashTool
-from mini_minion.tools.glob import GlobTool
-from mini_minion.tools.read import ReadTool
-from mini_minion.tools.write import WriteTool
+from minion_assistant.tools.bash import BashTool
+from minion_assistant.tools.glob import GlobTool
+from minion_assistant.tools.read import ReadTool
+from minion_assistant.tools.write import WriteTool
 
 # ---------------------------------------------------------------------------
 # ReadTool — path containment
@@ -176,8 +176,8 @@ def test_bash_tool_cwd_is_used(tmp_path):
 
 
 from pathlib import Path as _Path
-from mini_minion.tools.base import _is_sensitive
-from mini_minion.tools.policy import PermissionPolicy
+from minion_assistant.tools.base import _is_sensitive
+from minion_assistant.tools.policy import PermissionPolicy
 
 
 class TestSensitivePaths:

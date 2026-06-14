@@ -7,7 +7,7 @@ inject a fake client — the anthropic package does not need to be installed.
 
 from unittest.mock import MagicMock, Mock
 
-from mini_minion.providers.anthropic import (
+from minion_assistant.providers.anthropic import (
     AnthropicProvider,
     _format_tools,
     _to_anthropic_messages,
@@ -256,7 +256,7 @@ def test_streaming_was_streamed_false_when_no_text_tokens():
 
 
 def test_blocking_populates_usage_when_api_returns_it():
-    from mini_minion.providers.base import TokenUsage
+    from minion_assistant.providers.base import TokenUsage
     p = _provider()
     usage = Mock()
     usage.input_tokens = 120

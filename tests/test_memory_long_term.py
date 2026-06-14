@@ -1,6 +1,6 @@
 """Tests for LongTermMemory."""
 
-from mini_minion.memory.long_term import _SEARCH_MAX_RESULTS, LongTermMemory
+from minion_assistant.memory.long_term import _SEARCH_MAX_RESULTS, LongTermMemory
 
 
 def test_save_and_load_roundtrip(tmp_path):

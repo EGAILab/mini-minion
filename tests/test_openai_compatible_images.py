@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mini_minion.providers.openai_compatible import (
+from minion_assistant.providers.openai_compatible import (
     _convert_content_for_openai,
     _prepare_messages_for_openai,
 )

@@ -1,6 +1,6 @@
 """Tests for WriteTool 'confirm' callback integration."""
 
-from mini_minion.tools.write import WriteTool
+from minion_assistant.tools.write import WriteTool
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ def test_write_confirm_description_includes_char_count(tmp_path):
 
 def test_write_confirm_policy_read_only_blocks_before_confirm(tmp_path):
     """Policy read_only_mode check fires before the confirm callback."""
-    from mini_minion.tools.policy import PermissionPolicy
+    from minion_assistant.tools.policy import PermissionPolicy
     policy = PermissionPolicy(read_only_mode=True)
 
     called: list[bool] = []

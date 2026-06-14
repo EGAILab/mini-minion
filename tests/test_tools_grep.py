@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from mini_minion.tools.grep import GrepTool
-from mini_minion.tools.policy import PermissionPolicy
+from minion_assistant.tools.grep import GrepTool
+from minion_assistant.tools.policy import PermissionPolicy
 
 
 def _tool(tmp_path: Path) -> GrepTool:

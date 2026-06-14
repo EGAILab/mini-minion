@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from mini_minion.tools.edit import EditTool
-from mini_minion.tools.policy import PermissionPolicy
+from minion_assistant.tools.edit import EditTool
+from minion_assistant.tools.policy import PermissionPolicy
 
 
 def _tool(tmp_path: Path) -> EditTool:

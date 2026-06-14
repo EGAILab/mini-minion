@@ -1,6 +1,6 @@
 """Tests for ReadTool."""
 
-from mini_minion.tools.read import ReadTool
+from minion_assistant.tools.read import ReadTool
 
 
 def test_read_file(tmp_path):

@@ -1,7 +1,7 @@
 """Tests for ToolRegistry."""
 
-from mini_minion.tools.base import Tool, ToolSchema
-from mini_minion.tools.registry import ToolRegistry
+from minion_assistant.tools.base import Tool, ToolSchema
+from minion_assistant.tools.registry import ToolRegistry
 
 
 class _AddTool(Tool):
@@ -140,7 +140,7 @@ def test_hook_exception_does_not_crash_execution():
 
 
 def test_is_read_only_returns_true_for_read_only_tool():
-    from mini_minion.tools.read import ReadTool
+    from minion_assistant.tools.read import ReadTool
     reg = ToolRegistry()
     reg.register(ReadTool(root=None))
     assert reg.is_read_only("read") is True

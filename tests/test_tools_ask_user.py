@@ -1,6 +1,6 @@
 """Tests for AskUserTool."""
 
-from mini_minion.tools.ask_user import AskUserTool
+from minion_assistant.tools.ask_user import AskUserTool
 
 
 def test_ask_user_calls_prompt_fn():

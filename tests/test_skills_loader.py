@@ -2,7 +2,7 @@
 
 import pytest
 
-from mini_minion.skills import SkillInfo, discover_skills, format_skills_prompt
+from minion_assistant.skills import SkillInfo, discover_skills, format_skills_prompt
 
 
 def _write_skill(base, name, description="Does something useful.", body="# Instructions"):

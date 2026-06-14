@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from mini_minion.tools.apply_patch import ApplyPatchTool
-from mini_minion.tools.policy import PermissionPolicy
+from minion_assistant.tools.apply_patch import ApplyPatchTool
+from minion_assistant.tools.policy import PermissionPolicy
 
 
 def _git_available() -> bool:
@@ -106,7 +106,7 @@ def test_apply_patch_check_only_allowed_in_read_only_mode(tmp_path):
 
 def test_apply_patch_git_not_found_returns_error(monkeypatch):
     """When git is not on PATH, execute() returns a clear error before touching any file."""
-    import mini_minion.tools.apply_patch as ap_module
+    import minion_assistant.tools.apply_patch as ap_module
     # Pretend git is missing from PATH.
     monkeypatch.setattr(ap_module, "_GIT_PATH", None)
     # Also make shutil.which return None so the runtime re-check agrees.

@@ -1,6 +1,6 @@
 """Tests for default_registry factory."""
 
-from mini_minion.tools import default_registry
+from minion_assistant.tools import default_registry
 
 
 def test_default_registry_has_expected_tools():

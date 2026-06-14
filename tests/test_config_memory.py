@@ -14,33 +14,33 @@ from unittest.mock import patch
 
 def test_memory_config_defaults_to_enabled():
     """When 'memory' section is absent, enable_extraction defaults to True."""
-    from mini_minion.config import _resolve_memory
-    with patch("mini_minion.config._raw", {}):
+    from minion_assistant.config import _resolve_memory
+    with patch("minion_assistant.config._raw", {}):
         cfg = _resolve_memory()
     assert cfg.enable_extraction is True
 
 
 def test_memory_config_explicit_false():
     """enable_extraction=false in config is respected."""
-    from mini_minion.config import _resolve_memory
+    from minion_assistant.config import _resolve_memory
     raw = {"memory": {"enable_extraction": False}}
-    with patch("mini_minion.config._raw", raw):
+    with patch("minion_assistant.config._raw", raw):
         cfg = _resolve_memory()
     assert cfg.enable_extraction is False
 
 
 def test_memory_config_explicit_true():
     """enable_extraction=true in config is respected."""
-    from mini_minion.config import _resolve_memory
+    from minion_assistant.config import _resolve_memory
     raw = {"memory": {"enable_extraction": True}}
-    with patch("mini_minion.config._raw", raw):
+    with patch("minion_assistant.config._raw", raw):
         cfg = _resolve_memory()
     assert cfg.enable_extraction is True
 
 
 def test_memory_config_is_frozen():
     """MemoryConfig instances are immutable (frozen=True)."""
-    from mini_minion.config import MemoryConfig
+    from minion_assistant.config import MemoryConfig
     cfg = MemoryConfig(enable_extraction=True)
     with pytest.raises((AttributeError, TypeError)):
         cfg.enable_extraction = False  # type: ignore[misc]
@@ -67,11 +67,11 @@ def test_extra_plugin_manifests_reads_list():
 
 def test_extra_plugin_manifests_is_tuple():
     """The exported type must be a tuple, not a list."""
-    from mini_minion.config import extra_plugin_manifests
+    from minion_assistant.config import extra_plugin_manifests
     assert isinstance(extra_plugin_manifests, tuple)
 
 
 def test_memory_config_enable_extraction_is_bool():
     """The exported memory.enable_extraction is always a bool."""
-    from mini_minion.config import memory
+    from minion_assistant.config import memory
     assert isinstance(memory.enable_extraction, bool)

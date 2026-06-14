@@ -3,20 +3,20 @@
 import pytest
 from unittest.mock import Mock, patch
 
-from mini_minion.agents.definitions import AgentConfig
-from mini_minion.agents.events import (
+from minion_assistant.agents.definitions import AgentConfig
+from minion_assistant.agents.events import (
     CompactionFailed,
     CompactionStarted,
     FinalAnswer,
     ToolCalled,
 )
-from mini_minion.agents.session import AgentSession
-from mini_minion.context import Compactor
-from mini_minion.memory.long_term import LongTermMemory
-from mini_minion.memory.short_term import ShortTermMemory
-from mini_minion.providers.base import LLMResponse
-from mini_minion.session import SessionStore
-from mini_minion.tools import ToolRegistry
+from minion_assistant.agents.session import AgentSession
+from minion_assistant.context import Compactor
+from minion_assistant.memory.long_term import LongTermMemory
+from minion_assistant.memory.short_term import ShortTermMemory
+from minion_assistant.providers.base import LLMResponse
+from minion_assistant.session import SessionStore
+from minion_assistant.tools import ToolRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,7 @@ def test_send_rolls_back_partial_messages_on_exception(tmp_path):
         raise RuntimeError("mid-turn crash")
 
     session = _make_session(tmp_path)
-    with patch("mini_minion.agents.session.run_turn", side_effect=_crash_after_partial):
+    with patch("minion_assistant.agents.session.run_turn", side_effect=_crash_after_partial):
         try:
             session.send("hello")
         except RuntimeError:
@@ -273,7 +273,7 @@ def test_max_tool_rounds_forwarded_to_run_turn(tmp_path):
     def _fake_run_turn(*args, **kwargs):
         captured["max_tool_rounds"] = kwargs.get("max_tool_rounds")
 
-    with patch("mini_minion.agents.session.run_turn", side_effect=_fake_run_turn):
+    with patch("minion_assistant.agents.session.run_turn", side_effect=_fake_run_turn):
         try:
             session.send("hello")
         except Exception:
@@ -492,7 +492,7 @@ def test_budget_warning_injected_into_system_prompt(tmp_path):
     """When _format_budget_context returns a block, send() must include it in the system prompt."""
     # Test the injection path independently — we patch _format_budget_context to return
     # a known string so the test doesn't depend on token-counting thresholds.
-    from mini_minion.agents import session as session_module
+    from minion_assistant.agents import session as session_module
 
     provider = _mock_provider()
     sess = _make_session(tmp_path, provider=provider)
@@ -509,7 +509,7 @@ def test_budget_warning_injected_into_system_prompt(tmp_path):
 
 def test_budget_warning_absent_when_history_small(tmp_path):
     """<context_budget> must NOT appear when history is well within the usable budget."""
-    from mini_minion.agents.session import _format_budget_context
+    from minion_assistant.agents.session import _format_budget_context
 
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     tiny_history = [{"role": "user", "content": "hello"}]
@@ -519,7 +519,7 @@ def test_budget_warning_absent_when_history_small(tmp_path):
 
 def test_budget_warning_function_fires_at_threshold():
     """_format_budget_context must return a non-empty block when history exceeds 50% usable."""
-    from mini_minion.agents.session import _format_budget_context
+    from minion_assistant.agents.session import _format_budget_context
 
     compactor = Compactor(context_window=10_000, preserve_tokens=2_000)
     # usable = 8_000 tokens; 50% = 4_000.  Fill with enough text (varied content
@@ -538,7 +538,7 @@ def test_budget_warning_function_fires_at_threshold():
 def test_turn_completed_event_emitted(tmp_path):
     """TurnCompleted must be emitted after every successful turn."""
     import uuid
-    from mini_minion.agents.events import TurnCompleted
+    from minion_assistant.agents.events import TurnCompleted
 
     provider = _mock_provider(text="done")
     session = _make_session(tmp_path, provider=provider)
@@ -557,7 +557,7 @@ def test_turn_completed_event_emitted(tmp_path):
 
 def test_turn_completed_not_emitted_on_failure(tmp_path):
     """TurnCompleted must NOT be emitted when the turn raises."""
-    from mini_minion.agents.events import TurnCompleted
+    from minion_assistant.agents.events import TurnCompleted
     provider = Mock()
     provider.chat = Mock(side_effect=RuntimeError("fail"))
     session = _make_session(tmp_path, provider=provider)
@@ -643,7 +643,7 @@ def test_enable_memory_extraction_false_suppresses_extraction(tmp_path):
     def fake_extract(*args, **kwargs):
         extraction_calls.append(True)
 
-    with patch("mini_minion.memory.extractor.extract_and_save_async", side_effect=fake_extract):
+    with patch("minion_assistant.memory.extractor.extract_and_save_async", side_effect=fake_extract):
         session.send("hello")
 
     # The extraction function must NOT have been called.
@@ -676,7 +676,7 @@ def test_enable_memory_extraction_true_allows_extraction(tmp_path):
     def fake_extract(*args, **kwargs):
         extraction_calls.append(True)
 
-    with patch("mini_minion.memory.extractor.extract_and_save_async", side_effect=fake_extract):
+    with patch("minion_assistant.memory.extractor.extract_and_save_async", side_effect=fake_extract):
         session.send("hello")
 
     assert extraction_calls

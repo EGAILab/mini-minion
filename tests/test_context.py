@@ -14,11 +14,11 @@ Tests cover:
 
 import json
 
-from mini_minion.context import (
+from minion_assistant.context import (
     Compactor,
     _estimate_tokens,
 )
-from mini_minion.providers.base import LLMResponse
+from minion_assistant.providers.base import LLMResponse
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -335,7 +335,7 @@ def test_compact_prunes_tool_outputs_in_tail():
 
 def test_compact_summary_uses_structured_prompt():
     """The summarisation call uses the structured _SUMMARY_PROMPT as system."""
-    from mini_minion.context import _SUMMARY_PROMPT
+    from minion_assistant.context import _SUMMARY_PROMPT
     compactor = _make_compactor_with_usable(1)
     msgs = [_msg("user", "x" * 100), _msg("assistant", "y" * 100)]
     provider = _MockProvider()
@@ -349,7 +349,7 @@ def test_compact_summary_uses_structured_prompt():
 
 def test_compaction_config_loaded_from_config_json():
     """CompactionConfig is read from config.json; preserve_tokens is None when omitted (auto-compute)."""
-    from mini_minion.config import agents, compaction
+    from minion_assistant.config import agents, compaction
     # preserve_tokens is now optional — None means "use model.max_output_tokens" at runtime.
     assert compaction.preserve_tokens is None or compaction.preserve_tokens > 0
     # context_window is now per-agent via ModelConfig, not in CompactionConfig
@@ -400,7 +400,7 @@ def test_format_head_truncates_long_user_message():
 
 def test_prune_microcompacts_old_tool_results():
     """Tool results older than the last _tail_keep_full are replaced with one-liners."""
-    from mini_minion.context import _TAIL_KEEP_FULL_RESULTS
+    from minion_assistant.context import _TAIL_KEEP_FULL_RESULTS
     compactor = Compactor(context_window=10_000)
     # Build more tool results than the keep-full threshold.
     tail = [_tool_result("x" * 100, call_id=f"tc{i}") for i in range(_TAIL_KEEP_FULL_RESULTS + 2)]
@@ -418,7 +418,7 @@ def test_prune_microcompacts_old_tool_results():
 
 def test_prune_keeps_all_when_fewer_than_threshold(tmp_path=None):
     """When the tail has ≤ _tail_keep_full tool results, all are kept in full."""
-    from mini_minion.context import _TAIL_KEEP_FULL_RESULTS
+    from minion_assistant.context import _TAIL_KEEP_FULL_RESULTS
     compactor = Compactor(context_window=10_000)
     tail = [_tool_result("content", call_id=f"tc{i}") for i in range(_TAIL_KEEP_FULL_RESULTS - 1)]
     pruned = compactor._prune(tail)

@@ -4,7 +4,7 @@ import json
 from unittest.mock import Mock
 
 import pytest
-from mini_minion.agents.events import (
+from minion_assistant.agents.events import (
     FinalAnswer,
     MaxRoundsReached,
     StreamingStarted,
@@ -12,10 +12,10 @@ from mini_minion.agents.events import (
     TokenStreamed,
     ToolCalled,
 )
-from mini_minion.agents.runner import run_turn
-from mini_minion.providers.base import LLMResponse, ToolCall
-from mini_minion.tools.base import Tool, ToolSchema
-from mini_minion.tools.registry import ToolRegistry
+from minion_assistant.agents.runner import run_turn
+from minion_assistant.providers.base import LLMResponse, ToolCall
+from minion_assistant.tools.base import Tool, ToolSchema
+from minion_assistant.tools.registry import ToolRegistry
 
 
 class _EchoTool(Tool):
@@ -335,7 +335,7 @@ def test_tool_call_with_parse_error_feeds_error_to_model():
 
 def test_tool_round_limit_stops_loop():
     """Loop must stop after _MAX_TOOL_ROUNDS calls when the model never stops using tools."""
-    from mini_minion.agents.runner import _MAX_TOOL_ROUNDS  # noqa: PLC0415
+    from minion_assistant.agents.runner import _MAX_TOOL_ROUNDS  # noqa: PLC0415
 
     registry = ToolRegistry()
     registry.register(_EchoTool())
@@ -435,7 +435,7 @@ def test_retry_on_transient_error():
     """run_turn must retry transient provider errors and succeed on a later attempt."""
     import time
     from unittest.mock import patch
-    from mini_minion.providers.base import LLMResponse as R
+    from minion_assistant.providers.base import LLMResponse as R
 
     call_count = [0]
 
@@ -451,7 +451,7 @@ def test_retry_on_transient_error():
     messages: list[dict] = []
 
     # Patch sleep so the test runs instantly.
-    with patch("mini_minion.agents.runner.time.sleep"):
+    with patch("minion_assistant.agents.runner.time.sleep"):
         events = _run(provider, messages)
 
     assert call_count[0] == 3
@@ -478,7 +478,7 @@ def test_no_retry_on_permanent_error():
     provider.chat = Mock(side_effect=_bad_request)
     messages: list[dict] = []
 
-    with patch("mini_minion.agents.runner.time.sleep"):
+    with patch("minion_assistant.agents.runner.time.sleep"):
         with pytest.raises(_PermanentError):
             run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages)
 
@@ -569,7 +569,7 @@ def test_custom_max_tool_rounds():
 
 def test_tool_completed_event_emitted_in_serial_path():
     """ToolCompleted must be emitted once per tool call in the serial (default) path."""
-    from mini_minion.agents.events import ToolCompleted
+    from minion_assistant.agents.events import ToolCompleted
 
     registry = ToolRegistry()
     registry.register(_EchoTool())
