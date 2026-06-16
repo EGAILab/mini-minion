@@ -10,8 +10,8 @@ import json
 import pytest
 from pathlib import Path
 
-import minion_assistant.commands as commands_module
-from minion_assistant.commands import register_plugin_command, CommandSpec
+import minion_assist.commands as commands_module
+from minion_assist.commands import register_plugin_command, CommandSpec
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@ def clear_plugin_registry():
 def _write_handler(path: Path, return_msg: str = "handler ran") -> None:
     """Write a minimal valid command handler Python file to path."""
     path.write_text(
-        "from minion_assistant.commands import CommandResult\n"
+        "from minion_assist.commands import CommandResult\n"
         f"def handle(ctx):\n"
         f"    return CommandResult(handled=True, message={return_msg!r})\n",
         encoding="utf-8",
@@ -79,7 +79,7 @@ def test_register_plugin_command_deduplicates_by_name():
 
 def test_load_command_handler_registers_command(tmp_path):
     """_load_command_handler must register a valid handler file as a plugin command."""
-    from minion_assistant.plugins import _load_command_handler
+    from minion_assist.plugins import _load_command_handler
     handler_path = tmp_path / "my_cmd.py"
     _write_handler(handler_path)
     _load_command_handler("/my-cmd", "A test command", handler_path)
@@ -88,7 +88,7 @@ def test_load_command_handler_registers_command(tmp_path):
 
 def test_load_command_handler_missing_file_warns(tmp_path, capsys):
     """When the handler file doesn't exist, a warning is printed and nothing is registered."""
-    from minion_assistant.plugins import _load_command_handler
+    from minion_assist.plugins import _load_command_handler
     _load_command_handler("/missing", "Missing handler", tmp_path / "nope.py")
     out = capsys.readouterr().out
     assert "Warning" in out or "not found" in out.lower()
@@ -97,7 +97,7 @@ def test_load_command_handler_missing_file_warns(tmp_path, capsys):
 
 def test_load_command_handler_no_handle_function_warns(tmp_path, capsys):
     """When the handler file has no 'handle' function, a warning is printed."""
-    from minion_assistant.plugins import _load_command_handler
+    from minion_assist.plugins import _load_command_handler
     bad_handler = tmp_path / "bad.py"
     bad_handler.write_text("x = 1\n", encoding="utf-8")
     _load_command_handler("/bad", "Bad handler", bad_handler)
@@ -112,8 +112,8 @@ def test_load_command_handler_no_handle_function_warns(tmp_path, capsys):
 
 def test_load_manifest_commands_section(tmp_path):
     """_load_manifest must register commands declared in the 'commands' section."""
-    from minion_assistant.plugins import _load_manifest
-    from minion_assistant.tools.registry import ToolRegistry
+    from minion_assist.plugins import _load_manifest
+    from minion_assist.tools.registry import ToolRegistry
 
     handler_path = tmp_path / "cmd.py"
     _write_handler(handler_path, "plugin command ran")
@@ -131,8 +131,8 @@ def test_load_manifest_commands_section(tmp_path):
 
 def test_load_manifest_commands_missing_name_warns(tmp_path, capsys):
     """Command entries without 'name' are skipped with a warning."""
-    from minion_assistant.plugins import _load_manifest
-    from minion_assistant.tools.registry import ToolRegistry
+    from minion_assist.plugins import _load_manifest
+    from minion_assist.tools.registry import ToolRegistry
 
     handler_path = tmp_path / "cmd.py"
     _write_handler(handler_path)
@@ -150,8 +150,8 @@ def test_load_manifest_commands_missing_name_warns(tmp_path, capsys):
 
 def test_load_manifest_commands_missing_handler_warns(tmp_path, capsys):
     """Command entries without 'handler' are skipped with a warning."""
-    from minion_assistant.plugins import _load_manifest
-    from minion_assistant.tools.registry import ToolRegistry
+    from minion_assist.plugins import _load_manifest
+    from minion_assist.tools.registry import ToolRegistry
 
     manifest_path = tmp_path / "plugins.json"
     _write_manifest(manifest_path, [

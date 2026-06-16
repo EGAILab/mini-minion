@@ -1,8 +1,8 @@
 """Tests for SaveMemoryTool and NoteTool policy (read_only_mode) integration."""
 
-from minion_assistant.memory.long_term import LongTermMemory
-from minion_assistant.tools.memory import NoteTool, SaveMemoryTool
-from minion_assistant.tools.policy import PermissionPolicy
+from minion_assist.memory.long_term import LongTermMemory
+from minion_assist.tools.memory import NoteTool, SaveMemoryTool
+from minion_assist.tools.policy import PermissionPolicy
 
 
 # ---------------------------------------------------------------------------

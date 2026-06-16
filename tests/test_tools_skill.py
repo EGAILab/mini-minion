@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from minion_assistant.skills import SkillInfo
-from minion_assistant.tools.skill import SkillTool
+from minion_assist.skills import SkillInfo
+from minion_assist.tools.skill import SkillTool
 
 
 def _registry(*skills: SkillInfo) -> dict:

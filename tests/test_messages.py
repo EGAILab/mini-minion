@@ -1,4 +1,4 @@
-"""Tests for minion_assistant.messages — provider-neutral content block helpers.
+"""Tests for minion_assist.messages — provider-neutral content block helpers.
 
 Covers:
 - make_user_content: no attachments → string; with attachments → block list
@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from minion_assistant.messages import (
+from minion_assist.messages import (
     ALLOWED_IMAGE_TYPES,
     content_has_images,
     content_text,

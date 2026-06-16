@@ -1,5 +1,5 @@
 [project]
-name = "minion-assistant"
+name = "minion-assist"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,7 +20,7 @@ tiktoken  = ["tiktoken>=0.7.0"]
 testpaths = ["tests"]
 
 [project.scripts]
-minion-assistant = "minion_assistant.minion:main"
+minion-assist = "minion_assist.minion:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -40,4 +40,4 @@ target-version = "py311"
 select = ["E", "F", "I", "UP"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/minion_assistant"]
+packages = ["src/minion_assist"]

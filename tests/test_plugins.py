@@ -6,9 +6,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from minion_assistant.plugins import load_plugins, _load_tool_module
-from minion_assistant.tools.base import Tool, ToolSchema
-from minion_assistant.tools.registry import ToolRegistry
+from minion_assist.plugins import load_plugins, _load_tool_module
+from minion_assist.tools.base import Tool, ToolSchema
+from minion_assist.tools.registry import ToolRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +27,7 @@ def _write_tool_module(path: Path, tool_name: str = "plugin_test") -> None:
     """Write a minimal tool module that exports a TOOLS list."""
     path.write_text(
         f"""
-from minion_assistant.tools.base import Tool, ToolSchema
+from minion_assist.tools.base import Tool, ToolSchema
 
 class _PluginTool(Tool):
     @property
@@ -87,12 +87,12 @@ def test_load_plugins_project_local_overrides_global(tmp_path, monkeypatch):
     _write_manifest(tmp_path / "plugins.json", {"tools": [str(global_tool)]})
 
     # Local manifest declares a different tool with the same name
-    local_dir = tmp_path / ".minion-assistant"
+    local_dir = tmp_path / ".minion-assist"
     local_dir.mkdir()
     local_tool = local_dir / "local_tool.py"
     local_tool.write_text(
         """
-from minion_assistant.tools.base import Tool, ToolSchema
+from minion_assist.tools.base import Tool, ToolSchema
 
 class _LocalTool(Tool):
     @property
@@ -158,7 +158,7 @@ def test_load_tool_module_autodiscovery_without_tools_list(tmp_path):
     tool_file = tmp_path / "auto.py"
     tool_file.write_text(
         """
-from minion_assistant.tools.base import Tool, ToolSchema
+from minion_assist.tools.base import Tool, ToolSchema
 
 class AutoTool(Tool):
     @property

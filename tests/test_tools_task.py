@@ -4,7 +4,7 @@ import json
 import pytest
 from pathlib import Path
 
-from minion_assistant.tools.task import ReadTaskTool, UpdateTaskTool
+from minion_assist.tools.task import ReadTaskTool, UpdateTaskTool
 
 
 def _pair(tmp_path: Path):

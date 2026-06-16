@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from minion_assistant.tools.policy import PermissionPolicy
-from minion_assistant.tools.todo import TodoReadTool, TodoWriteTool
+from minion_assist.tools.policy import PermissionPolicy
+from minion_assist.tools.todo import TodoReadTool, TodoWriteTool
 
 
 def test_write_and_read_round_trip(tmp_path):

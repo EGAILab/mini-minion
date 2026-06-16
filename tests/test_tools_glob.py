@@ -1,6 +1,6 @@
 """Tests for GlobTool."""
 
-from minion_assistant.tools.glob import _MAX_RESULTS, GlobTool
+from minion_assist.tools.glob import _MAX_RESULTS, GlobTool
 
 
 def test_glob_finds_files(tmp_path):

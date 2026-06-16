@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from minion_assistant.tools.git import GitCommitTool, GitDiffTool, GitStatusTool
+from minion_assist.tools.git import GitCommitTool, GitDiffTool, GitStatusTool
 
 
 # ---------------------------------------------------------------------------

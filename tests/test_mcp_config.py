@@ -12,7 +12,7 @@ import pytest
 # so we test the helpers in isolation.
 # ---------------------------------------------------------------------------
 
-from minion_assistant.config import (
+from minion_assist.config import (
     McpConfig,
     McpServerConfig,
     _DANGEROUS_ENV_KEYS,
@@ -102,16 +102,16 @@ class TestExpandEnvVars:
 # ---------------------------------------------------------------------------
 
 class TestResolveMcp:
-    """These tests monkeypatch minion_assistant.config._raw to inject fake config."""
+    """These tests monkeypatch minion_assist.config._raw to inject fake config."""
 
     def _patch_raw(self, monkeypatch, mcp_section: dict):
-        import minion_assistant.config as cfg_module
+        import minion_assist.config as cfg_module
         fake_raw = dict(cfg_module._raw)  # shallow copy of real _raw
         fake_raw["mcp"] = mcp_section
         monkeypatch.setattr(cfg_module, "_raw", fake_raw)
 
     def test_absent_mcp_section_returns_empty(self, monkeypatch):
-        import minion_assistant.config as cfg_module
+        import minion_assist.config as cfg_module
         fake_raw = {k: v for k, v in cfg_module._raw.items() if k != "mcp"}
         monkeypatch.setattr(cfg_module, "_raw", fake_raw)
         result = _resolve_mcp()
@@ -276,7 +276,7 @@ class TestMcpValidation:
 
     def _validate_mcp(self, mcp_section: dict):
         """Run _validate with only the mcp section patched in."""
-        from minion_assistant.config import _validate, _raw
+        from minion_assist.config import _validate, _raw
         raw = dict(_raw)
         raw["mcp"] = mcp_section
         return _validate(raw)

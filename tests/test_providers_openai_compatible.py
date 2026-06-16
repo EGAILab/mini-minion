@@ -5,7 +5,7 @@ Uses a fake _client injected via object.__new__ — no real API connection neede
 
 from unittest.mock import Mock
 
-from minion_assistant.providers.openai_compatible import OpenAICompatibleProvider
+from minion_assist.providers.openai_compatible import OpenAICompatibleProvider
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -207,7 +207,7 @@ def test_streaming_multiple_tool_calls_assembled():
 
 
 def test_blocking_populates_usage_when_api_returns_it():
-    from minion_assistant.providers.base import TokenUsage
+    from minion_assist.providers.base import TokenUsage
     p = _provider()
     usage = Mock()
     usage.prompt_tokens = 80
@@ -236,7 +236,7 @@ def _stream_usage_chunk(prompt_tokens: int, completion_tokens: int):
 
 def test_streaming_populates_usage_from_final_chunk():
     """stream_options=include_usage causes a final empty chunk with usage data."""
-    from minion_assistant.providers.base import TokenUsage
+    from minion_assist.providers.base import TokenUsage
     p = _provider()
     chunks = [
         _stream_chunk(content="Hi"),

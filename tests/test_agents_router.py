@@ -7,8 +7,8 @@ routing logic using monkeypatching to simulate arbitrary configs.
 """
 
 
-import minion_assistant.agents.router as router_mod
-from minion_assistant.agents.router import _build_routes, resolve
+import minion_assist.agents.router as router_mod
+from minion_assist.agents.router import _build_routes, resolve
 
 # ---------------------------------------------------------------------------
 # Tests against the real config (validates the current config.json setup)
@@ -116,7 +116,7 @@ def test_longest_prefix_matched_first(monkeypatch):
 
 def test_build_routes_splits_prefixed_and_default(monkeypatch):
     """_build_routes correctly separates prefixed agents from the default."""
-    from minion_assistant.config import AgentModelConfig, ModelConfig, ProviderConfig
+    from minion_assist.config import AgentModelConfig, ModelConfig, ProviderConfig
 
     dummy_provider = ProviderConfig(name="x", base_url="", api_key="", api="x")
     dummy_model = ModelConfig(id="x", context_window=8192, max_output_tokens=4096)
@@ -138,7 +138,7 @@ def test_build_routes_splits_prefixed_and_default(monkeypatch):
 
 def test_build_routes_appends_space_to_prefix(monkeypatch):
     """_build_routes appends a trailing space so /foo doesn't match /foobar."""
-    from minion_assistant.config import AgentModelConfig, ModelConfig, ProviderConfig
+    from minion_assist.config import AgentModelConfig, ModelConfig, ProviderConfig
 
     dummy_provider = ProviderConfig(name="x", base_url="", api_key="", api="x")
     dummy_model = ModelConfig(id="x", context_window=8192, max_output_tokens=4096)
@@ -157,7 +157,7 @@ def test_build_routes_appends_space_to_prefix(monkeypatch):
 
 def test_build_routes_sorts_longest_first(monkeypatch):
     """_build_routes sorts routes so the longest prefix is tried first."""
-    from minion_assistant.config import AgentModelConfig, ModelConfig, ProviderConfig
+    from minion_assist.config import AgentModelConfig, ModelConfig, ProviderConfig
 
     dummy_provider = ProviderConfig(name="x", base_url="", api_key="", api="x")
     dummy_model = ModelConfig(id="x", context_window=8192, max_output_tokens=4096)
@@ -180,11 +180,11 @@ def test_build_routes_sorts_longest_first(monkeypatch):
 
 def test_researcher_route_prefix_in_config():
     """The researcher agent's route_prefix is read correctly from config.json."""
-    from minion_assistant.config import agents
+    from minion_assist.config import agents
     assert agents["researcher"].route_prefix == "/research"
 
 
 def test_main_agent_has_no_route_prefix():
     """The main agent has no route_prefix — it is the default fallback."""
-    from minion_assistant.config import agents
+    from minion_assist.config import agents
     assert agents["main"].route_prefix is None

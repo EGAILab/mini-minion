@@ -2,7 +2,7 @@
 
 import json
 
-from minion_assistant.memory.short_term import ShortTermMemory
+from minion_assist.memory.short_term import ShortTermMemory
 
 
 def test_load_empty_returns_empty_list(tmp_path):

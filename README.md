@@ -1,4 +1,4 @@
-# minion-assistant
+# minion-assist
 
 A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution, persistent memory, and long-running task support. Two agents — **Ada** (general assistant) and **Elizabeth** (research specialist) — run a Think-Act-Observe loop, calling tools until they reach a final answer, then persisting conversation history across sessions. Responses can be streamed token-by-token in interactive mode.
 
@@ -47,7 +47,7 @@ uv add --optional tiktoken tiktoken
 cp .env.example .env   # then fill in your keys
 
 # Run
-uv run minion-assistant
+uv run minion-assist
 ```
 
 At the prompt:
@@ -66,11 +66,11 @@ You: exit
 ## Project Structure
 
 ```
-minion-assistant/
+minion-assist/
 ├── config.json                  # Provider, model, agent, routing, workspace, and MCP config
 ├── .env                         # API keys (never commit)
 ├── pyproject.toml               # Package metadata and dependencies
-├── src/minion_assistant/
+├── src/minion_assist/
 │   ├── minion.py                # Entry point — interactive REPL
 │   ├── config.py                # Config loader (config.json + .env)
 │   ├── context.py               # Context window overflow detection and history compaction
@@ -170,7 +170,7 @@ minion-assistant/
     "researcher": {"model": "aliyuncs/glm-5", "route_prefix": "/research"}
   },
   "workspace": {
-    "path": "~/.minion-assistant"
+    "path": "~/.minion-assist"
   },
   "streaming": {
     "chat_mode": true,
@@ -214,7 +214,7 @@ minion-assistant/
 | `mcp.servers.<name>.args` | *(stdio only)* Arguments passed to the server command |
 | `mcp.servers.<name>.url` | *(sse / streamableHttp only)* URL of the MCP server endpoint |
 | `memory.enable_extraction` | *(Optional, default `true`)* Set to `false` to disable the background fact-extraction API call fired after each turn. Useful for expensive models where the extra call doubles token costs. |
-| `extra_plugin_manifests` | *(Optional)* List of additional `plugins.json` file paths to load beyond the two fixed locations (`~/.minion-assistant/plugins.json` and `.minion-assistant/plugins.json`). Paths support `~` expansion. |
+| `extra_plugin_manifests` | *(Optional)* List of additional `plugins.json` file paths to load beyond the two fixed locations (`~/.minion-assist/plugins.json` and `.minion-assist/plugins.json`). Paths support `~` expansion. |
 
 ### `.env`
 
@@ -295,10 +295,10 @@ AgentSession.send(message, on_event=callback, stream=True/False)
 
 **Message format** is the OpenAI Chat Completions wire format throughout — `{"role": "user"|"assistant"|"tool", "content": "..."}`. Providers that use a different format (Anthropic) convert internally.
 
-**Workspace layout** (default `~/.minion-assistant/`):
+**Workspace layout** (default `~/.minion-assist/`):
 
 ```
-~/.minion-assistant/
+~/.minion-assist/
 ├── sessions/
 │   ├── main.jsonl        ← Ada's conversation history
 │   └── researcher.jsonl  ← Elizabeth's conversation history
@@ -323,7 +323,7 @@ AgentSession.send(message, on_event=callback, stream=True/False)
 └── sessions.json         ← session metadata (turn counts, timestamps)
 ```
 
-Project-level skills live at `.minion-assistant/skills/` relative to the working directory and override global skills with the same name.
+Project-level skills live at `.minion-assist/skills/` relative to the working directory and override global skills with the same name.
 
 ---
 
@@ -408,7 +408,7 @@ Ada: The screenshot shows ...
 
 ## MCP Servers
 
-minion-assistant supports the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). Configure MCP servers in `config.json` under `"mcp"`:
+minion-assist supports the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). Configure MCP servers in `config.json` under `"mcp"`:
 
 ```json
 "mcp": {
@@ -435,7 +435,7 @@ minion-assistant supports the [Model Context Protocol](https://modelcontextproto
 **Transports:** `stdio` (subprocess), `sse` (server-sent events), `streamableHttp`.
 
 **How it works:**
-- At startup, minion-assistant connects to each configured MCP server.
+- At startup, minion-assist connects to each configured MCP server.
 - Tools exposed by MCP servers are registered in the tool registry as `mcp__<server>__<tool>` (e.g. `mcp__playwright__browser_navigate`).
 - The agents can call MCP tools like any built-in tool.
 - Five built-in management tools are always registered when MCP is configured: `mcp_status`, `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, and `get_mcp_prompt`.
@@ -494,7 +494,7 @@ Ada: [tool: mcp__playwright__browser_navigate({'url': 'https://news.ycombinator.
      1. ...
 ```
 
-**Screenshots** are automatically saved to `~/.minion-assistant/playwright-output/screenshot-<timestamp>.png` when the agent calls `browser_take_screenshot`. The agent receives the file path in the tool result.
+**Screenshots** are automatically saved to `~/.minion-assist/playwright-output/screenshot-<timestamp>.png` when the agent calls `browser_take_screenshot`. The agent receives the file path in the tool result.
 
 **Notes:**
 - The browser opens as a visible window by default (headed mode). You can watch the agent browse.
@@ -507,12 +507,12 @@ Ada: [tool: mcp__playwright__browser_navigate({'url': 'https://news.ycombinator.
 
 ### `config`
 
-**File:** `src/minion_assistant/config.py`
+**File:** `src/minion_assist/config.py`
 
 Loads `config.json` and `.env` at import time. Exposes four module-level values:
 
 ```python
-from minion_assistant.config import agents, workspace, streaming, compaction, memory, extra_plugin_manifests
+from minion_assist.config import agents, workspace, streaming, compaction, memory, extra_plugin_manifests
 
 agents                  # dict[str, AgentModelConfig] — one entry per agent in config.json
 workspace               # Path — resolved workspace directory
@@ -580,7 +580,7 @@ Invalid config.json:
 
 ### `providers`
 
-**Directory:** `src/minion_assistant/providers/`
+**Directory:** `src/minion_assist/providers/`
 
 Adapts different LLM APIs to a single protocol.
 
@@ -623,7 +623,7 @@ class LLMResponse:
 #### Factory
 
 ```python
-from minion_assistant.providers import create_provider
+from minion_assist.providers import create_provider
 
 provider = create_provider(
     api="openai-completions",   # or "lmstudio" / "anthropic"
@@ -645,7 +645,7 @@ provider = create_provider(
 
 ### `agents`
 
-**Directory:** `src/minion_assistant/agents/`
+**Directory:** `src/minion_assist/agents/`
 
 #### Definitions (`definitions.py`)
 
@@ -667,7 +667,7 @@ Both agents have `_TASK_SOUL_SUFFIX` appended to their souls, which instructs th
 #### Router (`router.py`)
 
 ```python
-from minion_assistant.agents.router import resolve
+from minion_assist.agents.router import resolve
 
 agent_id, message = resolve("/research find FastAPI benchmarks")
 # → ("researcher", "find FastAPI benchmarks")
@@ -681,7 +681,7 @@ Routing is **config-driven** — rules are read from `config.json` at startup. E
 #### Session (`session.py`)
 
 ```python
-from minion_assistant.agents import AgentSession
+from minion_assist.agents import AgentSession
 
 session = AgentSession(
     agent_id="main",
@@ -730,7 +730,7 @@ When `long_term` is provided, `AgentSession`:
 #### Runner (`runner.py`)
 
 ```python
-from minion_assistant.agents.runner import run_turn
+from minion_assist.agents.runner import run_turn
 
 usage = run_turn(
     provider,              # LLMProvider
@@ -757,7 +757,7 @@ Implements the TAO loop with three reliability features:
 
 ### `tools`
 
-**Directory:** `src/minion_assistant/tools/`
+**Directory:** `src/minion_assist/tools/`
 
 #### Base types (`base.py`)
 
@@ -794,7 +794,7 @@ registry.execute("tool_name", {"arg": "value"})  # str
 **Hook support:** plugins can attach callbacks that run before or after every tool execution:
 
 ```python
-from minion_assistant.agents.events import ToolPreExecuteHookEvent, ToolPostExecuteHookEvent
+from minion_assist.agents.events import ToolPreExecuteHookEvent, ToolPostExecuteHookEvent
 
 registry.add_before_hook(lambda event: print(f"→ {event.name}({event.arguments})"))
 registry.add_after_hook(lambda event: print(f"← {event.name} in {event.elapsed_ms}ms"))
@@ -868,9 +868,9 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 #### `default_registry()`
 
 ```python
-from minion_assistant.tools import default_registry
-from minion_assistant.memory import LongTermMemory
-from minion_assistant.skills import discover_skills
+from minion_assist.tools import default_registry
+from minion_assist.memory import LongTermMemory
+from minion_assist.skills import discover_skills
 from pathlib import Path
 
 # Minimal (4 tools: read, write, glob, bash)
@@ -886,7 +886,7 @@ reg = default_registry(
 reg = default_registry(
     long_term=LongTermMemory(some_path),
     root=Path.cwd(),
-    tasks_dir=Path("~/.minion-assistant/tasks").expanduser(),
+    tasks_dir=Path("~/.minion-assist/tasks").expanduser(),
     agent_id="main",
 )
 
@@ -917,7 +917,7 @@ reg = default_registry(
 `PermissionPolicy` is a centralised safety dataclass injected into all I/O tools. Rather than each tool implementing its own path/URL/command checks, they all delegate to one shared policy object.
 
 ```python
-from minion_assistant.tools.policy import PermissionPolicy
+from minion_assist.tools.policy import PermissionPolicy
 from pathlib import Path
 
 # Default: workspace boundary + standard SSRF markers
@@ -954,9 +954,9 @@ error = policy.check_command("curl 169.254.169.254")        # command / SSRF + r
 
 ### Plugin System (`plugins.py`)
 
-The plugin system lets you extend minion-assistant with custom tools, registry hooks, and skills — no source edits required.
+The plugin system lets you extend minion-assist with custom tools, registry hooks, and skills — no source edits required.
 
-**Manifest format** (`~/.minion-assistant/plugins.json` or `.minion-assistant/plugins.json`):
+**Manifest format** (`~/.minion-assist/plugins.json` or `.minion-assist/plugins.json`):
 
 ```json
 {
@@ -977,7 +977,7 @@ The plugin system lets you extend minion-assistant with custom tools, registry h
 **`"tools"` section** — paths to Python files that either export a `TOOLS` list (preferred) or contain auto-discoverable `Tool` subclasses:
 
 ```python
-from minion_assistant.tools.base import Tool, ToolSchema
+from minion_assist.tools.base import Tool, ToolSchema
 
 class MyCustomTool(Tool):
     @property
@@ -1024,7 +1024,7 @@ AFTER_HOOKS = [log_after]
 The `handler` path points to a Python file that must expose a `handle(ctx) -> CommandResult` function:
 
 ```python
-from minion_assistant.commands import CommandResult
+from minion_assist.commands import CommandResult
 
 def handle(ctx):
     return CommandResult(handled=True, message="Plugin command ran!")
@@ -1043,7 +1043,7 @@ Plugin commands appear in `/help` output under "Plugin commands:" and are dispat
 ]
 ```
 
-**Priority:** project-local manifest (`.minion-assistant/plugins.json`) loads after global (`~/.minion-assistant/plugins.json`), so local tools override global ones with the same name.
+**Priority:** project-local manifest (`.minion-assist/plugins.json`) loads after global (`~/.minion-assist/plugins.json`), so local tools override global ones with the same name.
 
 **Security note:** plugin files are executed with `importlib`. Only add paths to files you trust.
 
@@ -1051,21 +1051,21 @@ Plugin commands appear in `/help` output under "Plugin commands:" and are dispat
 
 ### `skills`
 
-**File:** `src/minion_assistant/skills/__init__.py`
+**File:** `src/minion_assist/skills/__init__.py`
 
 Discovers and loads agent skills from SKILL.md files on disk.
 
 ```python
-from minion_assistant.skills import discover_skills, format_skills_prompt
+from minion_assist.skills import discover_skills, format_skills_prompt
 
 registry = discover_skills([
-    Path("~/.minion-assistant/skills").expanduser(),  # global (lower priority)
-    Path(".minion-assistant/skills"),                  # project (higher priority)
+    Path("~/.minion-assist/skills").expanduser(),  # global (lower priority)
+    Path(".minion-assist/skills"),                  # project (higher priority)
 ])
 prompt_suffix = format_skills_prompt(registry)   # "" when no skills found
 ```
 
-**Skill file format** (`~/.minion-assistant/skills/my-skill/SKILL.md`):
+**Skill file format** (`~/.minion-assist/skills/my-skill/SKILL.md`):
 
 ```markdown
 ---
@@ -1084,16 +1084,16 @@ The `name:` field is required. `description:` is optional but must be non-empty 
 
 ### `memory`
 
-**Directory:** `src/minion_assistant/memory/`
+**Directory:** `src/minion_assist/memory/`
 
 #### Short-term (`short_term.py`)
 
 Stores conversation history as JSONL files — one file per agent at `{base_dir}/{key}.jsonl`. Uses an atomic tmp-file swap on every `save()` so a crash mid-write never corrupts the existing history.
 
 ```python
-from minion_assistant.memory import ShortTermMemory
+from minion_assist.memory import ShortTermMemory
 
-mem = ShortTermMemory(Path("~/.minion-assistant/sessions").expanduser())
+mem = ShortTermMemory(Path("~/.minion-assist/sessions").expanduser())
 mem.load("main")                          # list[dict] — full history
 mem.save("main", messages)               # atomic overwrite
 mem.append("main", {"role": "user", "content": "hi"})  # efficient append
@@ -1105,9 +1105,9 @@ mem.clear("main")                        # delete history file
 Stores notes as Markdown files — one file per key at `{base_dir}/{key}.md`. Forward slashes in keys are replaced with underscores.
 
 ```python
-from minion_assistant.memory import LongTermMemory
+from minion_assist.memory import LongTermMemory
 
-mem = LongTermMemory(Path("~/.minion-assistant/memory/main").expanduser())
+mem = LongTermMemory(Path("~/.minion-assist/memory/main").expanduser())
 mem.save("api-research", "# REST vs GraphQL\n...")
 mem.load("api-research")       # str or None
 mem.search("GraphQL REST")     # list[tuple[key, content]] — ranked results
@@ -1122,7 +1122,7 @@ mem.delete("api-research")     # bool
 #### Background extractor (`extractor.py`)
 
 ```python
-from minion_assistant.memory.extractor import extract_and_save_async
+from minion_assist.memory.extractor import extract_and_save_async
 
 # Fire after a successful turn — returns immediately (daemon thread)
 extract_and_save_async(long_term, provider, last_exchange)
@@ -1136,14 +1136,14 @@ This captures key facts — user preferences, decisions, findings — without re
 
 ### `session`
 
-**Directory:** `src/minion_assistant/session/`
+**Directory:** `src/minion_assist/session/`
 
 Tracks lightweight metadata for each agent's session in `{workspace}/sessions.json`.
 
 ```python
-from minion_assistant.session import SessionStore
+from minion_assist.session import SessionStore
 
-store = SessionStore(Path("~/.minion-assistant/sessions.json"))
+store = SessionStore(Path("~/.minion-assist/sessions.json"))
 info = store.get_or_create("main")   # SessionInfo(agent_id, created_at, last_active, turn_count)
 store.touch("main", increment_turns=True)
 store.list_sessions()                 # list[SessionInfo]
@@ -1153,12 +1153,12 @@ store.list_sessions()                 # list[SessionInfo]
 
 ### `context`
 
-**File:** `src/minion_assistant/context.py`
+**File:** `src/minion_assist/context.py`
 
 Detects context window overflow and compacts conversation history.
 
 ```python
-from minion_assistant.context import Compactor
+from minion_assist.context import Compactor
 
 compactor = Compactor(
     context_window=262_144,
@@ -1217,7 +1217,7 @@ If summarisation fails, `on_compaction_failed` is called and the original histor
 
 ## Adding a Provider
 
-1. Create `src/minion_assistant/providers/myprovider.py`:
+1. Create `src/minion_assist/providers/myprovider.py`:
 
 ```python
 from .base import LLMResponse
@@ -1239,7 +1239,7 @@ class MyProvider:
 ## Adding a Tool
 
 ```python
-from minion_assistant.tools.base import Tool, ToolSchema
+from minion_assist.tools.base import Tool, ToolSchema
 
 class MyTool(Tool):
     @property
@@ -1294,8 +1294,8 @@ AGENTS["coder"] = AgentConfig(
 ## Adding a Skill
 
 ```
-~/.minion-assistant/skills/openapi-design/SKILL.md    ← global (all projects)
-.minion-assistant/skills/openapi-design/SKILL.md       ← project-local (overrides global)
+~/.minion-assist/skills/openapi-design/SKILL.md    ← global (all projects)
+.minion-assist/skills/openapi-design/SKILL.md       ← project-local (overrides global)
 ```
 
 **Minimal `SKILL.md`:**

@@ -1,6 +1,6 @@
 """Tests for EditTool 'confirm' callback integration."""
 
-from minion_assistant.tools.edit import EditTool
+from minion_assist.tools.edit import EditTool
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ def test_edit_confirm_receives_description(tmp_path):
 
 def test_edit_confirm_policy_read_only_blocks_before_confirm(tmp_path):
     """Policy read_only_mode fires before the confirm callback."""
-    from minion_assistant.tools.policy import PermissionPolicy
+    from minion_assist.tools.policy import PermissionPolicy
     policy = PermissionPolicy(read_only_mode=True)
 
     target = tmp_path / "f.txt"

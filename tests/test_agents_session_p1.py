@@ -2,13 +2,13 @@
 
 from unittest.mock import Mock
 
-from minion_assistant.agents.definitions import AgentConfig
-from minion_assistant.agents.session import AgentSession, _export_html, _export_md, _had_write_call
-from minion_assistant.context import Compactor
-from minion_assistant.memory.short_term import ShortTermMemory
-from minion_assistant.providers.base import LLMResponse, ToolCall
-from minion_assistant.session import SessionStore
-from minion_assistant.tools import ToolRegistry
+from minion_assist.agents.definitions import AgentConfig
+from minion_assist.agents.session import AgentSession, _export_html, _export_md, _had_write_call
+from minion_assist.context import Compactor
+from minion_assist.memory.short_term import ShortTermMemory
+from minion_assist.providers.base import LLMResponse, ToolCall
+from minion_assist.session import SessionStore
+from minion_assist.tools import ToolRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +109,7 @@ def test_send_calls_verify_fn_after_write_tool(tmp_path):
     provider.chat = Mock(side_effect=_side_effect)
     session = _make_session(tmp_path, provider=provider)
     # Register a dummy write tool that always succeeds.
-    from minion_assistant.tools.base import Tool, ToolSchema
+    from minion_assist.tools.base import Tool, ToolSchema
     class DummyWrite(Tool):
         @property
         def schema(self):
@@ -153,7 +153,7 @@ def test_send_verify_fn_result_injected_into_history(tmp_path):
     provider.chat = Mock(side_effect=_side_effect)
     session = _make_session(tmp_path, provider=provider)
 
-    from minion_assistant.tools.base import Tool, ToolSchema
+    from minion_assist.tools.base import Tool, ToolSchema
     class DummyEdit(Tool):
         @property
         def schema(self):

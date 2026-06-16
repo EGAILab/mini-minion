@@ -5,14 +5,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from minion_assistant.agents.definitions import AgentConfig
-from minion_assistant.agents.session import AgentSession
-from minion_assistant.commands import CommandContext, CommandResult, dispatch_command
-from minion_assistant.context import Compactor
-from minion_assistant.memory.short_term import ShortTermMemory
-from minion_assistant.providers.base import LLMResponse
-from minion_assistant.session import SessionStore
-from minion_assistant.tools import ToolRegistry, default_registry
+from minion_assist.agents.definitions import AgentConfig
+from minion_assist.agents.session import AgentSession
+from minion_assist.commands import CommandContext, CommandResult, dispatch_command
+from minion_assist.context import Compactor
+from minion_assist.memory.short_term import ShortTermMemory
+from minion_assist.providers.base import LLMResponse
+from minion_assist.session import SessionStore
+from minion_assist.tools import ToolRegistry, default_registry
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ def test_audit_shows_denied_entries(tmp_path):
     # Record a denial via the policy.
     policy = session.registry.policy
     policy.audit_log.record(
-        __import__("minion_assistant.tools.audit", fromlist=["AuditEntry"]).AuditEntry(
+        __import__("minion_assist.tools.audit", fromlist=["AuditEntry"]).AuditEntry(
             timestamp="2026-01-01T00:00:00+00:00",
             tool_name="bash",
             args_repr="rm -rf /",
@@ -88,7 +88,7 @@ def test_audit_shows_denied_entries(tmp_path):
 
 
 def test_audit_respects_count_argument(tmp_path):
-    from minion_assistant.tools.audit import AuditEntry, _utcnow
+    from minion_assist.tools.audit import AuditEntry, _utcnow
     ctx, session = _ctx(tmp_path, "audit", args="2")
     policy = session.registry.policy
     for i in range(5):

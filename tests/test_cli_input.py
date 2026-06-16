@@ -3,7 +3,7 @@
 import pytest
 from pathlib import Path
 
-from minion_assistant.cli_input import _sanitize_surrogates, SafeFileHistory, PromptReader
+from minion_assist.cli_input import _sanitize_surrogates, SafeFileHistory, PromptReader
 
 
 # ---------------------------------------------------------------------------

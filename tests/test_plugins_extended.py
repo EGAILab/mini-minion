@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from minion_assistant.plugins import load_plugins, _load_hook_module
-from minion_assistant.tools.registry import ToolRegistry
+from minion_assist.plugins import load_plugins, _load_hook_module
+from minion_assist.tools.registry import ToolRegistry
 
 
 # ---------------------------------------------------------------------------

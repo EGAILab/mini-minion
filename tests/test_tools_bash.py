@@ -2,7 +2,7 @@
 
 import platform
 
-from minion_assistant.tools.bash import BashTool
+from minion_assist.tools.bash import BashTool
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -85,6 +85,6 @@ def test_bash_ssrf_markers_are_policy_markers():
     Importing the same object (``is``) rather than just equal values (``==``)
     proves there is a single source of truth.
     """
-    from minion_assistant.tools.bash import DEFAULT_SSRF_MARKERS as bash_markers
-    from minion_assistant.tools.policy import DEFAULT_SSRF_MARKERS as policy_markers
+    from minion_assist.tools.bash import DEFAULT_SSRF_MARKERS as bash_markers
+    from minion_assist.tools.policy import DEFAULT_SSRF_MARKERS as policy_markers
     assert bash_markers is policy_markers

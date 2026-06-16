@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from minion_assistant.mcp.schema import (
+from minion_assist.mcp.schema import (
     mcp_tool_name,
     normalize_schema_for_provider,
     normalize_windows_command,

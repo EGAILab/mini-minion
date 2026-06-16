@@ -3,15 +3,15 @@
 import pytest
 from unittest.mock import Mock, patch
 
-from minion_assistant.memory.short_term import ShortTermMemory
+from minion_assist.memory.short_term import ShortTermMemory
 
 
 def _run_main(tmp_path, inputs, run_turn_effect=None):
     """Run main() with a controlled workspace, input sequence, and run_turn behaviour.
 
     After the refactor, main() uses AgentSession which calls run_turn internally.
-    We patch minion_assistant.agents.session.run_turn (where AgentSession imports it)
-    rather than minion_assistant.minion.run_turn (which no longer exists there).
+    We patch minion_assist.agents.session.run_turn (where AgentSession imports it)
+    rather than minion_assist.minion.run_turn (which no longer exists there).
 
     Args:
         tmp_path: Pytest temporary directory used as the workspace root.
@@ -23,14 +23,14 @@ def _run_main(tmp_path, inputs, run_turn_effect=None):
     Returns:
         The ``run_turn`` Mock so callers can inspect call counts / args.
     """
-    import minion_assistant.minion as minion_mod
+    import minion_assist.minion as minion_mod
 
     rt_mock = Mock(side_effect=run_turn_effect) if run_turn_effect is not None else Mock()
 
     with (
-        patch("minion_assistant.minion.workspace", tmp_path),
-        patch("minion_assistant.agents.session.run_turn", rt_mock),
-        patch("minion_assistant.minion.create_provider", return_value=Mock()),
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.agents.session.run_turn", rt_mock),
+        patch("minion_assist.minion.create_provider", return_value=Mock()),
         patch("builtins.input", side_effect=iter(inputs)),
     ):
         minion_mod.main()
@@ -99,15 +99,15 @@ def test_successful_turn_persists_history(tmp_path):
 
 def test_main_exits_on_agent_identity_mismatch(tmp_path):
     """main() must raise SystemExit when AGENTS and config.json agent keys differ."""
-    import minion_assistant.minion as minion_mod
-    from minion_assistant.agents.definitions import AgentConfig
+    import minion_assist.minion as minion_mod
+    from minion_assist.agents.definitions import AgentConfig
 
     # Replace AGENTS with a key that doesn't exist in config.json.
     wrong_agents = {"unknown_agent": AgentConfig(name="X", soul="x")}
 
     with (
-        patch("minion_assistant.minion.workspace", tmp_path),
-        patch("minion_assistant.minion.AGENTS", wrong_agents),
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.minion.AGENTS", wrong_agents),
         patch("builtins.input", side_effect=iter([])),
     ):
         with pytest.raises(SystemExit):
@@ -116,8 +116,8 @@ def test_main_exits_on_agent_identity_mismatch(tmp_path):
 
 def test_compaction_receives_user_message(tmp_path):
     """compact() must be called after the user message is appended to the list."""
-    import minion_assistant.minion as minion_mod
-    from minion_assistant.context import Compactor
+    import minion_assist.minion as minion_mod
+    from minion_assist.context import Compactor
 
     seen: list[list[dict]] = []
 
@@ -126,9 +126,9 @@ def test_compaction_receives_user_message(tmp_path):
         return messages  # pass-through, no actual compaction
 
     with (
-        patch("minion_assistant.minion.workspace", tmp_path),
-        patch("minion_assistant.agents.session.run_turn", Mock()),
-        patch("minion_assistant.minion.create_provider", return_value=Mock()),
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.agents.session.run_turn", Mock()),
+        patch("minion_assist.minion.create_provider", return_value=Mock()),
         patch("builtins.input", side_effect=iter(["hello", "quit"])),
         patch.object(Compactor, "compact", spy_compact),
     ):
@@ -144,8 +144,8 @@ def test_compaction_receives_user_message(tmp_path):
 
 def test_streaming_response_printed_once(tmp_path, capsys):
     """Streamed response text must appear exactly once — not duplicated by FinalAnswer handler."""
-    import minion_assistant.minion as minion_mod
-    from minion_assistant.agents.events import FinalAnswer, StreamingStarted, TokenStreamed
+    import minion_assist.minion as minion_mod
+    from minion_assist.agents.events import FinalAnswer, StreamingStarted, TokenStreamed
 
     def _emit_streaming_events(provider, name, soul, max_tokens, tools, messages, on_event=None, **kwargs):
         # Simulate the runner emitting streaming events then FinalAnswer.
@@ -156,10 +156,10 @@ def test_streaming_response_printed_once(tmp_path, capsys):
             on_event(FinalAnswer(agent_name=name, text="Hello world"))
 
     with (
-        patch("minion_assistant.minion.workspace", tmp_path),
-        patch("minion_assistant.agents.session.run_turn", side_effect=_emit_streaming_events),
-        patch("minion_assistant.minion.create_provider", return_value=Mock()),
-        patch("minion_assistant.minion.streaming") as mock_streaming,
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.agents.session.run_turn", side_effect=_emit_streaming_events),
+        patch("minion_assist.minion.create_provider", return_value=Mock()),
+        patch("minion_assist.minion.streaming") as mock_streaming,
         patch("builtins.input", side_effect=iter(["hi", "quit"])),
     ):
         mock_streaming.chat_mode = True
@@ -177,11 +177,11 @@ def test_streaming_response_printed_once(tmp_path, capsys):
 
 def test_keyboard_interrupt_at_prompt_exits_cleanly(tmp_path, capsys):
     """KeyboardInterrupt at the input() prompt causes a clean exit, not a traceback."""
-    import minion_assistant.minion as minion_mod
+    import minion_assist.minion as minion_mod
     with (
-        patch("minion_assistant.minion.workspace", tmp_path),
-        patch("minion_assistant.agents.session.run_turn", Mock()),
-        patch("minion_assistant.minion.create_provider", return_value=Mock()),
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.agents.session.run_turn", Mock()),
+        patch("minion_assist.minion.create_provider", return_value=Mock()),
         patch("builtins.input", side_effect=KeyboardInterrupt),
     ):
         minion_mod.main()  # must return without raising
@@ -192,12 +192,12 @@ def test_keyboard_interrupt_at_prompt_exits_cleanly(tmp_path, capsys):
 
 def test_keyboard_interrupt_during_turn_continues_repl(tmp_path, capsys):
     """KeyboardInterrupt mid-turn prints a message and continues the REPL."""
-    import minion_assistant.minion as minion_mod
+    import minion_assist.minion as minion_mod
     inputs = iter(["hello", "quit"])
     with (
-        patch("minion_assistant.minion.workspace", tmp_path),
-        patch("minion_assistant.agents.session.run_turn", side_effect=KeyboardInterrupt),
-        patch("minion_assistant.minion.create_provider", return_value=Mock()),
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.agents.session.run_turn", side_effect=KeyboardInterrupt),
+        patch("minion_assist.minion.create_provider", return_value=Mock()),
         patch("builtins.input", side_effect=inputs),
     ):
         minion_mod.main()  # must return without raising

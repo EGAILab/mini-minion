@@ -1,6 +1,6 @@
 """Tests for agent definitions."""
 
-from minion_assistant.agents.definitions import AGENTS, AgentConfig
+from minion_assist.agents.definitions import AGENTS, AgentConfig
 
 
 def test_agents_has_main_and_researcher():

@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from minion_assistant.tools.patch import PatchPreviewTool
-from minion_assistant.tools.policy import PermissionPolicy
+from minion_assist.tools.patch import PatchPreviewTool
+from minion_assist.tools.policy import PermissionPolicy
 
 
 def _tool(tmp_path: Path) -> PatchPreviewTool:

@@ -1,6 +1,6 @@
 """Tests for the permission audit log (NEW-02)."""
 
-from minion_assistant.tools.audit import ApprovalDecision, AuditEntry, AuditLog, _utcnow
+from minion_assist.tools.audit import ApprovalDecision, AuditEntry, AuditLog, _utcnow
 
 
 # ---------------------------------------------------------------------------

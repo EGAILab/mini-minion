@@ -1,4 +1,4 @@
-"""Tests for minion_assistant.media — file staging and validation.
+"""Tests for minion_assist.media — file staging and validation.
 
 Covers:
 - stage_attachment with a real PNG file (minimal 1x1 PNG)
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from minion_assistant.media import (
+from minion_assist.media import (
     MediaAttachment,
     describe_attachment,
     stage_attachment,
@@ -156,7 +156,7 @@ class TestStageAttachmentErrors:
 
     def test_rejects_too_large_file(self, tmp_path, tmp_store):
         """Files over 15 MB should be rejected before staging."""
-        from minion_assistant.media import _MAX_IMAGE_BYTES
+        from minion_assist.media import _MAX_IMAGE_BYTES
 
         big = tmp_path / "big.png"
         # Write a valid PNG header followed by enough zeros to exceed the limit.

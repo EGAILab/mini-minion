@@ -2,11 +2,11 @@
 
 import pytest
 
-from minion_assistant.providers import create_provider
-from minion_assistant.providers.anthropic import AnthropicProvider
-from minion_assistant.providers.base import LLMResponse, ToolCall
-from minion_assistant.providers.lmstudio import LMStudioProvider
-from minion_assistant.providers.openai_compatible import OpenAICompatibleProvider
+from minion_assist.providers import create_provider
+from minion_assist.providers.anthropic import AnthropicProvider
+from minion_assist.providers.base import LLMResponse, ToolCall
+from minion_assist.providers.lmstudio import LMStudioProvider
+from minion_assist.providers.openai_compatible import OpenAICompatibleProvider
 
 
 def test_tool_call_fields():
@@ -69,7 +69,7 @@ def test_create_provider_unknown_falls_back_to_openai():
 
 
 # _parse_tool_arguments
-from minion_assistant.providers.openai_compatible import _parse_tool_arguments
+from minion_assist.providers.openai_compatible import _parse_tool_arguments
 
 
 def test_parse_tool_arguments_valid():
@@ -105,7 +105,7 @@ def test_parse_tool_arguments_non_object_json():
 
 
 def test_token_usage_fields():
-    from minion_assistant.providers.base import TokenUsage
+    from minion_assist.providers.base import TokenUsage
     u = TokenUsage(input_tokens=100, output_tokens=50)
     assert u.input_tokens == 100
     assert u.output_tokens == 50
