@@ -32,6 +32,10 @@ Thumbs.db
 # playwright mcp logs
 .playwright-mcp/
 
+# claude code local config (not for sharing)
+.claude/
+CLAUDE.md
+
 # superseded config format
 config.toml
 
