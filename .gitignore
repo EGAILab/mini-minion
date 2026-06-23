@@ -29,6 +29,9 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# playwright mcp logs
+.playwright-mcp/
+
 # superseded config format
 config.toml
 

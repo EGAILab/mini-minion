@@ -76,6 +76,7 @@ from .agents.events import (
     ToolCalled,
 )
 from .config import agents as agents_cfg
+from .config import channels as channels_cfg
 from .config import compaction as compaction_cfg
 from .config import extra_plugin_manifests
 from .config import mcp as mcp_cfg
@@ -187,6 +188,11 @@ def main() -> None:
             state_str = "OK" if status.state == "connected" else f"FAILED: {status.detail}"
             print(f"  MCP [{status.name}]: {state_str}")
 
+    # --- Matrix channel setup (optional) ---
+    # Runs in a background daemon thread; REPL continues on the main thread.
+    # The channel is started after sessions are built so it can share them.
+    _matrix_channel = None
+
     # --- Session setup — one AgentSession per agent ---
     sessions: dict[str, AgentSession] = {}
     for agent_id, cfg in agents_cfg.items():
@@ -245,6 +251,12 @@ def main() -> None:
             # the background API call that extracts facts after each turn.
             enable_memory_extraction=memory_cfg.enable_extraction,
         )
+
+    if channels_cfg.matrix is not None:
+        from .matrix.channel import MatrixChannel  # noqa: PLC0415 — optional dependency
+        _matrix_channel = MatrixChannel(channels_cfg.matrix, workspace)
+        _matrix_channel.start(sessions)
+        print("[matrix] Listener started.")
 
     use_streaming = streaming.chat_mode
 
@@ -456,6 +468,8 @@ def main() -> None:
                 print(f"\n[Error] {agent_name} failed to respond: {exc}", file=sys.stderr)
                 print("  Your message was kept. Try again or rephrase.", file=sys.stderr)
     finally:
+        if _matrix_channel is not None:
+            _matrix_channel.stop()
         # Always close MCP sessions on exit — cleans up subprocess stdio transports.
         if mcp_manager is not None:
             mcp_manager.close_sync()

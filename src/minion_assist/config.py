@@ -308,6 +308,26 @@ def _validate(raw: dict) -> list[ConfigIssue]:
                     issues.append(ConfigIssue(f"extra_plugin_manifests[{i}]", f"Expected string path, got {type(p).__name__}."))
 
 
+    # --- channels ---
+    channels_raw = raw.get("channels", {})
+    if channels_raw:
+        if not isinstance(channels_raw, dict):
+            issues.append(ConfigIssue("channels", "Expected an object."))
+        elif "matrix" in channels_raw:
+            m = channels_raw["matrix"]
+            if not isinstance(m, dict):
+                issues.append(ConfigIssue("channels.matrix", "Expected an object."))
+            else:
+                if not m.get("homeserver"):
+                    issues.append(ConfigIssue("channels.matrix.homeserver", "Required non-empty string."))
+                if not m.get("userId"):
+                    issues.append(ConfigIssue("channels.matrix.userId", "Required non-empty string."))
+                if not m.get("accessToken") and not m.get("password"):
+                    issues.append(ConfigIssue(
+                        "channels.matrix",
+                        "At least one of 'accessToken' or 'password' is required.",
+                    ))
+
     # --- mcp ---
     mcp_raw = raw.get("mcp", {})
     if mcp_raw and not isinstance(mcp_raw, dict):
@@ -456,6 +476,17 @@ class McpServerConfig:
 class McpConfig:
     """All MCP servers configured for this minion-assist instance."""
     servers: tuple[McpServerConfig, ...] = ()
+
+
+@dataclass(frozen=True)
+class ChannelsConfig:
+    """Channel integrations configured under ``channels`` in config.json.
+
+    Attributes:
+        matrix: Parsed :class:`~minion_assist.matrix.config.MatrixConfig` when
+            ``channels.matrix`` is present in config.json; ``None`` otherwise.
+    """
+    matrix: object = None  # MatrixConfig | None; typed as object to avoid circular import
 
 
 @dataclass(frozen=True)
@@ -743,6 +774,30 @@ def _resolve_mcp() -> McpConfig:
     return McpConfig(servers=tuple(server_list))
 
 
+def _resolve_channels() -> ChannelsConfig:
+    """Read the ``"channels"`` section from config.json and build a ChannelsConfig.
+
+    Lazily imports :class:`~minion_assist.matrix.config.MatrixConfig` so that
+    ``matrix-nio`` is only required when the Matrix channel is actually configured.
+
+    Returns:
+        ChannelsConfig: Config with ``matrix`` set to a ``MatrixConfig`` instance
+            when ``channels.matrix`` is present, otherwise ``matrix=None``.
+    """
+    channels_raw = _raw.get("channels", {})
+    if not isinstance(channels_raw, dict):
+        return ChannelsConfig()
+    matrix_raw = channels_raw.get("matrix")
+    if not matrix_raw or not isinstance(matrix_raw, dict):
+        return ChannelsConfig()
+    try:
+        from minion_assist.matrix.config import MatrixConfig  # noqa: PLC0415
+        matrix_cfg = MatrixConfig.from_dict(matrix_raw)
+    except Exception as exc:
+        raise ConfigError([ConfigIssue("channels.matrix", str(exc))]) from exc
+    return ChannelsConfig(matrix=matrix_cfg)
+
+
 def _resolve_streaming() -> StreamingConfig:
     """Read the ``"streaming"`` section from config.json and build a StreamingConfig.
 
@@ -804,6 +859,10 @@ mcp: McpConfig = _resolve_mcp()
 # memory: controls the optional background memory extraction subsystem.
 # Read from "memory" section; defaults to enable_extraction=True if absent.
 memory: MemoryConfig = _resolve_memory()
+
+# channels: integrations like Matrix that run alongside the REPL.
+# matrix is None when channels.matrix is absent from config.json.
+channels: ChannelsConfig = _resolve_channels()
 
 # extra_plugin_manifests: additional plugins.json paths to load beyond the two
 # fixed locations (~/.minion-assist/plugins.json and .minion-assist/plugins.json).

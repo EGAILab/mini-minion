@@ -34,6 +34,16 @@
     "task_mode": false
   },
   "compaction": {},
+  "channels": {
+    "matrix": {
+      "homeserver": "https://matrix.openegi.org",
+      "userId": "@ada:openegi.org",
+      "accessToken": "***REMOVED-MATRIX-TOKEN***",
+      "groups": {
+        "!KybiKEpgnYkYeJeqAM:openegi.org": {}
+      }
+    }
+  },
   "mcp": {
     "servers": {
       "playwright": {

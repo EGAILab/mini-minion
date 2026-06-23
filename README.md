@@ -13,6 +13,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 - [Slash Commands](#slash-commands)
 - [Image Attachments](#image-attachments)
 - [MCP Servers](#mcp-servers)
+- [Matrix Channel](#matrix-channel)
 - [Module Reference](#module-reference)
   - [config](#config)
   - [providers](#providers)
@@ -122,6 +123,22 @@ minion-assist/
 │   │   ├── web_search.py        # WebSearchTool — DuckDuckGo web search via ddgs, no API key
 │   │   └── __init__.py          # default_registry() factory; registers all tools; sets registry.policy
 │   ├── plugins.py               # Plugin manifest loader — tools, hooks, skills, and trust from plugins.json
+│   ├── matrix/                  # Optional Matrix channel (requires matrix-nio[e2e] + aiosqlite)
+│   │   ├── channel.py           # MatrixChannel — lifecycle manager (daemon thread + asyncio loop)
+│   │   ├── monitor.py           # monitor_matrix() — auth, callbacks, sync loop, teardown
+│   │   ├── handler.py           # MatrixMessageHandler — full inbound pipeline
+│   │   ├── outbound.py          # MatrixOutbound — markdown-formatted chunked send, draft preview, reactions, typing indicators
+│   │   ├── format.py            # to_matrix_html() / build_content() — markdown → org.matrix.custom.html
+│   │   ├── inbound_dedupe.py    # SQLite-backed event-ID deduplication (24 h TTL)
+│   │   ├── thread_bindings.py   # SQLite thread-root → agent session key mapping
+│   │   ├── bot_loop.py          # Sliding-window rate limiter per room
+│   │   ├── exec_approvals.py    # DM-based remote tool approval via ✅/❌ reactions
+│   │   ├── auto_join.py         # Invite handler — always / allowlist / off policy
+│   │   ├── crypto.py            # E2E encryption setup via SqliteCryptoStore + libolm
+│   │   ├── auth.py              # Authentication — access token / password / SSO
+│   │   ├── config.py            # MatrixConfig and nested dataclasses
+│   │   ├── allowlist.py         # User-ID normalisation and wildcard allowlist check
+│   │   └── __init__.py
 │   ├── memory/                  # Persistent memory storage
 │   │   ├── short_term.py        # JSONL conversation history (atomic writes)
 │   │   ├── long_term.py         # Markdown notes store (ranked keyword search)
@@ -130,7 +147,7 @@ minion-assist/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       └── __init__.py
-└── tests/                       # pytest test suite (966 tests, 3 skipped)
+└── tests/                       # pytest test suite (1074 tests, 2 skipped)
 ```
 
 ---
@@ -500,6 +517,104 @@ Ada: [tool: mcp__playwright__browser_navigate({'url': 'https://news.ycombinator.
 - The browser opens as a visible window by default (headed mode). You can watch the agent browse.
 - Use `browser_snapshot` (accessibility tree) for page analysis — it works with all text models. Use `browser_take_screenshot` only with vision-capable models.
 - Add `"--headless"` to `args` to run without a visible window: `"args": ["@playwright/mcp@latest", "--headless"]`.
+
+---
+
+## Matrix Channel
+
+minion-assist can connect to a Matrix homeserver so agents are reachable from any Matrix client (Element, Cinny, etc.). The channel runs in a background thread and shares the same `AgentSession` instances as the REPL — both can be active simultaneously.
+
+### Prerequisites
+
+```bash
+# Install Matrix channel dependencies
+uv add "minion-assist[matrix]"
+
+# E2E encryption also requires libolm at the OS level (optional but recommended)
+# Ubuntu/Debian: apt install libolm-dev
+# macOS: brew install libolm
+```
+
+### Configuration
+
+Add a `channels.matrix` block to `config.json`:
+
+```json
+{
+  "channels": {
+    "matrix": {
+      "homeserver": "https://matrix.example.org",
+      "userId": "@bot:example.org",
+      "accessToken": "syt_YourAccessTokenHere",
+      "defaultAgentId": "main",
+      "ackReaction": "👀",
+      "groupPolicy": "allowlist",
+      "groupAllowFrom": ["@alice:example.org"],
+      "groups": {
+        "!roomid:example.org": {"agent": "researcher", "enabled": true}
+      },
+      "threadBindings": {"enabled": true},
+      "execApprovals": {
+        "enabled": true,
+        "approvers": ["@alice:example.org"]
+      },
+      "botLoop": {
+        "enabled": true,
+        "maxEventsPerWindow": 10,
+        "windowSeconds": 60,
+        "cooldownSeconds": 300
+      },
+      "storePath": "~/.minion-assist/matrix"
+    }
+  }
+}
+```
+
+**Required fields:** `homeserver`, `userId`, and at least one of `accessToken` or `password`.
+
+| Field | Description |
+|-------|-------------|
+| `homeserver` | Matrix homeserver URL (e.g. `"https://matrix.example.org"`) |
+| `userId` | Bot's full Matrix user ID (e.g. `"@bot:example.org"`) |
+| `accessToken` | Preferred — bot account access token (no login call) |
+| `password` | Alternative — password login (creates a new device session) |
+| `defaultAgentId` | Agent used when no per-room override is configured |
+| `ackReaction` | Emoji sent immediately on receipt to acknowledge the message (e.g. `"👀"`) |
+| `groupPolicy` | `"open"` (anyone may send) or `"allowlist"` (only listed users) |
+| `groupAllowFrom` | Global allowlist of Matrix user IDs; `"*"` permits everyone |
+| `groups` | Per-room overrides — map room IDs to `{"agent": "...", "enabled": true/false}` |
+| `threadBindings.enabled` | `true` to persist Matrix thread → conversation mapping in SQLite |
+| `execApprovals.enabled` | `true` to send bash tool approval requests via DM |
+| `execApprovals.approvers` | List of Matrix user IDs who receive approval DMs |
+| `botLoop.enabled` | `true` to rate-limit events per room (prevents bot loops) |
+| `storePath` | Directory for SQLite state and E2E crypto store |
+
+### How It Works
+
+**Room routing:** each Matrix room can be mapped to a specific agent via `groups`. Messages in unmapped rooms go to `defaultAgentId`.
+
+**Thread continuity:** when `threadBindings.enabled = true`, each Matrix thread maps to a dedicated `AgentSession` history key persisted in SQLite. Replies within the same thread continue the same conversation across restarts.
+
+**Markdown formatting:** agent responses are automatically converted from markdown to `org.matrix.custom.html` before sending, so bold, code blocks, lists, and links render natively in Element and other Matrix clients. The `matrix/format.py` module handles conversion (using `markdown-it-py`) and intelligent paragraph chunking.
+
+**Typing indicators:** while the agent is processing a message, a typing notification appears in the Matrix room so users know the bot is working. The indicator is cleared automatically when the reply is sent, even if the agent errors.
+
+**Exec approvals:** when an agent calls a bash command, the `MatrixExecApprovalHandler` sends a DM to each configured approver. Reacting ✅ approves the command; reacting ❌ denies it. Commands time out after 60 seconds (denied by default).
+
+**E2E encryption:** if libolm is installed, the bot automatically uses `SqliteCryptoStore` for end-to-end encryption. Without libolm, the bot falls back to unencrypted communication with a console warning — it does not fail to start.
+
+**Bot-loop protection:** `BotLoopProtection` tracks event rates per room in a sliding window and enters a cooldown period if too many events arrive too quickly, preventing runaway bot-to-bot loops.
+
+### Startup Output
+
+When configured correctly:
+
+```
+[matrix] Listener started.
+You: ...
+```
+
+If the Matrix dependencies are missing, a clear `RuntimeError` is printed and the REPL starts without Matrix support.
 
 ---
 
@@ -1331,7 +1446,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **966 cases** across all modules (966 passed, 3 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`); one integration test is skipped when the `mcp` package is not installed.
+The test suite covers **1074 cases** across all modules (1074 passed, 2 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation. The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic
