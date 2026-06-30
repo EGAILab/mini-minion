@@ -9,10 +9,12 @@ from minion_assist.commands import (
     CommandSpec,
     BUILTIN_COMMANDS,
     _all_names,
+    build_completion_items,
     format_help,
     parse_command,
     dispatch_command,
 )
+from minion_assist.skills import SkillInfo
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +162,23 @@ def test_format_help_no_route_section_when_no_prefixes():
     assert "Route prefixes" not in text
 
 
+def test_completion_items_include_commands_routes_and_skills(tmp_path):
+    agents_cfg = _make_agents_cfg(include_route=True)
+    skill = SkillInfo(
+        name="interview",
+        description="Interview preparation.",
+        path=tmp_path / "SKILL.md",
+        content="",
+    )
+
+    items = build_completion_items(agents_cfg, {"interview": skill})
+    values = {value for value, _ in items}
+
+    assert "/help" in values
+    assert "/research" in values
+    assert "/skills interview" in values
+
+
 # ---------------------------------------------------------------------------
 # dispatch_command — /help
 # ---------------------------------------------------------------------------
@@ -182,6 +201,39 @@ def test_dispatch_commands_alias_works():
     result = dispatch_command(_make_ctx("/commands"))
     assert result.handled is True
     assert result.message is not None
+
+
+def test_dispatch_skills_lists_loaded_skills(tmp_path):
+    skill = SkillInfo(
+        name="interview",
+        description="Interview preparation.",
+        path=tmp_path / "SKILL.md",
+        content="",
+    )
+    ctx = _make_ctx("/skills")
+    ctx.skills = {"interview": skill}
+
+    result = dispatch_command(ctx)
+
+    assert result.handled is True
+    assert "interview" in result.message
+    assert "Interview preparation" in result.message
+
+
+def test_dispatch_skills_shows_single_skill_detail(tmp_path):
+    skill = SkillInfo(
+        name="interview",
+        description="Interview preparation.",
+        path=tmp_path / "SKILL.md",
+        content="",
+    )
+    ctx = _make_ctx("/skills", args="interview")
+    ctx.skills = {"interview": skill}
+
+    result = dispatch_command(ctx)
+
+    assert result.handled is True
+    assert str(skill.path) in result.message
 
 
 # ---------------------------------------------------------------------------

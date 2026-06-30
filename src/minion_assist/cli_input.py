@@ -14,6 +14,7 @@ from pathlib import Path
 # still fall back to plain input() rather than crashing at startup.
 try:
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.formatted_text import HTML
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.patch_stdout import patch_stdout
@@ -47,6 +48,37 @@ class SafeFileHistory(FileHistory):  # type: ignore[misc]
         super().store_string(_sanitize_surrogates(string))
 
 
+if _PROMPT_TOOLKIT_AVAILABLE:
+    class SlashCompleter(Completer):  # type: ignore[misc]
+        """Completion menu for slash commands, route prefixes, and skill hints."""
+
+        def __init__(self, items: list[tuple[str, str]]) -> None:
+            self._items = sorted(items, key=lambda item: item[0])
+
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            # Complete the first token only. Once the user has typed a space,
+            # let them write normal message text without a noisy menu.
+            if not text.startswith("/") or " " in text:
+                return
+
+            needle = text.lower()
+            for value, meta in self._items:
+                if value.lower().startswith(needle):
+                    yield Completion(
+                        value,
+                        start_position=-len(text),
+                        display=value,
+                        display_meta=meta,
+                    )
+else:
+    class SlashCompleter:  # type: ignore[no-redef]
+        """Fallback placeholder when prompt_toolkit is unavailable."""
+
+        def __init__(self, items: list[tuple[str, str]]) -> None:
+            self._items = items
+
+
 class PromptReader:
     """Reads user prompts with Up/Down history navigation via prompt_toolkit.
 
@@ -63,7 +95,11 @@ class PromptReader:
                       The parent directory is created if it does not exist.
     """
 
-    def __init__(self, history_path: Path) -> None:
+    def __init__(
+        self,
+        history_path: Path,
+        completion_items: list[tuple[str, str]] | None = None,
+    ) -> None:
         self.history_path = history_path
         history_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -78,6 +114,8 @@ class PromptReader:
             try:
                 self._session = PromptSession(
                     history=SafeFileHistory(str(history_path)),
+                    completer=SlashCompleter(completion_items or []),
+                    complete_while_typing=True,
                     enable_open_in_editor=False,  # disable Ctrl+X Ctrl+E — we don't need it
                     multiline=False,              # Enter always submits (no Shift+Enter newline)
                 )

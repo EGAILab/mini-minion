@@ -1,6 +1,7 @@
 """Tests for REPL exception handling and history persistence (minion.py)."""
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from minion_assist.memory.short_term import ShortTermMemory
@@ -29,6 +30,8 @@ def _run_main(tmp_path, inputs, run_turn_effect=None):
 
     with (
         patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.minion.mcp_cfg", SimpleNamespace(servers=())),
+        patch("minion_assist.minion.channels_cfg", SimpleNamespace(matrix=None)),
         patch("minion_assist.agents.session.run_turn", rt_mock),
         patch("minion_assist.minion.create_provider", return_value=Mock()),
         patch("builtins.input", side_effect=iter(inputs)),
@@ -95,6 +98,21 @@ def test_successful_turn_persists_history(tmp_path):
 
     history = ShortTermMemory(tmp_path / "sessions").load("main")
     assert any(m["role"] == "user" and m["content"] == "hello" for m in history)
+
+
+def test_route_prefix_message_is_not_treated_as_unknown_command(tmp_path, capsys):
+    """A routed chat message like '/research hello' must reach the routed agent."""
+    rt_mock = _run_main(tmp_path, ["/research how to prepare", "quit"])
+
+    assert rt_mock.call_count == 1
+    assert rt_mock.call_args.args[1] == "Elizabeth"
+
+    history = ShortTermMemory(tmp_path / "sessions").load("researcher")
+    assert any(
+        m["role"] == "user" and m["content"] == "how to prepare"
+        for m in history
+    )
+    assert "Unknown command '/research'" not in capsys.readouterr().out
 
 
 def test_main_exits_on_agent_identity_mismatch(tmp_path):

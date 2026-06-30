@@ -1,11 +1,25 @@
 {
   "models": {
     "providers": {
-      "aliyuncs": {
-        "baseUrl": "https://coding.dashscope.aliyuncs.com/v1",
+      "volces": {
+        "baseUrl": "https://ark.cn-beijing.volces.com/api/plan/v3",
         "api": "openai-completions",
         "models": [
-          {"id": "glm-5", "name": "glm-5 (Custom Provider)", "contextWindow": 128000, "maxOutputTokens": 4096}
+          {
+            "id": "glm-5.2",
+            "name": "GLM-5.2 (Volcengine Ark)",
+            "reasoning": false,
+            "inputModalities": ["text"],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 128000,
+            "maxOutputTokens": 4096,
+            "api": "openai-completions"
+          }
         ]
       },
       "lmstudio": {
@@ -19,10 +33,10 @@
   },
   "agents": {
     "main": {
-      "model": "lmstudio/qwen-qwen3.5-9b"
+      "model": "volces/glm-5.2"
     },
     "researcher": {
-      "model": "aliyuncs/glm-5",
+      "model": "lmstudio/qwen-qwen3.5-9b",
       "route_prefix": "/research"
     }
   },

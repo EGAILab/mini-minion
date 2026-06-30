@@ -145,7 +145,17 @@ class OpenAICompatibleProvider:
     def __init__(self, base_url: str, api_key: str, model: str) -> None:
         # The OpenAI SDK handles HTTP, retries, and auth header injection.
         # Passing a custom base_url redirects it to any compatible endpoint.
-        self._client = OpenAI(base_url=base_url, api_key=api_key)
+        #
+        # Keep the SDK timeout finite so a provider stream that stops sending
+        # chunks returns control to the REPL instead of leaving the CLI wedged.
+        # Retries are handled by agents.runner._call_with_retry, so disable the
+        # SDK's own retry loop to avoid multiplying wait time.
+        self._client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=60.0,
+            max_retries=0,
+        )
         self._model = model
 
     def chat(

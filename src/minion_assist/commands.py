@@ -63,6 +63,7 @@ class CommandContext:
     agents_cfg: dict                  # dict[str, AgentModelConfig] from config
     session_store: object = None      # SessionStore instance (optional, for /sessions)
     mcp_manager: object = None        # McpClientManager instance (optional, for /mcp-reload)
+    skills: dict | None = None        # dict[str, SkillInfo] loaded at startup
 
 
 @dataclass
@@ -172,6 +173,11 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
         description="Manage plugins. Use 'list' to show all registered tools and their sources.",
         arg_hint="list",
     ),
+    CommandSpec(
+        name="/skills",
+        description="List loaded skills available to the agent.",
+        arg_hint="[name]",
+    ),
 ]
 
 
@@ -251,6 +257,44 @@ def format_help(agents_cfg: dict) -> str:
             lines.append(f"  {prefix} <message>  → routes to {aid} agent")
 
     return "\n".join(lines)
+
+
+def build_completion_items(
+    agents_cfg: dict,
+    skills: dict | None = None,
+) -> list[tuple[str, str]]:
+    """Build prompt completion entries for commands, route prefixes, and skills.
+
+    Returns:
+        list of ``(insert_text, display_meta)`` tuples consumed by PromptReader.
+    """
+    items: list[tuple[str, str]] = []
+
+    for spec in BUILTIN_COMMANDS:
+        hint = f" {spec.arg_hint}" if spec.arg_hint else ""
+        meta = f"{hint} - {spec.description}" if hint else spec.description
+        for name in _all_names(spec):
+            items.append((name, meta))
+
+    for spec, _ in _PLUGIN_COMMAND_REGISTRY:
+        hint = f" {spec.arg_hint}" if spec.arg_hint else ""
+        meta = f"{hint} - {spec.description}" if hint else spec.description
+        for name in _all_names(spec):
+            items.append((name, meta))
+
+    for aid, cfg in agents_cfg.items():
+        if cfg.route_prefix:
+            items.append((cfg.route_prefix, f"route to {aid} agent"))
+
+    for name, info in sorted((skills or {}).items()):
+        description = getattr(info, "description", "") or "loaded skill"
+        items.append((f"/skills {name}", description))
+
+    # Keep first occurrence when aliases/plugins collide.
+    deduped: dict[str, str] = {}
+    for value, meta in items:
+        deduped.setdefault(value, meta)
+    return [(value, deduped[value]) for value in sorted(deduped)]
 
 
 def parse_command(text: str) -> tuple[str, str] | None:
@@ -705,6 +749,34 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
             lines = [f"Registered tools for '{ctx.target_agent_id}' ({len(tool_names)}):"]
             for name in tool_names:
                 lines.append(f"  {name}")
+            return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /skills ---
+        if spec.name == "/skills":
+            skills = ctx.skills or {}
+            if not skills:
+                return CommandResult(handled=True, message="No skills loaded.")
+
+            name = ctx.args.strip()
+            if name:
+                skill = skills.get(name)
+                if skill is None:
+                    known = ", ".join(sorted(skills))
+                    return CommandResult(
+                        handled=True,
+                        message=f"Unknown skill '{name}'. Loaded skills: {known}",
+                    )
+                description = getattr(skill, "description", "") or "(no description)"
+                path = getattr(skill, "path", "")
+                return CommandResult(
+                    handled=True,
+                    message=f"{name}\n  {description}\n  Path: {path}",
+                )
+
+            lines = [f"Loaded skills ({len(skills)}):"]
+            for skill_name, skill in sorted(skills.items()):
+                description = getattr(skill, "description", "") or "(no description)"
+                lines.append(f"  {skill_name} - {description}")
             return CommandResult(handled=True, message="\n".join(lines))
 
     # --- Plugin commands ---
