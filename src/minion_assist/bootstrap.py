@@ -1,0 +1,441 @@
+"""Bootstrap prompt layer — load workspace files and inject them into agent system prompts.
+
+This module implements the Project Context bootstrap layer for Minion Assist.
+It mirrors the OpenClaw workspace bootstrap behaviour: recognized workspace files
+are discovered, budget-clamped, and rendered into a ``# Project Context`` block
+that is injected into each agent's system prompt on every turn.
+
+The key design goals are:
+
+- **Live updates** — files are re-read on every turn so edits to ``AGENTS.md``,
+  ``SOUL.md``, etc. take effect without restarting the process.
+- **Bounded cost** — a per-file char cap (default 20 000) and a total cap
+  (default 60 000) prevent runaway prompt growth from large files.
+- **Deterministic ordering** — files are always injected in the canonical order
+  listed in ``_BOOTSTRAP_FILES``, regardless of filesystem ordering.
+- **Safe reads** — every candidate path is resolved and checked against the
+  configured root before any bytes are read; symlink escapes are rejected.
+- **Graceful degradation** — missing files are silently skipped; decode errors
+  fall back to UTF-8 replacement characters.
+
+Recognized files (in injection order):
+
+    AGENTS.md   SOUL.md   TOOLS.md   IDENTITY.md   USER.md   BOOTSTRAP.md   MEMORY.md
+
+``HEARTBEAT.md`` is intentionally omitted from ordinary turns (no heartbeat
+runs exist in Minion Assist yet).
+
+Typical call path::
+
+    build_bootstrap_prompt_block(root, bootstrap_cfg)   # called per turn by AgentSession
+
+Which internally runs::
+
+    load_bootstrap_files(root)
+    build_bootstrap_context_files(files, max_chars, total_max_chars)
+    render_bootstrap_pending_context(ctx_files)  # when BOOTSTRAP.md is present
+    render_project_context(ctx_files)
+    render_truncation_warning(ctx_files, mode)
+
+Public API
+----------
+- :func:`load_bootstrap_files`
+- :func:`build_bootstrap_context_files`
+- :func:`render_project_context`
+- :func:`render_bootstrap_pending_context`
+- :func:`render_truncation_warning`
+- :func:`build_bootstrap_prompt_block`
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Recognized bootstrap file names in canonical injection order.
+# HEARTBEAT.md is excluded: Minion Assist has no heartbeat runs yet.
+_BOOTSTRAP_FILES: tuple[str, ...] = (
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "USER.md",
+    "BOOTSTRAP.md",
+    "MEMORY.md",
+)
+
+# Maximum raw bytes to read from a single file before decoding.
+# Prevents OOM from pathologically large workspace files.
+# Mirrors OpenClaw's 2 MB raw file cap.
+_RAW_FILE_CAP: int = 2 * 1024 * 1024  # 2 MB
+
+# Process-local flag for "once" truncation warning mode.
+# Set to True after the first warning is emitted; reset only on process restart.
+_truncation_warned: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BootstrapFile:
+    """Result of attempting to load one recognized bootstrap file from disk.
+
+    Attributes:
+        name: The filename (e.g. ``"AGENTS.md"``).
+        path: Absolute path to the candidate file location, whether it exists or not.
+        content: Decoded file text, or ``None`` when the file is missing or
+            could not be read (permission denied, decode failure, etc.).
+        missing: ``True`` when the file does not exist at ``path``.
+    """
+
+    name: str
+    path: Path
+    content: str | None
+    missing: bool = False
+
+
+@dataclass(frozen=True)
+class ContextFile:
+    """A bootstrap file after budget limits have been applied.
+
+    Instances are produced by :func:`build_bootstrap_context_files`.  The
+    ``content`` field holds the exact text that will be injected into the
+    prompt, which may be a head+tail truncation of the raw file content.
+
+    Attributes:
+        path: Absolute path to the source file.
+        content: Text that will be injected (may be truncated).
+        truncated: ``True`` when the raw content was clipped to fit the budget.
+        raw_chars: Length of the original (stripped) file text before truncation.
+        injected_chars: Length of the text actually injected (``len(content)``).
+    """
+
+    path: Path
+    content: str
+    truncated: bool = False
+    raw_chars: int = 0
+    injected_chars: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+def _read_file(path: Path) -> str | None:
+    """Read a file, capping at _RAW_FILE_CAP bytes. Returns None on any error.
+
+    Uses UTF-8 with ``errors="replace"`` so a single bad byte does not abort
+    the entire read.  Reading more than ``_RAW_FILE_CAP`` bytes is prevented
+    at the binary level before decoding to avoid allocating huge strings.
+    """
+    try:
+        raw = path.read_bytes()
+        if len(raw) > _RAW_FILE_CAP:
+            # Trim at byte level before decoding to keep memory bounded.
+            raw = raw[:_RAW_FILE_CAP]
+        return raw.decode("utf-8", errors="replace")
+    except Exception:  # OSError, PermissionError, IsADirectoryError, …
+        return None
+
+
+def _truncate_content(raw_content: str, limit: int, name: str) -> str:
+    """Produce a head+tail excerpt of raw_content that fits within limit chars.
+
+    Injects a visible marker between the head and tail so the model knows
+    the file was clipped and should read the full file when details matter.
+
+    The marker itself adds a small number of extra chars beyond ``limit``.
+    This is intentional — the marker is metadata, not content, and the
+    slight overshoot is negligible relative to default limits.
+
+    Example marker::
+
+        [...truncated, read AGENTS.md for full content...]
+    """
+    head_size = limit // 2
+    tail_size = limit - head_size
+    marker = f"\n[...truncated, read {name} for full content...]\n"
+    return raw_content[:head_size] + marker + raw_content[-tail_size:]
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def load_bootstrap_files(root: Path) -> list[BootstrapFile]:
+    """Discover and load recognized bootstrap files from root.
+
+    Files are returned in the fixed canonical order defined by
+    ``_BOOTSTRAP_FILES`` regardless of filesystem ordering.  Missing files
+    are represented with ``missing=True`` and ``content=None`` so callers
+    can distinguish "absent" from "present but empty".
+
+    Security constraints:
+
+    - The ``root`` path is resolved to an absolute, symlink-free path.
+    - Each candidate file path is also resolved.
+    - A file is read only when its resolved path is contained within the
+      resolved root (``relative_to`` check).  Symlink escapes and ``..``
+      traversal are therefore rejected.
+    - Raw read size is capped at :data:`_RAW_FILE_CAP` bytes.
+
+    Args:
+        root: Directory to search for bootstrap files.
+
+    Returns:
+        A list of :class:`BootstrapFile` objects, one per recognized filename,
+        in canonical injection order.
+    """
+    # Resolve once; used for every containment check below.
+    try:
+        resolved_root = root.resolve()
+    except OSError:
+        # Unresolvable root — treat all files as missing.
+        return [
+            BootstrapFile(name=name, path=root / name, content=None, missing=True)
+            for name in _BOOTSTRAP_FILES
+        ]
+
+    result: list[BootstrapFile] = []
+    for name in _BOOTSTRAP_FILES:
+        candidate = root / name
+
+        # Security: reject any path that resolves outside the root.
+        try:
+            candidate.resolve().relative_to(resolved_root)
+        except (ValueError, OSError):
+            # Path escape or resolution failure — silently treat as missing.
+            result.append(BootstrapFile(name=name, path=candidate, content=None, missing=True))
+            continue
+
+        if not candidate.exists():
+            result.append(BootstrapFile(name=name, path=candidate, content=None, missing=True))
+            continue
+
+        content = _read_file(candidate)
+        # content is None on read/decode failure; missing=False because the file exists.
+        result.append(BootstrapFile(name=name, path=candidate, content=content, missing=False))
+
+    return result
+
+
+def build_bootstrap_context_files(
+    files: list[BootstrapFile],
+    max_chars: int,
+    total_max_chars: int,
+) -> list[ContextFile]:
+    """Apply per-file and total budget limits to the loaded bootstrap files.
+
+    Processing rules:
+
+    1. Files that are missing or have no content are skipped entirely.
+    2. Each file's content is stripped of leading/trailing whitespace before
+       measuring.
+    3. The effective char limit for any file is
+       ``min(max_chars, remaining_total_budget)``.
+    4. If the stripped content exceeds the effective limit it is truncated
+       with a head+tail split (see :func:`_truncate_content`).
+    5. Processing stops once the total budget is exhausted, even if more files
+       remain.
+
+    Args:
+        files: Loaded bootstrap files in canonical order (from
+            :func:`load_bootstrap_files`).
+        max_chars: Per-file character limit.
+        total_max_chars: Cumulative character limit across all files.
+
+    Returns:
+        Ordered list of :class:`ContextFile` objects ready for rendering.
+        Only files with usable content are included.
+    """
+    result: list[ContextFile] = []
+    total_used = 0
+
+    for bf in files:
+        # Skip absent or unreadable files.
+        if bf.missing or bf.content is None:
+            continue
+        raw_content = bf.content.strip()
+        if not raw_content:
+            continue
+
+        remaining_budget = total_max_chars - total_used
+        if remaining_budget <= 0:
+            break
+
+        # Effective limit is the tighter of per-file cap and remaining budget.
+        limit = min(max_chars, remaining_budget)
+        raw_chars = len(raw_content)
+
+        if raw_chars <= limit:
+            content = raw_content
+            truncated = False
+        else:
+            content = _truncate_content(raw_content, limit, bf.name)
+            truncated = True
+
+        injected_chars = len(content)
+        result.append(ContextFile(
+            path=bf.path,
+            content=content,
+            truncated=truncated,
+            raw_chars=raw_chars,
+            injected_chars=injected_chars,
+        ))
+        total_used += injected_chars
+
+    return result
+
+
+def render_project_context(files: list[ContextFile]) -> str:
+    """Render the Project Context block from a list of budget-applied files.
+
+    Wraps all injected files under a ``# Project Context`` top-level heading
+    with each file as a ``## FILENAME`` section.  Returns an empty string
+    when ``files`` is empty.
+
+    Args:
+        files: Budget-applied context files from :func:`build_bootstrap_context_files`.
+
+    Returns:
+        A multi-line string suitable for inclusion in a system prompt, or
+        ``""`` when there are no files to inject.
+    """
+    if not files:
+        return ""
+    parts = ["# Project Context"]
+    for ctx_file in files:
+        parts.append(f"## {ctx_file.path.name}\n{ctx_file.content}")
+    return "\n\n".join(parts)
+
+
+def render_bootstrap_pending_context(files: list[ContextFile]) -> str:
+    """Return a bootstrap-pending guidance block when BOOTSTRAP.md is present.
+
+    When ``BOOTSTRAP.md`` exists in the workspace and has content, the agent
+    should handle the bootstrap workflow described in it before responding
+    generically.  This function injects that guidance so the model sees it
+    prominently before the Project Context block.
+
+    Returns an empty string when BOOTSTRAP.md is not among the injected files.
+
+    Args:
+        files: Budget-applied context files from :func:`build_bootstrap_context_files`.
+
+    Returns:
+        A ``<bootstrap_pending>`` block string, or ``""`` if BOOTSTRAP.md is absent.
+    """
+    bootstrap_present = any(f.path.name == "BOOTSTRAP.md" for f in files)
+    if not bootstrap_present:
+        return ""
+    return (
+        "<bootstrap_pending>\n"
+        "A BOOTSTRAP.md workflow file is present in the workspace. "
+        "Handle the bootstrap workflow described in the Project Context below "
+        "before responding generically. Complete the bootstrap steps once, "
+        "then proceed normally.\n"
+        "</bootstrap_pending>"
+    )
+
+
+def render_truncation_warning(files: list[ContextFile], mode: str) -> str:
+    """Return a truncation warning when one or more files were clipped.
+
+    Warning modes:
+
+    - ``"off"``    — never emit the warning.
+    - ``"once"``   — emit at most one warning per process lifetime (module-level flag).
+    - ``"always"`` — emit the warning on every turn that has truncated content.
+
+    Args:
+        files: Budget-applied context files (truncated status is on each object).
+        mode: One of ``"off"``, ``"once"``, or ``"always"``.
+
+    Returns:
+        Warning string, or ``""`` when suppressed by mode or no truncation occurred.
+    """
+    global _truncation_warned
+
+    if mode == "off":
+        return ""
+
+    has_truncation = any(f.truncated for f in files)
+    if not has_truncation:
+        return ""
+
+    if mode == "once":
+        if _truncation_warned:
+            return ""
+        _truncation_warned = True
+
+    return (
+        "[Bootstrap truncation warning]\n"
+        "Some workspace bootstrap files were truncated before injection.\n"
+        "Treat Project Context as partial and read the relevant files directly "
+        "if details seem missing."
+    )
+
+
+def build_bootstrap_prompt_block(root: Path, config: object) -> str:
+    """Build the complete bootstrap prompt block for one agent turn.
+
+    This is the main entry point called per turn from :class:`AgentSession`.
+    It chains all the lower-level helpers:
+
+    1. Load recognized files from ``root`` (with security and size checks).
+    2. Apply per-file and total budget limits.
+    3. If BOOTSTRAP.md is present, prepend a bootstrap-pending guidance block.
+    4. Render the ``# Project Context`` section.
+    5. Append a truncation warning when any file was clipped (respecting mode).
+
+    The ``config`` argument is accessed via duck-typing; it must expose:
+
+    - ``config.enabled`` (bool)
+    - ``config.max_chars`` (int)
+    - ``config.total_max_chars`` (int)
+    - ``config.truncation_warning`` (str: "off", "once", or "always")
+
+    Args:
+        root: Bootstrap root directory (typically ``Path.cwd()``).
+        config: A config object with the attributes listed above.
+
+    Returns:
+        The complete block string to inject after the static agent soul, or
+        ``""`` when bootstrap is disabled or no files have content.
+    """
+    if not config.enabled:
+        return ""
+
+    files = load_bootstrap_files(root)
+    ctx_files = build_bootstrap_context_files(
+        files,
+        config.max_chars,
+        config.total_max_chars,
+    )
+
+    if not ctx_files:
+        return ""
+
+    parts: list[str] = []
+
+    # Bootstrap-pending guidance comes before the project context block so the
+    # model sees the instruction prominently before the file contents.
+    pending = render_bootstrap_pending_context(ctx_files)
+    if pending:
+        parts.append(pending)
+
+    # Main project context block with all budget-applied files.
+    parts.append(render_project_context(ctx_files))
+
+    # Truncation warning at the end so the model sees it after the content.
+    warning = render_truncation_warning(ctx_files, config.truncation_warning)
+    if warning:
+        parts.append(warning)
+
+    return "\n\n".join(parts)

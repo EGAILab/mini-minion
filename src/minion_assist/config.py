@@ -295,6 +295,37 @@ def _validate(raw: dict) -> list[ConfigIssue]:
                 f"Expected boolean (true/false), got {ee!r}.",
             ))
 
+    # --- bootstrap ---
+    bootstrap_raw = raw.get("bootstrap", {})
+    if bootstrap_raw and not isinstance(bootstrap_raw, dict):
+        issues.append(ConfigIssue("bootstrap", "Expected an object."))
+    elif isinstance(bootstrap_raw, dict):
+        _be = bootstrap_raw.get("enabled")
+        if _be is not None and not isinstance(_be, bool):
+            issues.append(ConfigIssue(
+                "bootstrap.enabled",
+                f"Expected boolean (true/false), got {_be!r}.",
+            ))
+        _bp = bootstrap_raw.get("path")
+        if _bp is not None and not isinstance(_bp, str):
+            issues.append(ConfigIssue(
+                "bootstrap.path",
+                f"Expected string or null, got {type(_bp).__name__}.",
+            ))
+        for _bfield in ("max_chars", "total_max_chars"):
+            _bval = bootstrap_raw.get(_bfield)
+            if _bval is not None and (not isinstance(_bval, int) or _bval <= 0):
+                issues.append(ConfigIssue(
+                    f"bootstrap.{_bfield}",
+                    f"Expected positive integer, got {_bval!r}.",
+                ))
+        _btw = bootstrap_raw.get("truncation_warning")
+        if _btw is not None and _btw not in ("off", "once", "always"):
+            issues.append(ConfigIssue(
+                "bootstrap.truncation_warning",
+                f"Expected 'off', 'once', or 'always', got {_btw!r}.",
+            ))
+
     # --- extra_plugin_manifests ---
     # Optional list of additional plugins.json paths to load, on top of the
     # two fixed locations (~/.minion-assist/plugins.json + .minion-assist/plugins.json).
@@ -505,6 +536,50 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class BootstrapConfig:
+    """Controls the workspace bootstrap prompt injection layer.
+
+    Bootstrap files (``AGENTS.md``, ``SOUL.md``, ``TOOLS.md``, etc.) are
+    discovered under ``path`` on every agent turn, budget-clamped, and
+    rendered into a ``# Project Context`` block injected into the system
+    prompt after the static agent soul.  Editing any bootstrap file takes
+    effect on the next turn without restarting the process.
+
+    Configured in ``config.json`` under the ``"bootstrap"`` key::
+
+        "bootstrap": {
+            "enabled": true,
+            "path": null,
+            "max_chars": 20000,
+            "total_max_chars": 60000,
+            "truncation_warning": "always"
+        }
+
+    Attributes:
+        enabled (bool): When ``True`` (default), bootstrap injection is active.
+            Set to ``false`` to disable entirely without removing config.
+        path (str | None): Filesystem path to search for bootstrap files.
+            ``None`` (the default) resolves to ``Path.cwd()`` at call time,
+            picking up the working directory of the process.
+        max_chars (int): Maximum characters to inject from any single bootstrap
+            file.  Content exceeding this limit is truncated with a head+tail
+            split.  Default 20 000 (≈ 5 000 tokens).
+        total_max_chars (int): Maximum total characters across all bootstrap
+            files combined.  Processing stops when this limit is reached.
+            Default 60 000 (≈ 15 000 tokens).
+        truncation_warning (str): Controls when a truncation warning is injected
+            into the prompt.  ``"always"`` (default) warns on every turn that
+            has truncated content; ``"once"`` warns at most once per process
+            lifetime; ``"off"`` suppresses the warning entirely.
+    """
+    enabled: bool = True
+    path: str | None = None
+    max_chars: int = 20_000
+    total_max_chars: int = 60_000
+    truncation_warning: str = "always"
+
+
+@dataclass(frozen=True)
 class CompactionConfig:
     """Controls when and how conversation history is compacted.
 
@@ -663,6 +738,28 @@ def _resolve_memory() -> MemoryConfig:
     return MemoryConfig(
         # Default True so existing configs work unchanged.
         enable_extraction=raw.get("enable_extraction", True),
+    )
+
+
+def _resolve_bootstrap() -> BootstrapConfig:
+    """Read the ``"bootstrap"`` section from config.json and build a BootstrapConfig.
+
+    All fields have sensible defaults so the section can be omitted entirely
+    from ``config.json`` without breaking the bootstrap layer — it will simply
+    discover files from ``Path.cwd()`` with the standard budget limits.
+
+    Returns:
+        BootstrapConfig: Immutable bootstrap settings; defaults apply when absent.
+    """
+    raw = _raw.get("bootstrap", {})
+    if not isinstance(raw, dict):
+        return BootstrapConfig()
+    return BootstrapConfig(
+        enabled=raw.get("enabled", True),
+        path=raw.get("path"),
+        max_chars=raw.get("max_chars", 20_000),
+        total_max_chars=raw.get("total_max_chars", 60_000),
+        truncation_warning=raw.get("truncation_warning", "always"),
     )
 
 
@@ -859,6 +956,10 @@ mcp: McpConfig = _resolve_mcp()
 # memory: controls the optional background memory extraction subsystem.
 # Read from "memory" section; defaults to enable_extraction=True if absent.
 memory: MemoryConfig = _resolve_memory()
+
+# bootstrap: controls workspace bootstrap file injection into agent system prompts.
+# Read from "bootstrap" section; all fields default so the section can be omitted.
+bootstrap: BootstrapConfig = _resolve_bootstrap()
 
 # channels: integrations like Matrix that run alongside the REPL.
 # matrix is None when channels.matrix is absent from config.json.

@@ -63,7 +63,7 @@ from pathlib import Path
 
 from .agents import AGENTS, AgentSession, resolve
 from .cli_input import PromptReader
-from .commands import CommandContext, dispatch_command, parse_command
+from .commands import CommandContext, build_completion_items, dispatch_command, parse_command
 from .media import MediaAttachment, describe_attachment, stage_attachment
 from .agents.events import (
     CompactionFailed,
@@ -75,7 +75,9 @@ from .agents.events import (
     TokenStreamed,
     ToolCalled,
 )
+from .bootstrap import build_bootstrap_prompt_block
 from .config import agents as agents_cfg
+from .config import bootstrap as bootstrap_cfg
 from .config import channels as channels_cfg
 from .config import compaction as compaction_cfg
 from .config import extra_plugin_manifests
@@ -193,6 +195,23 @@ def main() -> None:
     # The channel is started after sessions are built so it can share them.
     _matrix_channel = None
 
+    # --- Bootstrap context callable ---
+    # A single callable is built once and shared across all agent sessions.
+    # It is invoked per turn (inside AgentSession.send) so edits to workspace
+    # bootstrap files (AGENTS.md, SOUL.md, etc.) take effect without restart.
+    # bootstrap_cfg.path=None resolves to Path.cwd() at call time so the
+    # working directory is captured lazily rather than at startup.
+    _bootstrap_root = (
+        Path(bootstrap_cfg.path).expanduser()
+        if bootstrap_cfg.path is not None
+        else Path.cwd()
+    )
+    _bootstrap_context = (
+        (lambda: build_bootstrap_prompt_block(_bootstrap_root, bootstrap_cfg))
+        if bootstrap_cfg.enabled
+        else None
+    )
+
     # --- Session setup — one AgentSession per agent ---
     sessions: dict[str, AgentSession] = {}
     for agent_id, cfg in agents_cfg.items():
@@ -250,6 +269,9 @@ def main() -> None:
             # Respect config.json "memory.enable_extraction": false to suppress
             # the background API call that extracts facts after each turn.
             enable_memory_extraction=memory_cfg.enable_extraction,
+            # Bootstrap context callable: re-read workspace bootstrap files on
+            # every turn so file edits take effect without restarting.
+            bootstrap_context=_bootstrap_context,
         )
 
     if channels_cfg.matrix is not None:
@@ -276,7 +298,10 @@ def main() -> None:
     # PromptReader wraps prompt_toolkit for Up/Down arrow history navigation.
     # Falls back to plain input() automatically when not in a TTY (e.g. tests,
     # piped input), so no existing code paths break.
-    prompt_reader = PromptReader(workspace / "prompt_history.txt")
+    prompt_reader = PromptReader(
+        workspace / "prompt_history.txt",
+        completion_items=build_completion_items(agents_cfg, skills),
+    )
 
     # Install SIGTERM handler (POSIX only) so `kill <pid>` exits cleanly.
     # History is already persisted from the last turn's finally block.
@@ -397,9 +422,14 @@ def main() -> None:
             agent_id, message = resolve(user_input)
 
             # Determine the text to examine for slash commands.
-            # If routing stripped a prefix, examine the remaining payload; otherwise
-            # examine the full input (handles "/new", "/help", etc. without a prefix).
-            cmd_text = message if message.startswith("/") else user_input
+            # If routing stripped a prefix, only the routed payload can be a command.
+            # Example:
+            #   "/research /new"  -> command "/new" targeting researcher
+            #   "/research hello" -> normal chat to researcher, not unknown "/research"
+            # If no route matched, examine the full input so "/new", "/help", and
+            # mistyped slash commands still behave normally.
+            _route_matched = message != user_input
+            cmd_text = message if _route_matched else user_input
 
             parsed = parse_command(cmd_text)
             if parsed is not None:
@@ -424,6 +454,7 @@ def main() -> None:
                         agents_cfg=agents_cfg,
                         session_store=session_store,
                         mcp_manager=mcp_manager,
+                        skills=skills,
                     )
                     result = dispatch_command(ctx)
                     if result.handled:

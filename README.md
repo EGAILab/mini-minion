@@ -74,6 +74,7 @@ minion-assist/
 ├── src/minion_assist/
 │   ├── minion.py                # Entry point — interactive REPL
 │   ├── config.py                # Config loader (config.json + .env)
+│   ├── bootstrap.py             # Bootstrap prompt layer — workspace file discovery, budget, truncation, rendering
 │   ├── context.py               # Context window overflow detection and history compaction
 │   ├── cli_input.py             # PromptReader — Up/Down arrow key prompt history via prompt_toolkit
 │   ├── commands.py              # Slash command dispatcher and built-in commands
@@ -147,7 +148,7 @@ minion-assist/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       └── __init__.py
-└── tests/                       # pytest test suite (1074 tests, 2 skipped)
+└── tests/                       # pytest test suite (1031 tests, 2 skipped)
 ```
 
 ---
@@ -232,6 +233,11 @@ minion-assist/
 | `mcp.servers.<name>.url` | *(sse / streamableHttp only)* URL of the MCP server endpoint |
 | `memory.enable_extraction` | *(Optional, default `true`)* Set to `false` to disable the background fact-extraction API call fired after each turn. Useful for expensive models where the extra call doubles token costs. |
 | `extra_plugin_manifests` | *(Optional)* List of additional `plugins.json` file paths to load beyond the two fixed locations (`~/.minion-assist/plugins.json` and `.minion-assist/plugins.json`). Paths support `~` expansion. |
+| `bootstrap.enabled` | *(Optional, default `true`)* Set to `false` to disable workspace bootstrap file injection entirely. |
+| `bootstrap.path` | *(Optional, default `null`)* Directory to search for bootstrap files. `null` uses `Path.cwd()` at runtime. |
+| `bootstrap.max_chars` | *(Optional, default `20000`)* Maximum characters to inject from any single bootstrap file. Larger files are truncated with a head+tail excerpt. |
+| `bootstrap.total_max_chars` | *(Optional, default `60000`)* Maximum total characters across all bootstrap files combined. |
+| `bootstrap.truncation_warning` | *(Optional, default `"always"`)* When to inject a truncation warning: `"always"`, `"once"` (first occurrence only per process), or `"off"`. |
 
 ### `.env`
 
@@ -260,8 +266,12 @@ router.resolve()
 AgentSession.send(message, on_event=callback, stream=True/False)
     │
     ├─ Build system prompt:
-    │     soul + <user_context> (if user_context.md exists)
+    │     soul + bootstrap Project Context (AGENTS.md, SOUL.md, TOOLS.md, …)
+    │          + <bootstrap_pending> guidance (if BOOTSTRAP.md present)
+    │          + <user_context> (if user_context.md exists)
     │          + <relevant_memories> (proactive search — top-5 snippets)
+    │          + <active_task> (current task progress, if a task is active)
+    │          + <context_budget> warning (if history > 50% of context window)
     │          + <available_skills> suffix
     │
     ├─ compactor.compact(history, provider, on_compaction=..., on_compaction_failed=...)
@@ -627,13 +637,14 @@ If the Matrix dependencies are missing, a clear `RuntimeError` is printed and th
 Loads `config.json` and `.env` at import time. Exposes four module-level values:
 
 ```python
-from minion_assist.config import agents, workspace, streaming, compaction, memory, extra_plugin_manifests
+from minion_assist.config import agents, workspace, streaming, compaction, memory, bootstrap, extra_plugin_manifests
 
 agents                  # dict[str, AgentModelConfig] — one entry per agent in config.json
 workspace               # Path — resolved workspace directory
 streaming               # StreamingConfig — whether to stream in each execution mode
 compaction              # CompactionConfig — shared token reservation (context_window is per-agent on ModelConfig)
 memory                  # MemoryConfig — controls background fact extraction
+bootstrap               # BootstrapConfig — workspace bootstrap file injection settings
 extra_plugin_manifests  # tuple[str, ...] — extra plugins.json paths beyond the two fixed locations
 ```
 
@@ -677,6 +688,14 @@ class MemoryConfig:
     enable_extraction: bool = True
     # True  → background fact extraction fires after each turn (default)
     # False → skip the extra API call; useful for expensive models
+
+@dataclass(frozen=True)
+class BootstrapConfig:
+    enabled: bool = True          # False → disable bootstrap injection entirely
+    path: str | None = None       # None → Path.cwd() at call time
+    max_chars: int = 20_000       # per-file char cap (truncated with head+tail)
+    total_max_chars: int = 60_000 # cumulative cap across all bootstrap files
+    truncation_warning: str = "always"  # "always" | "once" | "off"
 ```
 
 API key resolution: set `{PROVIDER_NAME_UPPERCASE}_API_KEY` in `.env`. Inline `apiKey` fields in `config.json` are not supported — the validator flags them to prevent accidental commits.
@@ -690,6 +709,50 @@ Invalid config.json:
 ```
 
 `ConfigError.issues` is a `list[ConfigIssue]` where each `ConfigIssue` has a `path` and a `message`.
+
+---
+
+### `bootstrap`
+
+**File:** `src/minion_assist/bootstrap.py`
+
+The workspace bootstrap prompt layer discovers recognized Markdown files under the configured root and injects them into every agent's system prompt as a `# Project Context` block.  Files are re-read on every turn so edits take effect without restarting the process.
+
+**Recognized files** (injected in this order, `HEARTBEAT.md` excluded):
+
+| File | Purpose |
+|------|---------|
+| `AGENTS.md` | Agent behaviour rules and routing guidance |
+| `SOUL.md` | Workspace-level personality or persona overlay |
+| `TOOLS.md` | Tool constraints and usage hints for this workspace |
+| `IDENTITY.md` | Project-specific identity context |
+| `USER.md` | User preferences and context for this workspace |
+| `BOOTSTRAP.md` | First-run workflow — triggers bootstrap-pending guidance |
+| `MEMORY.md` | Project memory notes (may be routed through memory tools in future) |
+
+**Public API:**
+
+```python
+from minion_assist.bootstrap import build_bootstrap_prompt_block, load_bootstrap_files
+
+# Typical usage (as a per-turn callable in AgentSession):
+block = build_bootstrap_prompt_block(Path.cwd(), bootstrap_cfg)
+
+# Lower-level helpers:
+files    = load_bootstrap_files(root)              # BootstrapFile list (includes missing markers)
+ctx      = build_bootstrap_context_files(files, max_chars=20_000, total_max_chars=60_000)
+rendered = render_project_context(ctx)             # "# Project Context\n\n## AGENTS.md\n..."
+pending  = render_bootstrap_pending_context(ctx)   # non-empty only when BOOTSTRAP.md is present
+warning  = render_truncation_warning(ctx, "always")
+```
+
+**Security:** every candidate file path is resolved and checked to be inside the bootstrap root before reading.  Symlink escapes and `..` traversal are rejected.  Raw reads are capped at 2 MB before decoding.
+
+**Budget enforcement:** the effective limit for each file is `min(max_chars, remaining_total_budget)`.  Files that exceed the limit are truncated with a visible head+tail marker:
+
+```
+[...truncated, read AGENTS.md for full content...]
+```
 
 ---
 

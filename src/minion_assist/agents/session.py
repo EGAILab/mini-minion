@@ -27,8 +27,8 @@ How a turn works
 per-turn block:
 
 1. Append the user message to history.
-2. Build the effective system prompt: soul + user context + relevant memories
-   + skills suffix.
+2. Build the effective system prompt: soul + bootstrap context + user context
+   + relevant memories + active task + context-budget warning + skills suffix.
 3. Compact the history if it's approaching the model's context limit.
 4. Persist the user message to disk (saved even if the provider crashes).
 5. Snapshot the history length for rollback.
@@ -352,6 +352,12 @@ class AgentSession:
             ``provider.chat()`` call per turn).  Set to ``False`` when using
             expensive models where the extra call is undesirable, or when
             ``config.json`` has ``"memory": {"enable_extraction": false}``.
+        bootstrap_context (Callable[[], str] | None): Optional callable that
+            returns the workspace bootstrap prompt block on each invocation.
+            Called once per turn so edits to bootstrap files (``AGENTS.md``,
+            ``SOUL.md``, etc.) take effect immediately without restarting.
+            ``None`` (the default) disables bootstrap injection.  Typically
+            set by ``minion.py`` as a closure over the bootstrap config.
     """
 
     def __init__(
@@ -369,6 +375,7 @@ class AgentSession:
         long_term: LongTermMemory | None = None,
         tasks_dir: Path | None = None,
         enable_memory_extraction: bool = True,
+        bootstrap_context: Callable[[], str] | None = None,
     ) -> None:
         self._agent_id = agent_id
         self._agent = agent
@@ -385,6 +392,9 @@ class AgentSession:
         # When False, skip the background memory extraction call after each turn.
         # Controlled by config.json "memory.enable_extraction".
         self._enable_memory_extraction = enable_memory_extraction
+        # Optional per-turn callable that returns the workspace bootstrap block.
+        # Called on every turn so edits to bootstrap files take effect immediately.
+        self._bootstrap_context = bootstrap_context
 
         # Compute injection limits proportionally from the model's context window.
         # This ensures every budget scales automatically when the model is switched.
@@ -498,12 +508,23 @@ class AgentSession:
             self._history.append({"role": "user", "content": message})
 
         # Build the effective system prompt.
-        # Order: today's date → soul → user context → relevant memories → skills suffix.
+        # Order: today's date → soul → bootstrap context → user context
+        #        → relevant memories → active task → context-budget warning → skills suffix.
         # Important instructions are placed first (high priority) and last
         # (Lost in the Middle mitigation) for small models.
         # The date is prepended first so the model never defaults to its training-data
         # cutoff year when constructing time-sensitive queries (e.g. web searches).
         system = f"Today's date: {date.today().isoformat()}\n\n{self._agent.soul}"
+
+        # Bootstrap block — evaluated per turn so edits to workspace bootstrap files
+        # (AGENTS.md, SOUL.md, TOOLS.md, etc.) are picked up without restarting.
+        # Positioned immediately after the static soul so stable workspace context
+        # appears before dynamic memory and task context.
+        if self._bootstrap_context is not None:
+            _bootstrap_block = self._bootstrap_context()
+            if _bootstrap_block:
+                system += f"\n\n{_bootstrap_block}"
+
         if self._user_context_block:
             system += self._user_context_block
         if self._long_term is not None:
