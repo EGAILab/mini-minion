@@ -66,6 +66,7 @@ import difflib
 import json
 import os
 import re as _re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -92,9 +93,14 @@ class ConfigIssue:
         path (str): Dot-separated JSON path to the bad value,
             e.g. ``"agents.main.model"`` or ``"streaming.chat_mode"``.
         message (str): Human-readable description of what is wrong.
+        warning (bool): When ``True``, this issue is printed to stderr but
+            does not prevent startup. Use for conditions that will fail at
+            runtime (e.g. missing API key) but shouldn't block the REPL from
+            opening.  Defaults to ``False`` (fatal).
     """
     path: str
     message: str
+    warning: bool = False
 
 
 class ConfigError(Exception):
@@ -165,10 +171,13 @@ def _validate(raw: dict) -> list[ConfigIssue]:
             ))
         api_key_in_env = os.environ.get(f"{pname.upper()}_API_KEY", "")
         if not api_key_in_env and praw.get("api") not in _LOCAL_APIS:
+            # Warning rather than error: a missing key doesn't prevent startup.
+            # The first real API call will fail with a clear authentication error.
             issues.append(ConfigIssue(
                 ppath,
                 f"Environment variable {pname.upper()}_API_KEY is not set. "
                 f"API calls will fail at runtime with an authentication error.",
+                warning=True,
             ))
         models_list = praw.get("models", [])
         if not isinstance(models_list, list):
@@ -925,8 +934,13 @@ except json.JSONDecodeError as exc:
     raise ConfigError([ConfigIssue("config.json", f"Invalid JSON: {exc}")]) from exc
 
 _issues = _validate(_raw)
-if _issues:
-    raise ConfigError(_issues)
+_errors = [i for i in _issues if not i.warning]
+_warnings = [i for i in _issues if i.warning]
+# Print non-fatal warnings to stderr so they are visible without blocking startup.
+for _w in _warnings:
+    print(f"[minion-assist] Warning: {_w.path}: {_w.message}", file=sys.stderr)
+if _errors:
+    raise ConfigError(_errors)
 
 
 # ---------------------------------------------------------------------------

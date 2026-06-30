@@ -1,6 +1,19 @@
 {
   "models": {
     "providers": {
+      "openai": {
+        "baseUrl": "https://api.openai.com/v1",
+        "api": "openai-responses",
+        "models": [
+          {
+            "id": "codex-mini-latest",
+            "name": "Codex Mini (Latest)",
+            "inputModalities": ["text", "image"],
+            "contextWindow": 200000,
+            "maxOutputTokens": 100000
+          }
+        ]
+      },
       "volces": {
         "baseUrl": "https://ark.cn-beijing.volces.com/api/plan/v3",
         "api": "openai-completions",
@@ -8,17 +21,9 @@
           {
             "id": "glm-5.2",
             "name": "GLM-5.2 (Volcengine Ark)",
-            "reasoning": false,
             "inputModalities": ["text"],
-            "cost": {
-              "input": 0,
-              "output": 0,
-              "cacheRead": 0,
-              "cacheWrite": 0
-            },
             "contextWindow": 128000,
-            "maxOutputTokens": 4096,
-            "api": "openai-completions"
+            "maxOutputTokens": 4096
           }
         ]
       },
@@ -33,7 +38,7 @@
   },
   "agents": {
     "main": {
-      "model": "volces/glm-5.2"
+      "model": "openai/codex-mini-latest"
     },
     "researcher": {
       "model": "lmstudio/qwen-qwen3.5-9b",

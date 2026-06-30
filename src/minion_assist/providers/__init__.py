@@ -27,6 +27,7 @@ Talks to
 
 from .anthropic import AnthropicProvider
 from .base import LLMProvider, LLMResponse, TokenUsage, ToolCall
+from .codex import CodexProvider
 from .lmstudio import LMStudioProvider
 from .openai_compatible import OpenAICompatibleProvider
 
@@ -40,7 +41,8 @@ def create_provider(api: str, base_url: str, api_key: str, model: str) -> LLMPro
 
     Args:
         api (str): The adapter type string from ``config.json``, e.g.
-            ``"openai-completions"``, ``"lmstudio"``, or ``"anthropic"``.
+            ``"openai-completions"``, ``"openai-responses"``, ``"lmstudio"``,
+            or ``"anthropic"``.
         base_url (str): HTTP endpoint for the provider. Unused for Anthropic
             (the SDK uses its own default endpoint).
         api_key (str): Authentication token loaded from ``.env``.
@@ -61,9 +63,13 @@ def create_provider(api: str, base_url: str, api_key: str, model: str) -> LLMPro
         case "lmstudio":
             # LMStudioProvider is an alias for OpenAICompatibleProvider; same behavior.
             return LMStudioProvider(base_url=base_url, api_key=api_key, model=model)
+        case "openai-responses":
+            # Responses API surface — used by Codex subscription models and o-series.
+            # See codex.py for the format differences from Chat Completions.
+            return CodexProvider(base_url=base_url, api_key=api_key, model=model)
         case _:
             # Default: treat any unknown api value as an OpenAI-compatible endpoint.
-            # Covers "openai-completions", "openai-responses", "openai", and others.
+            # Covers "openai-completions", "openai", and any other Chat Completions API.
             return OpenAICompatibleProvider(base_url=base_url, api_key=api_key, model=model)
 
 
@@ -75,5 +81,6 @@ __all__ = [
     "OpenAICompatibleProvider",
     "AnthropicProvider",
     "LMStudioProvider",
+    "CodexProvider",
     "create_provider",
 ]

@@ -5,6 +5,7 @@ import pytest
 from minion_assist.providers import create_provider
 from minion_assist.providers.anthropic import AnthropicProvider
 from minion_assist.providers.base import LLMResponse, ToolCall
+from minion_assist.providers.codex import CodexProvider
 from minion_assist.providers.lmstudio import LMStudioProvider
 from minion_assist.providers.openai_compatible import OpenAICompatibleProvider
 
@@ -48,7 +49,7 @@ def test_create_provider_openai_completions():
 
 def test_create_provider_openai_responses():
     p = create_provider(api="openai-responses", base_url="http://x", api_key="k", model="m")
-    assert isinstance(p, OpenAICompatibleProvider)
+    assert isinstance(p, CodexProvider)
 
 
 def test_create_provider_lmstudio():
