@@ -47,9 +47,15 @@ def test_create_provider_openai_completions():
     assert isinstance(p, OpenAICompatibleProvider)
 
 
-def test_create_provider_openai_responses():
-    p = create_provider(api="openai-responses", base_url="http://x", api_key="k", model="m")
+def test_create_provider_codex():
+    p = create_provider(api="codex", base_url="", api_key="", model="gpt-5.5")
     assert isinstance(p, CodexProvider)
+
+
+def test_create_provider_openai_responses_falls_through():
+    # "openai-responses" is not a special case — falls through to OpenAICompatibleProvider.
+    p = create_provider(api="openai-responses", base_url="http://x", api_key="k", model="m")
+    assert isinstance(p, OpenAICompatibleProvider)
 
 
 def test_create_provider_lmstudio():

@@ -25,6 +25,7 @@ testpaths = ["tests"]
 
 [project.scripts]
 minion-assist = "minion_assist.minion:main"
+codex-login = "minion_assist.auth.codex_auth:_cli_main"
 
 [build-system]
 requires = ["hatchling"]

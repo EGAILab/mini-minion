@@ -1,485 +1,496 @@
-"""Tests for CodexProvider and the Responses API format helpers.
+"""Tests for CodexProvider (app-server / OAuth path).
 
-Uses fake clients/responses injected via object.__new__ — no real API
-connection is made.
+All tests use a stub _CodexRpcClient so no real subprocess is spawned.
 """
 
+from __future__ import annotations
+
+import threading
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from minion_assist.providers.codex import (
-    CodexProvider,
-    _convert_messages,
-    _convert_tools,
-    _extract_usage,
-    _parse_arguments,
-)
-from minion_assist.providers.base import LLMResponse, TokenUsage, ToolCall
+from minion_assist.providers.codex import CodexProvider, _CodexRpcClient
+from minion_assist.providers.base import LLMResponse
 
 
 # ---------------------------------------------------------------------------
-# _convert_messages — Chat Completions → Responses API input format
+# Stub RPC client — simulates the Codex binary over stdio
 # ---------------------------------------------------------------------------
 
 
-def test_convert_user_message():
-    result = _convert_messages([{"role": "user", "content": "hello"}])
-    assert result == [{"role": "user", "content": "hello"}]
+class _StubRpc:
+    """Test double for _CodexRpcClient.
 
+    ``turn/start`` dispatches fake notifications (via a short timer) before
+    returning so that the polling loop in CodexProvider.chat() finds a result.
 
-def test_convert_assistant_text():
-    result = _convert_messages([{"role": "assistant", "content": "hi there"}])
-    assert result == [
-        {"role": "assistant", "content": [{"type": "output_text", "text": "hi there"}]}
-    ]
+    When ``agent_text`` is set, an ``item/completed`` notification is fired
+    first (simulating the real binary's text delivery path), then
+    ``turn/completed`` fires.  This lets tests verify that the provider reads
+    text from ``item/completed`` rather than ``turn.items``.
+    """
 
+    def __init__(
+        self,
+        turn_items: list[dict] | None = None,
+        turn_status: str = "completed",
+        thread_id: str = "thread-1",
+        rpc_error: Exception | None = None,
+        notification_delay: float = 0.01,
+        agent_text: str = "",
+    ) -> None:
+        self.turn_items = turn_items or [{"text": "Hello from Codex"}]
+        self.turn_status = turn_status
+        self.thread_id = thread_id
+        self.rpc_error = rpc_error
+        self.notification_delay = notification_delay
+        self.agent_text = agent_text
+        self._handlers: list[Callable[[dict], None]] = []
+        self.calls: list[tuple[str, dict]] = []
 
-def test_convert_assistant_no_content_no_tool_calls():
-    # Edge case: assistant message with neither content nor tool calls.
-    result = _convert_messages([{"role": "assistant", "content": None}])
-    assert result == []
+    def _fire_notification(self) -> None:
+        if self.agent_text:
+            item_notification = {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "item-1",
+                        "text": self.agent_text,
+                    }
+                },
+            }
+            for handler in list(self._handlers):
+                try:
+                    handler(item_notification)
+                except Exception:
+                    pass
 
-
-def test_convert_assistant_tool_calls():
-    msgs = [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_abc",
-                    "type": "function",
-                    "function": {"name": "read", "arguments": '{"path": "/tmp/x"}'},
+        notification = {
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "id": "turn-1",
+                    "threadId": self.thread_id,
+                    "status": self.turn_status,
+                    "items": self.turn_items,
                 }
-            ],
-        }
-    ]
-    result = _convert_messages(msgs)
-    assert result == [
-        {
-            "type": "function_call",
-            "call_id": "call_abc",
-            "name": "read",
-            "arguments": '{"path": "/tmp/x"}',
-        }
-    ]
-
-
-def test_convert_assistant_text_and_tool_calls():
-    # Text plus tool call: should produce two separate items.
-    msgs = [
-        {
-            "role": "assistant",
-            "content": "I'll read the file.",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "read", "arguments": "{}"},
-                }
-            ],
-        }
-    ]
-    result = _convert_messages(msgs)
-    assert len(result) == 2
-    assert result[0] == {
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": "I'll read the file."}],
-    }
-    assert result[1] == {
-        "type": "function_call",
-        "call_id": "call_1",
-        "name": "read",
-        "arguments": "{}",
-    }
-
-
-def test_convert_tool_result():
-    msgs = [{"role": "tool", "tool_call_id": "call_abc", "content": "file contents here"}]
-    result = _convert_messages(msgs)
-    assert result == [
-        {
-            "type": "function_call_output",
-            "call_id": "call_abc",
-            "output": "file contents here",
-        }
-    ]
-
-
-def test_convert_mixed_conversation():
-    msgs = [
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": "Hi! Let me use a tool."},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": "c1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}
-            ],
-        },
-        {"role": "tool", "tool_call_id": "c1", "content": "file.txt"},
-        {"role": "user", "content": "Thanks"},
-    ]
-    result = _convert_messages(msgs)
-    assert len(result) == 5
-    assert result[0] == {"role": "user", "content": "Hello"}
-    assert result[1]["role"] == "assistant"
-    assert result[2]["type"] == "function_call"
-    assert result[3]["type"] == "function_call_output"
-    assert result[4] == {"role": "user", "content": "Thanks"}
-
-
-def test_convert_empty_messages():
-    assert _convert_messages([]) == []
-
-
-# ---------------------------------------------------------------------------
-# _convert_tools — Chat Completions → Responses API tool format
-# ---------------------------------------------------------------------------
-
-
-def test_convert_tools_basic():
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "read",
-                "description": "Read a file",
-                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
             },
         }
-    ]
-    result = _convert_tools(tools)
-    assert result == [
-        {
-            "type": "function",
-            "name": "read",
-            "description": "Read a file",
-            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
-        }
-    ]
+        for handler in list(self._handlers):
+            try:
+                handler(notification)
+            except Exception:
+                pass
+
+    def request(self, method: str, params: dict | None = None, timeout: float = 60.0) -> dict:
+        self.calls.append((method, params or {}))
+        if self.rpc_error:
+            raise self.rpc_error
+        if method == "initialize":
+            return {"serverInfo": {"name": "codex", "version": "1.0"}, "capabilities": {}}
+        if method in ("thread/start", "turn/start"):
+            # Dispatch the turn completion notification asynchronously so that
+            # CodexProvider.chat() has time to register done.wait() first.
+            timer = threading.Timer(self.notification_delay, self._fire_notification)
+            timer.daemon = True
+            timer.start()
+            if method == "thread/start":
+                return {"thread": {"id": self.thread_id}, "model": "gpt-5.5"}
+            return {"turn": {"id": "turn-1", "threadId": self.thread_id, "status": "idle"}}
+        return {}
+
+    def add_handler(self, handler: Callable[[dict], None]) -> None:
+        self._handlers.append(handler)
+
+    def remove_handler(self, handler: Callable[[dict], None]) -> None:
+        try:
+            self._handlers.remove(handler)
+        except ValueError:
+            pass
+
+    def close(self) -> None:
+        pass
 
 
-def test_convert_tools_empty():
-    assert _convert_tools([]) == []
-
-
-def test_convert_tools_non_function_ignored():
-    # Non-function tool types (hypothetical) should be skipped.
-    tools = [{"type": "unknown", "stuff": "value"}]
-    assert _convert_tools(tools) == []
-
-
-def test_convert_tools_multiple():
-    tools = [
-        {"type": "function", "function": {"name": "a", "description": "A", "parameters": {}}},
-        {"type": "function", "function": {"name": "b", "description": "B", "parameters": {}}},
-    ]
-    result = _convert_tools(tools)
-    assert len(result) == 2
-    assert result[0]["name"] == "a"
-    assert result[1]["name"] == "b"
-
-
-# ---------------------------------------------------------------------------
-# _parse_arguments
-# ---------------------------------------------------------------------------
-
-
-def test_parse_arguments_valid():
-    args, err = _parse_arguments('{"path": "/tmp/x"}', "read")
-    assert args == {"path": "/tmp/x"}
-    assert err is None
-
-
-def test_parse_arguments_empty_string():
-    args, err = _parse_arguments("", "tool")
-    assert args == {}
-    assert err is None
-
-
-def test_parse_arguments_invalid_json():
-    args, err = _parse_arguments("{not json}", "tool")
-    assert args == {}
-    assert err is not None
-    assert "tool" in err
-
-
-def test_parse_arguments_non_object():
-    args, err = _parse_arguments("[1, 2, 3]", "tool")
-    assert args == {}
-    assert err is not None
-    assert "JSON object" in err
-
-
-# ---------------------------------------------------------------------------
-# _extract_usage
-# ---------------------------------------------------------------------------
-
-
-def test_extract_usage_present():
-    raw = MagicMock()
-    raw.usage.input_tokens = 10
-    raw.usage.output_tokens = 20
-    result = _extract_usage(raw)
-    assert result == TokenUsage(input_tokens=10, output_tokens=20)
-
-
-def test_extract_usage_missing():
-    raw = MagicMock(spec=[])  # no 'usage' attribute
-    result = _extract_usage(raw)
-    assert result is None
-
-
-# ---------------------------------------------------------------------------
-# CodexProvider — blocking path
-# ---------------------------------------------------------------------------
-
-
-def _provider() -> CodexProvider:
-    """Build a provider with a mock client, bypassing __init__."""
+def _make_provider(stub: _StubRpc, model: str = "gpt-5.5") -> CodexProvider:
+    """Build a CodexProvider with a pre-injected stub RPC client."""
     p = object.__new__(CodexProvider)
-    p._client = MagicMock()
-    p._model = "codex-mini-latest"
+    p._codex_bin = "codex"
+    p._model = model
+    p._turn_timeout = 5.0
+    p._rpc = stub
+    p._thread_id = None
+    p._sent_count = 0
     return p
 
 
-def _make_message_item(text: str):
-    part = MagicMock()
-    part.type = "output_text"
-    part.text = text
-    item = MagicMock()
-    item.type = "message"
-    item.content = [part]
-    return item
+# ---------------------------------------------------------------------------
+# _extract_text
+# ---------------------------------------------------------------------------
 
 
-def _make_function_call_item(call_id: str, name: str, arguments: str):
-    item = MagicMock()
-    item.type = "function_call"
-    item.call_id = call_id
-    item.name = name
-    item.arguments = arguments
-    return item
+def test_extract_text_single_item():
+    turn = {"items": [{"text": "hello"}]}
+    assert CodexProvider._extract_text(turn) == "hello"
 
 
-def _make_response(output_items, input_tokens=5, output_tokens=10):
-    usage = MagicMock()
-    usage.input_tokens = input_tokens
-    usage.output_tokens = output_tokens
-    response = MagicMock()
-    response.output = output_items
-    response.usage = usage
-    return response
+def test_extract_text_multiple_items():
+    turn = {"items": [{"text": "part one"}, {"text": "part two"}]}
+    assert CodexProvider._extract_text(turn) == "part one\n\npart two"
 
 
-def test_blocking_text_response():
-    p = _provider()
-    p._client.responses.create.return_value = _make_response(
-        [_make_message_item("Hello world")]
-    )
+def test_extract_text_skips_empty():
+    turn = {"items": [{"text": ""}, {"text": "real text"}, {"text": ""}]}
+    assert CodexProvider._extract_text(turn) == "real text"
+
+
+def test_extract_text_non_dict_items_skipped():
+    turn = {"items": ["bad", None, {"text": "ok"}]}
+    assert CodexProvider._extract_text(turn) == "ok"
+
+
+def test_extract_text_no_items():
+    assert CodexProvider._extract_text({}) == ""
+    assert CodexProvider._extract_text({"items": []}) == ""
+
+
+def test_extract_text_items_without_text_field():
+    turn = {"items": [{"type": "tool_call", "name": "bash"}, {"text": "done"}]}
+    assert CodexProvider._extract_text(turn) == "done"
+
+
+# ---------------------------------------------------------------------------
+# CodexProvider.chat() — first turn (thread/start)
+# ---------------------------------------------------------------------------
+
+
+def test_first_turn_sends_thread_start():
+    stub = _StubRpc()
+    p = _make_provider(stub)
 
     result = p.chat(
         system="You are helpful.",
-        messages=[{"role": "user", "content": "Hi"}],
+        messages=[{"role": "user", "content": "Hello"}],
         tools=[],
         max_tokens=100,
     )
 
-    assert result.text == "Hello world"
+    # initialize was called via _get_rpc, but since we inject _rpc directly
+    # the stub already has the client; check thread/start was called.
+    methods = [c[0] for c in stub.calls]
+    assert "thread/start" in methods
+
+
+def test_first_turn_passes_developer_instructions():
+    stub = _StubRpc()
+    p = _make_provider(stub)
+
+    p.chat(system="Be concise.", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+
+    call = next(c for c in stub.calls if c[0] == "thread/start")
+    assert call[1].get("developerInstructions") == "Be concise."
+
+
+def test_first_turn_passes_user_message_as_input():
+    stub = _StubRpc()
+    p = _make_provider(stub)
+
+    p.chat(system="", messages=[{"role": "user", "content": "What time is it?"}], tools=[], max_tokens=50)
+
+    # thread/start creates the thread (no input); turn/start carries the message
+    thread_call = next(c for c in stub.calls if c[0] == "thread/start")
+    assert "input" not in thread_call[1]
+    turn_call = next(c for c in stub.calls if c[0] == "turn/start")
+    assert turn_call[1].get("input") == [{"type": "text", "text": "What time is it?"}]
+
+
+def test_first_turn_returns_text_from_turn_items():
+    stub = _StubRpc(turn_items=[{"text": "It is noon."}])
+    p = _make_provider(stub)
+
+    result = p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+
+    assert isinstance(result, LLMResponse)
+    assert result.text == "It is noon."
     assert result.tool_calls == []
     assert result.finish_reason == "stop"
-    assert result.was_streamed is False
-    assert result.usage == TokenUsage(input_tokens=5, output_tokens=10)
 
 
-def test_blocking_instructions_sent_as_field():
-    """System prompt should be passed as 'instructions', not prepended as a message."""
-    p = _provider()
-    p._client.responses.create.return_value = _make_response(
-        [_make_message_item("ok")]
-    )
+def test_first_turn_stores_thread_id():
+    stub = _StubRpc(thread_id="my-thread")
+    p = _make_provider(stub)
 
-    p.chat(system="Be concise.", messages=[], tools=[], max_tokens=50)
+    p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
 
-    call_kwargs = p._client.responses.create.call_args[1]
-    assert call_kwargs["instructions"] == "Be concise."
-    assert "instructions" in call_kwargs
-    # The system prompt must NOT appear as a message in 'input'.
-    for item in call_kwargs.get("input", []):
-        assert item.get("role") != "system"
+    assert p._thread_id == "my-thread"
 
 
-def test_blocking_tool_call_response():
-    p = _provider()
-    p._client.responses.create.return_value = _make_response([
-        _make_function_call_item("call_1", "read", '{"path": "/tmp/x"}')
-    ])
+def test_first_turn_passes_model():
+    stub = _StubRpc()
+    p = _make_provider(stub, model="gpt-5.5")
 
-    result = p.chat(
+    p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+
+    call = next(c for c in stub.calls if c[0] == "thread/start")
+    assert call[1].get("model") == "gpt-5.5"
+
+
+def test_empty_model_omits_model_param():
+    stub = _StubRpc()
+    p = _make_provider(stub, model="")
+
+    p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+
+    call = next(c for c in stub.calls if c[0] == "thread/start")
+    assert "model" not in call[1]
+
+
+# ---------------------------------------------------------------------------
+# CodexProvider.chat() — second turn (turn/start)
+# ---------------------------------------------------------------------------
+
+
+def test_second_turn_uses_turn_start():
+    stub = _StubRpc()
+    p = _make_provider(stub)
+
+    # First turn
+    p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+    # Second turn (extend message list as the runner would)
+    p.chat(
         system="",
-        messages=[{"role": "user", "content": "read file"}],
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "follow up"},
+        ],
         tools=[],
-        max_tokens=100,
+        max_tokens=50,
     )
 
-    assert result.text == ""
-    assert len(result.tool_calls) == 1
-    tc = result.tool_calls[0]
-    assert tc.id == "call_1"
-    assert tc.name == "read"
-    assert tc.arguments == {"path": "/tmp/x"}
-    assert tc.error is None
-    assert result.finish_reason == "tool_calls"
+    methods = [c[0] for c in stub.calls]
+    assert "thread/start" in methods
+    assert "turn/start" in methods
 
 
-def test_blocking_tool_call_invalid_json():
-    p = _provider()
-    p._client.responses.create.return_value = _make_response([
-        _make_function_call_item("call_bad", "tool", "not_json{")
-    ])
+def test_second_turn_sends_only_new_user_message():
+    stub = _StubRpc()
+    p = _make_provider(stub)
 
-    result = p.chat(system="", messages=[], tools=[], max_tokens=50)
+    p.chat(system="", messages=[{"role": "user", "content": "first"}], tools=[], max_tokens=50)
+    p.chat(
+        system="",
+        messages=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "response"},
+            {"role": "user", "content": "second"},
+        ],
+        tools=[],
+        max_tokens=50,
+    )
 
-    assert len(result.tool_calls) == 1
-    tc = result.tool_calls[0]
-    assert tc.error is not None
-    assert "Invalid JSON" in tc.error
-
-
-def test_blocking_tools_converted_before_call():
-    """Tool definitions should be flattened from Chat Completions format."""
-    p = _provider()
-    p._client.responses.create.return_value = _make_response([_make_message_item("ok")])
-
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Run a bash command",
-                "parameters": {"type": "object"},
-            },
-        }
-    ]
-    p.chat(system="", messages=[], tools=tools, max_tokens=50)
-
-    call_kwargs = p._client.responses.create.call_args[1]
-    assert "tools" in call_kwargs
-    sent_tool = call_kwargs["tools"][0]
-    # Must be flat (no nested "function" key).
-    assert sent_tool["name"] == "bash"
-    assert "function" not in sent_tool
+    # Both turns use turn/start; the second one carries "second"
+    turn_starts = [c for c in stub.calls if c[0] == "turn/start"]
+    assert len(turn_starts) == 2
+    inputs = turn_starts[1][1].get("input", [])
+    assert inputs == [{"type": "text", "text": "second"}]
 
 
-def test_blocking_no_tools_omits_field():
-    """When tools=[], the 'tools' key should not be sent to the API."""
-    p = _provider()
-    p._client.responses.create.return_value = _make_response([_make_message_item("ok")])
+def test_second_turn_passes_thread_id():
+    stub = _StubRpc(thread_id="abc-123")
+    p = _make_provider(stub)
 
-    p.chat(system="", messages=[], tools=[], max_tokens=50)
+    p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+    p.chat(
+        system="",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "user", "content": "follow"},
+        ],
+        tools=[],
+        max_tokens=50,
+    )
 
-    call_kwargs = p._client.responses.create.call_args[1]
-    assert "tools" not in call_kwargs
-
-
-def test_blocking_mixed_output_items():
-    """Text and tool call in the same response should both be captured."""
-    p = _provider()
-    p._client.responses.create.return_value = _make_response([
-        _make_message_item("Let me read that."),
-        _make_function_call_item("c1", "read", "{}"),
-    ])
-
-    result = p.chat(system="", messages=[], tools=[], max_tokens=100)
-
-    assert result.text == "Let me read that."
-    assert len(result.tool_calls) == 1
-    assert result.finish_reason == "tool_calls"
-
-
-def test_blocking_reasoning_items_ignored():
-    """Reasoning (thinking) output items should be silently skipped."""
-    reasoning_item = MagicMock()
-    reasoning_item.type = "reasoning"
-
-    p = _provider()
-    p._client.responses.create.return_value = _make_response([
-        reasoning_item,
-        _make_message_item("Final answer"),
-    ])
-
-    result = p.chat(system="", messages=[], tools=[], max_tokens=100)
-    assert result.text == "Final answer"
-    assert result.tool_calls == []
+    turn_start = next(c for c in stub.calls if c[0] == "turn/start")
+    assert turn_start[1].get("threadId") == "abc-123"
 
 
 # ---------------------------------------------------------------------------
-# CodexProvider — streaming path
+# on_token callback
 # ---------------------------------------------------------------------------
 
 
-def test_streaming_delivers_tokens_via_callback():
-    p = _provider()
-
-    # Build a mock stream context manager.
-    mock_stream = MagicMock()
-    mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-    mock_stream.__exit__ = MagicMock(return_value=False)
-    mock_stream.text_stream = iter(["Hello", " world"])
-    mock_stream.get_final_response.return_value = _make_response(
-        [_make_message_item("Hello world")]
-    )
-    p._client.responses.stream.return_value = mock_stream
+def test_on_token_called_with_full_text():
+    stub = _StubRpc(turn_items=[{"text": "Full response here"}])
+    p = _make_provider(stub)
 
     tokens: list[str] = []
     result = p.chat(
         system="",
         messages=[{"role": "user", "content": "hi"}],
         tools=[],
-        max_tokens=100,
+        max_tokens=50,
         on_token=tokens.append,
     )
 
-    assert tokens == ["Hello", " world"]
-    assert result.text == "Hello world"
-    assert result.was_streamed is True
+    assert tokens == ["Full response here"]
+    assert result.text == "Full response here"
 
 
-def test_streaming_tool_call_from_final_response():
-    """Tool calls should be extracted from the final response after streaming."""
-    p = _provider()
-
-    mock_stream = MagicMock()
-    mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-    mock_stream.__exit__ = MagicMock(return_value=False)
-    mock_stream.text_stream = iter([])  # no text, only tool call
-    mock_stream.get_final_response.return_value = _make_response([
-        _make_function_call_item("c1", "bash", '{"cmd": "ls"}')
-    ])
-    p._client.responses.stream.return_value = mock_stream
+def test_on_token_not_called_for_empty_response():
+    stub = _StubRpc(turn_items=[{"text": ""}])
+    p = _make_provider(stub)
 
     tokens: list[str] = []
-    result = p.chat(system="", messages=[], tools=[], max_tokens=100, on_token=tokens.append)
+    p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50, on_token=tokens.append)
 
-    assert result.text == ""
-    assert result.was_streamed is False
-    assert len(result.tool_calls) == 1
-    assert result.tool_calls[0].name == "bash"
-    assert result.finish_reason == "tool_calls"
+    assert tokens == []
 
 
-def test_streaming_was_streamed_false_when_no_text():
-    """was_streamed must be False when no text tokens were delivered."""
-    p = _provider()
+# ---------------------------------------------------------------------------
+# Timeout handling
+# ---------------------------------------------------------------------------
 
-    mock_stream = MagicMock()
-    mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-    mock_stream.__exit__ = MagicMock(return_value=False)
-    mock_stream.text_stream = iter([])
-    mock_stream.get_final_response.return_value = _make_response([_make_message_item("")])
-    p._client.responses.stream.return_value = mock_stream
 
-    result = p.chat(system="", messages=[], tools=[], max_tokens=50, on_token=lambda t: None)
-    assert result.was_streamed is False
+def test_chat_raises_on_turn_timeout():
+    """If no completion notification arrives, chat() raises TimeoutError."""
+
+    class _HangingStub(_StubRpc):
+        def request(self, method, params=None, timeout=60.0):
+            self.calls.append((method, params or {}))
+            # Deliberately never fire the notification
+            if method in ("thread/start", "turn/start"):
+                return {"thread": {"id": "t1"}, "model": "gpt-5.5"}
+            return {}
+
+    stub = _HangingStub()
+    p = _make_provider(stub)
+    p._turn_timeout = 0.05  # Very short timeout for the test
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+
+
+# ---------------------------------------------------------------------------
+# Message slicing — sent_count tracks what has been sent
+# ---------------------------------------------------------------------------
+
+
+def test_sent_count_advances_after_each_call():
+    stub = _StubRpc()
+    p = _make_provider(stub)
+
+    assert p._sent_count == 0
+    p.chat(system="", messages=[{"role": "user", "content": "one"}], tools=[], max_tokens=50)
+    assert p._sent_count == 1
+
+    p.chat(
+        system="",
+        messages=[{"role": "user", "content": "one"}, {"role": "user", "content": "two"}],
+        tools=[],
+        max_tokens=50,
+    )
+    assert p._sent_count == 2
+
+
+def test_no_new_user_message_sends_empty_input():
+    """If the new slice has no user message (e.g., only tool results), input is empty."""
+    stub = _StubRpc()
+    p = _make_provider(stub)
+    p._thread_id = "existing"
+    p._sent_count = 1
+
+    p.chat(
+        system="",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "c1", "content": "tool result"},
+        ],
+        tools=[],
+        max_tokens=50,
+    )
+
+    turn_start = next(c for c in stub.calls if c[0] == "turn/start")
+    # No user message in new slice → fallback to joining content
+    inputs = turn_start[1].get("input", [])
+    assert inputs == [{"type": "text", "text": "tool result"}]
+
+
+# ---------------------------------------------------------------------------
+# Notification matching — various terminal statuses are accepted
+# ---------------------------------------------------------------------------
+
+
+def test_canceled_turn_status_still_returns():
+    stub = _StubRpc(turn_status="canceled", turn_items=[{"text": ""}])
+    p = _make_provider(stub)
+
+    result = p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+    assert isinstance(result, LLMResponse)
+
+
+def test_error_turn_status_still_returns():
+    stub = _StubRpc(turn_status="error", turn_items=[{"text": "something went wrong"}])
+    p = _make_provider(stub)
+
+    result = p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+    assert result.text == "something went wrong"
+
+
+# ---------------------------------------------------------------------------
+# _CodexRpcClient — _extract_text unit (edge cases)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_text_concatenates_with_double_newline():
+    turn = {"items": [{"text": "A"}, {"text": "B"}, {"text": "C"}]}
+    result = CodexProvider._extract_text(turn)
+    assert result == "A\n\nB\n\nC"
+
+
+# ---------------------------------------------------------------------------
+# Protocol: thread/start vs turn/start split
+# ---------------------------------------------------------------------------
+
+
+def test_first_turn_does_not_pass_input_to_thread_start():
+    """thread/start must not carry input — the binary ignores it and stays idle."""
+    stub = _StubRpc()
+    p = _make_provider(stub)
+    p.chat(system="", messages=[{"role": "user", "content": "hello"}], tools=[], max_tokens=50)
+    call = next(c for c in stub.calls if c[0] == "thread/start")
+    assert "input" not in call[1]
+
+
+def test_first_turn_calls_turn_start():
+    """turn/start must be called on every turn, including the first."""
+    stub = _StubRpc()
+    p = _make_provider(stub)
+    p.chat(system="", messages=[{"role": "user", "content": "hello"}], tools=[], max_tokens=50)
+    methods = [c[0] for c in stub.calls]
+    assert "turn/start" in methods
+
+
+# ---------------------------------------------------------------------------
+# item/completed as the text source
+# ---------------------------------------------------------------------------
+
+
+def test_text_collected_from_item_completed_notification():
+    """Response text comes from item/completed, not turn.items."""
+    stub = _StubRpc(turn_items=[], agent_text="hello from item")
+    p = _make_provider(stub)
+    result = p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+    assert result.text == "hello from item"
+
+
+def test_item_completed_overrides_turn_items_text():
+    """When both item/completed and turn.items have text, item/completed wins."""
+    stub = _StubRpc(turn_items=[{"text": "from turn.items"}], agent_text="from item/completed")
+    p = _make_provider(stub)
+    result = p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+    assert result.text == "from item/completed"

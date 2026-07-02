@@ -25,6 +25,8 @@ Talks to
 - ``runner.py`` uses the returned provider to call the LLM.
 """
 
+import os
+
 from .anthropic import AnthropicProvider
 from .base import LLMProvider, LLMResponse, TokenUsage, ToolCall
 from .codex import CodexProvider
@@ -41,10 +43,10 @@ def create_provider(api: str, base_url: str, api_key: str, model: str) -> LLMPro
 
     Args:
         api (str): The adapter type string from ``config.json``, e.g.
-            ``"openai-completions"``, ``"openai-responses"``, ``"lmstudio"``,
+            ``"openai-completions"``, ``"codex"``, ``"lmstudio"``,
             or ``"anthropic"``.
-        base_url (str): HTTP endpoint for the provider. Unused for Anthropic
-            (the SDK uses its own default endpoint).
+        base_url (str): HTTP endpoint for the provider. Unused for Codex
+            (the binary manages auth) and Anthropic.
         api_key (str): Authentication token loaded from ``.env``.
         model (str): Model identifier string for API requests.
 
@@ -63,13 +65,14 @@ def create_provider(api: str, base_url: str, api_key: str, model: str) -> LLMPro
         case "lmstudio":
             # LMStudioProvider is an alias for OpenAICompatibleProvider; same behavior.
             return LMStudioProvider(base_url=base_url, api_key=api_key, model=model)
-        case "openai-responses":
-            # Responses API surface — used by Codex subscription models and o-series.
-            # See codex.py for the format differences from Chat Completions.
-            return CodexProvider(base_url=base_url, api_key=api_key, model=model)
+        case "codex":
+            # Codex app-server — auth injected via stored OAuth token (run codex-login).
+            # base_url and api_key are ignored.
+            codex_bin = os.environ.get("CODEX_BIN", "").strip() or "codex"
+            return CodexProvider(codex_bin=codex_bin, model=model)
         case _:
             # Default: treat any unknown api value as an OpenAI-compatible endpoint.
-            # Covers "openai-completions", "openai", and any other Chat Completions API.
+            # Covers "openai-completions", "openai-responses", and any Chat Completions API.
             return OpenAICompatibleProvider(base_url=base_url, api_key=api_key, model=model)
 
 

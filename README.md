@@ -25,6 +25,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
   - [memory](#memory)
   - [session](#session)
   - [context](#context)
+- [Codex Provider](#codex-provider)
 - [Adding a Provider](#adding-a-provider)
 - [Adding a Tool](#adding-a-tool)
 - [Adding an Agent](#adding-an-agent)
@@ -46,6 +47,9 @@ uv add --optional tiktoken tiktoken
 
 # Set API keys
 cp .env.example .env   # then fill in your keys
+
+# If using OpenAI Codex (ChatGPT Plus / Codex subscription, no API key needed)
+uv run codex-login
 
 # Run
 uv run minion-assist
@@ -80,11 +84,15 @@ minion-assist/
 │   ├── commands.py              # Slash command dispatcher and built-in commands
 │   ├── messages.py              # Provider-neutral content block helpers (text/image)
 │   ├── media.py                 # File-backed attachment ingestion with MIME/size validation
+│   ├── auth/                    # OAuth authentication for LLM providers
+│   │   ├── codex_auth.py        # OpenAI Codex device-code OAuth flow; token stored at ~/.minion-assist/codex-auth.json
+│   │   └── __init__.py
 │   ├── providers/               # LLM API adapters
 │   │   ├── base.py              # Protocol, ToolCall, LLMResponse types
 │   │   ├── openai_compatible.py # OpenAI Chat Completions adapter
 │   │   ├── anthropic.py         # Anthropic Claude adapter
 │   │   ├── lmstudio.py          # LM Studio alias
+│   │   ├── codex.py             # Codex app-server adapter (JSON-RPC 2.0 over stdio)
 │   │   └── __init__.py          # create_provider() factory
 │   ├── agents/                  # Agent definitions and execution
 │   │   ├── definitions.py       # AgentConfig, AGENTS dict (name, soul, max_tool_rounds)
@@ -814,9 +822,10 @@ provider = create_provider(
 | `api` value | Implementation | Notes |
 |---|---|---|
 | `openai-completions` | `OpenAICompatibleProvider` | Any OpenAI-compatible endpoint |
-| `openai-responses` | `OpenAICompatibleProvider` | Alias, same implementation |
+| `openai-responses` | `OpenAICompatibleProvider` | Alias for `openai-completions` (same implementation) |
 | `lmstudio` | `LMStudioProvider` | Alias for `OpenAICompatibleProvider` |
 | `anthropic` | `AnthropicProvider` | Requires `anthropic` package: `uv add anthropic` |
+| `codex` | `CodexProvider` | Requires `codex` CLI (`npm install -g @openai/codex`) + `codex-login` |
 | _(anything else)_ | `OpenAICompatibleProvider` | Fallback |
 
 ---
@@ -1393,6 +1402,53 @@ If summarisation fails, `on_compaction_failed` is called and the original histor
 
 ---
 
+## Codex Provider
+
+`CodexProvider` runs your **ChatGPT Plus / OpenAI Codex subscription** locally — no `OPENAI_API_KEY` needed.  It spawns the `codex` CLI binary as a child process and drives it with JSON-RPC 2.0 over stdio.
+
+### Prerequisites
+
+```bash
+npm install -g @openai/codex
+```
+
+### One-time authentication
+
+```bash
+uv run codex-login
+```
+
+This opens `https://auth.openai.com/codex/device` in your browser, prompts you to enter a short code, and stores a token at `~/.minion-assist/codex-auth.json`.  The token is auto-refreshed on every startup (5-minute buffer before expiry).
+
+### Configuration
+
+```json
+{
+  "models": {
+    "providers": {
+      "codex": {
+        "api": "codex",
+        "models": [
+          {"id": "openai/gpt-5.5", "name": "GPT-5.5 (Codex)", "contextWindow": 258400, "maxOutputTokens": 32768}
+        ]
+      }
+    }
+  },
+  "agents": {
+    "main": {"model": "codex/openai/gpt-5.5"}
+  }
+}
+```
+
+### Environment variables
+
+| Variable | Description |
+|---|---|
+| `CODEX_BIN` | Override the path to the `codex` binary (useful when it's not on PATH or you want a specific version) |
+| `MINION_ASSIST_HOME` | Override the token storage directory (default `~/.minion-assist`) |
+
+---
+
 ## Adding a Provider
 
 1. Create `src/minion_assist/providers/myprovider.py`:
@@ -1509,7 +1565,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **1074 cases** across all modules (1074 passed, 2 skipped). One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation. The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **1173 cases** across all modules. One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic
