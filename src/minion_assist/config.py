@@ -72,12 +72,17 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Resolve the project root: this file lives at src/minion_assist/config.py,
-# so three .parent calls walk up to the repo root directory.
-_ROOT = Path(__file__).resolve().parent.parent.parent
+# The user's minion-assist home directory.  Kept as a module-level name so
+# other modules can import it instead of re-computing the path themselves.
+# MINION_ASSIST_HOME lets the user redirect everything to a custom location
+# (e.g. different profiles, CI environments, or network drives).
+_HOME = Path(os.environ.get("MINION_ASSIST_HOME", "~/.minion-assist")).expanduser()
 
-# Load the .env file so API keys land in os.environ before we read them below.
-load_dotenv(_ROOT / ".env")
+# Load API keys from .env files before reading the config (providers need keys).
+# User-home .env is loaded first, then the project-local one — project .env
+# values override the user-level defaults so per-project keys work transparently.
+load_dotenv(_HOME / ".env", override=False)
+load_dotenv(Path.cwd() / ".env", override=False)
 
 
 # ---------------------------------------------------------------------------
@@ -924,14 +929,35 @@ def _resolve_streaming() -> StreamingConfig:
 # Load, validate, then resolve — in that order.
 # ---------------------------------------------------------------------------
 
-_config_path = _ROOT / "config.json"
+# Config lookup order (first file found wins):
+#   1. ~/.minion-assist/config.json  — user home; keeps credentials out of projects
+#   2. ./config.json                 — current working directory; useful during development
+#
+# Why not the repo root?  config.json may contain secrets (e.g. Matrix access
+# tokens) that must never be committed to version control.  Storing it in the
+# user home directory ensures it stays off git even if the developer forgets to
+# add it to .gitignore in a new clone.
+_CONFIG_CANDIDATES = [
+    _HOME / "config.json",
+    Path.cwd() / "config.json",
+]
+
+_config_path: Path | None = next((p for p in _CONFIG_CANDIDATES if p.exists()), None)
+
+if _config_path is None:
+    _searched = "\n".join(f"  {p}" for p in _CONFIG_CANDIDATES)
+    raise ConfigError([ConfigIssue(
+        "config.json",
+        f"File not found. Searched:\n{_searched}\n"
+        "Create it at ~/.minion-assist/config.json — "
+        "see config.example.json in the repo for the template.",
+    )]) from None
+
 try:
     with open(_config_path, encoding="utf-8") as _f:
         _raw = json.load(_f)
-except FileNotFoundError:
-    raise ConfigError([ConfigIssue("config.json", f"File not found at {_config_path}.")]) from None
 except json.JSONDecodeError as exc:
-    raise ConfigError([ConfigIssue("config.json", f"Invalid JSON: {exc}")]) from exc
+    raise ConfigError([ConfigIssue("config.json", f"Invalid JSON in {_config_path}: {exc}")]) from exc
 
 _issues = _validate(_raw)
 _errors = [i for i in _issues if not i.warning]

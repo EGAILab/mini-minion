@@ -1,4 +1,5 @@
 {
+  "_comment": "Copy this file to ~/.minion-assist/config.json and fill in your credentials. Never commit the real config.json to version control — it contains secrets.",
   "models": {
     "providers": {
       "openai": {
@@ -30,7 +31,12 @@
         "baseUrl": "http://127.0.0.1:1234/v1",
         "api": "lmstudio",
         "models": [
-          {"id": "qwen-qwen3.5-9b", "name": "Qwen 3.5 9B", "contextWindow": 262144, "maxOutputTokens": 32768}
+          {
+            "id": "qwen-qwen3.5-9b",
+            "name": "Qwen 3.5 9B",
+            "contextWindow": 262144,
+            "maxOutputTokens": 32768
+          }
         ]
       }
     }
@@ -54,11 +60,11 @@
   "compaction": {},
   "channels": {
     "matrix": {
-      "homeserver": "https://matrix.openegi.org",
-      "userId": "@ada:openegi.org",
-      "accessToken": "***REMOVED-MATRIX-TOKEN***",
+      "homeserver": "https://matrix.your-homeserver.org",
+      "userId": "@bot:your-homeserver.org",
+      "accessToken": "YOUR_MATRIX_ACCESS_TOKEN",
       "groups": {
-        "!KybiKEpgnYkYeJeqAM:openegi.org": {}
+        "!YOUR_ROOM_ID:your-homeserver.org": {}
       }
     }
   },

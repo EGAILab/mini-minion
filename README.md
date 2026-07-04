@@ -45,8 +45,13 @@ uv sync
 # Optional: install tiktoken for more accurate context-window token estimation
 uv add --optional tiktoken tiktoken
 
-# Set API keys
-cp .env.example .env   # then fill in your keys
+# Set up config (config lives in your home directory, not in the repo)
+cp config.example.json ~/.minion-assist/config.json
+# Edit ~/.minion-assist/config.json with your provider/agent settings
+
+# Optional: set provider API keys (not needed for Codex OAuth)
+# Create ~/.minion-assist/.env:  VOLCES_API_KEY=sk-...
+# Or a project-local .env in the working directory (overrides the global one)
 
 # If using OpenAI Codex (ChatGPT Plus / Codex subscription, no API key needed)
 uv run codex-login
@@ -163,56 +168,64 @@ minion-assist/
 
 ## Configuration
 
-### `config.json`
+### Config file location
+
+Config is loaded from the **first file found** in this order:
+
+1. `~/.minion-assist/config.json` — user home *(recommended — keeps credentials out of project directories)*
+2. `./config.json` — current working directory *(development / testing)*
+
+Override the home directory with the `MINION_ASSIST_HOME` environment variable:
+
+```bash
+MINION_ASSIST_HOME=/custom/path uv run minion-assist
+```
+
+> **Security note:** `config.json` can contain secrets such as Matrix access tokens. It is intentionally excluded from the repository via `.gitignore`. Use `config.example.json` as the starting template — it ships with placeholder credentials only.
+
+### `~/.minion-assist/config.json`
+
+Copy `config.example.json` from the repo to get started:
+
+```bash
+cp config.example.json ~/.minion-assist/config.json
+```
+
+Example structure (see `config.example.json` for the full template):
 
 ```json
 {
   "models": {
     "providers": {
+      "openai": {
+        "api": "codex",
+        "models": [
+          {"id": "gpt-5.5", "name": "GPT-5.5 (Codex subscription)", "contextWindow": 200000, "maxOutputTokens": 100000}
+        ]
+      },
       "lmstudio": {
         "baseUrl": "http://127.0.0.1:1234/v1",
         "api": "lmstudio",
         "models": [
           {"id": "qwen-qwen3.5-9b", "name": "Qwen 3.5 9B", "contextWindow": 262144, "maxOutputTokens": 32768}
         ]
-      },
-      "aliyuncs": {
-        "baseUrl": "https://coding.dashscope.aliyuncs.com/v1",
-        "api": "openai-completions",
-        "models": [
-          {"id": "glm-5", "name": "glm-5", "contextWindow": 128000, "maxOutputTokens": 4096}
-        ]
-      },
-      "anthropic": {
-        "api": "anthropic",
-        "models": [
-          {"id": "claude-sonnet-4-5", "name": "Claude Sonnet", "contextWindow": 200000, "maxOutputTokens": 8096, "inputModalities": ["text", "image"]}
-        ]
       }
     }
   },
   "agents": {
-    "main":       {"model": "lmstudio/qwen-qwen3.5-9b"},
-    "researcher": {"model": "aliyuncs/glm-5", "route_prefix": "/research"}
+    "main":       {"model": "openai/gpt-5.5"},
+    "researcher": {"model": "lmstudio/qwen-qwen3.5-9b", "route_prefix": "/research"}
   },
-  "workspace": {
-    "path": "~/.minion-assist"
-  },
-  "streaming": {
-    "chat_mode": true,
-    "task_mode": false
-  },
+  "workspace": {"path": "~/.minion-assist"},
+  "streaming":  {"chat_mode": true, "task_mode": false},
   "compaction": {},
   "mcp": {
     "servers": {
-      "filesystem": {
+      "playwright": {
         "transport": "stdio",
         "command": "npx",
-        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-      },
-      "myserver": {
-        "transport": "sse",
-        "url": "http://localhost:8000/sse"
+        "args": ["@playwright/mcp@latest"],
+        "tool_timeout": 60
       }
     }
   }
@@ -249,15 +262,22 @@ minion-assist/
 
 ### `.env`
 
-API keys are **never** stored in `config.json`. Place them in `.env`:
+API keys are **never** stored in `config.json`. Place them in a `.env` file:
 
 ```
-ALIYUNCS_API_KEY=sk-...
+VOLCES_API_KEY=sk-...
 LMSTUDIO_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 The key for a provider named `foo` is looked up as `FOO_API_KEY`.
+
+`.env` is loaded from two locations (later overrides earlier):
+
+1. `~/.minion-assist/.env` — global defaults
+2. `./.env` — project-local overrides (gitignored)
+
+Neither file is required — providers that use OAuth (Codex) or no auth (LM Studio) work without any API key.
 
 ---
 
