@@ -41,7 +41,7 @@ class AgentConfig:
 
     Args:
         name (str): The human-readable display name of the agent.
-            Shown in the terminal before each response, e.g. ``"Astra: Hello!"``.
+            Shown in the terminal before each response, e.g. ``"Ada: Hello!"``.
         soul (str): The system prompt that defines the agent's personality,
             expertise, and behavioral rules. Sent to the LLM on every turn.
         max_tool_rounds (int): Maximum LLM→tool-call iterations per user turn.
@@ -83,12 +83,12 @@ _TASK_SOUL_SUFFIX = (
 # ---------------------------------------------------------------------------
 AGENTS: dict[str, AgentConfig] = {
     "main": AgentConfig(
-        name="Astra",
+        name="Ada",
         max_tool_rounds=20,
         soul=(
-            # Astra is the default catch-all agent. She handles general questions,
+            # Ada is the default catch-all agent. She handles general questions,
             # API development topics, and anything not specifically routed elsewhere.
-            "You are Astra, an AI assistant specializing in API development.\n"
+            "You are Ada, an AI assistant specializing in API development.\n"
             "Be genuinely helpful. Skip the pleasantries. Have opinions.\n"
             "You have tools — use them proactively: gather what you need, then "
             "answer. If you see a <context_budget> warning above, be concise.\n"

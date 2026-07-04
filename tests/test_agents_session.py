@@ -38,7 +38,7 @@ def _make_session(tmp_path, provider=None, agent_id="main"):
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     return AgentSession(
         agent_id=agent_id,
-        agent=AgentConfig(name="Astra", soul="You are Astra."),
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
         tools=ToolRegistry(),
@@ -54,12 +54,12 @@ def _make_session(tmp_path, provider=None, agent_id="main"):
 
 def test_send_returns_response_text(tmp_path):
     """send() must return the text of the model's final answer."""
-    provider = _mock_provider(text="Hello from Astra!")
+    provider = _mock_provider(text="Hello from Ada!")
     session = _make_session(tmp_path, provider=provider)
 
     result = session.send("hi")
 
-    assert result == "Hello from Astra!"
+    assert result == "Hello from Ada!"
 
 
 def test_send_appends_user_and_assistant_to_history(tmp_path):
@@ -83,7 +83,7 @@ def test_send_persists_history_to_disk(tmp_path):
 
 def test_send_emits_final_answer_event(tmp_path):
     """send() with on_event must emit a FinalAnswer event."""
-    provider = _mock_provider(text="Astra here.")
+    provider = _mock_provider(text="Ada here.")
     session = _make_session(tmp_path, provider=provider)
     events: list[object] = []
 
@@ -91,8 +91,8 @@ def test_send_emits_final_answer_event(tmp_path):
 
     final_events = [e for e in events if isinstance(e, FinalAnswer)]
     assert len(final_events) == 1
-    assert final_events[0].text == "Astra here."
-    assert final_events[0].agent_name == "Astra"
+    assert final_events[0].text == "Ada here."
+    assert final_events[0].agent_name == "Ada"
 
 
 def test_send_none_response_when_no_text(tmp_path):
@@ -260,7 +260,7 @@ def test_max_tool_rounds_forwarded_to_run_turn(tmp_path):
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     session = AgentSession(
         agent_id="main",
-        agent=AgentConfig(name="Astra", soul="You are Astra.", max_tool_rounds=7),
+        agent=AgentConfig(name="Ada", soul="You are Ada.", max_tool_rounds=7),
         provider=provider,
         max_output_tokens=512,
         tools=ToolRegistry(),
@@ -325,7 +325,7 @@ def test_user_context_injected_into_system_prompt(tmp_path):
 
     session = AgentSession(
         agent_id="main",
-        agent=AgentConfig(name="Astra", soul="Base soul."),
+        agent=AgentConfig(name="Ada", soul="Base soul."),
         provider=provider,
         max_output_tokens=512,
         tools=ToolRegistry(),
@@ -361,7 +361,7 @@ def test_no_user_context_when_file_absent(tmp_path):
 
     session = AgentSession(
         agent_id="main",
-        agent=AgentConfig(name="Astra", soul="Base soul."),
+        agent=AgentConfig(name="Ada", soul="Base soul."),
         provider=provider,
         max_output_tokens=512,
         tools=ToolRegistry(),
@@ -404,7 +404,7 @@ def _make_session_with_tasks(tmp_path, tasks_dir, provider=None, agent_id="main"
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     return AgentSession(
         agent_id=agent_id,
-        agent=AgentConfig(name="Astra", soul="You are Astra."),
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
         tools=ToolRegistry(),
@@ -548,7 +548,7 @@ def test_turn_completed_event_emitted(tmp_path):
     completed = [e for e in events if isinstance(e, TurnCompleted)]
     assert len(completed) == 1
     tc = completed[0]
-    assert tc.agent_name == "Astra"
+    assert tc.agent_name == "Ada"
     assert uuid.UUID(tc.trace_id)   # must be a valid UUID
     assert tc.turn_number == 1
     assert tc.elapsed_ms >= 0
@@ -627,7 +627,7 @@ def test_enable_memory_extraction_false_suppresses_extraction(tmp_path):
 
     session = AgentSession(
         agent_id="main",
-        agent=AgentConfig(name="Astra", soul="You are Astra."),
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
         tools=ToolRegistry(),
@@ -660,7 +660,7 @@ def test_enable_memory_extraction_true_allows_extraction(tmp_path):
 
     session = AgentSession(
         agent_id="main",
-        agent=AgentConfig(name="Astra", soul="You are Astra."),
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
         tools=ToolRegistry(),

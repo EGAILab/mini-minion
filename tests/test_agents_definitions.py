@@ -14,7 +14,7 @@ def test_agents_are_agent_config_instances():
 
 
 def test_agent_names():
-    assert AGENTS["main"].name == "Astra"
+    assert AGENTS["main"].name == "Ada"
     assert AGENTS["researcher"].name == "Elizabeth"
 
 

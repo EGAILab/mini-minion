@@ -33,7 +33,7 @@ def _make_session(tmp_path, provider=None, agent_id="main"):
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     return AgentSession(
         agent_id=agent_id,
-        agent=AgentConfig(name="Astra", soul="You are Astra."),
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
         tools=ToolRegistry(),
@@ -222,7 +222,7 @@ def test_fork_does_not_modify_original_history(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_export_md_basic(tmp_path):
-    provider = _mock_provider(text="I am Astra.")
+    provider = _mock_provider(text="I am Ada.")
     session = _make_session(tmp_path, provider=provider)
     session.send("who are you?")
 
@@ -230,8 +230,8 @@ def test_export_md_basic(tmp_path):
 
     assert "**User:**" in result
     assert "who are you?" in result
-    assert "**Astra:**" in result
-    assert "I am Astra." in result
+    assert "**Ada:**" in result
+    assert "I am Ada." in result
 
 
 def test_export_html_basic(tmp_path):
@@ -243,7 +243,7 @@ def test_export_html_basic(tmp_path):
 
     assert "<!DOCTYPE html>" in result
     assert "<b>User:</b>" in result
-    assert "<b>Astra:</b>" in result
+    assert "<b>Ada:</b>" in result
 
 
 def test_export_md_default_format(tmp_path):

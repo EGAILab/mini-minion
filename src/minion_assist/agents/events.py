@@ -52,8 +52,8 @@ class StreamingStarted:
     subsequent :class:`TokenStreamed` events appear inline after it.
 
     Attributes:
-        agent_name: The agent's display name, e.g. ``"Astra"``.  Used by the
-            CLI handler to print ``"\\nAstra: "`` before the first token.
+        agent_name: The agent's display name, e.g. ``"Ada"``.  Used by the
+            CLI handler to print ``"\\nAda: "`` before the first token.
     """
     agent_name: str
 
@@ -95,7 +95,7 @@ class ThoughtEmitted:
     same round.
 
     Attributes:
-        agent_name: The agent's display name, e.g. ``"Astra"``.
+        agent_name: The agent's display name, e.g. ``"Ada"``.
         text: The full preamble text the model generated before its tool call.
     """
     agent_name: str
@@ -113,7 +113,7 @@ class FinalAnswer:
     should be displayed now.
 
     Attributes:
-        agent_name: The agent's display name, e.g. ``"Astra"``.
+        agent_name: The agent's display name, e.g. ``"Ada"``.
         text: The full response text.  Empty string when the model only
               called tools and produced no prose.
     """

@@ -400,7 +400,7 @@ def _make_session(tmp_path, bootstrap_context=None, provider=None):
 
     return AgentSession(
         agent_id="main",
-        agent=AgentConfig(name="Ada", soul="You are Astra."),
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
         tools=ToolRegistry(),
@@ -430,11 +430,11 @@ def test_agent_session_injects_bootstrap_after_soul(tmp_path):
     system = captured_systems[0]
 
     # Soul must be present.
-    assert "You are Astra." in system
+    assert "You are Ada." in system
     # Bootstrap must be present.
     assert "# Project Context" in system
     # Bootstrap must come after the soul.
-    assert system.index("You are Astra.") < system.index("# Project Context")
+    assert system.index("You are Ada.") < system.index("# Project Context")
 
 
 def test_agent_session_reads_bootstrap_each_turn(tmp_path):
@@ -476,7 +476,7 @@ def test_agent_session_without_bootstrap_context(tmp_path):
         session.send("hello")
 
     system = captured_systems[0]
-    assert "You are Astra." in system
+    assert "You are Ada." in system
     # No bootstrap content injected.
     assert "# Project Context" not in system
 

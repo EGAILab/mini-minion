@@ -5,7 +5,7 @@ nothing but plain Python, the OpenAI SDK, and flat files.
 
 Two agents run in the same process:
 
-- **Astra** (``"main"``) — a general assistant that handles any question.
+- **Ada** (``"main"``) — a general assistant that handles any question.
 - **Elizabeth** (``"researcher"``) — a research specialist activated via ``/research``.
 
 Both agents run a **Think–Act–Observe** (TAO) loop: they think about the user's
