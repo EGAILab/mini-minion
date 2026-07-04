@@ -1,6 +1,6 @@
 # minion-assist
 
-A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution, persistent memory, and long-running task support. Two agents — **Ada** (general assistant) and **Elizabeth** (research specialist) — run a Think-Act-Observe loop, calling tools until they reach a final answer, then persisting conversation history across sessions. Responses can be streamed token-by-token in interactive mode.
+A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution, persistent memory, and long-running task support. Two agents — **Astra** (general assistant) and **Elizabeth** (research specialist) — run a Think-Act-Observe loop, calling tools until they reach a final answer, then persisting conversation history across sessions. Responses can be streamed token-by-token in interactive mode.
 
 ---
 
@@ -70,7 +70,7 @@ You: /help
 You: exit
 ```
 
-`/research <message>` routes to Elizabeth (researcher). Everything else goes to Ada (main). Type `/help` for a list of all slash commands.
+`/research <message>` routes to Elizabeth (researcher). Everything else goes to Astra (main). Type `/help` for a list of all slash commands.
 
 ---
 
@@ -293,7 +293,7 @@ User input
     ▼
 router.resolve()
     │  "/research ..." → researcher (Elizabeth)
-    │  everything else → main (Ada)
+    │  everything else → main (Astra)
     ▼
 AgentSession.send(message, on_event=callback, stream=True/False)
     │
@@ -359,10 +359,10 @@ AgentSession.send(message, on_event=callback, stream=True/False)
 ```
 ~/.minion-assist/
 ├── sessions/
-│   ├── main.jsonl        ← Ada's conversation history
+│   ├── main.jsonl        ← Astra's conversation history
 │   └── researcher.jsonl  ← Elizabeth's conversation history
 ├── memory/
-│   ├── main/             ← Ada's long-term notes (isolated per agent)
+│   ├── main/             ← Astra's long-term notes (isolated per agent)
 │   │   ├── user_context.md     ← injected into system prompt every turn (optional)
 │   │   ├── _auto_extracted.md  ← rolling facts extracted automatically after turns
 │   │   ├── project-goals.md
@@ -370,7 +370,7 @@ AgentSession.send(message, on_event=callback, stream=True/False)
 │   └── researcher/       ← Elizabeth's long-term notes (isolated)
 │       └── findings.md
 ├── tasks/
-│   ├── main.json         ← Ada's active task progress file (created on demand)
+│   ├── main.json         ← Astra's active task progress file (created on demand)
 │   └── researcher.json   ← Elizabeth's active task progress file
 ├── attachments/          ← staged image/media files (organised by date)
 │   └── 2024-01-15/
@@ -431,11 +431,11 @@ Route-targeted commands work on individual agent sessions. For example, `/resear
 You: /plan
 Read-only mode enabled for 'main'. ...
 You: write a refactoring plan for src/foo.py
-Ada: [reads files, reasons, proposes plan — does not edit anything]
+Astra: [reads files, reasons, proposes plan — does not edit anything]
 You: /auto
 Full tool access restored.
 You: apply the refactoring
-Ada: [edits files, runs tests, commits]
+Astra: [edits files, runs tests, commits]
 ```
 
 ---
@@ -451,7 +451,7 @@ You: /attach /home/user/screenshot.png
 [Attached: screenshot.png (342 KB, image/png)]
 
 You: what is shown in this image?
-Ada: The screenshot shows ...
+Astra: The screenshot shows ...
 ```
 
 **Details:**
@@ -547,7 +547,7 @@ npx @playwright/mcp install-browser chrome-for-testing
 ```
 You: go to https://news.ycombinator.com and summarize the top 5 stories
 
-Ada: [tool: mcp__playwright__browser_navigate({'url': 'https://news.ycombinator.com'})]
+Astra: [tool: mcp__playwright__browser_navigate({'url': 'https://news.ycombinator.com'})]
      [tool: mcp__playwright__browser_snapshot({})]
      Based on the page snapshot:
      1. ...
@@ -933,7 +933,7 @@ class AgentConfig:
     max_tool_rounds: int  # max TAO-loop iterations per turn (default 10)
 
 AGENTS: dict[str, AgentConfig]
-# Keys: "main" (Ada, max_tool_rounds=20), "researcher" (Elizabeth, max_tool_rounds=15)
+# Keys: "main" (Astra, max_tool_rounds=20), "researcher" (Elizabeth, max_tool_rounds=15)
 ```
 
 `max_tool_rounds` lets task-focused agents run more tool-call iterations per turn (complex multi-step work) while keeping conversational agents snappy (default 10).

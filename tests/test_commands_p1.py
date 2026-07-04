@@ -33,7 +33,7 @@ def _make_session(tmp_path, provider=None, agent_id="main"):
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     return AgentSession(
         agent_id=agent_id,
-        agent=AgentConfig(name="Ada", soul="soul"),
+        agent=AgentConfig(name="Astra", soul="soul"),
         provider=provider,
         max_output_tokens=512,
         tools=default_registry(root=tmp_path),

@@ -34,7 +34,7 @@ Visual:
 
 ONE LOOP, ALL SERVERS
 ---------------------
-All MCP servers and both agents (Ada and Elizabeth) share the same background
+All MCP servers and both agents (Astra and Elizabeth) share the same background
 loop. This avoids opening duplicate sessions when both agents use the same
 server. Per-server asyncio.Locks prevent concurrent calls on a single session.
 

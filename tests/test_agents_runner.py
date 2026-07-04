@@ -44,7 +44,7 @@ def _provider(*responses: LLMResponse) -> Mock:
 def _run(provider, messages, stream=False):
     """Run a turn and return collected events."""
     events: list[object] = []
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages, on_event=events.append, stream=stream)
+    run_turn(provider, "Astra", "system", 100, ToolRegistry(), messages, on_event=events.append, stream=stream)
     return events
 
 
@@ -58,7 +58,7 @@ def test_simple_text_response():
     assert messages[0] == {"role": "assistant", "content": "Hello!"}
     final = next(e for e in events if isinstance(e, FinalAnswer))
     assert final.text == "Hello!"
-    assert final.agent_name == "Ada"
+    assert final.agent_name == "Astra"
 
 
 def test_tool_call_then_stop():
@@ -75,7 +75,7 @@ def test_tool_call_then_stop():
         LLMResponse(text="Done.", finish_reason="stop"),
     )
     events: list[object] = []
-    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append)
+    run_turn(provider, "Astra", "system", 100, registry, messages, on_event=events.append)
 
     # user + assistant(tool_call) + tool_result + assistant(final)
     assert len(messages) == 4
@@ -112,7 +112,7 @@ def test_preamble_text_before_tools_emits_thought_event():
     thought_events = [e for e in events if isinstance(e, ThoughtEmitted)]
     assert len(thought_events) == 1
     assert thought_events[0].text == "Let me look that up for you."
-    assert thought_events[0].agent_name == "Ada"
+    assert thought_events[0].agent_name == "Astra"
 
     # ThoughtEmitted must appear before the ToolCalled event.
     thought_idx = next(i for i, e in enumerate(events) if isinstance(e, ThoughtEmitted))
@@ -143,7 +143,7 @@ def test_no_thought_event_when_preamble_was_streamed():
     provider = Mock()
     provider.chat = Mock(side_effect=_chat)
     events: list[object] = []
-    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append, stream=True)
+    run_turn(provider, "Astra", "system", 100, registry, messages, on_event=events.append, stream=True)
 
     assert not any(isinstance(e, ThoughtEmitted) for e in events)
 
@@ -186,7 +186,7 @@ def test_multiple_tool_calls_in_one_response():
     )
 
     events: list[object] = []
-    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append)
+    run_turn(provider, "Astra", "system", 100, registry, messages, on_event=events.append)
 
     tool_results = [m for m in messages if m["role"] == "tool"]
     assert len(tool_results) == 2
@@ -257,7 +257,7 @@ def test_empty_response_after_tool_uses_targeted_nudge():
         LLMResponse(text="Done! The echo returned 'hi'.", finish_reason="stop"),
     )
     events: list[object] = []
-    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append)
+    run_turn(provider, "Astra", "system", 100, registry, messages, on_event=events.append)
 
     # The targeted nudge should have been injected — check message history
     user_nudges = [m for m in messages if m["role"] == "user" and m.get("content", "").startswith("[System:")]
@@ -278,7 +278,7 @@ def test_empty_response_without_prior_tools_uses_generic_nudge():
         LLMResponse(text="Sorry, here is my answer.", finish_reason="stop"),
     )
     events: list[object] = []
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages, on_event=events.append)
+    run_turn(provider, "Astra", "system", 100, ToolRegistry(), messages, on_event=events.append)
 
     user_nudges = [m for m in messages if m["role"] == "user" and m.get("content", "").startswith("[System:")]
     assert len(user_nudges) == 1
@@ -294,7 +294,7 @@ def test_empty_response_emits_final_answer_on_last_round():
     provider = _provider(LLMResponse(text="", finish_reason="stop"))
     events: list[object] = []
     # max_tool_rounds=1 means round 0 is the last — no recovery budget, goes to FinalAnswer.
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages,
+    run_turn(provider, "Astra", "system", 100, ToolRegistry(), messages,
              on_event=events.append, max_tool_rounds=1)
     final_events = [e for e in events if isinstance(e, FinalAnswer)]
     assert len(final_events) == 1
@@ -307,7 +307,7 @@ def test_no_events_when_on_event_is_none():
     provider = _provider(LLMResponse(text="Hello!", finish_reason="stop"))
 
     # Should not raise and should still mutate messages
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages)
+    run_turn(provider, "Astra", "system", 100, ToolRegistry(), messages)
 
     assert messages == [{"role": "assistant", "content": "Hello!"}]
 
@@ -351,7 +351,7 @@ def test_tool_round_limit_stops_loop():
     ]
     provider = _provider(*never_stops)
     events: list[object] = []
-    run_turn(provider, "Ada", "system", 100, registry, messages, on_event=events.append)
+    run_turn(provider, "Astra", "system", 100, registry, messages, on_event=events.append)
 
     assert provider.chat.call_count == _MAX_TOOL_ROUNDS
     assert messages[-1]["role"] == "assistant"
@@ -368,7 +368,7 @@ def test_provider_called_with_correct_args():
     messages: list[dict] = []
     provider = _provider(LLMResponse(text="hi", finish_reason="stop"))
 
-    run_turn(provider, "Ada", "my system prompt", 512, registry, messages)
+    run_turn(provider, "Astra", "my system prompt", 512, registry, messages)
 
     call_args = provider.chat.call_args[0]
     assert call_args[0] == "my system prompt"
@@ -391,13 +391,13 @@ def test_streaming_emits_token_events():
     provider.chat = Mock(side_effect=_streaming_chat)
     events: list[object] = []
 
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages,
+    run_turn(provider, "Astra", "system", 100, ToolRegistry(), messages,
              on_event=events.append, stream=True)
 
     stream_start = [e for e in events if isinstance(e, StreamingStarted)]
     tokens = [e for e in events if isinstance(e, TokenStreamed)]
     assert len(stream_start) == 1
-    assert stream_start[0].agent_name == "Ada"
+    assert stream_start[0].agent_name == "Astra"
     assert len(tokens) == 2
     assert tokens[0].token == "Hel"
     assert tokens[1].token == "lo!"
@@ -416,7 +416,7 @@ def test_no_streaming_without_stream_flag():
     provider.chat = Mock(side_effect=_streaming_chat)
     events: list[object] = []
 
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages,
+    run_turn(provider, "Astra", "system", 100, ToolRegistry(), messages,
              on_event=events.append, stream=False)
 
     stream_start = [e for e in events if isinstance(e, StreamingStarted)]
@@ -480,7 +480,7 @@ def test_no_retry_on_permanent_error():
 
     with patch("minion_assist.agents.runner.time.sleep"):
         with pytest.raises(_PermanentError):
-            run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages)
+            run_turn(provider, "Astra", "system", 100, ToolRegistry(), messages)
 
     assert call_count[0] == 1  # no retry
 
@@ -509,7 +509,7 @@ def test_empty_response_on_last_round_emits_final_answer():
     messages: list[dict] = []
     provider = _provider(LLMResponse(text="", finish_reason="stop"))
     events: list[object] = []
-    run_turn(provider, "Ada", "system", 100, ToolRegistry(), messages,
+    run_turn(provider, "Astra", "system", 100, ToolRegistry(), messages,
              on_event=events.append, max_tool_rounds=1)
     final_events = [e for e in events if isinstance(e, FinalAnswer)]
     assert len(final_events) == 1
@@ -553,7 +553,7 @@ def test_custom_max_tool_rounds():
     ]
     provider = _provider(*never_stops)
     events: list[object] = []
-    run_turn(provider, "Ada", "system", 100, registry, messages,
+    run_turn(provider, "Astra", "system", 100, registry, messages,
              on_event=events.append, max_tool_rounds=5)
 
     assert provider.chat.call_count == 5
@@ -583,7 +583,7 @@ def test_tool_completed_event_emitted_in_serial_path():
         LLMResponse(text="done", finish_reason="stop"),
     )
     events: list[object] = []
-    run_turn(provider, "Ada", "sys", 100, registry, messages, on_event=events.append)
+    run_turn(provider, "Astra", "sys", 100, registry, messages, on_event=events.append)
 
     completed = [e for e in events if isinstance(e, ToolCompleted)]
     assert len(completed) == 1
@@ -636,7 +636,7 @@ def test_read_only_tools_run_concurrently():
         LLMResponse(text="done", finish_reason="stop"),
     )
     _start = _time.monotonic()
-    run_turn(provider, "Ada", "sys", 100, registry, messages)
+    run_turn(provider, "Astra", "sys", 100, registry, messages)
     _elapsed = _time.monotonic() - _start
 
     tool_results = [m for m in messages if m.get("role") == "tool"]
@@ -685,7 +685,7 @@ def test_mixed_read_write_batch_runs_serially():
         ),
         LLMResponse(text="done", finish_reason="stop"),
     )
-    run_turn(provider, "Ada", "sys", 100, registry, messages)
+    run_turn(provider, "Astra", "sys", 100, registry, messages)
 
     main_id = threading.main_thread().ident
     assert all(tid == main_id for tid in _thread_ids)
