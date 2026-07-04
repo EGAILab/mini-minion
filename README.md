@@ -14,6 +14,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 - [Image Attachments](#image-attachments)
 - [MCP Servers](#mcp-servers)
 - [Matrix Channel](#matrix-channel)
+- [Multi-Agent Workspace](#multi-agent-workspace)
 - [Module Reference](#module-reference)
   - [config](#config)
   - [providers](#providers)
@@ -133,9 +134,12 @@ minion-assist/
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool, NoteTool
 │   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
+│   │   ├── spawn_subagent.py    # SpawnSubagentTool — delegate tasks to child AgentSession; _make_subagent_registry
 │   │   ├── task.py              # ReadTaskTool, UpdateTaskTool — long-running task progress
 │   │   ├── web_search.py        # WebSearchTool — DuckDuckGo web search via ddgs, no API key
 │   │   └── __init__.py          # default_registry() factory; registers all tools; sets registry.policy
+│   ├── workspace.py             # Per-agent workspace management: ensure_workspace, check_workspace, WorkspaceVanishedError
+│   ├── spawn_registry.py        # Multi-agent spawn limits: get_spawn_depth, count_active_children, MAX_SPAWN_DEPTH
 │   ├── plugins.py               # Plugin manifest loader — tools, hooks, skills, and trust from plugins.json
 │   ├── matrix/                  # Optional Matrix channel (requires matrix-nio[e2e] + aiosqlite)
 │   │   ├── channel.py           # MatrixChannel — lifecycle manager (daemon thread + asyncio loop)
@@ -656,6 +660,71 @@ If the Matrix dependencies are missing, a clear `RuntimeError` is printed and th
 
 ---
 
+## Multi-Agent Workspace
+
+Agents can delegate self-contained subtasks to child subagents using the `spawn_subagent` tool. The subagent runs in a background thread, returns a text result, and its history is persisted under a unique child session ID.
+
+### How it works
+
+1. An agent calls `spawn_subagent(task="...", agent_id="researcher")` as a tool call.
+2. minion-assist checks depth (max 4) and child-count (max 5) limits.
+3. A child `AgentSession` is created with a read-only tool registry (ReadTool, GlobTool, GrepTool, WebSearchTool, WebFetchTool — no write tools).
+4. The subagent runs `send(task)` in a daemon thread and returns the text response.
+5. The parent agent receives the result as the tool's return value and incorporates it into its own response.
+
+### `spawn_subagent` tool
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `task` | string | required | The task to delegate. Include all context the subagent needs. |
+| `agent_id` | string | `"researcher"` | Agent definition to use (must match an ID in `agents/definitions.py`). |
+| `timeout_seconds` | integer | `120` | Maximum seconds to wait before returning a timeout error. |
+
+### Per-agent workspaces (optional)
+
+Each agent can have its own workspace directory with custom bootstrap files:
+
+```
+~/.minion-assist/workspaces/
+  main/           ← root agent workspace (fallback for all agents)
+    AGENTS.md
+    SOUL.md
+    TOOLS.md
+    .workspace-marker
+  researcher/     ← per-agent workspace (optional override)
+    AGENTS.md
+    TOOLS.md
+    .workspace-marker
+```
+
+When `~/.minion-assist/workspaces/{agent_id}/` exists, it is used for that agent's bootstrap injection. Otherwise, `workspaces/main/` is used as a fallback. If neither exists, the standard bootstrap root (`config.json → bootstrap.path` or `Path.cwd()`) is used — backward-compatible behaviour.
+
+**Subagent bootstrap filtering:** Subagents only receive `AGENTS.md` + `TOOLS.md` from the workspace. `SOUL.md`, `IDENTITY.md`, and `USER.md` define the root agent's character and are withheld from subagents.
+
+### Workspace attestation (Phase 5)
+
+When an agent has a `workspace_root`, minion-assist checks that the directory and its `.workspace-marker` file still exist at the start of every turn. If the workspace was accidentally deleted, `WorkspaceVanishedError` is raised with a clear message instead of propagating a confusing provider error.
+
+### Depth and child limits
+
+Override the defaults in `config.json`:
+
+```json
+{
+  "multi_agent": {
+    "max_spawn_depth": 4,
+    "max_children_per_agent": 5,
+    "default_subagent_timeout_seconds": 120
+  }
+}
+```
+
+### Phase 4 — real-time event relay
+
+When a subagent is running, its token output is relayed to the parent's terminal in real time with a `[sub:{agent_id}]` prefix (e.g. `[sub:researcher]: Here is what I found...`). This uses `dataclasses.replace()` to tag the agent name on each event before forwarding to the parent's `_on_event` handler — no queue or extra thread is needed since `print()` is thread-safe.
+
+---
+
 ## Module Reference
 
 ### `config`
@@ -1040,6 +1109,7 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `WebFetchTool` | `web_fetch` | Fetch a URL and return its text content. Strips HTML tags (skips `<script>`, `<style>`, `<head>`), collapses whitespace, and truncates at `max_chars` (default 8 000). Blocks SSRF targets (AWS metadata, GCP metadata). `is_read_only=True`. |
 | `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `ddgs` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. Query string is checked against SSRF markers when a policy is injected. |
 | `AskUserTool` | `ask_user` | Pause the agent and ask the human operator a question. Returns the human's typed response. When no `ask_user_fn` is provided (headless mode), returns an error instructing the agent to proceed without input. |
+| `SpawnSubagentTool` | `spawn_subagent` | Delegate a self-contained task to a child subagent and return its text response. The subagent runs in a daemon thread with a read-only registry (no write tools). Enforces depth (max 4) and child-count (max 5) limits. Parameters: `task` (required), `agent_id` (default: `"researcher"`), `timeout_seconds` (default: 120). Subagent events are relayed to the parent's terminal with a `[sub:{agent_id}]` prefix. |
 | `GitStatusTool` | `git_status` | Show git working-tree status (`git status --short --branch`): branch name, staged, modified, and untracked files. `is_read_only=True`. |
 | `GitDiffTool` | `git_diff` | Show a unified diff of changes. Optional `staged=true` for staged changes; optional `path` to limit to a file. `is_read_only=True`. |
 | `GitCommitTool` | `git_commit` | Stage files (optional `files` list) and create a git commit with the given `message`. Calls the `bash_confirm` callback before executing, same as `BashTool`. |

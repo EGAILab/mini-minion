@@ -68,6 +68,12 @@ _BOOTSTRAP_FILES: tuple[str, ...] = (
     "MEMORY.md",
 )
 
+# Subset of bootstrap files injected into spawned subagents.
+# Subagents do not receive SOUL/IDENTITY/USER — those define the root agent's
+# character.  They only need AGENTS.md (available tools/agents) and TOOLS.md
+# (tool usage instructions) so they can act effectively on their delegated task.
+_SUBAGENT_BOOTSTRAP_FILES: tuple[str, ...] = ("AGENTS.md", "TOOLS.md")
+
 # Maximum raw bytes to read from a single file before decoding.
 # Prevents OOM from pathologically large workspace files.
 # Mirrors OpenClaw's 2 MB raw file cap.
@@ -168,7 +174,10 @@ def _truncate_content(raw_content: str, limit: int, name: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def load_bootstrap_files(root: Path) -> list[BootstrapFile]:
+def load_bootstrap_files(
+    root: Path,
+    allowed_names: tuple[str, ...] | None = None,
+) -> list[BootstrapFile]:
     """Discover and load recognized bootstrap files from root.
 
     Files are returned in the fixed canonical order defined by
@@ -187,11 +196,17 @@ def load_bootstrap_files(root: Path) -> list[BootstrapFile]:
 
     Args:
         root: Directory to search for bootstrap files.
+        allowed_names: When provided, only files whose name appears in this
+            tuple are loaded.  Used by :func:`build_bootstrap_prompt_block`
+            with ``session_type="subagent"`` to restrict to
+            :data:`_SUBAGENT_BOOTSTRAP_FILES`.  ``None`` loads all files in
+            :data:`_BOOTSTRAP_FILES` (the default for root agents).
 
     Returns:
         A list of :class:`BootstrapFile` objects, one per recognized filename,
         in canonical injection order.
     """
+    names = allowed_names if allowed_names is not None else _BOOTSTRAP_FILES
     # Resolve once; used for every containment check below.
     try:
         resolved_root = root.resolve()
@@ -199,11 +214,11 @@ def load_bootstrap_files(root: Path) -> list[BootstrapFile]:
         # Unresolvable root — treat all files as missing.
         return [
             BootstrapFile(name=name, path=root / name, content=None, missing=True)
-            for name in _BOOTSTRAP_FILES
+            for name in names
         ]
 
     result: list[BootstrapFile] = []
-    for name in _BOOTSTRAP_FILES:
+    for name in names:
         candidate = root / name
 
         # Security: reject any path that resolves outside the root.
@@ -382,13 +397,17 @@ def render_truncation_warning(files: list[ContextFile], mode: str) -> str:
     )
 
 
-def build_bootstrap_prompt_block(root: Path, config: object) -> str:
+def build_bootstrap_prompt_block(
+    root: Path,
+    config: object,
+    session_type: str = "root",
+) -> str:
     """Build the complete bootstrap prompt block for one agent turn.
 
     This is the main entry point called per turn from :class:`AgentSession`.
     It chains all the lower-level helpers:
 
-    1. Load recognized files from ``root`` (with security and size checks).
+    1. Load recognized files from ``root`` (filtered by ``session_type``).
     2. Apply per-file and total budget limits.
     3. If BOOTSTRAP.md is present, prepend a bootstrap-pending guidance block.
     4. Render the ``# Project Context`` section.
@@ -404,6 +423,11 @@ def build_bootstrap_prompt_block(root: Path, config: object) -> str:
     Args:
         root: Bootstrap root directory (typically ``Path.cwd()``).
         config: A config object with the attributes listed above.
+        session_type: ``"root"`` (default) injects all bootstrap files.
+            ``"subagent"`` restricts to :data:`_SUBAGENT_BOOTSTRAP_FILES`
+            (``AGENTS.md`` + ``TOOLS.md`` only) — subagents do not receive
+            ``SOUL.md``, ``IDENTITY.md``, or ``USER.md`` which define the
+            root agent's character.
 
     Returns:
         The complete block string to inject after the static agent soul, or
@@ -412,7 +436,8 @@ def build_bootstrap_prompt_block(root: Path, config: object) -> str:
     if not config.enabled:
         return ""
 
-    files = load_bootstrap_files(root)
+    allowed = _SUBAGENT_BOOTSTRAP_FILES if session_type == "subagent" else None
+    files = load_bootstrap_files(root, allowed_names=allowed)
     ctx_files = build_bootstrap_context_files(
         files,
         config.max_chars,

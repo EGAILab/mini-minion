@@ -571,3 +571,90 @@ def test_config_validates_bootstrap_enabled_must_be_bool():
     raw["bootstrap"] = {"enabled": "yes"}  # string instead of bool
     issues = _validate(raw)
     assert any("bootstrap.enabled" in i.path for i in issues)
+
+
+# ---------------------------------------------------------------------------
+# session_type — subagent bootstrap filtering
+# ---------------------------------------------------------------------------
+
+def test_load_bootstrap_files_with_allowed_names(tmp_path):
+    """load_bootstrap_files with allowed_names only loads the permitted files."""
+    from minion_assist.bootstrap import _SUBAGENT_BOOTSTRAP_FILES
+
+    for name in ("AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md"):
+        _write_file(tmp_path, name, f"{name} content")
+
+    files = load_bootstrap_files(tmp_path, allowed_names=_SUBAGENT_BOOTSTRAP_FILES)
+    names = [f.name for f in files]
+
+    # Only allowed names appear — order matches allowed_names tuple.
+    assert names == list(_SUBAGENT_BOOTSTRAP_FILES)
+
+
+def test_load_bootstrap_files_subagent_files_have_content(tmp_path):
+    """Files matching allowed_names have their content loaded."""
+    from minion_assist.bootstrap import _SUBAGENT_BOOTSTRAP_FILES
+
+    _write_file(tmp_path, "AGENTS.md", "agents content")
+    _write_file(tmp_path, "TOOLS.md", "tools content")
+
+    files = load_bootstrap_files(tmp_path, allowed_names=_SUBAGENT_BOOTSTRAP_FILES)
+    content_map = {f.name: f.content for f in files if not f.missing}
+
+    assert content_map["AGENTS.md"] == "agents content"
+    assert content_map["TOOLS.md"] == "tools content"
+
+
+def test_build_bootstrap_prompt_block_root_includes_all_files(tmp_path):
+    """session_type='root' (default) includes all present bootstrap files."""
+    _write_file(tmp_path, "AGENTS.md", "agents")
+    _write_file(tmp_path, "SOUL.md", "soul")
+    _write_file(tmp_path, "TOOLS.md", "tools")
+    cfg = _make_config()
+
+    result = build_bootstrap_prompt_block(tmp_path, cfg, session_type="root")
+
+    assert "agents" in result
+    assert "soul" in result
+    assert "tools" in result
+
+
+def test_build_bootstrap_prompt_block_subagent_excludes_soul(tmp_path):
+    """session_type='subagent' excludes SOUL.md, IDENTITY.md, and USER.md."""
+    _write_file(tmp_path, "AGENTS.md", "agents")
+    _write_file(tmp_path, "SOUL.md", "soul personality")
+    _write_file(tmp_path, "TOOLS.md", "tools")
+    _write_file(tmp_path, "IDENTITY.md", "identity")
+    _write_file(tmp_path, "USER.md", "user profile")
+    cfg = _make_config()
+
+    result = build_bootstrap_prompt_block(tmp_path, cfg, session_type="subagent")
+
+    assert "agents" in result
+    assert "tools" in result
+    assert "soul personality" not in result
+    assert "identity" not in result
+    assert "user profile" not in result
+
+
+def test_build_bootstrap_prompt_block_subagent_only_agents_and_tools(tmp_path):
+    """session_type='subagent' produces a block with only AGENTS.md and TOOLS.md."""
+    _write_file(tmp_path, "AGENTS.md", "AGENTS_CONTENT")
+    _write_file(tmp_path, "TOOLS.md", "TOOLS_CONTENT")
+    cfg = _make_config()
+
+    result = build_bootstrap_prompt_block(tmp_path, cfg, session_type="subagent")
+
+    assert "AGENTS_CONTENT" in result
+    assert "TOOLS_CONTENT" in result
+
+
+def test_build_bootstrap_prompt_block_default_session_type_is_root(tmp_path):
+    """Omitting session_type defaults to 'root' (all files included)."""
+    _write_file(tmp_path, "SOUL.md", "soul content")
+    cfg = _make_config()
+
+    result_explicit = build_bootstrap_prompt_block(tmp_path, cfg, session_type="root")
+    result_default = build_bootstrap_prompt_block(tmp_path, cfg)
+
+    assert result_explicit == result_default

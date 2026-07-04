@@ -84,6 +84,7 @@ from ..messages import content_text, make_user_content, strip_media_data
 from ..providers.base import LLMProvider
 from ..session import SessionStore
 from ..tools import ToolRegistry
+from ..workspace import WorkspaceVanishedError, check_workspace
 from .definitions import AgentConfig
 from .events import CompactionFailed, CompactionStarted, TurnCompleted
 from .runner import run_turn
@@ -358,6 +359,12 @@ class AgentSession:
             ``SOUL.md``, etc.) take effect immediately without restarting.
             ``None`` (the default) disables bootstrap injection.  Typically
             set by ``minion.py`` as a closure over the bootstrap config.
+        workspace_root (Path | None): Optional path to this agent's workspace
+            directory.  When set, :func:`~minion_assist.workspace.check_workspace`
+            is called at the start of every ``send()`` turn.  If the directory
+            or its marker file has disappeared, :class:`WorkspaceVanishedError`
+            is raised before the provider is called.  ``None`` (the default)
+            disables per-turn attestation.
     """
 
     def __init__(
@@ -376,6 +383,7 @@ class AgentSession:
         tasks_dir: Path | None = None,
         enable_memory_extraction: bool = True,
         bootstrap_context: Callable[[], str] | None = None,
+        workspace_root: Path | None = None,
     ) -> None:
         self._agent_id = agent_id
         self._agent = agent
@@ -395,6 +403,10 @@ class AgentSession:
         # Optional per-turn callable that returns the workspace bootstrap block.
         # Called on every turn so edits to bootstrap files take effect immediately.
         self._bootstrap_context = bootstrap_context
+        # Optional workspace root for per-turn attestation (Phase 5).
+        # When set, check_workspace() is called at the top of send() to detect
+        # accidental deletion of the workspace directory between turns.
+        self._workspace_root = workspace_root
 
         # Compute injection limits proportionally from the model's context window.
         # This ensures every budget scales automatically when the model is switched.
@@ -496,6 +508,12 @@ class AgentSession:
         _trace_id = str(uuid.uuid4())
         _start = time.monotonic()
         _compacted = False
+
+        # Phase 5: workspace attestation — verify the workspace dir is still present.
+        # Raises WorkspaceVanishedError immediately so the provider is never called
+        # with a broken state (e.g. deleted workspace between turns).
+        if self._workspace_root is not None:
+            check_workspace(self._workspace_root)
 
         if attachments:
             # Build multimodal content: text block + image blocks.

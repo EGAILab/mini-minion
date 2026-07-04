@@ -53,6 +53,7 @@ from .read import ReadTool
 from .registry import ToolRegistry
 from .sandbox import LocalSandboxBackend, SandboxBackend
 from .skill import SkillTool
+from .spawn_subagent import SpawnSubagentTool
 from .task import ReadTaskTool, UpdateTaskTool
 from .todo import TodoReadTool, TodoWriteTool
 from .web_fetch import WebFetchTool
@@ -232,6 +233,7 @@ __all__ = [
     "TodoWriteTool",
     "WebFetchTool",
     "SkillTool",
+    "SpawnSubagentTool",
     "ReadTaskTool",
     "UpdateTaskTool",
     "default_registry",

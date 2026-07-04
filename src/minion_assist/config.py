@@ -309,6 +309,19 @@ def _validate(raw: dict) -> list[ConfigIssue]:
                 f"Expected boolean (true/false), got {ee!r}.",
             ))
 
+    # --- multi_agent ---
+    ma_raw = raw.get("multi_agent", {})
+    if ma_raw and not isinstance(ma_raw, dict):
+        issues.append(ConfigIssue("multi_agent", "Expected an object."))
+    elif isinstance(ma_raw, dict):
+        for _ma_key in ("max_spawn_depth", "max_children_per_agent", "default_subagent_timeout_seconds"):
+            _ma_val = ma_raw.get(_ma_key)
+            if _ma_val is not None and (not isinstance(_ma_val, int) or _ma_val <= 0):
+                issues.append(ConfigIssue(
+                    f"multi_agent.{_ma_key}",
+                    f"Expected positive integer, got {_ma_val!r}.",
+                ))
+
     # --- bootstrap ---
     bootstrap_raw = raw.get("bootstrap", {})
     if bootstrap_raw and not isinstance(bootstrap_raw, dict):
@@ -550,6 +563,26 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class MultiAgentConfig:
+    """Controls multi-agent subagent spawning limits and defaults.
+
+    Read from the optional ``"multi_agent"`` section in ``config.json``.
+    All fields have sensible defaults so the section can be omitted entirely.
+
+    Attributes:
+        max_spawn_depth (int): Maximum parent→child nesting depth.  A root
+            agent has depth 0; each spawned subagent adds 1.  Default 4.
+        max_children_per_agent (int): Maximum number of child sessions a single
+            parent session may spawn in its lifetime.  Default 5.
+        default_subagent_timeout_seconds (int): Seconds the parent waits for a
+            subagent to finish before returning a timeout error.  Default 120.
+    """
+    max_spawn_depth: int = 4
+    max_children_per_agent: int = 5
+    default_subagent_timeout_seconds: int = 120
+
+
+@dataclass(frozen=True)
 class BootstrapConfig:
     """Controls the workspace bootstrap prompt injection layer.
 
@@ -774,6 +807,24 @@ def _resolve_bootstrap() -> BootstrapConfig:
         max_chars=raw.get("max_chars", 20_000),
         total_max_chars=raw.get("total_max_chars", 60_000),
         truncation_warning=raw.get("truncation_warning", "always"),
+    )
+
+
+def _resolve_multi_agent() -> MultiAgentConfig:
+    """Read the ``"multi_agent"`` section from config.json and build a MultiAgentConfig.
+
+    All fields have sensible defaults so the section can be omitted entirely.
+
+    Returns:
+        MultiAgentConfig: Immutable spawn-limit settings; defaults apply when absent.
+    """
+    raw = _raw.get("multi_agent", {})
+    if not isinstance(raw, dict):
+        return MultiAgentConfig()
+    return MultiAgentConfig(
+        max_spawn_depth=raw.get("max_spawn_depth", 4),
+        max_children_per_agent=raw.get("max_children_per_agent", 5),
+        default_subagent_timeout_seconds=raw.get("default_subagent_timeout_seconds", 120),
     )
 
 
@@ -1004,6 +1055,10 @@ bootstrap: BootstrapConfig = _resolve_bootstrap()
 # channels: integrations like Matrix that run alongside the REPL.
 # matrix is None when channels.matrix is absent from config.json.
 channels: ChannelsConfig = _resolve_channels()
+
+# multi_agent: subagent spawning limits and timeout defaults.
+# Read from "multi_agent" section; all fields default when section absent.
+multi_agent: MultiAgentConfig = _resolve_multi_agent()
 
 # extra_plugin_manifests: additional plugins.json paths to load beyond the two
 # fixed locations (~/.minion-assist/plugins.json and .minion-assist/plugins.json).

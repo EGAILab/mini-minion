@@ -59,6 +59,10 @@ Every module in the package.  This is the integration layer.
 
 import signal
 import sys
+import threading
+import uuid
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from .agents import AGENTS, AgentSession, resolve
@@ -83,6 +87,7 @@ from .config import compaction as compaction_cfg
 from .config import extra_plugin_manifests
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
+from .config import multi_agent as multi_agent_cfg
 from .plugins import load_plugins
 from .config import streaming, workspace
 from .mcp import McpClientManager
@@ -91,7 +96,10 @@ from .memory import LongTermMemory, ShortTermMemory
 from .providers import create_provider
 from .session import SessionStore
 from .skills import discover_skills, format_skills_prompt
+from .spawn_registry import count_active_children, get_spawn_depth
 from .tools import default_registry
+from .tools.spawn_subagent import SpawnSubagentTool, _make_subagent_registry
+from .workspace import agent_workspace_root, ensure_workspace
 
 
 def main() -> None:
@@ -195,22 +203,144 @@ def main() -> None:
     # The channel is started after sessions are built so it can share them.
     _matrix_channel = None
 
-    # --- Bootstrap context callable ---
-    # A single callable is built once and shared across all agent sessions.
-    # It is invoked per turn (inside AgentSession.send) so edits to workspace
-    # bootstrap files (AGENTS.md, SOUL.md, etc.) take effect without restart.
-    # bootstrap_cfg.path=None resolves to Path.cwd() at call time so the
-    # working directory is captured lazily rather than at startup.
+    # --- Bootstrap root (global fallback) ---
+    # bootstrap_cfg.path=None resolves to Path.cwd() so the working directory
+    # is captured lazily rather than at startup.  Per-agent workspace directories
+    # (if present) override this fallback for that agent's session.
     _bootstrap_root = (
         Path(bootstrap_cfg.path).expanduser()
         if bootstrap_cfg.path is not None
         else Path.cwd()
     )
-    _bootstrap_context = (
-        (lambda: build_bootstrap_prompt_block(_bootstrap_root, bootstrap_cfg))
-        if bootstrap_cfg.enabled
-        else None
-    )
+
+    # --- Subagent spawn factory ---
+    # Returns a spawn_fn closure bound to the per-agent parent context.
+    # All state is captured by default-argument binding to avoid Python's
+    # loop-closure gotcha (last-iteration capture).
+    def _make_spawn_fn(
+        parent_id: str,
+        parent_cfg: object,
+        parent_provider: object,
+    ) -> "Callable[[str, str, int, object], str]":
+        """Build the spawn callable for one parent agent session.
+
+        The returned function runs a child AgentSession in a daemon thread,
+        enforces depth/child limits, and returns the subagent's text response.
+
+        Phase 4: event relay is wired when ``relay_fn`` is not None — the
+        subagent's on_event stream is tagged with ``[sub:{agent_id}]`` and
+        forwarded to the parent's terminal handler in real time.
+        """
+        def _spawn(
+            task: str,
+            subagent_id: str,
+            timeout_seconds: int,
+            relay_fn: object,
+        ) -> str:
+            # Depth and child-count limits.
+            depth = get_spawn_depth(parent_id, session_store)
+            if depth >= multi_agent_cfg.max_spawn_depth:
+                return (
+                    f"[spawn_subagent] Spawn depth limit reached "
+                    f"({depth} ≥ {multi_agent_cfg.max_spawn_depth}). "
+                    "Cannot spawn further subagents."
+                )
+            n_children = count_active_children(parent_id, session_store)
+            if n_children >= multi_agent_cfg.max_children_per_agent:
+                return (
+                    f"[spawn_subagent] Child limit reached "
+                    f"({n_children} ≥ {multi_agent_cfg.max_children_per_agent}). "
+                    "Too many active subagents for this parent."
+                )
+
+            # Unique child session ID: sub-{parent}-{agenttype}-{token}
+            child_id = f"sub-{parent_id}-{subagent_id}-{uuid.uuid4().hex[:8]}"
+            session_store.get_or_create(child_id, parent_id=parent_id)
+
+            # Agent definition (personality / soul).
+            sub_agent_def = AGENTS.get(subagent_id) or AGENTS.get("researcher") or list(AGENTS.values())[0]
+
+            # Provider for child: use subagent's configured model if available,
+            # otherwise fall back to parent's provider.
+            child_model_cfg = agents_cfg.get(subagent_id, parent_cfg)
+            child_provider = create_provider(
+                api=child_model_cfg.provider.api,
+                base_url=child_model_cfg.provider.base_url,
+                api_key=child_model_cfg.provider.api_key,
+                model=child_model_cfg.model.id,
+            )
+
+            # Per-subagent workspace: resolves to main/ workspace if no per-agent dir.
+            child_workspace = agent_workspace_root(workspace, subagent_id)
+            if child_workspace is not None:
+                ensure_workspace(child_workspace)
+
+            # Bootstrap context for subagent: filtered to AGENTS.md + TOOLS.md only.
+            child_boot_root = child_workspace or _bootstrap_root
+            child_bootstrap_context = (
+                (
+                    lambda root=child_boot_root: build_bootstrap_prompt_block(
+                        root, bootstrap_cfg, session_type="subagent"
+                    )
+                )
+                if bootstrap_cfg.enabled
+                else None
+            )
+
+            # Compactor sized to the subagent's model context window.
+            child_preserve = child_model_cfg.model.max_output_tokens + _SNIP_SAFETY_BUFFER
+            child_compactor = Compactor(
+                context_window=child_model_cfg.model.context_window,
+                preserve_tokens=child_preserve,
+            )
+
+            # Read-only tool registry for the subagent.
+            child_tools = _make_subagent_registry(root=_tool_root)
+
+            child_session = AgentSession(
+                agent_id=child_id,
+                agent=sub_agent_def,
+                provider=child_provider,
+                max_output_tokens=child_model_cfg.model.max_output_tokens,
+                tools=child_tools,
+                compactor=child_compactor,
+                short_term=short_term,
+                session_store=session_store,
+                workspace_root=child_workspace,
+                bootstrap_context=child_bootstrap_context,
+                # Suppress background memory extraction for subagents — they are
+                # short-lived task runners and the extra API call is wasteful.
+                enable_memory_extraction=False,
+            )
+
+            # Phase 4: relay subagent events to the parent's terminal in real time.
+            # relay_fn wraps _on_event with a [sub:id] prefix on agent_name.
+            def _child_on_event(event: object) -> None:
+                if relay_fn is not None:
+                    relay_fn(event)  # type: ignore[operator]
+
+            result: list[str] = []
+            error: list[str] = []
+
+            def _run() -> None:
+                try:
+                    on_ev = _child_on_event if relay_fn is not None else None
+                    text = child_session.send(task, on_event=on_ev)
+                    result.append(text or "")
+                except Exception as exc:
+                    error.append(str(exc))
+
+            t = threading.Thread(target=_run, daemon=True, name=f"subagent-{child_id}")
+            t.start()
+            t.join(timeout=timeout_seconds)
+
+            if t.is_alive():
+                return f"[spawn_subagent] Timed out after {timeout_seconds}s waiting for subagent '{subagent_id}'."
+            if error:
+                return f"[spawn_subagent] Subagent '{subagent_id}' error: {error[0]}"
+            return result[0] if result else ""
+
+        return _spawn
 
     # --- Session setup — one AgentSession per agent ---
     sessions: dict[str, AgentSession] = {}
@@ -254,6 +384,29 @@ def main() -> None:
             context_window=cfg.model.context_window,
             preserve_tokens=_preserve,
         )
+
+        # Per-agent workspace root: prefer {workspace}/workspaces/{agent_id}/,
+        # fall back to {workspace}/workspaces/main/ if neither exists → None.
+        _agent_workspace = agent_workspace_root(workspace, agent_id)
+        if _agent_workspace is not None:
+            ensure_workspace(_agent_workspace)
+            _agent_bootstrap_root = _agent_workspace
+        else:
+            _agent_bootstrap_root = _bootstrap_root
+
+        # Per-agent bootstrap context: uses the per-agent workspace root when
+        # available so different agents can have different bootstrap files.
+        # Root agents always receive the full file set (session_type="root").
+        _agent_bootstrap_context = (
+            (
+                lambda root=_agent_bootstrap_root: build_bootstrap_prompt_block(
+                    root, bootstrap_cfg, session_type="root"
+                )
+            )
+            if bootstrap_cfg.enabled
+            else None
+        )
+
         sessions[agent_id] = AgentSession(
             agent_id=agent_id,
             agent=AGENTS[agent_id],
@@ -269,10 +422,35 @@ def main() -> None:
             # Respect config.json "memory.enable_extraction": false to suppress
             # the background API call that extracts facts after each turn.
             enable_memory_extraction=memory_cfg.enable_extraction,
-            # Bootstrap context callable: re-read workspace bootstrap files on
-            # every turn so file edits take effect without restarting.
-            bootstrap_context=_bootstrap_context,
+            # Per-agent bootstrap: re-reads workspace files on each turn.
+            bootstrap_context=_agent_bootstrap_context,
+            # Per-agent workspace root for Phase 5 attestation.
+            workspace_root=_agent_workspace,
         )
+
+        # Phase 4: build a relay function that tags subagent events with
+        # [sub:{agent_id}] and forwards them to the parent's terminal handler.
+        # dataclasses.replace() copies the event with a new agent_name so
+        # the frozen event dataclasses are not mutated in place.
+        def _make_relay(subagent_label: str) -> "Callable[[object], None]":
+            def _relay(event: object) -> None:
+                try:
+                    if hasattr(event, "agent_name"):
+                        event = replace(event, agent_name=f"[sub:{subagent_label}]")  # type: ignore[call-arg]
+                except Exception:
+                    pass
+                _on_event(event)
+            return _relay
+
+        # Register SpawnSubagentTool on this agent's registry.
+        # spawn_fn is bound via default-argument capture to avoid the loop closure gotcha.
+        _spawn_fn = _make_spawn_fn(
+            parent_id=agent_id,
+            parent_cfg=cfg,
+            parent_provider=provider,
+        )
+        _relay_fn = _make_relay(agent_id)
+        tools.register(SpawnSubagentTool(spawn_fn=_spawn_fn, relay_fn=_relay_fn))
 
     if channels_cfg.matrix is not None:
         from .matrix.channel import MatrixChannel  # noqa: PLC0415 — optional dependency
