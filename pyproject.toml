@@ -14,12 +14,13 @@ dependencies = [
     "python-frontmatter>=1.1.0",
     "markdown-it-py>=3.0",
     "tzdata>=2024.1",
+    "linkify-it-py>=2.0",
 ]
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0"]
 tiktoken  = ["tiktoken>=0.7.0"]
-matrix    = ["matrix-nio[e2e]>=0.21", "aiosqlite>=0.19"]
+matrix    = ["matrix-nio[e2e]>=0.21", "aiosqlite>=0.19", "linkify-it-py>=2.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
