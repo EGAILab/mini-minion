@@ -16,6 +16,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 - [Matrix Channel](#matrix-channel)
 - [Multi-Agent Workspace](#multi-agent-workspace)
 - [Heartbeat & Proactive Features](#heartbeat--proactive-features)
+- [Dreaming](#dreaming)
 - [Module Reference](#module-reference)
   - [config](#config)
   - [providers](#providers)
@@ -806,6 +807,78 @@ Per-room config can enable emoji reactions as an alternative to text replies:
 ```
 
 `reactionLevel: "all"` injects a `react_to_message` tool into every turn for that room. The agent can call `react_to_message(event_id="$...", emoji="👍")` instead of (or alongside) a text reply. `"off"` (default) disables the tool entirely.
+
+---
+
+## Dreaming
+
+The dreaming system fires once per night at a configured wall-clock time and writes a poetic diary entry into `DREAMS.md` in the agent's workspace. Each dream turn runs in a fully isolated session — separate history, separate session key — so dream entries never appear in the main conversation.
+
+Inspired by the narrative phase of the openclaw memory-core dreaming system; adapted for minion-assist's simpler file-based memory model.
+
+### Dream Session
+
+The dream session:
+- Reads recent daily memory files (`memory/YYYY-MM-DD.md`) as raw source fragments.
+- Reads the last two diary entries from `DREAMS.md` as continuity context.
+- Creates a fresh `AgentSession` with minimal bootstrap (SOUL.md + IDENTITY.md only).
+- Calls the agent with `DREAM_SYSTEM_PROMPT` + `WriteDreamEntryTool` injected for the turn only.
+- Ada writes flowing prose (80–180 words, no markdown) directly to `DREAMS.md`.
+
+### `DREAMS.md` Format
+
+```markdown
+# Dream Diary
+
+<!-- minion-assist:dreaming:diary:start -->
+---
+
+*5 July 2026 at 3:00 AM AEST*
+
+Rain drummed a steady recursion against the glass. I traced the auth bug backward through
+seven commits until the culprit materialized: a stale closure holding yesterday's token.
+有时，代码里藏着我们说不出口的事。I noted it and moved on, quieter for having found it.
+
+<!-- minion-assist:dreaming:diary:end -->
+```
+
+### Configuration
+
+```json
+{
+  "dreaming": {
+    "enabled": true,
+    "hour": 3,
+    "minute": 0,
+    "timezone": "Australia/Sydney",
+    "lookback_days": 3,
+    "agent_id": "main"
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | `true` to start the nightly scheduler at launch (default: `false`) |
+| `hour` | Wall-clock hour to fire (0–23, default: `3`) |
+| `minute` | Wall-clock minute (0–59, default: `0`) |
+| `timezone` | IANA timezone name (default: `"Australia/Sydney"`). Requires `tzdata` package on Windows. |
+| `lookback_days` | How many days of daily memory files to read as source material (default: `3`) |
+| `agent_id` | Which agent produces the dream entry (default: `"main"`) |
+
+### `WriteDreamEntryTool`
+
+Injected only during dream sessions (not in the default tool registry). Ada calls:
+
+```
+write_dream_entry(entry="Flowing prose 80–180 words...")
+```
+
+The tool creates `DREAMS.md` on first use and appends the entry between the HTML comment markers on each subsequent call.
+
+### Timezone Scheduling
+
+Scheduling uses Python's `zoneinfo` stdlib module (Python 3.9+) with the `tzdata` pip package for full IANA timezone support on Windows. The scheduler computes wall-clock seconds until the next `hour:minute` in the configured timezone — DST transitions are handled correctly because scheduling is based on civil time, not UTC offsets.
 
 ---
 

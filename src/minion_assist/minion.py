@@ -85,6 +85,7 @@ from .config import bootstrap as bootstrap_cfg
 from .config import channels as channels_cfg
 from .config import compaction as compaction_cfg
 from .config import extra_plugin_manifests
+from .config import dreaming as dreaming_cfg
 from .config import heartbeat as heartbeat_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
@@ -98,7 +99,7 @@ from .providers import create_provider
 from .session import SessionStore
 from .skills import discover_skills, format_skills_prompt
 from .spawn_registry import count_active_children, get_spawn_depth
-from .tools import default_registry
+from .tools import ToolRegistry, default_registry
 from .tools.spawn_subagent import SpawnSubagentTool, _make_subagent_registry
 from .workspace import agent_workspace_root, ensure_workspace
 
@@ -344,6 +345,10 @@ def main() -> None:
         return _spawn
 
     # --- Session setup — one AgentSession per agent ---
+    # _dream_session_factory is captured below inside the loop for the dreaming
+    # agent and used later to start the DreamingScheduler.
+    _dream_session_factory: "Callable[[], AgentSession] | None" = None
+    _dream_workspace_dir: "Path | None" = None
     sessions: dict[str, AgentSession] = {}
     for agent_id, cfg in agents_cfg.items():
         long_term = LongTermMemory(workspace / "memory" / agent_id)
@@ -455,6 +460,46 @@ def main() -> None:
         _relay_fn = _make_relay(agent_id)
         tools.register(SpawnSubagentTool(spawn_fn=_spawn_fn, relay_fn=_relay_fn))
 
+        # Capture the dream session factory for the configured dreaming agent.
+        # Default-argument binding prevents the loop-closure gotcha — each variable
+        # is frozen at the value it holds in this iteration.
+        if dreaming_cfg.enabled and agent_id == dreaming_cfg.agent_id:
+            _dream_workspace_dir = _agent_workspace or _bootstrap_root
+
+            def _dream_factory(
+                _provider=provider,
+                _cfg=cfg,
+                _aid=agent_id,
+                _ws=_dream_workspace_dir,
+                _st=short_term,
+                _ss=session_store,
+            ) -> AgentSession:
+                """Create a fresh isolated AgentSession for one nightly dream turn."""
+                from datetime import date as _date  # noqa: PLC0415
+                from .dreaming import _read_dream_bootstrap  # noqa: PLC0415
+                _session_id = f"dreaming-{_aid}-{_date.today().isoformat()}"
+                _dream_tools = ToolRegistry()
+                _dream_compactor = Compactor(
+                    context_window=_cfg.model.context_window,
+                    preserve_tokens=_cfg.model.max_output_tokens + _SNIP_SAFETY_BUFFER,
+                )
+                return AgentSession(
+                    agent_id=_session_id,
+                    agent=AGENTS[_aid],
+                    provider=_provider,
+                    max_output_tokens=_cfg.model.max_output_tokens,
+                    tools=_dream_tools,
+                    compactor=_dream_compactor,
+                    short_term=_st,
+                    session_store=_ss,
+                    # Dream sessions do not extract facts into long-term memory.
+                    # Narrative reflection is the purpose; curation stays with heartbeat.
+                    enable_memory_extraction=False,
+                    bootstrap_context=lambda ws=_ws: _read_dream_bootstrap(ws),
+                )
+
+            _dream_session_factory = _dream_factory
+
     if channels_cfg.matrix is not None:
         from .matrix.channel import MatrixChannel  # noqa: PLC0415 — optional dependency
         _matrix_channel = MatrixChannel(channels_cfg.matrix, workspace)
@@ -477,6 +522,35 @@ def main() -> None:
         )
         _heartbeat.start()  # type: ignore[attr-defined]
         print(f"[heartbeat] Scheduler started (interval: {heartbeat_cfg.interval_seconds}s).")
+
+    # --- Dreaming scheduler (optional) ---
+    # Fires a nightly isolated agent turn that writes a poetic diary entry to
+    # DREAMS.md.  Disabled by default; enabled via "dreaming": {"enabled": true}.
+    _dreaming: object = None
+    if dreaming_cfg.enabled:
+        if _dream_session_factory is None or _dream_workspace_dir is None:
+            print(
+                f"[dreaming] Warning: agent '{dreaming_cfg.agent_id}' not found in config — "
+                "dreaming disabled.",
+                file=sys.stderr,
+            )
+        else:
+            from .dreaming import DreamingScheduler  # noqa: PLC0415
+            _dream_matrix_outbound = getattr(_matrix_channel, "_outbound", None) if _matrix_channel else None
+            _dream_matrix_loop = getattr(_matrix_channel, "_loop", None) if _matrix_channel else None
+            _dreaming = DreamingScheduler(
+                cfg=dreaming_cfg,
+                dream_session_factory=_dream_session_factory,
+                workspace_dir=_dream_workspace_dir,
+                matrix_outbound=_dream_matrix_outbound,
+                matrix_loop=_dream_matrix_loop,
+            )
+            _dreaming.start()  # type: ignore[attr-defined]
+            print(
+                f"[dreaming] Scheduler started "
+                f"(nightly at {dreaming_cfg.hour:02d}:{dreaming_cfg.minute:02d} "
+                f"{dreaming_cfg.timezone})."
+            )
 
     use_streaming = streaming.chat_mode
 

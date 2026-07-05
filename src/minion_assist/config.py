@@ -666,6 +666,45 @@ class HeartbeatConfig:
 
 
 @dataclass(frozen=True)
+class DreamingConfig:
+    """Controls the nightly dream diary scheduler.
+
+    The dreaming system fires an isolated agent turn each night that reads
+    recent daily memory files and writes a poetic diary entry to DREAMS.md
+    in the agent's workspace directory.
+
+    Configured in ``config.json`` under the ``"dreaming"`` key::
+
+        "dreaming": {
+            "enabled": true,
+            "hour": 3,
+            "minute": 0,
+            "timezone": "Australia/Sydney",
+            "lookback_days": 3,
+            "agent_id": "main"
+        }
+
+    Attributes:
+        enabled (bool): When ``True`` (default ``False``), the dreaming
+            scheduler starts at process startup.
+        hour (int): Wall-clock hour of day to fire (0-23). Default 3 (3am).
+        minute (int): Wall-clock minute to fire (0-59). Default 0.
+        timezone (str): IANA timezone name for scheduling. Default
+            ``"Australia/Sydney"``.  Requires the ``tzdata`` package on Windows.
+        lookback_days (int): How many days of daily memory files to read as
+            source material.  Default 3.
+        agent_id (str): Which agent produces the dream entry. Default ``"main"``.
+    """
+
+    enabled: bool = False
+    hour: int = 3
+    minute: int = 0
+    timezone: str = "Australia/Sydney"
+    lookback_days: int = 3
+    agent_id: str = "main"
+
+
+@dataclass(frozen=True)
 class CompactionConfig:
     """Controls when and how conversation history is compacted.
 
@@ -1130,3 +1169,31 @@ extra_plugin_manifests: tuple[str, ...] = tuple(
 # heartbeat: controls the periodic background heartbeat scheduler.
 # Disabled by default; enabled via "heartbeat": {"enabled": true} in config.json.
 heartbeat: HeartbeatConfig = _resolve_heartbeat()
+
+
+def _resolve_dreaming() -> DreamingConfig:
+    """Read the ``"dreaming"`` section from config.json and build a DreamingConfig.
+
+    All fields have sensible defaults so the section can be omitted entirely.
+
+    Returns:
+        DreamingConfig: Immutable dreaming settings; defaults apply when absent.
+    """
+    raw = _raw.get("dreaming", {})
+    if not isinstance(raw, dict):
+        return DreamingConfig()
+    hour = int(raw.get("hour", 3))
+    minute = int(raw.get("minute", 0))
+    return DreamingConfig(
+        enabled=bool(raw.get("enabled", False)),
+        hour=max(0, min(23, hour)),
+        minute=max(0, min(59, minute)),
+        timezone=str(raw.get("timezone", "Australia/Sydney")),
+        lookback_days=max(1, int(raw.get("lookback_days", 3))),
+        agent_id=str(raw.get("agent_id", "main")),
+    )
+
+
+# dreaming: controls the nightly dream diary scheduler.
+# Disabled by default; enabled via "dreaming": {"enabled": true} in config.json.
+dreaming: DreamingConfig = _resolve_dreaming()
