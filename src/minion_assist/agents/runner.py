@@ -69,6 +69,8 @@ Talks to
 - ``agents/events.py`` — event dataclasses are imported and emitted here.
 """
 
+# Treat type annotations as strings so TYPE_CHECKING guards work without circular imports.
+# See tools/base.py module docstring for a full explanation of this pattern.
 from __future__ import annotations
 
 import json

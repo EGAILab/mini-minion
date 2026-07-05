@@ -37,6 +37,27 @@ Key concepts for new readers
   and mixed separators are all normalised first — there is no way to sneak a
   path past it with cleverly constructed strings.
 
+**``from __future__ import annotations``**
+  You will see this line at the top of almost every file in this codebase.
+  It tells Python to treat all type annotations as strings instead of
+  evaluating them immediately at import time.  This has two benefits:
+
+  1. *Forward references work*: you can write ``def foo() -> "MyClass"``
+     even if ``MyClass`` is defined further down in the same file.
+  2. *Circular imports are avoided*: type hints in ``if TYPE_CHECKING:``
+     blocks (see below) only run during static analysis, not at runtime,
+     so two modules can reference each other's types without causing an
+     import cycle.
+
+**``if TYPE_CHECKING:``**
+  ``TYPE_CHECKING`` is a constant from Python's ``typing`` module.  At
+  runtime it is always ``False``, so the imports inside the block never
+  execute (and can therefore never cause circular imports).  When a static
+  type checker like mypy or Pyright analyses the code it sets
+  ``TYPE_CHECKING = True``, so the imports *are* seen by the analyser.
+  Result: you get full type-checking accuracy without any runtime cost or
+  import-cycle risk.
+
 Talks to
 --------
 - ``registry.py`` — calls ``tool.schema`` to build LLM definitions, and
@@ -45,6 +66,8 @@ Talks to
   module and subclasses :class:`Tool`.
 """
 
+# Treat all type annotations as strings so forward references and TYPE_CHECKING
+# guards work without circular imports.  Explained in the module docstring above.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod

@@ -26,6 +26,9 @@ from typing import TYPE_CHECKING
 from .heartbeat_token import is_heartbeat_ok, strip_heartbeat_token
 from .tools.heartbeat_respond import HeartbeatResponseCapture, HeartbeatRespondTool
 
+# TYPE_CHECKING is False at runtime (so these imports never execute and cannot cause
+# circular imports), but True when a type-checker runs (so types are fully resolved).
+# See tools/base.py module docstring for a full explanation of this pattern.
 if TYPE_CHECKING:
     from .agents.session import AgentSession
     from .config import HeartbeatConfig

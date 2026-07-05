@@ -68,6 +68,8 @@ Talks to
 - ``tools/``               — :class:`ToolRegistry` is passed into :func:`run_turn`.
 """
 
+# Treat type annotations as strings so TYPE_CHECKING guards work without circular imports.
+# See tools/base.py module docstring for a full explanation of this pattern.
 from __future__ import annotations
 
 import json
