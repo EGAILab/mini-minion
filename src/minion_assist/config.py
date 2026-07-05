@@ -159,7 +159,8 @@ def _validate(raw: dict) -> list[ConfigIssue]:
         providers_raw = {}
 
     # API types that work without an API key (no env var warning for these).
-    _LOCAL_APIS = frozenset({"lmstudio"})
+    # codex: uses OAuth tokens from codex-auth.json, not PROVIDER_API_KEY.
+    _LOCAL_APIS = frozenset({"lmstudio", "codex"})
 
     for pname, praw in providers_raw.items():
         ppath = f"models.providers.{pname}"
