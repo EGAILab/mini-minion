@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 from .allowlist import check_allowlist, normalise_matrix_user_id
 from .config import MatrixConfig
+from ..heartbeat_token import is_heartbeat_ok, strip_heartbeat_token
 
 if TYPE_CHECKING:
     from .bot_loop import BotLoopProtection
@@ -128,6 +129,14 @@ class MatrixMessageHandler:
         if not self._is_sender_allowed(normalised_sender, room_id, room_cfg):
             return
 
+        # Step 5b — Mention gate.
+        # When require_mention=True for this room, only respond when the bot's
+        # userId appears in the message body.  This prevents the agent from
+        # replying to every message in busy group chats.
+        if room_cfg and room_cfg.require_mention:
+            if not self._is_mentioned(body):
+                return
+
         # Step 6 — Thread binding.
         # If this message is part of a Matrix thread, map the thread root event ID
         # to an isolated session key so threaded convos don't bleed into each other.
@@ -158,6 +167,7 @@ class MatrixMessageHandler:
             text=body,
             agent_id=agent_id,
             thread_id=thread_id,
+            room_cfg=room_cfg,
         )
 
     def _is_sender_allowed(self, sender: str, room_id: str, room_cfg) -> bool:
@@ -190,6 +200,17 @@ class MatrixMessageHandler:
             return getattr(relates, "event_id", None)
         return None
 
+    def _is_mentioned(self, body: str) -> bool:
+        """Return True when the bot's userId appears in the message body."""
+        user_id = self._client.user_id or ""
+        # Match full user ID (e.g. @ada:example.org) or bare localpart (e.g. ada).
+        localpart = user_id.split(":")[0].lstrip("@") if ":" in user_id else user_id.lstrip("@")
+        body_lower = body.lower()
+        return (
+            user_id.lower() in body_lower
+            or (bool(localpart) and localpart.lower() in body_lower)
+        )
+
     async def _dispatch_and_reply(
         self,
         room_id: str,
@@ -197,10 +218,30 @@ class MatrixMessageHandler:
         text: str,
         agent_id: str,
         thread_id: str | None,
+        room_cfg=None,
     ) -> None:
         """Run the agent turn in a thread-pool thread and post the reply."""
         session = self._sessions[agent_id]
         loop = asyncio.get_running_loop()
+
+        # Build per-turn extra tools (injected for this turn only).
+        extra_tools = []
+
+        # ReactToMessageTool: available in rooms where reaction_level != "off".
+        reaction_level = getattr(room_cfg, "reaction_level", "off") if room_cfg else "off"
+        if reaction_level != "off" and event_id:
+            from ..tools.react_to_message import ReactToMessageTool  # noqa: PLC0415
+            extra_tools.append(
+                ReactToMessageTool(
+                    outbound=self._outbound,
+                    room_id=room_id,
+                    event_id=event_id,
+                    loop=loop,
+                )
+            )
+
+        # Per-turn system suffix from the room's custom system_prompt.
+        system_suffix = getattr(room_cfg, "system_prompt", None) if room_cfg else None
 
         # Lists are used as simple mutable containers so the nested function
         # can write results back to the outer scope without `nonlocal`.
@@ -214,7 +255,13 @@ class MatrixMessageHandler:
                 # event loop thread or it would freeze all Matrix I/O.
                 # on_event=None and stream=False: collect the full response
                 # in one shot.  Streaming draft-preview is deferred (TODO).
-                resp = session.send(text, on_event=None, stream=False)
+                resp = session.send(
+                    text,
+                    on_event=None,
+                    stream=False,
+                    extra_tools=extra_tools or None,
+                    system_suffix=system_suffix,
+                )
                 result_holder.append(resp or "")
             except Exception as exc:
                 error_holder.append(exc)
@@ -238,6 +285,12 @@ class MatrixMessageHandler:
             return
 
         reply_text = result_holder[0] if result_holder else ""
+
+        # Suppress silent heartbeat acknowledgements — they are not user-facing.
+        if is_heartbeat_ok(reply_text):
+            return
+        reply_text = strip_heartbeat_token(reply_text)
+
         if not reply_text.strip():
             return
 

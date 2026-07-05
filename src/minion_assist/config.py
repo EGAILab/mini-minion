@@ -627,6 +627,45 @@ class BootstrapConfig:
 
 
 @dataclass(frozen=True)
+class HeartbeatConfig:
+    """Controls the periodic background heartbeat scheduler.
+
+    The heartbeat fires an agent turn on a timer so the agent can check emails,
+    calendars, or other proactive tasks without a human prompting it.
+
+    Configured in ``config.json`` under the ``"heartbeat"`` key::
+
+        "heartbeat": {
+            "enabled": true,
+            "interval_seconds": 1800,
+            "prompt": "Read HEARTBEAT.md if it exists. If nothing needs attention, reply HEARTBEAT_OK.",
+            "agent_id": "main",
+            "notification_room_id": "!abc:example.org"
+        }
+
+    Attributes:
+        enabled (bool): When ``True`` (default ``False``), the scheduler starts
+            automatically at process startup.
+        interval_seconds (int): Seconds between heartbeat turns.  Default 1800
+            (30 minutes).  Clamped to [60, 86400] at runtime.
+        prompt (str): The message sent to the agent each heartbeat turn.
+        agent_id (str): Which agent receives the heartbeat.  Default ``"main"``.
+        notification_room_id (str | None): Matrix room ID to post proactive
+            notifications when the agent calls ``heartbeat_respond``.  ``None``
+            means print to the terminal instead.
+    """
+    enabled: bool = False
+    interval_seconds: int = 1800
+    prompt: str = (
+        "Read HEARTBEAT.md if it exists (workspace context). "
+        "Follow it strictly. Do not infer or repeat old tasks from prior chats. "
+        "If nothing needs attention, reply HEARTBEAT_OK."
+    )
+    agent_id: str = "main"
+    notification_room_id: str | None = None
+
+
+@dataclass(frozen=True)
 class CompactionConfig:
     """Controls when and how conversation history is compacted.
 
@@ -960,6 +999,26 @@ def _resolve_channels() -> ChannelsConfig:
     return ChannelsConfig(matrix=matrix_cfg)
 
 
+def _resolve_heartbeat() -> HeartbeatConfig:
+    """Read the ``"heartbeat"`` section from config.json and build a HeartbeatConfig.
+
+    All fields have sensible defaults so the section can be omitted entirely.
+
+    Returns:
+        HeartbeatConfig: Immutable heartbeat settings; defaults apply when absent.
+    """
+    raw = _raw.get("heartbeat", {})
+    if not isinstance(raw, dict):
+        return HeartbeatConfig()
+    return HeartbeatConfig(
+        enabled=raw.get("enabled", False),
+        interval_seconds=int(raw.get("interval_seconds", 1800)),
+        prompt=raw.get("prompt") or HeartbeatConfig().prompt,
+        agent_id=raw.get("agent_id", "main"),
+        notification_room_id=raw.get("notification_room_id") or None,
+    )
+
+
 def _resolve_streaming() -> StreamingConfig:
     """Read the ``"streaming"`` section from config.json and build a StreamingConfig.
 
@@ -1067,3 +1126,7 @@ multi_agent: MultiAgentConfig = _resolve_multi_agent()
 extra_plugin_manifests: tuple[str, ...] = tuple(
     _raw.get("extra_plugin_manifests", [])
 )
+
+# heartbeat: controls the periodic background heartbeat scheduler.
+# Disabled by default; enabled via "heartbeat": {"enabled": true} in config.json.
+heartbeat: HeartbeatConfig = _resolve_heartbeat()

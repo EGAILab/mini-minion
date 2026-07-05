@@ -15,6 +15,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 - [MCP Servers](#mcp-servers)
 - [Matrix Channel](#matrix-channel)
 - [Multi-Agent Workspace](#multi-agent-workspace)
+- [Heartbeat & Proactive Features](#heartbeat--proactive-features)
 - [Module Reference](#module-reference)
   - [config](#config)
   - [providers](#providers)
@@ -165,7 +166,7 @@ minion-assist/
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       └── __init__.py
-└── tests/                       # pytest test suite (1031 tests, 2 skipped)
+└── tests/                       # pytest test suite (1104 tests, 2 skipped)
 ```
 
 ---
@@ -722,6 +723,89 @@ Override the defaults in `config.json`:
 ### Phase 4 — real-time event relay
 
 When a subagent is running, its token output is relayed to the parent's terminal in real time with a `[sub:{agent_id}]` prefix (e.g. `[sub:researcher]: Here is what I found...`). This uses `dataclasses.replace()` to tag the agent name on each event before forwarding to the parent's `_on_event` handler — no queue or extra thread is needed since `print()` is thread-safe.
+
+---
+
+## Heartbeat & Proactive Features
+
+The heartbeat system lets the agent wake up periodically without user input — checking pending tasks, sending proactive notifications to Matrix, reacting to messages with emoji, and maintaining a daily memory log.
+
+### Heartbeat Scheduler
+
+When enabled, `HeartbeatScheduler` fires a background agent turn on a configurable interval. The agent reads `HEARTBEAT.md` (a workspace file listing background tasks) and either:
+- replies `HEARTBEAT_OK` to silently acknowledge (suppressed from all output), or
+- calls the `heartbeat_respond` tool to send a notification to the configured Matrix room (or prints to the terminal if no room is set).
+
+Configure in `config.json`:
+
+```json
+{
+  "heartbeat": {
+    "enabled": true,
+    "interval_seconds": 1800,
+    "agent_id": "main",
+    "notification_room_id": "!yourroom:example.org",
+    "prompt": "Read HEARTBEAT.md if it exists. If you have pending background tasks, do them now. If nothing needs attention, reply HEARTBEAT_OK."
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | `true` to start the scheduler at launch |
+| `interval_seconds` | Seconds between heartbeats (default: `1800`) |
+| `agent_id` | Which agent runs the heartbeat turns (default: `"main"`) |
+| `notification_room_id` | Matrix room for proactive notifications; if absent, notifications print to terminal |
+| `prompt` | The message sent to the agent on each heartbeat tick |
+
+**Thread safety:** `AgentSession.send()` acquires a `threading.Lock`, so heartbeat turns and interactive REPL turns (or Matrix messages) can never interleave.
+
+### `heartbeat_respond` Tool
+
+Available only during a heartbeat turn (injected as `extra_tools` — it does not appear in the permanent tool registry). When the agent calls `heartbeat_respond(message="...")`, the scheduler routes the message to `notification_room_id` or prints it to the terminal.
+
+### `write_daily_memory` Tool
+
+Agents can append notes to a per-day markdown file in their workspace (`memory/YYYY-MM-DD.md`). Useful for capturing observations during heartbeat turns that should persist but don't belong in long-term memory yet.
+
+```
+write_daily_memory(content="Processed the daily digest. 3 emails flagged.")
+```
+
+### Smart Group-Chat (Mention Gate)
+
+Per-room config in `config.json` can require that the bot be mentioned before it responds:
+
+```json
+{
+  "channels": {
+    "matrix": {
+      "groups": {
+        "!yourroom:example.org": {
+          "requireMention": true,
+          "agent": "main"
+        }
+      }
+    }
+  }
+}
+```
+
+When `requireMention: true`, the bot only responds if its Matrix user ID or localpart appears in the message body (case-insensitive).
+
+### Agent Reactions (`react_to_message` Tool)
+
+Per-room config can enable emoji reactions as an alternative to text replies:
+
+```json
+"groups": {
+  "!yourroom:example.org": {
+    "reactionLevel": "all"
+  }
+}
+```
+
+`reactionLevel: "all"` injects a `react_to_message` tool into every turn for that room. The agent can call `react_to_message(event_id="$...", emoji="👍")` instead of (or alongside) a text reply. `"off"` (default) disables the tool entirely.
 
 ---
 

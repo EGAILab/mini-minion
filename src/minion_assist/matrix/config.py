@@ -31,6 +31,10 @@ class MatrixRoomConfig:
     allow_bots: bool | str = False  # False, True, or "mentions"
     users: list[str] = field(default_factory=list)
     system_prompt: str | None = None
+    # Emoji reaction level for inbound messages in this room.
+    # "off" — never react; "all" — react to every message;
+    # "mentions" — react only when the bot is mentioned.
+    reaction_level: str = "off"
 
     @classmethod
     def from_dict(cls, raw: dict) -> "MatrixRoomConfig":
@@ -41,6 +45,7 @@ class MatrixRoomConfig:
             allow_bots=raw.get("allowBots", False),
             users=list(raw.get("users") or []),
             system_prompt=raw.get("systemPrompt"),
+            reaction_level=raw.get("reactionLevel", "off"),
         )
 
 

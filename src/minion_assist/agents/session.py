@@ -71,6 +71,7 @@ Talks to
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -438,6 +439,10 @@ class AgentSession:
         _mem_tokens: int = max(100, min(8_000, _ctx // 130))
         self._memory_injection_chars: int = _mem_tokens * 4
 
+        # Serialises concurrent send() calls from the Matrix handler and the
+        # heartbeat scheduler so history is never mutated from two threads at once.
+        self._lock = threading.Lock()
+
         # Load user context once at init — reloaded on next process restart.
         self._user_context_block = (
             _load_user_context(long_term, max_chars=self._user_context_max_chars)
@@ -476,6 +481,8 @@ class AgentSession:
         on_event: Callable[[object], None] | None = None,
         stream: bool = False,
         verify_fn: Callable[[], str] | None = None,
+        extra_tools: list | None = None,
+        system_suffix: str | None = None,
     ) -> str | None:
         """Send a user message (with optional media attachments) and return the agent's text response.
 
@@ -496,6 +503,13 @@ class AgentSession:
                 user message so the agent sees the verification result at the
                 start of the next turn.  Useful for test runners or linters that
                 confirm whether changes applied correctly.
+            extra_tools (list | None): Optional list of :class:`~tools.base.Tool`
+                instances to inject for this turn only (e.g. ``heartbeat_respond``
+                or ``react_to_message``).  They are added to a temporary registry
+                that shadows the agent's permanent one for this call only.
+            system_suffix (str | None): Optional text appended to the system
+                prompt for this turn only.  Used by the Matrix handler to inject
+                group-chat context without permanently modifying the soul suffix.
 
         Returns:
             str | None: The agent's final response text, or ``None`` if the
@@ -505,6 +519,28 @@ class AgentSession:
             Exception: Re-raises any provider exception after rolling back
                 partial history and persisting the user message + error record.
         """
+        with self._lock:
+            return self._send_locked(
+                message=message,
+                attachments=attachments,
+                on_event=on_event,
+                stream=stream,
+                verify_fn=verify_fn,
+                extra_tools=extra_tools,
+                system_suffix=system_suffix,
+            )
+
+    def _send_locked(
+        self,
+        message: str,
+        attachments: list | None,
+        on_event: Callable[[object], None] | None,
+        stream: bool,
+        verify_fn: Callable[[], str] | None,
+        extra_tools: list | None,
+        system_suffix: str | None,
+    ) -> str | None:
+        """Locked implementation of send() — called with self._lock already held."""
         _trace_id = str(uuid.uuid4())
         _start = time.monotonic()
         _compacted = False
@@ -567,6 +603,9 @@ class AgentSession:
             system += f"\n\n{budget_block}"
         if self._soul_suffix:
             system += f"\n\n{self._soul_suffix}"
+        # Per-turn system suffix from caller (e.g. group-chat context injection).
+        if system_suffix:
+            system += f"\n\n{system_suffix}"
 
         # Build compaction callbacks. The notify function tracks whether compaction
         # actually ran so TurnCompleted can report it.
@@ -593,13 +632,28 @@ class AgentSession:
         # Snapshot for rollback on mid-turn crash.
         snapshot_len = len(self._history)
 
+        # Build the active tool registry for this turn.  When extra_tools are
+        # provided (e.g. heartbeat_respond, react_to_message), create a temporary
+        # registry that layers them on top of the permanent one for this call only.
+        if extra_tools:
+            from ..tools.registry import ToolRegistry as _ToolRegistry  # noqa: PLC0415
+            _tmp = _ToolRegistry()
+            _tmp.policy = self._tools.policy
+            for _t in self._tools._tools.values():
+                _tmp.register(_t)
+            for _t in extra_tools:
+                _tmp.register(_t)
+            _active_tools = _tmp
+        else:
+            _active_tools = self._tools
+
         try:
             _usage = run_turn(
                 self._provider,
                 self._agent.name,
                 system,
                 self._max_output_tokens,
-                self._tools,
+                _active_tools,
                 self._history,
                 on_event=on_event,
                 stream=stream,

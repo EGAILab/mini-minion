@@ -57,7 +57,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 # Recognized bootstrap file names in canonical injection order.
-# HEARTBEAT.md is excluded: Minion Assist has no heartbeat runs yet.
+# HEARTBEAT.md is injected after BOOTSTRAP.md so the agent sees its checklist
+# on every turn without needing an explicit read call.
 _BOOTSTRAP_FILES: tuple[str, ...] = (
     "AGENTS.md",
     "SOUL.md",
@@ -65,6 +66,7 @@ _BOOTSTRAP_FILES: tuple[str, ...] = (
     "IDENTITY.md",
     "USER.md",
     "BOOTSTRAP.md",
+    "HEARTBEAT.md",
     "MEMORY.md",
 )
 

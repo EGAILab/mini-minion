@@ -85,6 +85,7 @@ from .config import bootstrap as bootstrap_cfg
 from .config import channels as channels_cfg
 from .config import compaction as compaction_cfg
 from .config import extra_plugin_manifests
+from .config import heartbeat as heartbeat_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
 from .config import multi_agent as multi_agent_cfg
@@ -346,6 +347,16 @@ def main() -> None:
     sessions: dict[str, AgentSession] = {}
     for agent_id, cfg in agents_cfg.items():
         long_term = LongTermMemory(workspace / "memory" / agent_id)
+
+        # Per-agent workspace root: resolved before default_registry() so
+        # WriteDailyMemoryTool can be given the correct workspace path.
+        _agent_workspace = agent_workspace_root(workspace, agent_id)
+        if _agent_workspace is not None:
+            ensure_workspace(_agent_workspace)
+            _agent_bootstrap_root = _agent_workspace
+        else:
+            _agent_bootstrap_root = _bootstrap_root
+
         tools = default_registry(
             long_term=long_term,
             root=_tool_root,
@@ -356,6 +367,7 @@ def main() -> None:
             agent_id=agent_id,
             mcp_manager=mcp_manager,
             ask_user_fn=_console_ask_user,
+            workspace_root=_agent_workspace,
         )
         # Load user-defined tools from plugins.json manifests.
         # Done after default_registry() so plugins can override built-in tools
@@ -384,15 +396,6 @@ def main() -> None:
             context_window=cfg.model.context_window,
             preserve_tokens=_preserve,
         )
-
-        # Per-agent workspace root: prefer {workspace}/workspaces/{agent_id}/,
-        # fall back to {workspace}/workspaces/main/ if neither exists → None.
-        _agent_workspace = agent_workspace_root(workspace, agent_id)
-        if _agent_workspace is not None:
-            ensure_workspace(_agent_workspace)
-            _agent_bootstrap_root = _agent_workspace
-        else:
-            _agent_bootstrap_root = _bootstrap_root
 
         # Per-agent bootstrap context: uses the per-agent workspace root when
         # available so different agents can have different bootstrap files.
@@ -457,6 +460,23 @@ def main() -> None:
         _matrix_channel = MatrixChannel(channels_cfg.matrix, workspace)
         _matrix_channel.start(sessions)
         print("[matrix] Listener started.")
+
+    # --- Heartbeat scheduler (optional) ---
+    # Fires periodic background agent turns so the agent can check emails,
+    # calendars, or other proactive tasks.  Disabled by default.
+    _heartbeat: object = None
+    if heartbeat_cfg.enabled:
+        from .heartbeat import HeartbeatScheduler  # noqa: PLC0415
+        _matrix_outbound = getattr(_matrix_channel, "_outbound", None) if _matrix_channel else None
+        _matrix_loop = getattr(_matrix_channel, "_loop", None) if _matrix_channel else None
+        _heartbeat = HeartbeatScheduler(
+            config=heartbeat_cfg,
+            sessions=sessions,
+            matrix_outbound=_matrix_outbound,
+            matrix_loop=_matrix_loop,
+        )
+        _heartbeat.start()  # type: ignore[attr-defined]
+        print(f"[heartbeat] Scheduler started (interval: {heartbeat_cfg.interval_seconds}s).")
 
     use_streaming = streaming.chat_mode
 

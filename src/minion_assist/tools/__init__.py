@@ -59,6 +59,7 @@ from .todo import TodoReadTool, TodoWriteTool
 from .web_fetch import WebFetchTool
 from .web_search import WebSearchTool
 from .write import WriteTool
+from .write_daily_memory import WriteDailyMemoryTool
 
 
 def default_registry(
@@ -73,6 +74,7 @@ def default_registry(
     policy: "PermissionPolicy | None" = None,
     ask_user_fn: "Callable[[str], str] | None" = None,
     write_confirm: "Callable[[str], bool] | None" = None,
+    workspace_root: Path | None = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` with all standard tools registered.
 
@@ -163,6 +165,12 @@ def default_registry(
         registry.register(SearchMemoryTool(long_term))
         registry.register(NoteTool(long_term, policy=_policy))
 
+    # Daily memory tool — only when an agent workspace root is provided.
+    # Lets the agent append notes to memory/YYYY-MM-DD.md without needing to
+    # read → edit → write the whole file.
+    if workspace_root is not None:
+        registry.register(WriteDailyMemoryTool(workspace_root))
+
     # Skill tool — only when at least one skill was discovered.
     if skills:
         registry.register(SkillTool(skills))
@@ -236,5 +244,6 @@ __all__ = [
     "SpawnSubagentTool",
     "ReadTaskTool",
     "UpdateTaskTool",
+    "WriteDailyMemoryTool",
     "default_registry",
 ]
