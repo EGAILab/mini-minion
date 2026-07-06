@@ -61,7 +61,11 @@ class _CodexRpcClient:
     - server request (has both ``id`` and ``method``) → we reply immediately.
     """
 
-    def __init__(self, command: list[str]) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        approve_command: Callable[[str, dict], str] | None = None,
+    ) -> None:
         self._proc = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -76,6 +80,7 @@ class _CodexRpcClient:
         self._pending_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._handlers: list[Callable[[dict], None]] = []
+        self._approve_command = approve_command
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 
@@ -218,7 +223,7 @@ class CodexProvider:
             resolved = shutil.which(self._codex_bin) or self._codex_bin
             cmd = [resolved, "app-server", "--listen", "stdio://"]
             try:
-                self._rpc = _CodexRpcClient(cmd)
+                self._rpc = _CodexRpcClient(cmd, approve_command=self._approve_command)
             except FileNotFoundError:
                 raise FileNotFoundError(
                     f"Codex binary not found: {self._codex_bin!r}\n"
