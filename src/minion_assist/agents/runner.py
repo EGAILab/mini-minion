@@ -79,7 +79,9 @@ import random
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
+from ..llm_logger import log_tool_call, log_tool_result, log_turn_start
 from ..providers import LLMProvider, LLMResponse
 from ..providers.base import TokenUsage
 from ..tools import ToolRegistry
@@ -207,6 +209,7 @@ def run_turn(
     on_event: Callable[[object], None] | None = None,
     stream: bool = False,
     max_tool_rounds: int = _MAX_TOOL_ROUNDS,
+    log_dir: Path | None = None,
 ) -> TokenUsage | None:
     """Drive a single user turn to completion, executing tools as needed.
 
@@ -263,6 +266,12 @@ def run_turn(
     # model to acknowledge what it just did — rather than the generic "please
     # respond or call a tool" which leaves open the choice to do nothing.
     _prev_round_had_tools = False
+
+    # Log the user message that triggered this turn before the first LLM call.
+    if log_dir is not None and messages:
+        _last = messages[-1]
+        if _last.get("role") == "user":
+            log_turn_start(log_dir, agent_name, str(_last.get("content", "")))
 
     # --- TAO loop ---
     for _round in range(max_tool_rounds):
@@ -424,6 +433,8 @@ def run_turn(
             for tc in response.tool_calls:
                 if on_event:
                     on_event(ToolCalled(name=tc.name, args=tc.arguments))
+                if log_dir is not None:
+                    log_tool_call(log_dir, agent_name, tc.name, tc.arguments)
 
             # Run all tools concurrently using a thread pool.
             # ThreadPoolExecutor(max_workers=N) creates at most N threads — one
@@ -455,6 +466,8 @@ def run_turn(
                 _output, _elapsed_ms = _results[tc.id]
                 if on_event:
                     on_event(ToolCompleted(name=tc.name, elapsed_ms=_elapsed_ms, output_chars=len(_output)))
+                if log_dir is not None:
+                    log_tool_result(log_dir, agent_name, tc.name, _output)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": _output})
 
             # Mark that this round executed tools — Recovery A will use a targeted nudge
@@ -467,6 +480,8 @@ def run_turn(
             for tc in response.tool_calls:
                 if on_event:
                     on_event(ToolCalled(name=tc.name, args=tc.arguments))
+                if log_dir is not None:
+                    log_tool_call(log_dir, agent_name, tc.name, tc.arguments)
 
                 if tc.error:
                     # The provider couldn't parse the model's JSON arguments.
@@ -481,6 +496,8 @@ def run_turn(
 
                 if on_event:
                     on_event(ToolCompleted(name=tc.name, elapsed_ms=elapsed_ms, output_chars=len(output)))
+                if log_dir is not None:
+                    log_tool_result(log_dir, agent_name, tc.name, output)
 
                 # --- OBSERVE: append this tool's result before moving to the next ---
                 # The result becomes part of the conversation history so the model

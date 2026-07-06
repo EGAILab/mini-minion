@@ -347,8 +347,7 @@ class CodexProvider:
             if self._log_dir is not None:
                 log_request(self._log_dir, "stdio://codex", {
                     "model": self._model or "codex-default",
-                    "threadId": self._thread_id,
-                    "input": turn_input,
+                    "messages": [{"role": "system", "content": system}, *messages],
                 })
             rpc.request("turn/start", {
                 "threadId": self._thread_id,

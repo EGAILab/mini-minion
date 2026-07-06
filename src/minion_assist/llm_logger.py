@@ -52,3 +52,47 @@ def log_response(log_dir: Path, model: str, response: dict) -> None:
             fh.write(entry)
     except Exception:
         pass
+
+
+_TURN_SNIPPET = 200
+_TOOL_RESULT_TRUNCATE = 2000
+
+
+def log_turn_start(log_dir: Path, agent_name: str, user_message: str) -> None:
+    """Append a turn-start marker showing the user's message."""
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        snippet = user_message[:_TURN_SNIPPET]
+        if len(user_message) > _TURN_SNIPPET:
+            snippet += "..."
+        entry = f"[{_now()}][TURN][{agent_name}] User: {snippet!r}\n"
+        with _log_file(log_dir).open("a", encoding="utf-8") as fh:
+            fh.write(entry)
+    except Exception:
+        pass
+
+
+def log_tool_call(log_dir: Path, agent_name: str, tool_name: str, arguments: dict) -> None:
+    """Append a tool-call entry showing what tool was invoked and with what arguments."""
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        args_str = json.dumps(arguments, ensure_ascii=False, default=str)
+        entry = f"[{_now()}][TOOL_CALL][{agent_name}] {tool_name} {args_str}\n"
+        with _log_file(log_dir).open("a", encoding="utf-8") as fh:
+            fh.write(entry)
+    except Exception:
+        pass
+
+
+def log_tool_result(log_dir: Path, agent_name: str, tool_name: str, result: str) -> None:
+    """Append a tool-result entry showing what the tool returned (truncated at 2000 chars)."""
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        total = len(result)
+        snippet = result[:_TOOL_RESULT_TRUNCATE]
+        suffix = f" [truncated, {total} chars total]" if total > _TOOL_RESULT_TRUNCATE else ""
+        entry = f"[{_now()}][TOOL_RESULT][{agent_name}] {tool_name} → {total} chars: {snippet}{suffix}\n"
+        with _log_file(log_dir).open("a", encoding="utf-8") as fh:
+            fh.write(entry)
+    except Exception:
+        pass

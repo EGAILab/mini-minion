@@ -316,6 +316,7 @@ def main() -> None:
                 # Suppress background memory extraction for subagents — they are
                 # short-lived task runners and the extra API call is wasteful.
                 enable_memory_extraction=False,
+                log_dir=_log_dir,
             )
 
             # Phase 4: relay subagent events to the parent's terminal in real time.
@@ -438,6 +439,7 @@ def main() -> None:
             bootstrap_context=_agent_bootstrap_context,
             # Per-agent workspace root for Phase 5 attestation.
             workspace_root=_agent_workspace,
+            log_dir=_log_dir,
         )
 
         # Phase 4: build a relay function that tags subagent events with
@@ -500,6 +502,7 @@ def main() -> None:
                     # Narrative reflection is the purpose; curation stays with heartbeat.
                     enable_memory_extraction=False,
                     bootstrap_context=lambda ws=_ws: _read_dream_bootstrap(ws),
+                    log_dir=_log_dir,
                 )
 
             _dream_session_factory = _dream_factory

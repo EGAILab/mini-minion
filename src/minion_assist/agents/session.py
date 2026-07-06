@@ -387,6 +387,7 @@ class AgentSession:
         enable_memory_extraction: bool = True,
         bootstrap_context: Callable[[], str] | None = None,
         workspace_root: Path | None = None,
+        log_dir: Path | None = None,
     ) -> None:
         self._agent_id = agent_id
         self._agent = agent
@@ -410,6 +411,8 @@ class AgentSession:
         # When set, check_workspace() is called at the top of send() to detect
         # accidental deletion of the workspace directory between turns.
         self._workspace_root = workspace_root
+        # Optional log directory for verbose LLM and tool call/result logging.
+        self._log_dir = log_dir
 
         # Compute injection limits proportionally from the model's context window.
         # This ensures every budget scales automatically when the model is switched.
@@ -660,6 +663,7 @@ class AgentSession:
                 on_event=on_event,
                 stream=stream,
                 max_tool_rounds=self._agent.max_tool_rounds,
+                log_dir=self._log_dir,
             )
             _session_info = self._session_store.touch(self._agent_id, increment_turns=True)
 
