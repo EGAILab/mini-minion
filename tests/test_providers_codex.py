@@ -500,3 +500,38 @@ def test_item_completed_overrides_turn_items_text():
     p = _make_provider(stub)
     result = p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
     assert result.text == "from item/completed"
+
+
+# ---------------------------------------------------------------------------
+# reset_session — /new command hook
+# ---------------------------------------------------------------------------
+
+
+def test_reset_session_clears_thread_id_and_sent_count():
+    """/new must clear the Codex thread so the next turn starts fresh."""
+    stub = _StubRpc(thread_id="old-thread")
+    p = _make_provider(stub)
+
+    p.chat(system="", messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=50)
+    assert p._thread_id == "old-thread"
+    assert p._sent_count == 1
+
+    p.reset_session()
+
+    assert p._thread_id is None
+    assert p._sent_count == 0
+
+
+def test_reset_session_causes_new_thread_start():
+    """After reset_session(), the next chat() call issues a new thread/start."""
+    stub = _StubRpc(thread_id="new-thread")
+    p = _make_provider(stub)
+
+    p.chat(system="", messages=[{"role": "user", "content": "turn 1"}], tools=[], max_tokens=50)
+    p.reset_session()
+
+    # Second chat after reset should create a new thread, not continue old one.
+    p.chat(system="", messages=[{"role": "user", "content": "turn 2"}], tools=[], max_tokens=50)
+
+    thread_starts = [c for c in stub.calls if c[0] == "thread/start"]
+    assert len(thread_starts) == 2, "expected two thread/start calls (one per session)"

@@ -746,6 +746,11 @@ class AgentSession:
         """
         self._history = []
         self._short_term.clear(self._agent_id)
+        # If the provider maintains session state (e.g. CodexProvider's thread),
+        # reset it so the next turn starts a fresh context rather than continuing
+        # the old conversation inside the provider's session.
+        if hasattr(self._provider, "reset_session"):
+            self._provider.reset_session()
 
     def compact_now(self) -> bool:
         """Manually trigger history compaction regardless of current size.

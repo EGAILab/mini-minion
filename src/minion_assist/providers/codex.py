@@ -438,6 +438,17 @@ class CodexProvider:
         # Callback for Codex built-in tool approval (item/commandExecution/requestApproval etc.).
         self._approve_command = approve_command
 
+    def reset_session(self) -> None:
+        """Forget the current Codex thread so the next chat() starts a fresh one.
+
+        Called by AgentSession.reset() (/new command).  Without this, the Codex
+        binary retains the full prior conversation in its thread even after the
+        minion-assist message history is cleared, causing answers from the old
+        context to bleed into the new conversation.
+        """
+        self._thread_id = None
+        self._sent_count = 0
+
     def _get_rpc(self) -> _CodexRpcClient:
         if self._rpc is None:
             # npm global installs on Windows create codex.cmd (a batch wrapper),
