@@ -92,14 +92,17 @@ class _StubRpc:
             raise self.rpc_error
         if method == "initialize":
             return {"serverInfo": {"name": "codex", "version": "1.0"}, "capabilities": {}}
-        if method in ("thread/start", "turn/start"):
+        if method == "thread/start":
+            # thread/start creates the thread only — the real binary does NOT
+            # send any turn notifications here (no inference happens until
+            # turn/start is called).  Return the thread dict immediately.
+            return {"thread": {"id": self.thread_id}, "model": "gpt-5.5"}
+        if method == "turn/start":
             # Dispatch the turn completion notification asynchronously so that
             # CodexProvider.chat() has time to register done.wait() first.
             timer = threading.Timer(self.notification_delay, self._fire_notification)
             timer.daemon = True
             timer.start()
-            if method == "thread/start":
-                return {"thread": {"id": self.thread_id}, "model": "gpt-5.5"}
             return {"turn": {"id": "turn-1", "threadId": self.thread_id, "status": "idle"}}
         return {}
 
@@ -126,6 +129,8 @@ def _make_provider(stub: _StubRpc, model: str = "gpt-5.5") -> CodexProvider:
     p._thread_id = None
     p._sent_count = 0
     p._log_dir = None
+    p._registry = None
+    p._approve_command = None
     return p
 
 

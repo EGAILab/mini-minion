@@ -1694,6 +1694,26 @@ This opens `https://auth.openai.com/codex/device` in your browser, prompts you t
 | `CODEX_BIN` | Override the path to the `codex` binary (useful when it's not on PATH or you want a specific version) |
 | `MINION_ASSIST_HOME` | Override the token storage directory (default `~/.minion-assist`) |
 
+### Dynamic tool bridge
+
+All tools from the agent's `ToolRegistry` (web search, Playwright, memory, file tools, etc.) are registered with Codex as **dynamic tools** at session start.  Codex can then call them during inference exactly as it uses its own built-in tools.  When Codex invokes one, minion-assist executes it via `registry.execute()` and replies with the result — the same execution path used by all other LLM backends.
+
+This mirrors [openclaw's dynamic tool bridge](../minion-assist-docs/22-codex-provider-setup.md) and means there is no Codex-specific subset of tools — the same full tool set is available regardless of backend.
+
+### Built-in tool approval
+
+Codex's own bash/file capabilities (separate from dynamic tools) can be auto-approved or prompt the user:
+
+```json
+{
+  "codex": {
+    "allow_all_commands": true
+  }
+}
+```
+
+`allow_all_commands: true` silently approves all built-in shell and file operations.  When `false` (default), a TUI prompt appears for each request.
+
 ---
 
 ## Adding a Provider

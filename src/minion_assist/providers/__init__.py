@@ -28,12 +28,16 @@ Talks to
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .anthropic import AnthropicProvider
 from .base import LLMProvider, LLMResponse, TokenUsage, ToolCall
 from .codex import CodexProvider
 from .lmstudio import LMStudioProvider
 from .openai_compatible import OpenAICompatibleProvider
+
+if TYPE_CHECKING:
+    from ..tools import ToolRegistry
 
 
 def create_provider(
@@ -42,6 +46,7 @@ def create_provider(
     api_key: str,
     model: str,
     log_dir: Path | None = None,
+    registry: "ToolRegistry | None" = None,
     approve_command: Callable[[str, dict], str] | None = None,
 ) -> LLMProvider:
     """Instantiate the correct provider class for the given API type.
@@ -61,6 +66,10 @@ def create_provider(
         log_dir (Path | None): When set, every request and response is appended
             to ``log_dir/YYYY-MM-DD.log`` in LM Studio's server log format.
             ``None`` disables logging (default).
+        registry (ToolRegistry | None): Tool registry whose tools are exposed
+            to Codex as dynamic tools.  Ignored by non-Codex providers (they
+            receive tool schemas via ``chat()`` and return tool_calls for the
+            runner to dispatch).
 
     Returns:
         LLMProvider: A fully constructed provider ready to call ``.chat()``.
@@ -85,6 +94,7 @@ def create_provider(
                 codex_bin=codex_bin,
                 model=model,
                 log_dir=log_dir,
+                registry=registry,
                 approve_command=approve_command,
             )
         case _:

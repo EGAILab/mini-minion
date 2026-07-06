@@ -26,8 +26,8 @@ Turn lifecycle (confirmed via live testing against codex-cli 0.142.3)
 ----------------------------------------------------------------------
 1. ``initialize`` with ``capabilities: {experimentalApi: true}`` — required
    or ``account/login/start`` returns -32600.
-2. ``thread/start`` — creates the thread only (no input, ``turns: []``).
-   The binary does NOT start processing until ``turn/start`` is called.
+2. ``thread/start`` — creates the thread and registers dynamic tool specs.
+   The binary sits idle until ``turn/start`` is called.
 3. ``turn/start`` — sends the user message and begins model inference.
    Used for EVERY turn including the first.
 4. Server streams ``item/agentMessage/delta`` notifications as tokens arrive,
@@ -35,6 +35,20 @@ Turn lifecycle (confirmed via live testing against codex-cli 0.142.3)
 5. ``turn/completed`` fires last — but ``params.turn.items`` is always ``[]``
    (the binary does not hydrate items in completion notifications).
    All response text must be collected from ``item/completed`` in step 4.
+
+Dynamic tool bridge (openclaw approach)
+----------------------------------------
+All tools from the ToolRegistry are registered with Codex as dynamic tools
+under a ``"minion-assist"`` namespace in the ``thread/start`` call.  When
+Codex decides to invoke one, it sends an ``item/tool/call`` server request;
+the reader thread executes the tool inline via ``registry.execute()`` and
+replies with ``{contentItems: [...], success: bool}``.  This mirrors how
+openclaw bridges its tools into the Codex app-server.
+
+Approval requests (``item/commandExecution/requestApproval``,
+``item/fileChange/requestApproval``, ``item/permissions/requestApproval``)
+are handled separately — they reflect Codex's own built-in shell/file
+capabilities and are NOT routed through the tool registry.
 """
 
 from __future__ import annotations
@@ -47,9 +61,68 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .base import LLMResponse, ToolCall
 from ..llm_logger import log_request, log_response
+
+if TYPE_CHECKING:
+    from ..tools import ToolRegistry
+
+# Namespace name sent to Codex for all minion-assist dynamic tools.
+# Mirrors openclaw's CODEX_OPENCLAW_DYNAMIC_TOOL_NAMESPACE = "openclaw".
+_DYNAMIC_TOOL_NAMESPACE = "minion-assist"
+
+# Approval request methods — handled separately from dynamic tool calls.
+_APPROVAL_METHODS = frozenset({
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+})
+
+
+def _build_dynamic_tool_specs(registry: "ToolRegistry") -> list[dict]:
+    """Convert a ToolRegistry to a Codex dynamic tool namespace spec.
+
+    Mirrors openclaw's ``createCodexDynamicToolSpecs()`` in dynamic-tools.ts:
+    all tools are placed inside a single namespace with ``deferLoading: true``
+    so Codex loads their schemas lazily rather than flooding its context window.
+
+    The OpenAI format uses ``function.parameters`` for the JSON Schema;
+    Codex uses ``inputSchema`` — same content, different key.
+
+    Returns:
+        A list with one namespace entry, or an empty list if the registry
+        has no tools.
+    """
+    namespace_tools: list[dict] = []
+    for defn in registry.definitions:
+        fn = defn.get("function") or {}
+        name: str = fn.get("name") or ""
+        if not name:
+            continue
+        namespace_tools.append({
+            "type": "function",
+            "name": name,
+            "description": fn.get("description") or "",
+            # Codex uses "inputSchema"; OpenAI uses "parameters" — same JSON Schema object.
+            "inputSchema": fn.get("parameters") or {},
+            # deferLoading=True: Codex loads the full schema only when it intends to call
+            # the tool, keeping the initial context window lean.
+            "deferLoading": True,
+        })
+
+    if not namespace_tools:
+        return []
+
+    return [{
+        "type": "namespace",
+        "name": _DYNAMIC_TOOL_NAMESPACE,
+        # Empty description: the namespace is an implementation detail; the
+        # individual tool descriptions carry the semantically useful content.
+        "description": "",
+        "tools": namespace_tools,
+    }]
 
 
 class _CodexRpcClient:
@@ -59,11 +132,19 @@ class _CodexRpcClient:
     - response (has ``id``, no ``method``) → matches a pending client request.
     - notification (has ``method``, no ``id``) → broadcast to registered handlers.
     - server request (has both ``id`` and ``method``) → we reply immediately.
+
+    Server requests fall into two categories:
+    - ``item/tool/call`` — Codex calling a dynamic tool we registered;
+      dispatched to ``registry.execute()`` inline on the reader thread.
+    - approval requests (``item/commandExecution/requestApproval`` etc.) —
+      Codex asking permission to use its own built-in bash/file capabilities;
+      dispatched to the ``approve_command`` callback.
     """
 
     def __init__(
         self,
         command: list[str],
+        registry: "ToolRegistry | None" = None,
         approve_command: Callable[[str, dict], str] | None = None,
     ) -> None:
         self._proc = subprocess.Popen(
@@ -80,6 +161,10 @@ class _CodexRpcClient:
         self._pending_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._handlers: list[Callable[[dict], None]] = []
+        # Tool registry for dynamic tool calls (item/tool/call).
+        self._registry = registry
+        # Callback for approval requests (item/commandExecution/requestApproval etc.).
+        # Returns "approve" or "deny"; None means auto-deny.
         self._approve_command = approve_command
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -99,17 +184,17 @@ class _CodexRpcClient:
             method = msg.get("method")
 
             if method is not None and msg_id is not None:
-                # Server → client request (e.g. item/tool/call for dynamic tools)
+                # Server → client request (dynamic tool call or approval).
                 self._handle_server_request(msg_id, method, msg.get("params"))
             elif msg_id is not None:
-                # Response to a client request
+                # Response to a client request.
                 with self._pending_lock:
                     pending = self._pending.pop(msg_id, None)
                 if pending:
                     pending["result"] = msg
                     pending["event"].set()
             elif method is not None:
-                # Notification
+                # Notification — broadcast to all registered handlers.
                 for handler in list(self._handlers):
                     try:
                         handler(msg)
@@ -117,24 +202,110 @@ class _CodexRpcClient:
                         pass
 
     def _handle_server_request(self, req_id: int, method: str, _params: object) -> None:
-        # Codex sends server requests when it wants to execute a built-in tool
-        # (bash command, file write, web search, etc.).  The binary expects a
-        # response with a "decision" field using its own enum values:
-        #   "accept" | "acceptForSession" | "decline" | "cancel" | ...
-        # Our internal callback returns "approve" or "deny" for simplicity;
-        # we map those to the protocol values here.
+        """Dispatch an incoming server request to the correct handler.
+
+        Two distinct paths, mirroring openclaw's run-attempt.ts dispatch:
+        - ``item/tool/call``  → dynamic tool execution via the registry.
+        - approval methods   → built-in bash/file permission requests.
+        """
         params = _params if isinstance(_params, dict) else {}
+
+        if method == "item/tool/call":
+            self._handle_tool_call(req_id, params)
+        elif method in _APPROVAL_METHODS:
+            self._handle_approval(req_id, method, params)
+        # Unknown methods: no response sent; Codex will time out on its own.
+
+    def _handle_tool_call(self, req_id: int, params: dict) -> None:
+        """Execute a dynamic tool requested by Codex and reply with the result.
+
+        Mirrors openclaw's ``CodexDynamicToolBridge.handleToolCall()``:
+        look up the tool name in the registry, call ``execute()``, wrap the
+        output in ``{contentItems: [...], success: bool}``.
+
+        Executes inline on the reader thread — safe because Codex is blocked
+        waiting for this response and will not send further messages until
+        we reply.  (Equivalent to openclaw's ``await tool.execute()``.)
+        """
+        tool_name: str = params.get("tool") or ""
+        arguments: dict = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        if not tool_name or self._registry is None:
+            self._write_tool_response(req_id, f"Tool not available: {tool_name!r}", success=False)
+            return
+
+        # Check existence before dispatching — ToolRegistry.execute() never raises
+        # (it returns error strings for both unknown tools and tool exceptions).
+        # We need to signal success=False for unknown tools ourselves.
+        if tool_name not in self._registry._tools:
+            self._write_tool_response(req_id, f"Unknown tool: {tool_name!r}", success=False)
+            return
+
+        # registry.execute() runs pre/post hooks and catches tool exceptions,
+        # returning them as error strings.  Always success=True from the protocol
+        # perspective — the content carries the error message if something failed.
+        output = self._registry.execute(tool_name, arguments)
+        self._write_tool_response(req_id, output, success=True)
+
+    def _write_tool_response(self, req_id: int, text: str, *, success: bool) -> None:
+        """Send a ``{contentItems, success}`` response for an item/tool/call request."""
+        resp = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "contentItems": [{"type": "inputText", "text": text}],
+                "success": success,
+            },
+        }
+        self._write_raw(json.dumps(resp))
+
+    def _handle_approval(self, req_id: int, method: str, params: dict) -> None:
+        """Handle a Codex built-in tool approval request.
+
+        Reads ``params["available"]`` to find the valid decision values for this
+        specific request (mirrors openclaw's ``hasAvailableDecision()`` check),
+        then maps our internal "approve"/"deny" to a protocol-valid value.
+
+        ``item/permissions/requestApproval`` uses a different response shape
+        (``{permissions, scope}``) from the other approval methods
+        (``{decision}``).
+        """
+        available: list[str] = params.get("available") or []
+
         if self._approve_command is not None:
             raw = self._approve_command(method, params)
         else:
             raw = "deny"
-        decision = "accept" if raw == "approve" else "decline"
-        resp = {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {"decision": decision},
-        }
-        self._write_raw(json.dumps(resp))
+
+        approved = (raw == "approve")
+
+        if method == "item/permissions/requestApproval":
+            # Grant all requested permissions for the session; or deny with
+            # an empty permissions dict scoped to this turn only.
+            if approved:
+                result: dict = {"permissions": params.get("permissions") or {}, "scope": "session"}
+            else:
+                result = {"permissions": {}, "scope": "turn"}
+        else:
+            # Command/file approval: pick the best valid decision value.
+            if approved:
+                # Prefer "acceptForSession" (persists for session, avoids repeated prompts).
+                decision = (
+                    "acceptForSession" if "acceptForSession" in available
+                    else "accept" if "accept" in available
+                    else (available[0] if available else "accept")
+                )
+            else:
+                decision = (
+                    "decline" if "decline" in available
+                    else "cancel" if "cancel" in available
+                    else "decline"
+                )
+            result = {"decision": decision}
+
+        self._write_raw(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}))
 
     def _write_raw(self, line: str) -> None:
         assert self._proc.stdin
@@ -190,12 +361,23 @@ class CodexProvider:
     Each provider instance maintains one Codex thread across multiple
     ``chat()`` calls so the binary owns conversation continuity.
 
+    All tools from the optional ``registry`` are registered with Codex as
+    dynamic tools under the ``"minion-assist"`` namespace on the first call.
+    Codex can then invoke them via ``item/tool/call`` server requests, which
+    are executed inline and replied to before Codex continues.
+
     Args:
         codex_bin: Path to the ``codex`` binary.  Defaults to ``"codex"``
             (on PATH).  Overridden by ``CODEX_BIN``.
         model: Codex model ID (e.g. ``"gpt-5.5"``).  Pass an empty string
             to let the binary choose.
         turn_timeout: Seconds to wait for a turn to complete (default 120).
+        registry: Tool registry whose tools are exposed to Codex as dynamic
+            tools.  Pass the same registry used by runner.py so the tool
+            execution logic is shared across all backends.
+        approve_command: Called when Codex requests approval for its own
+            built-in shell/file operations.  Receives ``(method, params)``
+            and must return ``"approve"`` or ``"deny"``.  ``None`` = auto-deny.
     """
 
     def __init__(
@@ -204,6 +386,7 @@ class CodexProvider:
         model: str = "",
         turn_timeout: float = 120.0,
         log_dir: Path | None = None,
+        registry: "ToolRegistry | None" = None,
         approve_command: Callable[[str, dict], str] | None = None,
     ) -> None:
         env_bin = os.environ.get("CODEX_BIN", "").strip()
@@ -214,9 +397,9 @@ class CodexProvider:
         self._thread_id: str | None = None
         self._sent_count: int = 0
         self._log_dir = log_dir
-        # Called when Codex requests approval to execute a built-in tool command.
-        # Receives (method, params) and must return "approve" or "deny".
-        # None means auto-deny (safe default for tests and non-interactive use).
+        # Tool registry exposed to Codex as dynamic tools (item/tool/call path).
+        self._registry = registry
+        # Callback for Codex built-in tool approval (item/commandExecution/requestApproval etc.).
         self._approve_command = approve_command
 
     def _get_rpc(self) -> _CodexRpcClient:
@@ -227,7 +410,11 @@ class CodexProvider:
             resolved = shutil.which(self._codex_bin) or self._codex_bin
             cmd = [resolved, "app-server", "--listen", "stdio://"]
             try:
-                self._rpc = _CodexRpcClient(cmd, approve_command=self._approve_command)
+                self._rpc = _CodexRpcClient(
+                    cmd,
+                    registry=self._registry,
+                    approve_command=self._approve_command,
+                )
             except FileNotFoundError:
                 raise FileNotFoundError(
                     f"Codex binary not found: {self._codex_bin!r}\n"
@@ -292,13 +479,15 @@ class CodexProvider:
         The latest user message becomes the turn input; prior messages live
         in the Codex thread's own history.
 
-        Tools registered via ``tools`` are not forwarded to the binary —
-        Codex handles all tool execution internally using its built-in
-        capabilities (bash, filesystem, web search).
+        Tool definitions in ``tools`` are not forwarded per-turn — they are
+        registered once via ``dynamicTools`` in ``thread/start`` using the
+        registry provided at construction.  Codex calls them back via
+        ``item/tool/call`` server requests during inference; the reader thread
+        executes them inline and replies before Codex continues.
 
         Returns:
-            LLMResponse with ``text`` populated and no tool_calls (Codex
-            handles tools internally and returns a final text answer).
+            LLMResponse with ``text`` populated and no tool_calls (tool
+            execution happens inside Codex's inference loop, not in runner.py).
         """
         rpc = self._get_rpc()
 
@@ -356,12 +545,15 @@ class CodexProvider:
         rpc.add_handler(_on_notification)
         try:
             if self._thread_id is None:
-                # thread/start creates the thread but does NOT start inference.
-                # The binary sits idle until turn/start is called.
-                resp = rpc.request("thread/start", {
-                    "developerInstructions": system,
-                    **model_kwargs,
-                }, timeout=30.0)
+                # thread/start creates the thread and registers dynamic tool specs.
+                # Dynamic tools are built here (not at construction) so MCP tools
+                # that load asynchronously after provider creation are included.
+                thread_params: dict = {"developerInstructions": system, **model_kwargs}
+                if self._registry is not None:
+                    dynamic_tools = _build_dynamic_tool_specs(self._registry)
+                    if dynamic_tools:
+                        thread_params["dynamicTools"] = dynamic_tools
+                resp = rpc.request("thread/start", thread_params, timeout=30.0)
                 self._thread_id = (resp.get("thread") or {}).get("id") or ""
 
             if self._log_dir is not None:

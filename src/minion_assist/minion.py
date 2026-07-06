@@ -296,19 +296,25 @@ def main() -> None:
             # Provider for child: use subagent's configured model if available,
             # otherwise fall back to parent's provider.
             child_model_cfg = agents_cfg.get(subagent_id, parent_cfg)
+
+            # Per-subagent workspace: resolves to main/ workspace if no per-agent dir.
+            child_workspace = agent_workspace_root(workspace, subagent_id)
+            if child_workspace is not None:
+                ensure_workspace(child_workspace)
+
+            # Read-only tool registry built BEFORE the provider so Codex
+            # receives it at construction (same as openclaw's startup tool build).
+            child_tools = _make_subagent_registry(root=_tool_root)
+
             child_provider = create_provider(
                 api=child_model_cfg.provider.api,
                 base_url=child_model_cfg.provider.base_url,
                 api_key=child_model_cfg.provider.api_key,
                 model=child_model_cfg.model.id,
                 log_dir=_log_dir,
+                registry=child_tools,
                 approve_command=_codex_approve,
             )
-
-            # Per-subagent workspace: resolves to main/ workspace if no per-agent dir.
-            child_workspace = agent_workspace_root(workspace, subagent_id)
-            if child_workspace is not None:
-                ensure_workspace(child_workspace)
 
             # Bootstrap context for subagent: filtered to AGENTS.md + TOOLS.md only.
             child_boot_root = child_workspace or _bootstrap_root
@@ -328,9 +334,6 @@ def main() -> None:
                 context_window=child_model_cfg.model.context_window,
                 preserve_tokens=child_preserve,
             )
-
-            # Read-only tool registry for the subagent.
-            child_tools = _make_subagent_registry(root=_tool_root)
 
             child_session = AgentSession(
                 agent_id=child_id,
@@ -421,6 +424,7 @@ def main() -> None:
             api_key=cfg.provider.api_key,
             model=cfg.model.id,
             log_dir=_log_dir,
+            registry=tools,
             approve_command=_codex_approve,
         )
         # preserve_tokens: use explicit config override when present; otherwise
