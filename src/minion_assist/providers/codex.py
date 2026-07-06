@@ -112,12 +112,18 @@ class _CodexRpcClient:
                         pass
 
     def _handle_server_request(self, req_id: int, method: str, _params: object) -> None:
-        # Decline all server requests — we don't register dynamic tools.
-        # Codex uses its own built-in tools (bash, filesystem) independently.
+        # Codex sends server requests when it wants to execute a built-in tool
+        # (bash command, file write, web search, etc.).  The binary expects a
+        # response with a "decision" field: "approve" or "deny".
+        params = _params if isinstance(_params, dict) else {}
+        if self._approve_command is not None:
+            decision = self._approve_command(method, params)
+        else:
+            decision = "deny"
         resp = {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {"success": False, "text": f"Tool not available: {method}"},
+            "result": {"decision": decision},
         }
         self._write_raw(json.dumps(resp))
 
@@ -189,6 +195,7 @@ class CodexProvider:
         model: str = "",
         turn_timeout: float = 120.0,
         log_dir: Path | None = None,
+        approve_command: Callable[[str, dict], str] | None = None,
     ) -> None:
         env_bin = os.environ.get("CODEX_BIN", "").strip()
         self._codex_bin = env_bin or codex_bin
@@ -198,6 +205,10 @@ class CodexProvider:
         self._thread_id: str | None = None
         self._sent_count: int = 0
         self._log_dir = log_dir
+        # Called when Codex requests approval to execute a built-in tool command.
+        # Receives (method, params) and must return "approve" or "deny".
+        # None means auto-deny (safe default for tests and non-interactive use).
+        self._approve_command = approve_command
 
     def _get_rpc(self) -> _CodexRpcClient:
         if self._rpc is None:

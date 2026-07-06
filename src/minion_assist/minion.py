@@ -87,7 +87,7 @@ from .config import compaction as compaction_cfg
 from .config import extra_plugin_manifests
 from .config import dreaming as dreaming_cfg
 from .config import heartbeat as heartbeat_cfg
-from .config import logging_cfg
+from .config import codex_cfg, logging_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
 from .config import multi_agent as multi_agent_cfg
@@ -182,6 +182,35 @@ def main() -> None:
         print(f"\n[ask_user] {question}")
         return input("Your answer: ").strip()
 
+    def _console_approve_codex(method: str, params: dict) -> str:
+        """Called by CodexProvider when Codex requests to execute a built-in tool.
+
+        Runs in the Codex reader thread (main thread is blocked in done.wait).
+        Returns "approve" or "deny".
+        """
+        import sys as _sys
+        # Extract a human-readable command summary from params.
+        cmd = (
+            params.get("command")
+            or params.get("cmd")
+            or (params.get("arguments") or {}).get("command")
+            or ""
+        )
+        print(f"\n[codex] Permission request: {method}")
+        if cmd:
+            print(f"  Command: {cmd[:200]}")
+        elif params:
+            import json as _json
+            print(f"  Params:  {_json.dumps(params, ensure_ascii=False)[:200]}")
+        _sys.stdout.flush()
+        choice = input("Allow? [Y/n]: ").strip().lower()
+        return "deny" if choice == "n" else "approve"
+
+    if codex_cfg.allow_all_commands:
+        _codex_approve: "Callable[[str, dict], str]" = lambda m, p: "approve"
+    else:
+        _codex_approve = _console_approve_codex
+
     # --- MCP setup — one shared manager for all agents ---
     # The manager owns a background asyncio loop and keeps sessions open for the
     # lifetime of the process. All agents share the same manager so they don't
@@ -273,6 +302,7 @@ def main() -> None:
                 api_key=child_model_cfg.provider.api_key,
                 model=child_model_cfg.model.id,
                 log_dir=_log_dir,
+                approve_command=_codex_approve,
             )
 
             # Per-subagent workspace: resolves to main/ workspace if no per-agent dir.
@@ -391,6 +421,7 @@ def main() -> None:
             api_key=cfg.provider.api_key,
             model=cfg.model.id,
             log_dir=_log_dir,
+            approve_command=_codex_approve,
         )
         # preserve_tokens: use explicit config override when present; otherwise
         # auto-compute as max_output_tokens + _SNIP_SAFETY_BUFFER.

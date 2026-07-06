@@ -1252,3 +1252,38 @@ def _resolve_logging() -> LoggingConfig:
 # logging: controls verbose LLM request/response logging.
 # Enabled by default; set "logging": {"llm_requests": false} to suppress.
 logging_cfg: LoggingConfig = _resolve_logging()
+
+
+@dataclass(frozen=True)
+class CodexConfig:
+    """Controls behaviour specific to the Codex app-server provider.
+
+    Configured in ``config.json`` under ``"codex"``:
+
+        "codex": {
+            "allow_all_commands": true
+        }
+
+    Attributes:
+        allow_all_commands (bool): When ``True``, the Codex binary's built-in
+            tool execution requests (bash commands, file writes, web searches)
+            are approved automatically without prompting.  When ``False``
+            (the default), a TUI prompt is shown for every request so the
+            user can approve or deny each command.
+    """
+    allow_all_commands: bool = False
+
+
+def _resolve_codex() -> CodexConfig:
+    """Read the ``"codex"`` section from config.json and build a CodexConfig."""
+    raw = _raw.get("codex", {})
+    if not isinstance(raw, dict):
+        return CodexConfig()
+    return CodexConfig(
+        allow_all_commands=bool(raw.get("allow_all_commands", False)),
+    )
+
+
+# codex: controls Codex app-server provider behaviour.
+# Set "codex": {"allow_all_commands": true} to skip per-command approval prompts.
+codex_cfg: CodexConfig = _resolve_codex()

@@ -26,6 +26,7 @@ Talks to
 """
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from .anthropic import AnthropicProvider
@@ -41,6 +42,7 @@ def create_provider(
     api_key: str,
     model: str,
     log_dir: Path | None = None,
+    approve_command: Callable[[str, dict], str] | None = None,
 ) -> LLMProvider:
     """Instantiate the correct provider class for the given API type.
 
@@ -79,7 +81,12 @@ def create_provider(
             # Codex app-server — auth injected via stored OAuth token (run codex-login).
             # base_url and api_key are ignored.
             codex_bin = os.environ.get("CODEX_BIN", "").strip() or "codex"
-            return CodexProvider(codex_bin=codex_bin, model=model, log_dir=log_dir)
+            return CodexProvider(
+                codex_bin=codex_bin,
+                model=model,
+                log_dir=log_dir,
+                approve_command=approve_command,
+            )
         case _:
             # Default: treat any unknown api value as an OpenAI-compatible endpoint.
             # Covers "openai-completions", "openai-responses", and any Chat Completions API.
