@@ -593,6 +593,14 @@ def main() -> None:
     # text that was already streamed token-by-token.
     _streaming_active = False
 
+    # ANSI escape codes for pink agent name in the terminal.
+    _PINK = "\033[38;5;213m"   # bright pink (256-colour palette)
+    _RESET = "\033[0m"          # resets all colour/style attributes
+
+    def _pink(name: str) -> str:
+        """Wrap *name* in ANSI pink colour codes for terminal display."""
+        return f"{_PINK}{name}{_RESET}"
+
     def _on_event(event: object) -> None:
         """Render one agent runtime event as terminal output.
 
@@ -602,7 +610,7 @@ def main() -> None:
         nonlocal _streaming_active
 
         if isinstance(event, StreamingStarted):
-            print(f"\n{event.agent_name}: ", end="", flush=True)
+            print(f"\n{_pink(event.agent_name)}: ", end="", flush=True)
             _streaming_active = True
 
         elif isinstance(event, TokenStreamed):
@@ -615,14 +623,14 @@ def main() -> None:
                 _streaming_active = False
 
             if isinstance(event, ThoughtEmitted):
-                print(f"\n{event.agent_name}: {event.text}")
+                print(f"\n{_pink(event.agent_name)}: {event.text}")
             elif isinstance(event, FinalAnswer):
                 if event.text and not was_streaming:
-                    print(f"\n{event.agent_name}: {event.text}")
+                    print(f"\n{_pink(event.agent_name)}: {event.text}")
             elif isinstance(event, ToolCalled):
                 print(f"  [tool: {event.name}({event.args})]")
             elif isinstance(event, MaxRoundsReached):
-                print(f"\n{event.agent_name}: {event.message}")
+                print(f"\n{_pink(event.agent_name)}: {event.message}")
             elif isinstance(event, CompactionStarted):
                 print("\n  Compacting session history...")
             elif isinstance(event, CompactionFailed):
