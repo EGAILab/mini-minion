@@ -125,6 +125,7 @@ def _provider() -> AnthropicProvider:
     p = object.__new__(AnthropicProvider)
     p._client = Mock()
     p._model = "claude-3"
+    p._log_dir = None
     return p
 
 

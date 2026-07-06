@@ -87,6 +87,7 @@ from .config import compaction as compaction_cfg
 from .config import extra_plugin_manifests
 from .config import dreaming as dreaming_cfg
 from .config import heartbeat as heartbeat_cfg
+from .config import logging_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
 from .config import multi_agent as multi_agent_cfg
@@ -140,6 +141,7 @@ def main() -> None:
     session_store = SessionStore(workspace / "sessions.json")
     _tool_root = Path.cwd()
     _tasks_dir = workspace / "tasks"
+    _log_dir = workspace / "logs" if logging_cfg.llm_requests else None
 
     # --- Console callbacks (the only two places that call print/input) ---
 
@@ -270,6 +272,7 @@ def main() -> None:
                 base_url=child_model_cfg.provider.base_url,
                 api_key=child_model_cfg.provider.api_key,
                 model=child_model_cfg.model.id,
+                log_dir=_log_dir,
             )
 
             # Per-subagent workspace: resolves to main/ workspace if no per-agent dir.
@@ -386,6 +389,7 @@ def main() -> None:
             base_url=cfg.provider.base_url,
             api_key=cfg.provider.api_key,
             model=cfg.model.id,
+            log_dir=_log_dir,
         )
         # preserve_tokens: use explicit config override when present; otherwise
         # auto-compute as max_output_tokens + _SNIP_SAFETY_BUFFER.

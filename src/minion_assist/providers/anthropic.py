@@ -51,9 +51,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from pathlib import Path
 
 from .base import LLMResponse, TokenUsage, ToolCall
 from ..messages import content_has_images, materialize_image_data
+from ..llm_logger import log_request, log_response
 
 
 class AnthropicProvider:
@@ -70,13 +72,14 @@ class AnthropicProvider:
             ``pip install minion-assist[anthropic]``.
     """
 
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, log_dir: Path | None = None) -> None:
         try:
             import anthropic as _anthropic
         except ImportError:
             raise ImportError("anthropic package required: pip install minion-assist[anthropic]")
         self._client = _anthropic.Anthropic(api_key=api_key)
         self._model = model
+        self._log_dir = log_dir
 
     def chat(
         self,
@@ -122,6 +125,8 @@ class AnthropicProvider:
         if tools:
             kwargs["tools"] = _format_tools(tools)
 
+        if self._log_dir is not None:
+            log_request(self._log_dir, "https://api.anthropic.com/v1/messages", kwargs)
         if on_token is not None:
             return self._chat_streaming(kwargs, on_token)
         return self._chat_blocking(kwargs)
@@ -158,6 +163,22 @@ class AnthropicProvider:
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
             )
+        if self._log_dir is not None:
+            _resp_dict: dict = {
+                "id": getattr(response, "id", ""),
+                "type": "message",
+                "role": "assistant",
+                "model": getattr(response, "model", self._model),
+                "stop_reason": response.stop_reason,
+                "content": [
+                    {"type": "text", "text": b.text} if b.type == "text"
+                    else {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+                    for b in response.content
+                ],
+            }
+            if _usage:
+                _resp_dict["usage"] = {"input_tokens": _usage.input_tokens, "output_tokens": _usage.output_tokens}
+            log_response(self._log_dir, self._model, _resp_dict)
         return LLMResponse(
             text="\n".join(text_parts),
             tool_calls=tool_calls,
@@ -214,6 +235,22 @@ class AnthropicProvider:
                 input_tokens=final_message.usage.input_tokens,
                 output_tokens=final_message.usage.output_tokens,
             )
+        if self._log_dir is not None:
+            _resp_dict: dict = {
+                "id": getattr(final_message, "id", ""),
+                "type": "message",
+                "role": "assistant",
+                "model": getattr(final_message, "model", self._model),
+                "stop_reason": final_message.stop_reason,
+                "content": [
+                    {"type": "text", "text": b.text} if b.type == "text"
+                    else {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+                    for b in final_message.content
+                ],
+            }
+            if _usage:
+                _resp_dict["usage"] = {"input_tokens": _usage.input_tokens, "output_tokens": _usage.output_tokens}
+            log_response(self._log_dir, self._model, _resp_dict)
         return LLMResponse(
             text="\n".join(text_parts),
             tool_calls=tool_calls,

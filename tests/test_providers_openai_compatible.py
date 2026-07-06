@@ -17,6 +17,8 @@ def _provider() -> OpenAICompatibleProvider:
     p = object.__new__(OpenAICompatibleProvider)
     p._client = Mock()
     p._model = "test-model"
+    p._base_url = "http://test"
+    p._log_dir = None
     return p
 
 

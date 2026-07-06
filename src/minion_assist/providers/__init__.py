@@ -26,6 +26,7 @@ Talks to
 """
 
 import os
+from pathlib import Path
 
 from .anthropic import AnthropicProvider
 from .base import LLMProvider, LLMResponse, TokenUsage, ToolCall
@@ -34,7 +35,13 @@ from .lmstudio import LMStudioProvider
 from .openai_compatible import OpenAICompatibleProvider
 
 
-def create_provider(api: str, base_url: str, api_key: str, model: str) -> LLMProvider:
+def create_provider(
+    api: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    log_dir: Path | None = None,
+) -> LLMProvider:
     """Instantiate the correct provider class for the given API type.
 
     This is the only place in the codebase that knows which ``api`` string
@@ -49,6 +56,9 @@ def create_provider(api: str, base_url: str, api_key: str, model: str) -> LLMPro
             (the binary manages auth) and Anthropic.
         api_key (str): Authentication token loaded from ``.env``.
         model (str): Model identifier string for API requests.
+        log_dir (Path | None): When set, every request and response is appended
+            to ``log_dir/YYYY-MM-DD.log`` in LM Studio's server log format.
+            ``None`` disables logging (default).
 
     Returns:
         LLMProvider: A fully constructed provider ready to call ``.chat()``.
@@ -61,19 +71,19 @@ def create_provider(api: str, base_url: str, api_key: str, model: str) -> LLMPro
     match api:
         case "anthropic":
             # Anthropic uses a different SDK and message format; see anthropic.py.
-            return AnthropicProvider(api_key=api_key, model=model)
+            return AnthropicProvider(api_key=api_key, model=model, log_dir=log_dir)
         case "lmstudio":
             # LMStudioProvider is an alias for OpenAICompatibleProvider; same behavior.
-            return LMStudioProvider(base_url=base_url, api_key=api_key, model=model)
+            return LMStudioProvider(base_url=base_url, api_key=api_key, model=model, log_dir=log_dir)
         case "codex":
             # Codex app-server — auth injected via stored OAuth token (run codex-login).
             # base_url and api_key are ignored.
             codex_bin = os.environ.get("CODEX_BIN", "").strip() or "codex"
-            return CodexProvider(codex_bin=codex_bin, model=model)
+            return CodexProvider(codex_bin=codex_bin, model=model, log_dir=log_dir)
         case _:
             # Default: treat any unknown api value as an OpenAI-compatible endpoint.
             # Covers "openai-completions", "openai-responses", and any Chat Completions API.
-            return OpenAICompatibleProvider(base_url=base_url, api_key=api_key, model=model)
+            return OpenAICompatibleProvider(base_url=base_url, api_key=api_key, model=model, log_dir=log_dir)
 
 
 __all__ = [

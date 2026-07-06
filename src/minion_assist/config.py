@@ -367,6 +367,18 @@ def _validate(raw: dict) -> list[ConfigIssue]:
                     issues.append(ConfigIssue(f"extra_plugin_manifests[{i}]", f"Expected string path, got {type(p).__name__}."))
 
 
+    # --- logging ---
+    logging_raw = raw.get("logging", {})
+    if logging_raw and not isinstance(logging_raw, dict):
+        issues.append(ConfigIssue("logging", "Expected an object."))
+    elif isinstance(logging_raw, dict):
+        _llmr = logging_raw.get("llm_requests")
+        if _llmr is not None and not isinstance(_llmr, bool):
+            issues.append(ConfigIssue(
+                "logging.llm_requests",
+                f"Expected boolean (true/false), got {_llmr!r}.",
+            ))
+
     # --- channels ---
     channels_raw = raw.get("channels", {})
     if channels_raw:
@@ -703,6 +715,27 @@ class DreamingConfig:
     timezone: str = "Australia/Sydney"
     lookback_days: int = 3
     agent_id: str = "main"
+
+
+@dataclass(frozen=True)
+class LoggingConfig:
+    """Controls verbose LLM request/response logging.
+
+    When enabled, every request body sent to the LLM and every response received
+    is appended to a daily log file at ``~/.minion-assist/logs/YYYY-MM-DD.log``
+    in LM Studio's server log format so both files can be correlated by timestamp.
+
+    Configured in ``config.json`` under ``"logging"``:
+
+        "logging": {
+            "llm_requests": false
+        }
+
+    Attributes:
+        llm_requests (bool): When ``True`` (the default), log all LLM traffic.
+            Set to ``false`` in ``config.json`` to suppress logging.
+    """
+    llm_requests: bool = True
 
 
 @dataclass(frozen=True)
@@ -1198,3 +1231,24 @@ def _resolve_dreaming() -> DreamingConfig:
 # dreaming: controls the nightly dream diary scheduler.
 # Disabled by default; enabled via "dreaming": {"enabled": true} in config.json.
 dreaming: DreamingConfig = _resolve_dreaming()
+
+
+def _resolve_logging() -> LoggingConfig:
+    """Read the ``"logging"`` section from config.json and build a LoggingConfig.
+
+    Defaults to ``llm_requests=True`` so logging is on out of the box.
+
+    Returns:
+        LoggingConfig: Immutable logging settings; defaults apply when absent.
+    """
+    raw = _raw.get("logging", {})
+    if not isinstance(raw, dict):
+        return LoggingConfig()
+    return LoggingConfig(
+        llm_requests=raw.get("llm_requests", True),
+    )
+
+
+# logging: controls verbose LLM request/response logging.
+# Enabled by default; set "logging": {"llm_requests": false} to suppress.
+logging_cfg: LoggingConfig = _resolve_logging()

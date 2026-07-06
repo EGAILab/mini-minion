@@ -46,8 +46,10 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from .base import LLMResponse, ToolCall
+from ..llm_logger import log_request, log_response
 
 
 class _CodexRpcClient:
@@ -186,6 +188,7 @@ class CodexProvider:
         codex_bin: str = "codex",
         model: str = "",
         turn_timeout: float = 120.0,
+        log_dir: Path | None = None,
     ) -> None:
         env_bin = os.environ.get("CODEX_BIN", "").strip()
         self._codex_bin = env_bin or codex_bin
@@ -194,6 +197,7 @@ class CodexProvider:
         self._rpc: _CodexRpcClient | None = None
         self._thread_id: str | None = None
         self._sent_count: int = 0
+        self._log_dir = log_dir
 
     def _get_rpc(self) -> _CodexRpcClient:
         if self._rpc is None:
@@ -340,6 +344,12 @@ class CodexProvider:
                 }, timeout=30.0)
                 self._thread_id = (resp.get("thread") or {}).get("id") or ""
 
+            if self._log_dir is not None:
+                log_request(self._log_dir, "stdio://codex", {
+                    "model": self._model or "codex-default",
+                    "threadId": self._thread_id,
+                    "input": turn_input,
+                })
             rpc.request("turn/start", {
                 "threadId": self._thread_id,
                 "input": turn_input,
@@ -364,6 +374,8 @@ class CodexProvider:
         # Prefer text collected from item/completed; fall back to _extract_text
         # for future binary versions that may hydrate turn.items.
         text = " ".join(agent_texts) if agent_texts else self._extract_text(turn_holder.get("turn") or {})
+        if self._log_dir is not None:
+            log_response(self._log_dir, self._model or "codex-default", {"output": text})
         if on_token and text:
             on_token(text)
         return LLMResponse(text=text, tool_calls=[], finish_reason="stop")

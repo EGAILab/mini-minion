@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from pathlib import Path
 
 from openai import OpenAI
 
 from .base import LLMResponse, TokenUsage, ToolCall
 from ..messages import content_has_images, materialize_image_data
+from ..llm_logger import log_request, log_response
 
 
 def _convert_content_for_openai(content: str | list) -> str | list:
@@ -130,6 +132,39 @@ def _parse_tool_arguments(raw: str, tool_name: str) -> tuple[dict, str | None]:
     return value, None
 
 
+def _blocking_response_to_dict(response) -> dict:
+    """Serialize an OpenAI SDK ChatCompletion object to a plain dict for logging."""
+    choices = []
+    for ch in response.choices:
+        msg: dict = {"role": "assistant"}
+        if ch.message.content is not None:
+            msg["content"] = ch.message.content
+        if ch.message.tool_calls:
+            msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in ch.message.tool_calls
+            ]
+        choices.append({"index": ch.index, "message": msg, "finish_reason": ch.finish_reason})
+    out: dict = {
+        "id": response.id,
+        "object": response.object,
+        "created": response.created,
+        "model": response.model,
+        "choices": choices,
+    }
+    if response.usage:
+        out["usage"] = {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens,
+        }
+    return out
+
+
 class OpenAICompatibleProvider:
     """LLM provider for any OpenAI-compatible Chat Completions API.
 
@@ -142,7 +177,7 @@ class OpenAICompatibleProvider:
             ``"qwen-qwen3.5-9b"`` or ``"gpt-4o"``.
     """
 
-    def __init__(self, base_url: str, api_key: str, model: str) -> None:
+    def __init__(self, base_url: str, api_key: str, model: str, log_dir: Path | None = None) -> None:
         # The OpenAI SDK handles HTTP, retries, and auth header injection.
         # Passing a custom base_url redirects it to any compatible endpoint.
         #
@@ -157,6 +192,8 @@ class OpenAICompatibleProvider:
             max_retries=0,
         )
         self._model = model
+        self._base_url = base_url.rstrip("/")
+        self._log_dir = log_dir
 
     def chat(
         self,
@@ -223,7 +260,11 @@ class OpenAICompatibleProvider:
         Returns:
             LLMResponse: Complete response with text, tool calls, finish reason.
         """
+        if self._log_dir is not None:
+            log_request(self._log_dir, f"{self._base_url}/chat/completions", kwargs)
         response = self._client.chat.completions.create(**kwargs)
+        if self._log_dir is not None:
+            log_response(self._log_dir, self._model, _blocking_response_to_dict(response))
         msg = response.choices[0].message
 
         # Parse tool calls from the SDK's typed objects into our ToolCall dataclass.
@@ -283,6 +324,8 @@ class OpenAICompatibleProvider:
         # all content chunks have been delivered.  Not all providers honour this,
         # but those that don't will simply send no final chunk — usage stays None.
         kwargs = {**kwargs, "stream": True, "stream_options": {"include_usage": True}}
+        if self._log_dir is not None:
+            log_request(self._log_dir, f"{self._base_url}/chat/completions", kwargs)
 
         text_parts: list[str] = []
         # Accumulate tool-call fragments keyed by their position index.
@@ -349,6 +392,24 @@ class OpenAICompatibleProvider:
             )
 
         text = "".join(text_parts)
+        if self._log_dir is not None:
+            _tool_calls_log = [
+                {"id": a["id"], "type": "function", "function": {"name": a["name"], "arguments": a["arguments"]}}
+                for a in tool_accumulators.values()
+            ]
+            _msg: dict = {"role": "assistant", "content": text or None}
+            if _tool_calls_log:
+                _msg["tool_calls"] = _tool_calls_log
+            _resp_dict: dict = {
+                "model": self._model,
+                "choices": [{"message": _msg, "finish_reason": "tool_calls" if _tool_calls_log else finish_reason}],
+            }
+            if _raw_usage is not None:
+                _resp_dict["usage"] = {
+                    "prompt_tokens": _raw_usage.prompt_tokens,
+                    "completion_tokens": _raw_usage.completion_tokens,
+                }
+            log_response(self._log_dir, self._model, _resp_dict)
         return LLMResponse(
             text=text,
             tool_calls=tool_calls,

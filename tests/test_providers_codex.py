@@ -125,6 +125,7 @@ def _make_provider(stub: _StubRpc, model: str = "gpt-5.5") -> CodexProvider:
     p._rpc = stub
     p._thread_id = None
     p._sent_count = 0
+    p._log_dir = None
     return p
 
 
