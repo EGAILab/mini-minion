@@ -119,12 +119,16 @@ class _CodexRpcClient:
     def _handle_server_request(self, req_id: int, method: str, _params: object) -> None:
         # Codex sends server requests when it wants to execute a built-in tool
         # (bash command, file write, web search, etc.).  The binary expects a
-        # response with a "decision" field: "approve" or "deny".
+        # response with a "decision" field using its own enum values:
+        #   "accept" | "acceptForSession" | "decline" | "cancel" | ...
+        # Our internal callback returns "approve" or "deny" for simplicity;
+        # we map those to the protocol values here.
         params = _params if isinstance(_params, dict) else {}
         if self._approve_command is not None:
-            decision = self._approve_command(method, params)
+            raw = self._approve_command(method, params)
         else:
-            decision = "deny"
+            raw = "deny"
+        decision = "accept" if raw == "approve" else "decline"
         resp = {
             "jsonrpc": "2.0",
             "id": req_id,
