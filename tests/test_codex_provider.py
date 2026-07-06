@@ -21,6 +21,7 @@ import pytest
 from minion_assist.providers.codex import (
     _CodexRpcClient,
     _build_dynamic_tool_specs,
+    _codex_tool_name,
     _DYNAMIC_TOOL_NAMESPACE,
 )
 from minion_assist.tools.registry import ToolRegistry
@@ -65,6 +66,21 @@ class _ErrorTool(Tool):
         raise RuntimeError("tool exploded")
 
 
+class _McpEchoTool(Tool):
+    """Simulates an MCP tool (name has mcp__ prefix)."""
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="mcp__playwright__browser_close",
+            description="Close the browser.",
+            parameters={"type": "object", "properties": {}},
+        )
+
+    def execute(self, **kwargs: object) -> str:
+        return "browser closed"
+
+
 def _make_client(registry=None, approve_command=None) -> tuple[_CodexRpcClient, list[str]]:
     """Build a _CodexRpcClient with a fake subprocess; return (client, written_lines)."""
     written: list[str] = []
@@ -101,12 +117,14 @@ def _make_client(registry=None, approve_command=None) -> tuple[_CodexRpcClient, 
 class TestBuildDynamicToolSpecs:
     def test_empty_registry_returns_empty_list(self):
         registry = ToolRegistry()
-        assert _build_dynamic_tool_specs(registry) == []
+        specs, name_map = _build_dynamic_tool_specs(registry)
+        assert specs == []
+        assert name_map == {}
 
     def test_single_tool_produces_namespace_spec(self):
         registry = ToolRegistry()
         registry.register(_EchoTool())
-        specs = _build_dynamic_tool_specs(registry)
+        specs, _ = _build_dynamic_tool_specs(registry)
 
         assert len(specs) == 1
         ns = specs[0]
@@ -117,7 +135,8 @@ class TestBuildDynamicToolSpecs:
     def test_tool_spec_fields(self):
         registry = ToolRegistry()
         registry.register(_EchoTool())
-        tool_spec = _build_dynamic_tool_specs(registry)[0]["tools"][0]
+        specs, _ = _build_dynamic_tool_specs(registry)
+        tool_spec = specs[0]["tools"][0]
 
         assert tool_spec["type"] == "function"
         assert tool_spec["name"] == "echo"
@@ -131,10 +150,26 @@ class TestBuildDynamicToolSpecs:
         registry = ToolRegistry()
         registry.register(_EchoTool())
         registry.register(_ErrorTool())
-        specs = _build_dynamic_tool_specs(registry)
+        specs, _ = _build_dynamic_tool_specs(registry)
         tool_names = [t["name"] for t in specs[0]["tools"]]
         assert "echo" in tool_names
         assert "boom" in tool_names
+
+    def test_mcp_prefix_stripped_for_codex(self):
+        """mcp__* names are stripped to avoid Codex's reserved mcp__ namespace."""
+        assert _codex_tool_name("mcp__playwright__browser_close") == "playwright__browser_close"
+        assert _codex_tool_name("mcp__search__web_search") == "search__web_search"
+
+    def test_non_mcp_names_pass_through(self):
+        assert _codex_tool_name("web_search") == "web_search"
+        assert _codex_tool_name("bash") == "bash"
+
+    def test_name_map_maps_codex_name_to_registry_name(self):
+        """name_map returned by _build_dynamic_tool_specs allows reverse lookup."""
+        registry = ToolRegistry()
+        registry.register(_EchoTool())  # name = "echo" (no mcp__ prefix)
+        _, name_map = _build_dynamic_tool_specs(registry)
+        assert name_map["echo"] == "echo"
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +257,26 @@ class TestHandleToolCall:
         assert "result" in resp
         assert "contentItems" in resp["result"]
         assert "success" in resp["result"]
+
+    def test_mcp_tool_dispatched_via_name_map(self):
+        """Codex sends the stripped name; name_map translates back to the mcp__ registry name."""
+        registry = ToolRegistry()
+        registry.register(_McpEchoTool())  # registered as "mcp__playwright__browser_close"
+        client, written = _make_client(registry=registry)
+
+        # Simulate what CodexProvider.chat() does: set the name_map after building specs.
+        _, name_map = _build_dynamic_tool_specs(registry)
+        client._tool_name_map = name_map
+
+        # Codex calls the tool using the stripped name ("playwright__browser_close").
+        client._handle_server_request(req_id=6, method="item/tool/call", _params={
+            "tool": "playwright__browser_close",
+            "arguments": {},
+        })
+
+        resp = json.loads(written[-1])
+        assert resp["result"]["success"] is True
+        assert "browser closed" in resp["result"]["contentItems"][0]["text"]
 
 
 # ---------------------------------------------------------------------------

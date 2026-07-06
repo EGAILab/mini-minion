@@ -81,7 +81,22 @@ _APPROVAL_METHODS = frozenset({
 })
 
 
-def _build_dynamic_tool_specs(registry: "ToolRegistry") -> list[dict]:
+def _codex_tool_name(registry_name: str) -> str:
+    """Return a Codex-safe tool name for the given registry tool name.
+
+    Codex reserves all names matching the ``mcp__*`` pattern because it uses
+    that prefix for its own internal MCP server integration.  Stripping the
+    leading ``mcp__`` yields a name Codex accepts while keeping the MCP server
+    and tool name intact (e.g. ``playwright__browser_close``).
+
+    Non-MCP tools (e.g. ``web_search``, ``bash``) pass through unchanged.
+    """
+    if registry_name.startswith("mcp__"):
+        return registry_name[5:]  # strip leading "mcp__"
+    return registry_name
+
+
+def _build_dynamic_tool_specs(registry: "ToolRegistry") -> tuple[list[dict], dict[str, str]]:
     """Convert a ToolRegistry to a Codex dynamic tool namespace spec.
 
     Mirrors openclaw's ``createCodexDynamicToolSpecs()`` in dynamic-tools.ts:
@@ -91,19 +106,29 @@ def _build_dynamic_tool_specs(registry: "ToolRegistry") -> list[dict]:
     The OpenAI format uses ``function.parameters`` for the JSON Schema;
     Codex uses ``inputSchema`` — same content, different key.
 
+    MCP tool names (``mcp__server__tool``) are registered under sanitized names
+    (``server__tool``) because Codex reserves the ``mcp__*`` namespace for its
+    own MCP integration.  The returned ``name_map`` maps each Codex-side name
+    back to the original registry name so ``_handle_tool_call`` can dispatch
+    correctly when ``item/tool/call`` arrives.
+
     Returns:
-        A list with one namespace entry, or an empty list if the registry
-        has no tools.
+        (specs, name_map) where ``specs`` is a list with one namespace entry
+        (empty list if the registry has no tools), and ``name_map`` maps each
+        Codex tool name to its registry name.
     """
+    name_map: dict[str, str] = {}  # codex_name → registry_name
     namespace_tools: list[dict] = []
     for defn in registry.definitions:
         fn = defn.get("function") or {}
-        name: str = fn.get("name") or ""
-        if not name:
+        registry_name: str = fn.get("name") or ""
+        if not registry_name:
             continue
+        codex_name = _codex_tool_name(registry_name)
+        name_map[codex_name] = registry_name
         namespace_tools.append({
             "type": "function",
-            "name": name,
+            "name": codex_name,
             "description": fn.get("description") or "",
             # Codex uses "inputSchema"; OpenAI uses "parameters" — same JSON Schema object.
             "inputSchema": fn.get("parameters") or {},
@@ -113,9 +138,9 @@ def _build_dynamic_tool_specs(registry: "ToolRegistry") -> list[dict]:
         })
 
     if not namespace_tools:
-        return []
+        return [], {}
 
-    return [{
+    specs = [{
         "type": "namespace",
         "name": _DYNAMIC_TOOL_NAMESPACE,
         # Empty description: the namespace is an implementation detail; the
@@ -123,6 +148,7 @@ def _build_dynamic_tool_specs(registry: "ToolRegistry") -> list[dict]:
         "description": "",
         "tools": namespace_tools,
     }]
+    return specs, name_map
 
 
 class _CodexRpcClient:
@@ -163,6 +189,11 @@ class _CodexRpcClient:
         self._handlers: list[Callable[[dict], None]] = []
         # Tool registry for dynamic tool calls (item/tool/call).
         self._registry = registry
+        # Maps Codex-side name → registry name.  Populated by CodexProvider.chat()
+        # when thread/start registers dynamic tools.  Needed because mcp__* names
+        # are stripped of their "mcp__" prefix before registration (Codex reserves
+        # the mcp__ namespace for its own MCP server integration).
+        self._tool_name_map: dict[str, str] = {}
         # Callback for approval requests (item/commandExecution/requestApproval etc.).
         # Returns "approve" or "deny"; None means auto-deny.
         self._approve_command = approve_command
@@ -236,17 +267,22 @@ class _CodexRpcClient:
             self._write_tool_response(req_id, f"Tool not available: {tool_name!r}", success=False)
             return
 
+        # Translate Codex-side name back to the registry name.
+        # "mcp__" was stripped when registering (Codex reserves the mcp__ namespace),
+        # so "playwright__browser_close" maps back to "mcp__playwright__browser_close".
+        registry_name = self._tool_name_map.get(tool_name, tool_name)
+
         # Check existence before dispatching — ToolRegistry.execute() never raises
         # (it returns error strings for both unknown tools and tool exceptions).
         # We need to signal success=False for unknown tools ourselves.
-        if tool_name not in self._registry._tools:
+        if registry_name not in self._registry._tools:
             self._write_tool_response(req_id, f"Unknown tool: {tool_name!r}", success=False)
             return
 
         # registry.execute() runs pre/post hooks and catches tool exceptions,
         # returning them as error strings.  Always success=True from the protocol
         # perspective — the content carries the error message if something failed.
-        output = self._registry.execute(tool_name, arguments)
+        output = self._registry.execute(registry_name, arguments)
         self._write_tool_response(req_id, output, success=True)
 
     def _write_tool_response(self, req_id: int, text: str, *, success: bool) -> None:
@@ -550,9 +586,10 @@ class CodexProvider:
                 # that load asynchronously after provider creation are included.
                 thread_params: dict = {"developerInstructions": system, **model_kwargs}
                 if self._registry is not None:
-                    dynamic_tools = _build_dynamic_tool_specs(self._registry)
+                    dynamic_tools, name_map = _build_dynamic_tool_specs(self._registry)
                     if dynamic_tools:
                         thread_params["dynamicTools"] = dynamic_tools
+                        rpc._tool_name_map = name_map
                 resp = rpc.request("thread/start", thread_params, timeout=30.0)
                 self._thread_id = (resp.get("thread") or {}).get("id") or ""
 
