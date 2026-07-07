@@ -12,6 +12,7 @@ Supported commands:
   /status                    — show current agent/model info
   /sessions                  — list all known sessions with turn counts and last-active time
   /history [N|uuid-prefix]   — list past session files for the active agent; restore one by index or prefix
+  /rename [N] <name>         — give a session a descriptive name (current session if N omitted)
   /resume [agent_id]         — switch the default routing target to the given agent
   /diagnose                  — show provider configuration and API key status for all agents
   /mcp-reload                — close and reconnect all MCP servers, refresh tool adapters
@@ -117,6 +118,11 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
         name="/history",
         description="List past session files for the active agent; restore one by index or UUID prefix.",
         arg_hint="[N | uuid-prefix]",
+    ),
+    CommandSpec(
+        name="/rename",
+        description="Give the current session (or session N from /history) a descriptive name.",
+        arg_hint="[N] <name>",
     ),
     CommandSpec(
         name="/resume",
@@ -451,24 +457,29 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                     msg_count = sum(1 for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip())
                     is_current = p.stem == current_id
                     marker = "*" if is_current else " "
-                    preview = ""
-                    try:
-                        for ln in p.read_text(encoding="utf-8").splitlines():
-                            m = json.loads(ln.strip())
-                            if m.get("role") == "user":
-                                content = m.get("content", "")
-                                if isinstance(content, list):
-                                    content = next(
-                                        (b.get("text", "") for b in content
-                                         if isinstance(b, dict) and b.get("type") == "text"),
-                                        "",
-                                    )
-                                if content:
-                                    preview = f'  "{content[:50]}"'
-                                break
-                    except Exception:
-                        pass
-                    lines.append(f"{marker} [{i}] {ts}  msgs={msg_count}  {uuid_hint}{preview}")
+                    # Name takes priority; fall back to first-message preview.
+                    name = ctx.short_term.get_name(agent_id, p.stem) if ctx.short_term else None
+                    if name:
+                        label = f"  [{name}]"
+                    else:
+                        label = ""
+                        try:
+                            for ln in p.read_text(encoding="utf-8").splitlines():
+                                m = json.loads(ln.strip())
+                                if m.get("role") == "user":
+                                    content = m.get("content", "")
+                                    if isinstance(content, list):
+                                        content = next(
+                                            (b.get("text", "") for b in content
+                                             if isinstance(b, dict) and b.get("type") == "text"),
+                                            "",
+                                        )
+                                    if content:
+                                        label = f'  "{content[:50]}"'
+                                    break
+                        except Exception:
+                            pass
+                    lines.append(f"{marker} [{i}] {ts}  msgs={msg_count}  {uuid_hint}{label}")
                 lines.append("Use /history <N> or /history <uuid-prefix> to restore.")
                 return CommandResult(handled=True, message="\n".join(lines))
 
@@ -505,6 +516,50 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
             return CommandResult(
                 handled=True,
                 message=f"Loaded session {target_id[:8]} ({n} messages).",
+            )
+
+        # --- /rename ---
+        if spec.name == "/rename":
+            if ctx.short_term is None:
+                return CommandResult(handled=True, message="Short-term memory not available.")
+            if not ctx.args:
+                return CommandResult(
+                    handled=True,
+                    message="Usage: /rename <name>  or  /rename <N> <name>",
+                )
+            agent_id = ctx.target_agent_id
+            # If first token is an int, treat it as a /history index; rest is the name.
+            tokens = ctx.args.split(None, 1)
+            target_id: str | None = None
+            name_part: str = ctx.args
+            if len(tokens) >= 2:
+                try:
+                    idx = int(tokens[0])
+                    paths = list(reversed(ctx.short_term.list_sessions(agent_id)))
+                    if not paths:
+                        return CommandResult(handled=True, message=f"No sessions found for '{agent_id}'.")
+                    if not (1 <= idx <= len(paths)):
+                        return CommandResult(
+                            handled=True,
+                            message=f"Index {idx} out of range (1–{len(paths)}).",
+                        )
+                    target_id = paths[idx - 1].stem
+                    name_part = tokens[1]
+                except ValueError:
+                    pass  # first token is not an int — use whole args as name
+            if target_id is None:
+                # Rename the current session.
+                session = ctx.sessions.get(agent_id)
+                target_id = getattr(session, "session_id", None)
+                if target_id is None:
+                    return CommandResult(handled=True, message=f"Agent '{agent_id}' not found.")
+            name_part = name_part.strip()
+            if not name_part:
+                return CommandResult(handled=True, message="Name cannot be empty.")
+            ctx.short_term.set_name(agent_id, target_id, name_part)
+            return CommandResult(
+                handled=True,
+                message=f"Session {target_id[:8]} renamed to '{name_part}'.",
             )
 
         # --- /resume ---

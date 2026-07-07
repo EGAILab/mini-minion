@@ -160,6 +160,45 @@ class ShortTermMemory:
         files = sorted(agent_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
         return files
 
+    def _name_path(self, agent_id: str, session_id: str) -> Path:
+        """Return the path of the sidecar name file for a session."""
+        return self._dir / agent_id / f"{session_id}.name"
+
+    def get_name(self, agent_id: str, session_id: str) -> str | None:
+        """Return the human-readable name for a session, or ``None`` if unset.
+
+        Args:
+            agent_id (str): Agent ID.
+            session_id (str): Session UUID.
+
+        Returns:
+            str | None: The stored name, or ``None`` if the session has no name.
+        """
+        p = self._name_path(agent_id, session_id)
+        if not p.exists():
+            return None
+        return p.read_text(encoding="utf-8").strip() or None
+
+    def set_name(self, agent_id: str, session_id: str, name: str) -> None:
+        """Assign a human-readable name to a session.
+
+        Stored as a sidecar ``.name`` file alongside the ``.jsonl`` history file.
+        Passing an empty string clears the name (removes the file).
+
+        Args:
+            agent_id (str): Agent ID.
+            session_id (str): Session UUID to rename.
+            name (str): The new display name.  Leading/trailing whitespace is stripped.
+        """
+        p = self._name_path(agent_id, session_id)
+        name = name.strip()
+        if not name:
+            if p.exists():
+                p.unlink()
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(name, encoding="utf-8")
+
     def prune_sessions(self, agent_id: str, keep_n: int = 20) -> int:
         """Delete old session files, keeping only the N most recent.
 

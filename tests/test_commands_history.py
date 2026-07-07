@@ -1,4 +1,4 @@
-"""Tests for the /history slash command."""
+"""Tests for the /history and /rename slash commands."""
 
 import json
 import time
@@ -175,3 +175,95 @@ def test_history_no_match_prefix(tmp_path):
     result = dispatch_command(_ctx("zzz", stm))
     assert result.handled
     assert "No session matching" in result.message
+
+
+# ---------------------------------------------------------------------------
+# Tests: /rename
+# ---------------------------------------------------------------------------
+
+def _rename_ctx(args: str, stm: ShortTermMemory, session_id: str = "cur-001") -> CommandContext:
+    session = _make_session_mock(session_id)
+    return CommandContext(
+        raw=f"/rename {args}".strip(),
+        command="/rename",
+        args=args,
+        target_agent_id="main",
+        sessions={"main": session},
+        agents_cfg={},
+        short_term=stm,
+    )
+
+
+def test_rename_current_session(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "hi"}])
+
+    result = dispatch_command(_rename_ctx("Auth debugging", stm))
+    assert result.handled
+    assert "Auth debugging" in result.message
+    assert stm.get_name("main", "cur-001") == "Auth debugging"
+
+
+def test_rename_by_index(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "new"}])
+
+    # [2] is the older session (old-001)
+    result = dispatch_command(_rename_ctx("2 Old session", stm, session_id="cur-001"))
+    assert result.handled
+    assert "Old session" in result.message
+    assert stm.get_name("main", "old-001") == "Old session"
+
+
+def test_rename_empty_name_returns_error(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    result = dispatch_command(_rename_ctx("", stm))
+    assert result.handled
+    assert "Usage" in result.message
+
+
+def test_rename_shows_in_history_listing(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "aaa-001", [{"role": "user", "content": "first message"}])
+    stm.set_name("main", "aaa-001", "My named session")
+
+    result = dispatch_command(_ctx("", stm, session_id="aaa-001"))
+    assert result.handled
+    assert "[My named session]" in result.message
+    # Name takes priority — first message preview should not appear
+    assert "first message" not in result.message
+
+
+def test_rename_no_short_term_returns_error():
+    ctx = CommandContext(
+        raw="/rename foo",
+        command="/rename",
+        args="foo",
+        target_agent_id="main",
+        sessions={"main": MagicMock()},
+        agents_cfg={},
+        short_term=None,
+    )
+    result = dispatch_command(ctx)
+    assert result.handled
+    assert "not available" in result.message
+
+
+def test_rename_index_out_of_range(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "aaa-001", [{"role": "user", "content": "a"}])
+
+    result = dispatch_command(_rename_ctx("5 Name", stm))
+    assert result.handled
+    assert "out of range" in result.message
+
+
+def test_set_name_empty_clears_name(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    stm.save("main", "ses-001", [])
+    stm.set_name("main", "ses-001", "Temp name")
+    assert stm.get_name("main", "ses-001") == "Temp name"
+    stm.set_name("main", "ses-001", "")
+    assert stm.get_name("main", "ses-001") is None
