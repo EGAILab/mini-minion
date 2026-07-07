@@ -93,6 +93,7 @@ class MatrixChannel:
             self._loop = None
 
     async def _run_monitor(self, sessions: dict) -> None:
+        """Launch the Matrix monitor coroutine, stopping when ``_stop_event`` is set."""
         # Lazy import: importing monitor pulls in matrix-nio which loads libolm.
         # We defer this until the background thread actually starts so the CLI
         # can import minion_assist quickly even if matrix-nio is not installed.

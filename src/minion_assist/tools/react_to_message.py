@@ -44,6 +44,7 @@ class ReactToMessageTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="react_to_message",
             description=(

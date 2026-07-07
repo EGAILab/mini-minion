@@ -87,6 +87,7 @@ class WriteDreamEntryTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="write_dream_entry",
             description=(

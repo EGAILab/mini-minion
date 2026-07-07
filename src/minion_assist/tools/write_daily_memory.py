@@ -31,6 +31,7 @@ class WriteDailyMemoryTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="write_daily_memory",
             description=(

@@ -173,6 +173,17 @@ class _CodexRpcClient:
         registry: "ToolRegistry | None" = None,
         approve_command: Callable[[str, dict], str] | None = None,
     ) -> None:
+        """Launch the Codex subprocess and start the background reader thread.
+
+        Args:
+            command: Full command-line list to launch the Codex binary, e.g.
+                ``["codex", "app-server", "--listen", "stdio://"]``.
+            registry: Tool registry whose tools can be called back by Codex
+                via ``item/tool/call`` server requests.
+            approve_command: Callback invoked when Codex requests permission to
+                use one of its built-in capabilities (shell, file writes).
+                Should return ``"approve"`` or ``"deny"``.
+        """
         self._proc = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -201,6 +212,7 @@ class _CodexRpcClient:
         self._reader.start()
 
     def _read_loop(self) -> None:
+        """Background thread: read lines from the Codex process stdout and dispatch them."""
         assert self._proc.stdout
         for raw in self._proc.stdout:
             raw = raw.strip()
@@ -344,12 +356,27 @@ class _CodexRpcClient:
         self._write_raw(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}))
 
     def _write_raw(self, line: str) -> None:
+        """Write a newline-terminated JSON-RPC message to the Codex process stdin."""
         assert self._proc.stdin
         with self._write_lock:
             self._proc.stdin.write(line + "\n")
             self._proc.stdin.flush()
 
     def request(self, method: str, params: dict | None = None, timeout: float = 60.0) -> dict:
+        """Send a JSON-RPC request and wait synchronously for its response.
+
+        Args:
+            method: JSON-RPC method name, e.g. ``"initialize"`` or ``"turn/start"``.
+            params: Optional parameters dict. Defaults to an empty dict.
+            timeout: Seconds to wait for a response before raising ``TimeoutError``.
+
+        Returns:
+            The ``result`` field from the JSON-RPC response dict.
+
+        Raises:
+            TimeoutError: The response did not arrive within *timeout* seconds.
+            RuntimeError: The server returned a JSON-RPC error object.
+        """
         with self._id_lock:
             req_id = self._next_id
             self._next_id += 1
@@ -374,15 +401,18 @@ class _CodexRpcClient:
         return result.get("result") or {}
 
     def add_handler(self, handler: Callable[[dict], None]) -> None:
+        """Register a notification handler to receive all server-sent notifications."""
         self._handlers.append(handler)
 
     def remove_handler(self, handler: Callable[[dict], None]) -> None:
+        """Unregister a previously added notification handler (no-op if not found)."""
         try:
             self._handlers.remove(handler)
         except ValueError:
             pass
 
     def close(self) -> None:
+        """Close stdin and terminate the Codex subprocess."""
         try:
             if self._proc.stdin:
                 self._proc.stdin.close()
@@ -450,6 +480,7 @@ class CodexProvider:
         self._sent_count = 0
 
     def _get_rpc(self) -> _CodexRpcClient:
+        """Return the active RPC client, launching the Codex subprocess if not yet started."""
         if self._rpc is None:
             # npm global installs on Windows create codex.cmd (a batch wrapper),
             # not codex.exe.  subprocess.Popen needs the full resolved path with

@@ -46,6 +46,7 @@ class HeartbeatRespondTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="heartbeat_respond",
             description=(

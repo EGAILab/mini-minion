@@ -107,6 +107,7 @@ class SpawnSubagentTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="spawn_subagent",
             description=(

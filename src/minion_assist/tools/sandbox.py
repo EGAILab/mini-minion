@@ -76,6 +76,7 @@ class LocalSandboxBackend:
         timeout: int,
         cwd: object,
     ) -> subprocess.CompletedProcess:
+        """Delegate directly to subprocess.run() with no additional isolation."""
         return subprocess.run(
             args,
             capture_output=capture_output,

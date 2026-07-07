@@ -39,6 +39,7 @@ class McpToolAdapter(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Return the ToolSchema built from the MCP server's tool metadata."""
         desc = self._info.description or f"MCP tool from server '{self._info.server_name}'."
         return ToolSchema(
             name=self._safe_name,
@@ -74,6 +75,7 @@ class McpStatusTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="mcp_status",
             description=(
@@ -94,6 +96,14 @@ class McpStatusTool(Tool):
         )
 
     def execute(self, **kwargs: object) -> str:
+        """Return a status summary for all (or one) MCP server(s).
+
+        Args:
+            server (str, optional): Filter output to this server name.
+
+        Returns:
+            str: Formatted server status lines.
+        """
         server_filter = str(kwargs.get("server", "")) or None
         lines = ["MCP server status:"]
         for status in self._manager.list_statuses():
@@ -115,6 +125,7 @@ class ListMcpResourcesTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="list_mcp_resources",
             description="List resources available from connected MCP servers.",
@@ -131,6 +142,14 @@ class ListMcpResourcesTool(Tool):
         )
 
     def execute(self, **kwargs: object) -> str:
+        """List MCP resources from all connected servers (or one server).
+
+        Args:
+            server (str, optional): Filter to a single server name.
+
+        Returns:
+            str: Formatted list of resources with URI and description.
+        """
         server_filter = str(kwargs.get("server", "")) or None
         resources = self._manager.list_resources(server_name=server_filter)
         if not resources:
@@ -149,6 +168,7 @@ class ReadMcpResourceTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="read_mcp_resource",
             description="Read the content of an MCP resource by server name and URI.",
@@ -164,6 +184,15 @@ class ReadMcpResourceTool(Tool):
         )
 
     def execute(self, **kwargs: object) -> str:
+        """Fetch and return the content of one MCP resource.
+
+        Args:
+            server (str): MCP server name.
+            uri (str): Resource URI (from list_mcp_resources).
+
+        Returns:
+            str: Resource content, or an error string.
+        """
         server = str(kwargs.get("server", "")).strip()
         uri = str(kwargs.get("uri", "")).strip()
         if not server or not uri:
@@ -184,6 +213,7 @@ class ListMcpPromptsTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="list_mcp_prompts",
             description=(
@@ -204,6 +234,14 @@ class ListMcpPromptsTool(Tool):
         )
 
     def execute(self, **kwargs: object) -> str:
+        """List MCP prompts from all connected servers (or one server).
+
+        Args:
+            server (str, optional): Filter to a single server name.
+
+        Returns:
+            str: Formatted list of prompts with argument details.
+        """
         server_filter = str(kwargs.get("server", "")) or None
         prompts = self._manager.list_prompts(server_name=server_filter)
         if not prompts:
@@ -235,6 +273,7 @@ class GetMcpPromptTool(Tool):
 
     @property
     def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
         return ToolSchema(
             name="get_mcp_prompt",
             description=(
@@ -263,6 +302,16 @@ class GetMcpPromptTool(Tool):
         )
 
     def execute(self, **kwargs: object) -> str:
+        """Render and return an MCP prompt template.
+
+        Args:
+            server (str): MCP server name.
+            name (str): Prompt name (from list_mcp_prompts).
+            arguments (dict, optional): Template arguments.
+
+        Returns:
+            str: Rendered prompt text, or an error string.
+        """
         server = str(kwargs.get("server", "")).strip()
         name = str(kwargs.get("name", "")).strip()
         if not server or not name:

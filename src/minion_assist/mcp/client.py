@@ -426,6 +426,7 @@ class McpClientManager:
             return f"[MCP error reading resource: {type(exc).__name__}: {exc}]"
 
     async def _read_resource_async(self, server_name: str, uri: str) -> str:
+        """Async implementation — reads a resource from the MCP session and formats it."""
         session = self._sessions[server_name]
         lock = self._locks[server_name]
         async with lock:

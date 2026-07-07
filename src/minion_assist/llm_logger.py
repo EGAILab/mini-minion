@@ -23,10 +23,12 @@ from pathlib import Path
 
 
 def _now() -> str:
+    """Return the current local time as a formatted string ``YYYY-MM-DD HH:MM:SS``."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _log_file(log_dir: Path) -> Path:
+    """Return the path to today's log file inside *log_dir*."""
     return log_dir / f"{date.today().isoformat()}.log"
 
 

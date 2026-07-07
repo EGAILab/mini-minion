@@ -52,6 +52,7 @@ _TOKEN_FILENAME = "codex-auth.json"
 # ---------------------------------------------------------------------------
 
 def _token_path() -> Path:
+    """Return the path to the Codex token file, creating the parent directory if needed."""
     home = Path(os.environ.get("MINION_ASSIST_HOME", "~/.minion-assist")).expanduser()
     home.mkdir(parents=True, exist_ok=True)
     return home / _TOKEN_FILENAME
@@ -64,6 +65,7 @@ def save_token(
     account_id: str,
     email: str | None = None,
 ) -> None:
+    """Persist a token dict to the Codex auth JSON file on disk."""
     data: dict = {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -144,6 +146,7 @@ _REQUEST_HEADERS = {
 
 
 def _post_json(url: str, body: dict) -> dict:
+    """POST a JSON body to *url* and return the decoded JSON response."""
     data = json.dumps(body).encode()
     req = Request(url, data=data, headers={**_REQUEST_HEADERS, "Content-Type": "application/json"})
     with urlopen(req, timeout=30) as resp:
@@ -151,6 +154,7 @@ def _post_json(url: str, body: dict) -> dict:
 
 
 def _post_form(url: str, body: dict) -> dict:
+    """POST a URL-encoded form body to *url* and return the decoded JSON response."""
     data = urlencode(body).encode()
     req = Request(url, data=data, headers={**_REQUEST_HEADERS, "Content-Type": "application/x-www-form-urlencoded"})
     with urlopen(req, timeout=30) as resp:

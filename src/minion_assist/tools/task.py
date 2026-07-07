@@ -40,6 +40,7 @@ _STATUS_ICON = {"done": "✓", "in_progress": "→", "blocked": "✗", "pending"
 
 
 def _now() -> str:
+    """Return the current UTC time as an ISO-8601 string."""
     return datetime.now(UTC).isoformat()
 
 
@@ -88,6 +89,12 @@ class ReadTaskTool(Tool):
         )
 
     def execute(self, **kwargs: object) -> str:  # noqa: ARG002
+        """Return a formatted summary of the active task and step progress.
+
+        Returns:
+            str: Markdown summary of goal, steps, and next pending step,
+                or a message if no task file exists yet.
+        """
         data = _load(self._path)
         if not data:
             return (
@@ -211,6 +218,21 @@ class UpdateTaskTool(Tool):
         )
 
     def execute(self, **kwargs: object) -> str:
+        """Create or update the task file.
+
+        Args:
+            goal (str, optional): High-level objective; starts a new task when provided.
+            steps (list[str], optional): Step descriptions; used only with ``goal``.
+            step_id (int, optional): 1-indexed ID of the step to update.
+            status (str, optional): New status for the step (``pending``, ``in_progress``,
+                ``done``, or ``blocked``).
+            notes (str, optional): Notes to store with the step.
+            context (str, optional): Free-form context saved at the task level.
+            clear (bool, optional): When true, delete the task file entirely.
+
+        Returns:
+            str: Confirmation message, or an error string.
+        """
         if kwargs.get("clear"):
             if self._path.exists():
                 self._path.unlink()

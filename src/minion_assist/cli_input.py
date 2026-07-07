@@ -53,9 +53,16 @@ if _PROMPT_TOOLKIT_AVAILABLE:
         """Completion menu for slash commands, route prefixes, and skill hints."""
 
         def __init__(self, items: list[tuple[str, str]]) -> None:
+            """Store completion items sorted alphabetically for deterministic menu ordering."""
             self._items = sorted(items, key=lambda item: item[0])
 
         def get_completions(self, document, complete_event):
+            """Yield completions for the current typed text.
+
+            Only completes the first token and only when the text starts with ``/``.
+            Once the user has typed a space (moving past the command), the menu
+            disappears so normal message text is not interfered with.
+            """
             text = document.text_before_cursor
             # Complete the first token only. Once the user has typed a space,
             # let them write normal message text without a noisy menu.

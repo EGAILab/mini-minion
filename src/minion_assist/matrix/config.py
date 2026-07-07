@@ -38,6 +38,7 @@ class MatrixRoomConfig:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "MatrixRoomConfig":
+        """Parse a raw config dict into a MatrixRoomConfig."""
         return cls(
             agent=raw.get("agent", "main"),
             enabled=raw.get("enabled", True),
@@ -59,6 +60,7 @@ class MatrixDmConfig:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "MatrixDmConfig":
+        """Parse a raw config dict into a MatrixDmConfig."""
         return cls(
             enabled=raw.get("enabled", True),
             policy=raw.get("policy", "allowlist"),
@@ -76,6 +78,7 @@ class MatrixThreadBindingsConfig:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "MatrixThreadBindingsConfig":
+        """Parse a raw config dict into a MatrixThreadBindingsConfig."""
         return cls(
             enabled=raw.get("enabled", True),
             idle_hours=float(raw.get("idleHours", 1.0)),
@@ -92,6 +95,7 @@ class MatrixExecApprovalsConfig:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "MatrixExecApprovalsConfig":
+        """Parse a raw config dict into a MatrixExecApprovalsConfig."""
         return cls(
             enabled=raw.get("enabled", False),
             approvers=list(raw.get("approvers") or []),
@@ -109,6 +113,7 @@ class MatrixBotLoopConfig:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "MatrixBotLoopConfig":
+        """Parse a raw config dict into a MatrixBotLoopConfig."""
         return cls(
             enabled=raw.get("enabled", True),
             max_events_per_window=int(raw.get("maxEventsPerWindow", 10)),
