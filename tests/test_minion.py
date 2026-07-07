@@ -2,7 +2,7 @@
 
 import pytest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, call
 
 from minion_assist.memory.short_term import ShortTermMemory
 
@@ -222,3 +222,83 @@ def test_keyboard_interrupt_during_turn_continues_repl(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert "interrupted" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# ephemeral_history
+# ---------------------------------------------------------------------------
+
+
+def test_ephemeral_history_clears_history_before_session_start(tmp_path):
+    """When ephemeral_history=True, pre-existing JSONL is wiped at startup."""
+    import minion_assist.minion as minion_mod
+    from minion_assist.config import AgentModelConfig, ProviderConfig, ModelConfig
+
+    # Pre-populate the researcher's JSONL with stale history.
+    stm = ShortTermMemory(tmp_path / "sessions")
+    stm.append("researcher", {"role": "user", "content": "old question"})
+    stm.append("researcher", {"role": "assistant", "content": "old answer"})
+    assert len(stm.load("researcher")) == 2
+
+    _provider = SimpleNamespace(
+        base_url="", api="lmstudio", api_key="", name="lmstudio",
+    )
+    _model = SimpleNamespace(id="test", context_window=8192, max_output_tokens=512)
+    _ephemeral_cfg = SimpleNamespace(
+        provider=_provider, model=_model, route_prefix="/research", ephemeral_history=True,
+    )
+    _main_provider = SimpleNamespace(
+        base_url="", api="lmstudio", api_key="", name="lmstudio",
+    )
+    _main_cfg = SimpleNamespace(
+        provider=_main_provider, model=_model, route_prefix=None, ephemeral_history=False,
+    )
+    fake_agents_cfg = {"main": _main_cfg, "researcher": _ephemeral_cfg}
+
+    with (
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.minion.agents_cfg", fake_agents_cfg),
+        patch("minion_assist.minion.mcp_cfg", SimpleNamespace(servers=())),
+        patch("minion_assist.minion.channels_cfg", SimpleNamespace(matrix=None)),
+        patch("minion_assist.agents.session.run_turn", Mock()),
+        patch("minion_assist.minion.create_provider", return_value=Mock()),
+        patch("builtins.input", side_effect=iter(["quit"])),
+    ):
+        minion_mod.main()
+
+    # After startup with ephemeral_history=True, the JSONL must be empty.
+    assert stm.load("researcher") == []
+
+
+def test_non_ephemeral_history_preserves_history_at_startup(tmp_path):
+    """When ephemeral_history=False (default), pre-existing JSONL is kept."""
+    import minion_assist.minion as minion_mod
+
+    stm = ShortTermMemory(tmp_path / "sessions")
+    stm.append("researcher", {"role": "user", "content": "old question"})
+    stm.append("researcher", {"role": "assistant", "content": "old answer"})
+
+    _provider = SimpleNamespace(base_url="", api="lmstudio", api_key="", name="lmstudio")
+    _model = SimpleNamespace(id="test", context_window=8192, max_output_tokens=512)
+    _persistent_cfg = SimpleNamespace(
+        provider=_provider, model=_model, route_prefix="/research", ephemeral_history=False,
+    )
+    _main_cfg = SimpleNamespace(
+        provider=_provider, model=_model, route_prefix=None, ephemeral_history=False,
+    )
+    fake_agents_cfg = {"main": _main_cfg, "researcher": _persistent_cfg}
+
+    with (
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.minion.agents_cfg", fake_agents_cfg),
+        patch("minion_assist.minion.mcp_cfg", SimpleNamespace(servers=())),
+        patch("minion_assist.minion.channels_cfg", SimpleNamespace(matrix=None)),
+        patch("minion_assist.agents.session.run_turn", Mock()),
+        patch("minion_assist.minion.create_provider", return_value=Mock()),
+        patch("builtins.input", side_effect=iter(["quit"])),
+    ):
+        minion_mod.main()
+
+    # With ephemeral_history=False, the JSONL must still have the old messages.
+    history = stm.load("researcher")
+    assert any(m["content"] == "old question" for m in history)

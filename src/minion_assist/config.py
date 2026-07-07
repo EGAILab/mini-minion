@@ -515,10 +515,18 @@ class AgentModelConfig:
         route_prefix (str | None): The command prefix that routes messages to this
             agent (e.g. ``"/research"``). ``None`` means this agent is the default
             fallback — it handles messages that match no other prefix.
+        ephemeral_history (bool): When ``True``, the agent's conversation history
+            is cleared at each process start.  Within a session the agent still
+            accumulates context from multiple turns (useful for multi-step research),
+            but old conversations from previous sessions are not carried forward.
+            Defaults to ``False`` (persistent history, like the main agent).
+            Recommended for task-oriented sub-agents (researchers, etc.) that should
+            start each session fresh rather than inheriting weeks-old context.
     """
     provider: ProviderConfig
     model: ModelConfig
     route_prefix: str | None = None  # None → default/fallback agent; field with default must come last
+    ephemeral_history: bool = False  # True → wipe JSONL at startup; False → persist across restarts
 
 
 @dataclass(frozen=True)
@@ -879,10 +887,12 @@ def _resolve_all() -> dict[str, AgentModelConfig]:
         base = _resolve_provider(provider_name, model_id)
         # route_prefix is optional; absent or empty string both mean "default agent".
         route_prefix = agent_raw.get("route_prefix") or None
+        ephemeral_history = bool(agent_raw.get("ephemeral_history", False))
         result[agent_id] = AgentModelConfig(
             provider=base.provider,
             model=base.model,
             route_prefix=route_prefix,
+            ephemeral_history=ephemeral_history,
         )
     return result
 

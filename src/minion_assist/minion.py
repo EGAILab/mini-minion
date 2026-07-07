@@ -455,6 +455,13 @@ def main() -> None:
             else None
         )
 
+        # ephemeral_history: wipe the JSONL before loading so this agent starts
+        # each process run with a clean slate.  Within the session it still
+        # accumulates turns normally (useful for multi-step /research tasks);
+        # old conversations from previous runs are not carried forward.
+        if cfg.ephemeral_history:
+            short_term.clear(agent_id)
+
         sessions[agent_id] = AgentSession(
             agent_id=agent_id,
             agent=AGENTS[agent_id],
