@@ -108,30 +108,50 @@ from .workspace import agent_workspace_root, ensure_workspace
 def _resolve_session_id(
     agent_id: str,
     session_store: "SessionStore",
-    freshness_seconds: int,
+    reset_mode: str = "daily",
+    reset_at_hour: int = 4,
+    idle_minutes: int = 0,
 ) -> str:
     """Return the session UUID for an agent, rotating if the session is stale.
 
     Mirrors openclaw's ``resolveSession()`` + ``evaluateSessionFreshness()``:
-    - freshness_seconds == 0  → always rotate (always fresh)
-    - elapsed < freshness_seconds → reuse existing session UUID
-    - elapsed >= freshness_seconds → rotate to a new UUID
 
-    Old session JSONL files are never deleted here; :meth:`ShortTermMemory.prune_sessions`
-    handles housekeeping separately.
+    - ``"daily"`` mode: stale when ``last_active`` predates today's ``reset_at_hour``
+      (e.g. 4am).  Continuing a mid-day conversation always reuses the UUID.
+    - ``"idle"`` mode: stale when ``last_active`` is older than ``idle_minutes``.
+      ``idle_minutes=0`` always rotates (never reuse).
+
+    Old session JSONL files are never deleted here; prune_sessions() handles housekeeping.
     """
-    from datetime import UTC, datetime  # noqa: PLC0415
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
     info = session_store.get_or_create(agent_id)
-    if freshness_seconds == 0 or not info.session_id:
+    if not info.session_id:
         return session_store.new_session(agent_id)
-    try:
-        last_active = datetime.fromisoformat(info.last_active)
-        elapsed = (datetime.now(UTC) - last_active).total_seconds()
-        if elapsed <= freshness_seconds:
-            return info.session_id
-    except (ValueError, TypeError):
-        pass
-    return session_store.new_session(agent_id)
+
+    now = datetime.now(UTC)
+    stale = False
+
+    if reset_mode == "daily":
+        try:
+            last_active = datetime.fromisoformat(info.last_active)
+            # Most-recent reset boundary: today at reset_at_hour, or yesterday's if not yet reached.
+            boundary = now.replace(hour=reset_at_hour, minute=0, second=0, microsecond=0)
+            if now < boundary:
+                boundary -= timedelta(days=1)
+            stale = last_active < boundary
+        except (ValueError, TypeError):
+            stale = True
+    else:  # "idle"
+        if idle_minutes == 0:
+            stale = True
+        else:
+            try:
+                last_active = datetime.fromisoformat(info.last_active)
+                stale = (now - last_active).total_seconds() > idle_minutes * 60
+            except (ValueError, TypeError):
+                stale = True
+
+    return session_store.new_session(agent_id) if stale else info.session_id
 
 
 def main() -> None:
@@ -490,7 +510,12 @@ def main() -> None:
         # Reuse the last session UUID if the agent was active within the freshness
         # window; otherwise rotate to a new UUID (new JSONL file, clean slate).
         # Old session files remain on disk for history / future resume.
-        _session_id = _resolve_session_id(agent_id, session_store, cfg.session_freshness_seconds)
+        _session_id = _resolve_session_id(
+            agent_id, session_store,
+            reset_mode=cfg.session_reset_mode,
+            reset_at_hour=cfg.session_reset_at_hour,
+            idle_minutes=cfg.session_idle_minutes,
+        )
         short_term.prune_sessions(agent_id, keep_n=20)
 
         sessions[agent_id] = AgentSession(

@@ -237,45 +237,44 @@ def test_keyboard_interrupt_during_turn_continues_repl(tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 
-def _fake_agents_cfg(freshness_seconds=3600):
+def _fake_agents_cfg(reset_mode="daily", at_hour=4, idle_minutes=0):
     """Build a minimal fake agents_cfg dict matching the real AGENTS keys."""
     _provider = SimpleNamespace(base_url="", api="lmstudio", api_key="", name="lmstudio")
     _model = SimpleNamespace(id="test", context_window=8192, max_output_tokens=512)
-    _cfg = SimpleNamespace(provider=_provider, model=_model, session_freshness_seconds=freshness_seconds)
+    _cfg = SimpleNamespace(
+        provider=_provider, model=_model,
+        session_reset_mode=reset_mode, session_reset_at_hour=at_hour, session_idle_minutes=idle_minutes,
+    )
     return {
         "main": SimpleNamespace(**{**vars(_cfg), "route_prefix": None}),
         "researcher": SimpleNamespace(**{**vars(_cfg), "route_prefix": "/research"}),
     }
 
 
-def test_freshness_zero_always_generates_new_session_id(tmp_path):
-    """session_freshness_seconds=0 must rotate to a new UUID on every startup."""
+def test_idle_zero_always_generates_new_session_id(tmp_path):
+    """idle mode with idle_minutes=0 must rotate to a new UUID on every startup."""
     from minion_assist.minion import _resolve_session_id
     store = SessionStore(tmp_path / "sessions.json")
-    # First startup.
-    id1 = _resolve_session_id("main", store, freshness_seconds=0)
-    # Second startup immediately after.
-    id2 = _resolve_session_id("main", store, freshness_seconds=0)
+    id1 = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=0)
+    id2 = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=0)
     assert id1 != id2
 
 
-def test_freshness_long_window_reuses_session_id(tmp_path):
-    """Within the freshness window the same UUID must be returned."""
+def test_idle_long_window_reuses_session_id(tmp_path):
+    """idle mode within the window must reuse the same UUID."""
     from minion_assist.minion import _resolve_session_id
     store = SessionStore(tmp_path / "sessions.json")
-    id1 = _resolve_session_id("main", store, freshness_seconds=3600)
-    id2 = _resolve_session_id("main", store, freshness_seconds=3600)
+    id1 = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=60)
+    id2 = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=60)
     assert id1 == id2
 
 
-def test_stale_session_rotates_to_new_uuid(tmp_path):
-    """When last_active is beyond the freshness window a new UUID must be issued."""
+def test_idle_stale_session_rotates_to_new_uuid(tmp_path):
+    """idle mode: when last_active exceeds idle_minutes a new UUID is issued."""
     from minion_assist.minion import _resolve_session_id
-    from minion_assist.session.store import SessionStore as _Store, _now
+    from minion_assist.session.store import SessionStore as _Store
     import json, datetime as dt
 
-    store = _Store(tmp_path / "sessions.json")
-    # Create a session with last_active two hours ago.
     old_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)).isoformat()
     raw = {
         "main": {
@@ -288,9 +287,63 @@ def test_stale_session_rotates_to_new_uuid(tmp_path):
         }
     }
     (tmp_path / "sessions.json").write_text(json.dumps(raw), encoding="utf-8")
-    store2 = _Store(tmp_path / "sessions.json")
-    new_id = _resolve_session_id("main", store2, freshness_seconds=3600)
+    store = _Store(tmp_path / "sessions.json")
+    new_id = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=60)
     assert new_id != "old-uuid"
+
+
+def test_daily_reuses_session_started_after_reset_hour(tmp_path):
+    """daily mode: session started after today's reset hour must be reused."""
+    from minion_assist.minion import _resolve_session_id
+    from minion_assist.session.store import SessionStore as _Store
+    import json, datetime as dt
+
+    # last_active = 2 hours ago but after today's 4am boundary.
+    now = dt.datetime.now(dt.timezone.utc)
+    recent_ts = (now - dt.timedelta(hours=2)).isoformat()
+    # Only run this test if 2 hours ago is still after 4am today.
+    boundary = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    if now - dt.timedelta(hours=2) < boundary:
+        pytest.skip("too early in the day for this test to be meaningful")
+
+    raw = {
+        "main": {
+            "agent_id": "main",
+            "created_at": recent_ts,
+            "last_active": recent_ts,
+            "turn_count": 0,
+            "parent_id": None,
+            "session_id": "same-uuid",
+        }
+    }
+    (tmp_path / "sessions.json").write_text(json.dumps(raw), encoding="utf-8")
+    store = _Store(tmp_path / "sessions.json")
+    reused = _resolve_session_id("main", store, reset_mode="daily", reset_at_hour=4)
+    assert reused == "same-uuid"
+
+
+def test_daily_rotates_session_started_before_reset_hour(tmp_path):
+    """daily mode: session with last_active before today's reset hour must rotate."""
+    from minion_assist.minion import _resolve_session_id
+    from minion_assist.session.store import SessionStore as _Store
+    import json, datetime as dt
+
+    # last_active = yesterday, well before any 4am boundary.
+    old_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+    raw = {
+        "main": {
+            "agent_id": "main",
+            "created_at": old_ts,
+            "last_active": old_ts,
+            "turn_count": 0,
+            "parent_id": None,
+            "session_id": "yesterday-uuid",
+        }
+    }
+    (tmp_path / "sessions.json").write_text(json.dumps(raw), encoding="utf-8")
+    store = _Store(tmp_path / "sessions.json")
+    new_id = _resolve_session_id("main", store, reset_mode="daily", reset_at_hour=4)
+    assert new_id != "yesterday-uuid"
 
 
 def test_session_files_stored_per_agent_subdirectory(tmp_path):

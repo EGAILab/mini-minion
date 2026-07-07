@@ -515,19 +515,24 @@ class AgentModelConfig:
         route_prefix (str | None): The command prefix that routes messages to this
             agent (e.g. ``"/research"``). ``None`` means this agent is the default
             fallback — it handles messages that match no other prefix.
-        session_freshness_seconds (int): How long (in seconds) a session stays
-            "fresh" after its last interaction.  When the process starts, if the
-            agent's last session was active within this window the same session UUID
-            is reused (conversation continues).  If the window has elapsed a new
-            UUID is generated and the agent starts a fresh conversation.  Old
-            session files remain on disk.  ``0`` means always start fresh (never
-            reuse). Default 3600 (1 hour).  Set to 0 for task-oriented sub-agents
-            (researchers, etc.) that should start each session clean.
+        session_reset_mode (str): When to start a new session on process restart.
+            ``"daily"`` (default) rotates after the daily ``session_reset_at_hour``.
+            ``"idle"`` rotates when the agent has been inactive for
+            ``session_idle_minutes``. Mirrors openclaw's ``sessions.reset.mode``.
+        session_reset_at_hour (int): Hour of day (0-23) for the daily reset boundary.
+            Only used when ``session_reset_mode == "daily"``. Default 4 (4am).
+            Mirrors openclaw's ``sessions.reset.atHour``.
+        session_idle_minutes (int): Inactivity threshold in minutes for idle-mode
+            reset. ``0`` means always rotate (never reuse). Only used when
+            ``session_reset_mode == "idle"``. Default 0.
+            Mirrors openclaw's ``sessions.reset.idleMinutes``.
     """
     provider: ProviderConfig
     model: ModelConfig
-    route_prefix: str | None = None  # None → default/fallback agent; field with default must come last
-    session_freshness_seconds: int = 3600  # 0 = always fresh; >0 = reuse if session idle < N seconds
+    route_prefix: str | None = None
+    session_reset_mode: str = "daily"
+    session_reset_at_hour: int = 4
+    session_idle_minutes: int = 0
 
 
 @dataclass(frozen=True)
@@ -888,17 +893,28 @@ def _resolve_all() -> dict[str, AgentModelConfig]:
         base = _resolve_provider(provider_name, model_id)
         # route_prefix is optional; absent or empty string both mean "default agent".
         route_prefix = agent_raw.get("route_prefix") or None
-        # session_freshness_seconds: how long a session stays alive between restarts.
-        # Backward compat: ephemeral_history:true maps to freshness=0 (always fresh).
+        # Session reset policy — mirrors openclaw's sessions.reset shape.
+        # Backward compat: ephemeral_history:true → idle mode, idle_minutes=0.
+        # Backward compat: session_freshness_seconds:N → idle mode, idle_minutes=N//60.
         if agent_raw.get("ephemeral_history"):
-            session_freshness_seconds = 0
+            session_reset_mode, session_reset_at_hour, session_idle_minutes = "idle", 4, 0
+        elif agent_raw.get("session_freshness_seconds") is not None:
+            session_reset_mode = "idle"
+            session_idle_minutes = int(agent_raw["session_freshness_seconds"]) // 60
+            session_reset_at_hour = 4
         else:
-            session_freshness_seconds = int(agent_raw.get("session_freshness_seconds", 3600))
+            _reset = agent_raw.get("session_reset", {})
+            _reset = _reset if isinstance(_reset, dict) else {}
+            session_reset_mode = _reset.get("mode", "daily")
+            session_reset_at_hour = int(_reset.get("at_hour", 4))
+            session_idle_minutes = int(_reset.get("idle_minutes", 0))
         result[agent_id] = AgentModelConfig(
             provider=base.provider,
             model=base.model,
             route_prefix=route_prefix,
-            session_freshness_seconds=session_freshness_seconds,
+            session_reset_mode=session_reset_mode,
+            session_reset_at_hour=session_reset_at_hour,
+            session_idle_minutes=session_idle_minutes,
         )
     return result
 
