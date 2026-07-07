@@ -1,4 +1,4 @@
-"""Tests for the /history and /rename slash commands."""
+"""Tests for the /session and /rename slash commands."""
 
 import json
 import time
@@ -29,8 +29,8 @@ def _make_session_mock(session_id: str) -> MagicMock:
 def _ctx(args: str, stm: ShortTermMemory, agent_id: str = "main", session_id: str = "aaa") -> CommandContext:
     session = _make_session_mock(session_id)
     return CommandContext(
-        raw=f"/history {args}".strip(),
-        command="/history",
+        raw=f"/session {args}".strip(),
+        command="/session",
         args=args,
         target_agent_id=agent_id,
         sessions={agent_id: session},
@@ -40,7 +40,7 @@ def _ctx(args: str, stm: ShortTermMemory, agent_id: str = "main", session_id: st
 
 
 # ---------------------------------------------------------------------------
-# Tests: bare /history (list)
+# Tests: bare /session (list)
 # ---------------------------------------------------------------------------
 
 def test_history_no_sessions(tmp_path):
@@ -70,7 +70,7 @@ def test_history_lists_sessions(tmp_path):
     # Most recent (bbb) is [1], oldest (aaa) is [2]
     assert msg.index("[1]") < msg.index("bbb")
     assert "Hello world" in msg or "Second session" in msg
-    assert "Use /history" in msg
+    assert "Use /session" in msg
 
 
 def test_history_marks_current_session(tmp_path):
@@ -93,8 +93,8 @@ def test_history_marks_current_session(tmp_path):
 
 def test_history_no_short_term_returns_error():
     ctx = CommandContext(
-        raw="/history",
-        command="/history",
+        raw="/session",
+        command="/session",
         args="",
         target_agent_id="main",
         sessions={"main": MagicMock()},
@@ -107,7 +107,7 @@ def test_history_no_short_term_returns_error():
 
 
 # ---------------------------------------------------------------------------
-# Tests: /history <N> (load by index)
+# Tests: /session <N> (load by index)
 # ---------------------------------------------------------------------------
 
 def test_history_load_by_index(tmp_path):
@@ -143,7 +143,7 @@ def test_history_already_on_current(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Tests: /history <uuid-prefix> (load by prefix)
+# Tests: /session <uuid-prefix> (load by prefix)
 # ---------------------------------------------------------------------------
 
 def test_history_load_by_uuid_prefix(tmp_path):

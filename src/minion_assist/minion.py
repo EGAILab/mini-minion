@@ -898,7 +898,7 @@ def main() -> None:
                     if result.handled:
                         if result.message:
                             print(result.message)
-                        # /resume sets activate_agent_id to switch the default agent.
+                        # /switch sets activate_agent_id to switch the default agent.
                         if result.activate_agent_id:
                             active_agent_id = result.activate_agent_id
                         if result.should_exit:

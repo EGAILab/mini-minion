@@ -10,10 +10,10 @@ Supported commands:
   /new [all]                 — clear conversation history for the active (or all) agent(s)
   /compact                   — manually compact the active agent's history
   /status                    — show current agent/model info
-  /sessions                  — list all known sessions with turn counts and last-active time
-  /history [N|uuid-prefix]   — list past session files for the active agent; restore one by index or prefix
+  /agents                    — list all known agents with turn counts and last-active time
+  /session [N|uuid-prefix]   — list past session files for the active agent; restore one by index or prefix
   /rename [N] <name>         — give a session a descriptive name (current session if N omitted)
-  /resume [agent_id]         — switch the default routing target to the given agent
+  /switch [agent_id]         — switch the default routing target to the given agent
   /diagnose                  — show provider configuration and API key status for all agents
   /mcp-reload                — close and reconnect all MCP servers, refresh tool adapters
   /mcp-list                  — list connected MCP servers and their available tools
@@ -65,10 +65,10 @@ class CommandContext:
     target_agent_id: str              # which agent this command targets
     sessions: dict                    # dict[str, AgentSession] — keyed by agent_id
     agents_cfg: dict                  # dict[str, AgentModelConfig] from config
-    session_store: object = None      # SessionStore instance (optional, for /sessions)
+    session_store: object = None      # SessionStore instance (optional, for /agents)
     mcp_manager: object = None        # McpClientManager instance (optional, for /mcp-reload)
     skills: dict | None = None        # dict[str, SkillInfo] loaded at startup
-    short_term: object = None         # ShortTermMemory instance (for /history)
+    short_term: object = None         # ShortTermMemory instance (for /session)
 
 
 @dataclass
@@ -111,21 +111,21 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
         description="Show active agent, model, and history information.",
     ),
     CommandSpec(
-        name="/sessions",
-        description="List all known agent sessions with turn counts and last-active timestamps.",
+        name="/agents",
+        description="List all known agents with turn counts and last-active timestamps.",
     ),
     CommandSpec(
-        name="/history",
+        name="/session",
         description="List past session files for the active agent; restore one by index or UUID prefix.",
         arg_hint="[N | uuid-prefix]",
     ),
     CommandSpec(
         name="/rename",
-        description="Give the current session (or session N from /history) a descriptive name.",
+        description="Give the current session (or session N from /session) a descriptive name.",
         arg_hint="[N] <name>",
     ),
     CommandSpec(
-        name="/resume",
+        name="/switch",
         description="Switch the default routing target to the given agent for the current session.",
         arg_hint="[agent_id]",
     ),
@@ -416,8 +416,8 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
             lines.append(f"  Streaming: {'on' if _streaming_cfg.chat_mode else 'off'}")
             return CommandResult(handled=True, message="\n".join(lines))
 
-        # --- /sessions ---
-        if spec.name == "/sessions":
+        # --- /agents ---
+        if spec.name == "/agents":
             if ctx.session_store is None:
                 return CommandResult(handled=True, message="Session store not available.")
             sessions_list = ctx.session_store.list_sessions()
@@ -434,8 +434,8 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                 )
             return CommandResult(handled=True, message="\n".join(lines))
 
-        # --- /history ---
-        if spec.name == "/history":
+        # --- /session ---
+        if spec.name == "/session":
             if ctx.short_term is None:
                 return CommandResult(handled=True, message="Short-term memory not available.")
             agent_id = ctx.target_agent_id
@@ -480,7 +480,7 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                         except Exception:
                             pass
                     lines.append(f"{marker} [{i}] {ts}  msgs={msg_count}  {uuid_hint}{label}")
-                lines.append("Use /history <N> or /history <uuid-prefix> to restore.")
+                lines.append("Use /session <N> or /session <uuid-prefix> to restore.")
                 return CommandResult(handled=True, message="\n".join(lines))
 
             # Resolve arg: 1-based index or UUID prefix
@@ -528,7 +528,7 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                     message="Usage: /rename <name>  or  /rename <N> <name>",
                 )
             agent_id = ctx.target_agent_id
-            # If first token is an int, treat it as a /history index; rest is the name.
+            # If first token is an int, treat it as a /session index; rest is the name.
             tokens = ctx.args.split(None, 1)
             target_id: str | None = None
             name_part: str = ctx.args
@@ -562,8 +562,8 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                 message=f"Session {target_id[:8]} renamed to '{name_part}'.",
             )
 
-        # --- /resume ---
-        if spec.name == "/resume":
+        # --- /switch ---
+        if spec.name == "/switch":
             # Resolve the target agent: use the argument if given, fall back to
             # the currently targeted agent (no-op switch, still prints confirmation).
             target = ctx.args.strip().lower() or ctx.target_agent_id
@@ -574,7 +574,7 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                     message=f"Unknown agent '{target}'. Known agents: {known}",
                 )
             # Reload the target agent's history from disk before switching.
-            # This ensures /resume reflects any turns that happened in previous
+            # This ensures /switch reflects any turns that happened in previous
             # process runs and picks up the latest state after /new was used.
             ctx.sessions[target].reload()
             return CommandResult(
@@ -792,7 +792,7 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                 message=(
                     f"Forked '{ctx.target_agent_id}' → '{new_id}' "
                     f"({len(session.history)} messages copied).\n"
-                    f"Use /resume {new_id} to switch to the forked session."
+                    f"Use /switch {new_id} to switch to the forked session."
                 ),
             )
 

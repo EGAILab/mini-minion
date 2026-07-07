@@ -388,7 +388,7 @@ def test_dispatch_unknown_command_no_should_exit():
 
 
 # ---------------------------------------------------------------------------
-# dispatch_command — /sessions
+# dispatch_command — /agents
 # ---------------------------------------------------------------------------
 
 def _make_ctx_with_store(command: str, args: str = "", target: str = "main", store=None):
@@ -406,45 +406,45 @@ def _make_ctx_with_store(command: str, args: str = "", target: str = "main", sto
     )
 
 
-def test_dispatch_sessions_no_store_returns_message():
-    """/sessions without a store must return a graceful message."""
-    result = dispatch_command(_make_ctx_with_store("/sessions", store=None))
+def test_dispatch_agents_no_store_returns_message():
+    """/agents without a store must return a graceful message."""
+    result = dispatch_command(_make_ctx_with_store("/agents", store=None))
     assert result.handled is True
     assert result.message is not None
 
 
-def test_dispatch_sessions_lists_sessions():
-    """/sessions must list session records returned by session_store."""
+def test_dispatch_agents_lists_agents():
+    """/agents must list session records returned by session_store."""
     store = MagicMock()
     store.list_sessions.return_value = [
         MagicMock(agent_id="main", turn_count=5, last_active="2026-06-01T10:00:00+00:00"),
     ]
-    result = dispatch_command(_make_ctx_with_store("/sessions", store=store))
+    result = dispatch_command(_make_ctx_with_store("/agents", store=store))
     assert result.handled is True
     assert "main" in result.message
     assert "5" in result.message
 
 
-def test_dispatch_sessions_empty_store():
-    """/sessions with an empty store reports no sessions."""
+def test_dispatch_agents_empty_store():
+    """/agents with an empty store reports no sessions."""
     store = MagicMock()
     store.list_sessions.return_value = []
-    result = dispatch_command(_make_ctx_with_store("/sessions", store=store))
+    result = dispatch_command(_make_ctx_with_store("/agents", store=store))
     assert result.handled is True
     assert "No sessions" in result.message
 
 
 # ---------------------------------------------------------------------------
-# dispatch_command — /resume
+# dispatch_command — /switch
 # ---------------------------------------------------------------------------
 
-def test_dispatch_resume_known_agent():
-    """/resume <known> must return activate_agent_id and a message."""
+def test_dispatch_switch_known_agent():
+    """/switch <known> must return activate_agent_id and a message."""
     sessions = {"main": _make_session(), "researcher": _make_session()}
     agents_cfg = _make_agents_cfg(include_route=True)
     ctx = CommandContext(
-        raw="/resume researcher",
-        command="/resume",
+        raw="/switch researcher",
+        command="/switch",
         args="researcher",
         target_agent_id="main",
         sessions=sessions,
@@ -455,9 +455,9 @@ def test_dispatch_resume_known_agent():
     assert result.activate_agent_id == "researcher"
 
 
-def test_dispatch_resume_unknown_agent_returns_error():
-    """/resume <unknown> must report the known agents and NOT set activate_agent_id."""
-    ctx = _make_ctx_with_store("/resume", args="ghost")
+def test_dispatch_switch_unknown_agent_returns_error():
+    """/switch <unknown> must report the known agents and NOT set activate_agent_id."""
+    ctx = _make_ctx_with_store("/switch", args="ghost")
     result = dispatch_command(ctx)
     assert result.handled is True
     assert result.activate_agent_id is None
@@ -465,13 +465,13 @@ def test_dispatch_resume_unknown_agent_returns_error():
     assert "main" in result.message  # list of known agents shown
 
 
-def test_dispatch_resume_no_args_targets_current_agent():
-    """/resume with no args defaults to the already-active agent."""
+def test_dispatch_switch_no_args_targets_current_agent():
+    """/switch with no args defaults to the already-active agent."""
     sessions = {"main": _make_session()}
     agents_cfg = _make_agents_cfg()
     ctx = CommandContext(
-        raw="/resume",
-        command="/resume",
+        raw="/switch",
+        command="/switch",
         args="",
         target_agent_id="main",
         sessions=sessions,
@@ -569,7 +569,7 @@ def test_dispatch_mcp_reload_calls_reconnect_and_refresh():
 
 def test_builtin_commands_includes_new_commands():
     names = {spec.name for spec in BUILTIN_COMMANDS}
-    assert "/sessions" in names
-    assert "/resume" in names
+    assert "/agents" in names
+    assert "/switch" in names
     assert "/diagnose" in names
     assert "/mcp-reload" in names

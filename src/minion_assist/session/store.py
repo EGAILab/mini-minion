@@ -224,7 +224,7 @@ class SessionStore:
         """Update the stored session UUID for an agent without rotating it.
 
         Used by :meth:`AgentSession.switch_session` to point the store at a
-        different existing session file after the user picks one via ``/history``.
+        different existing session file after the user picks one via ``/session``.
 
         Args:
             agent_id (str): The agent whose ``session_id`` to update.

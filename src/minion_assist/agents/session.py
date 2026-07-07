@@ -738,7 +738,7 @@ class AgentSession:
         """Reload conversation history from disk, discarding in-memory state.
 
         Useful when:
-        - The ``/resume`` command switches to this agent after it may have been
+        - The ``/switch`` command switches to this agent after it may have been
           active in a previous process run.
         - An external tool modified the JSONL file.
         - The user wants to restore history after clearing it with ``/new``.
@@ -746,7 +746,7 @@ class AgentSession:
         Long-term memory, task files, and the session store are NOT affected —
         only ``_history`` (the in-memory message list) is replaced.
 
-        Called by the ``/resume`` command via :func:`dispatch_command`.
+        Called by the ``/switch`` command via :func:`dispatch_command`.
         """
         self._history = self._short_term.load(self._agent_id, self._session_id)
 
@@ -864,12 +864,12 @@ class AgentSession:
         """Copy this session's history to a new agent ID.
 
         Creates a new JSONL history file and session record with the same
-        history as the current session.  Use ``/resume <new_agent_id>`` to
+        history as the current session.  Use ``/switch <new_agent_id>`` to
         interact with the forked session.
 
         The fork is a snapshot — subsequent turns on either session are
         independent.  The new session's :attr:`SessionInfo.parent_id` is set
-        to this agent's ID so the lineage is visible in ``/sessions``.
+        to this agent's ID so the lineage is visible in ``/agents``.
 
         Args:
             new_agent_id (str): The ID to assign to the forked session.
