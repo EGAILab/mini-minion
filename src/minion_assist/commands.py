@@ -11,6 +11,7 @@ Supported commands:
   /compact                   — manually compact the active agent's history
   /status                    — show current agent/model info
   /sessions                  — list all known sessions with turn counts and last-active time
+  /history [N|uuid-prefix]   — list past session files for the active agent; restore one by index or prefix
   /resume [agent_id]         — switch the default routing target to the given agent
   /diagnose                  — show provider configuration and API key status for all agents
   /mcp-reload                — close and reconnect all MCP servers, refresh tool adapters
@@ -33,8 +34,10 @@ Route-aware targeting:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,7 @@ class CommandContext:
     session_store: object = None      # SessionStore instance (optional, for /sessions)
     mcp_manager: object = None        # McpClientManager instance (optional, for /mcp-reload)
     skills: dict | None = None        # dict[str, SkillInfo] loaded at startup
+    short_term: object = None         # ShortTermMemory instance (for /history)
 
 
 @dataclass
@@ -108,6 +112,11 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec(
         name="/sessions",
         description="List all known agent sessions with turn counts and last-active timestamps.",
+    ),
+    CommandSpec(
+        name="/history",
+        description="List past session files for the active agent; restore one by index or UUID prefix.",
+        arg_hint="[N | uuid-prefix]",
     ),
     CommandSpec(
         name="/resume",
@@ -418,6 +427,85 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                     f"  [{s.agent_id}]  turns={s.turn_count}  last_active={last}"
                 )
             return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /history ---
+        if spec.name == "/history":
+            if ctx.short_term is None:
+                return CommandResult(handled=True, message="Short-term memory not available.")
+            agent_id = ctx.target_agent_id
+            paths = list(reversed(ctx.short_term.list_sessions(agent_id)))
+            if not paths:
+                return CommandResult(
+                    handled=True,
+                    message=f"No session history found for '{agent_id}'.",
+                )
+            current_id = getattr(ctx.sessions.get(agent_id), "session_id", None)
+
+            if not ctx.args:
+                label = "session" if len(paths) == 1 else "sessions"
+                lines = [f"History for {agent_id} ({len(paths)} {label}):"]
+                for i, p in enumerate(paths, 1):
+                    mtime = datetime.fromtimestamp(p.stat().st_mtime)
+                    ts = mtime.strftime("%Y-%m-%d %H:%M")
+                    uuid_hint = p.stem[:8]
+                    msg_count = sum(1 for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip())
+                    is_current = p.stem == current_id
+                    marker = "*" if is_current else " "
+                    preview = ""
+                    try:
+                        for ln in p.read_text(encoding="utf-8").splitlines():
+                            m = json.loads(ln.strip())
+                            if m.get("role") == "user":
+                                content = m.get("content", "")
+                                if isinstance(content, list):
+                                    content = next(
+                                        (b.get("text", "") for b in content
+                                         if isinstance(b, dict) and b.get("type") == "text"),
+                                        "",
+                                    )
+                                if content:
+                                    preview = f'  "{content[:50]}"'
+                                break
+                    except Exception:
+                        pass
+                    lines.append(f"{marker} [{i}] {ts}  msgs={msg_count}  {uuid_hint}{preview}")
+                lines.append("Use /history <N> or /history <uuid-prefix> to restore.")
+                return CommandResult(handled=True, message="\n".join(lines))
+
+            # Resolve arg: 1-based index or UUID prefix
+            arg = ctx.args.strip()
+            target_path = None
+            try:
+                idx = int(arg)
+                if 1 <= idx <= len(paths):
+                    target_path = paths[idx - 1]
+                else:
+                    return CommandResult(
+                        handled=True,
+                        message=f"Index {idx} out of range (1–{len(paths)}).",
+                    )
+            except ValueError:
+                matches = [p for p in paths if p.stem.startswith(arg)]
+                if not matches:
+                    return CommandResult(handled=True, message=f"No session matching '{arg}'.")
+                if len(matches) > 1:
+                    return CommandResult(
+                        handled=True,
+                        message=f"Ambiguous prefix '{arg}' matches {len(matches)} sessions.",
+                    )
+                target_path = matches[0]
+
+            session = ctx.sessions.get(agent_id)
+            if session is None:
+                return CommandResult(handled=True, message=f"Agent '{agent_id}' not found.")
+            target_id = target_path.stem
+            if target_id == current_id:
+                return CommandResult(handled=True, message="Already on that session.")
+            n = session.switch_session(target_id)
+            return CommandResult(
+                handled=True,
+                message=f"Loaded session {target_id[:8]} ({n} messages).",
+            )
 
         # --- /resume ---
         if spec.name == "/resume":

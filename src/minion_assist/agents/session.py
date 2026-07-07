@@ -480,6 +480,11 @@ class AgentSession:
         return self._tools
 
     @property
+    def session_id(self) -> str:
+        """The current session UUID."""
+        return self._session_id
+
+    @property
     def history(self) -> list[dict]:
         """Snapshot of the current conversation history (defensive copy)."""
         return list(self._history)
@@ -744,6 +749,25 @@ class AgentSession:
         Called by the ``/resume`` command via :func:`dispatch_command`.
         """
         self._history = self._short_term.load(self._agent_id, self._session_id)
+
+    def switch_session(self, session_id: str) -> int:
+        """Load a different session's history by UUID, making it the active session.
+
+        Updates both in-memory state and the session store so future turns
+        persist against the new UUID.  The previous session file is unmodified.
+
+        Args:
+            session_id (str): UUID of the existing session file to load.
+
+        Returns:
+            int: Number of messages loaded from the target session.
+        """
+        with self._lock:
+            messages = self._short_term.load(self._agent_id, session_id)
+            self._session_id = session_id
+            self._history = messages
+            self._session_store.set_session_id(self._agent_id, session_id)
+            return len(messages)
 
     def reset(self) -> None:
         """Start a new session, keeping the old session file on disk.

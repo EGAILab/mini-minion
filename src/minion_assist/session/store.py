@@ -220,6 +220,22 @@ class SessionStore:
         self._save(data)
         return SessionInfo(**data[agent_id])
 
+    def set_session_id(self, agent_id: str, session_id: str) -> None:
+        """Update the stored session UUID for an agent without rotating it.
+
+        Used by :meth:`AgentSession.switch_session` to point the store at a
+        different existing session file after the user picks one via ``/history``.
+
+        Args:
+            agent_id (str): The agent whose ``session_id`` to update.
+            session_id (str): The new UUID to store (must be an existing session).
+        """
+        data = self._load()
+        if agent_id not in data:
+            return
+        data[agent_id]["session_id"] = session_id
+        self._save(data)
+
     def list_sessions(self) -> list[SessionInfo]:
         """Return all stored session records.
 

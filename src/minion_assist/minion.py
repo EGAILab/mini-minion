@@ -892,6 +892,7 @@ def main() -> None:
                         session_store=session_store,
                         mcp_manager=mcp_manager,
                         skills=skills,
+                        short_term=short_term,
                     )
                     result = dispatch_command(ctx)
                     if result.handled:
