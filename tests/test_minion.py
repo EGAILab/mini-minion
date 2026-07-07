@@ -2,9 +2,17 @@
 
 import pytest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch, call
+from unittest.mock import Mock, patch
 
 from minion_assist.memory.short_term import ShortTermMemory
+from minion_assist.session import SessionStore
+
+
+def _load_history(tmp_path, agent_id: str) -> list[dict]:
+    """Load history for an agent by resolving the session_id from the store."""
+    store = SessionStore(tmp_path / "sessions.json")
+    info = store.get_or_create(agent_id)
+    return ShortTermMemory(tmp_path / "sessions").load(agent_id, info.session_id)
 
 
 def _run_main(tmp_path, inputs, run_turn_effect=None):
@@ -53,7 +61,7 @@ def test_provider_exception_records_error_in_history(tmp_path):
     """After a provider exception, history has the user message and an assistant error entry."""
     _run_main(tmp_path, ["hello", "quit"], run_turn_effect=RuntimeError("timeout"))
 
-    history = ShortTermMemory(tmp_path / "sessions").load("main")
+    history = _load_history(tmp_path, "main")
     assert any(m["role"] == "user" and m["content"] == "hello" for m in history)
     assert any(
         m["role"] == "assistant" and "Provider error" in m["content"]
@@ -75,7 +83,7 @@ def test_provider_exception_rolls_back_partial_messages(tmp_path):
 
     _run_main(tmp_path, ["hello", "quit"], run_turn_effect=_crash_after_partial)
 
-    history = ShortTermMemory(tmp_path / "sessions").load("main")
+    history = _load_history(tmp_path, "main")
     # The partial assistant+tool_calls message must not appear in saved history.
     assert not any("tool_calls" in m for m in history)
     # Only the user message and the assistant error message should remain.
@@ -88,7 +96,7 @@ def test_user_message_persisted_on_exception(tmp_path):
     """User message is on disk after a provider crash (early save before run_turn)."""
     _run_main(tmp_path, ["my question", "quit"], run_turn_effect=RuntimeError("boom"))
 
-    history = ShortTermMemory(tmp_path / "sessions").load("main")
+    history = _load_history(tmp_path, "main")
     assert history[0] == {"role": "user", "content": "my question"}
 
 
@@ -96,7 +104,7 @@ def test_successful_turn_persists_history(tmp_path):
     """On a successful turn, history is saved and contains the user message."""
     _run_main(tmp_path, ["hello", "quit"])
 
-    history = ShortTermMemory(tmp_path / "sessions").load("main")
+    history = _load_history(tmp_path, "main")
     assert any(m["role"] == "user" and m["content"] == "hello" for m in history)
 
 
@@ -107,7 +115,7 @@ def test_route_prefix_message_is_not_treated_as_unknown_command(tmp_path, capsys
     assert rt_mock.call_count == 1
     assert rt_mock.call_args.args[1] == "Elizabeth"
 
-    history = ShortTermMemory(tmp_path / "sessions").load("researcher")
+    history = _load_history(tmp_path, "researcher")
     assert any(
         m["role"] == "user" and m["content"] == "how to prepare"
         for m in history
@@ -225,80 +233,85 @@ def test_keyboard_interrupt_during_turn_continues_repl(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# ephemeral_history
+# Session ID resolution (_resolve_session_id)
 # ---------------------------------------------------------------------------
 
 
-def test_ephemeral_history_clears_history_before_session_start(tmp_path):
-    """When ephemeral_history=True, pre-existing JSONL is wiped at startup."""
-    import minion_assist.minion as minion_mod
-    from minion_assist.config import AgentModelConfig, ProviderConfig, ModelConfig
-
-    # Pre-populate the researcher's JSONL with stale history.
-    stm = ShortTermMemory(tmp_path / "sessions")
-    stm.append("researcher", {"role": "user", "content": "old question"})
-    stm.append("researcher", {"role": "assistant", "content": "old answer"})
-    assert len(stm.load("researcher")) == 2
-
-    _provider = SimpleNamespace(
-        base_url="", api="lmstudio", api_key="", name="lmstudio",
-    )
-    _model = SimpleNamespace(id="test", context_window=8192, max_output_tokens=512)
-    _ephemeral_cfg = SimpleNamespace(
-        provider=_provider, model=_model, route_prefix="/research", ephemeral_history=True,
-    )
-    _main_provider = SimpleNamespace(
-        base_url="", api="lmstudio", api_key="", name="lmstudio",
-    )
-    _main_cfg = SimpleNamespace(
-        provider=_main_provider, model=_model, route_prefix=None, ephemeral_history=False,
-    )
-    fake_agents_cfg = {"main": _main_cfg, "researcher": _ephemeral_cfg}
-
-    with (
-        patch("minion_assist.minion.workspace", tmp_path),
-        patch("minion_assist.minion.agents_cfg", fake_agents_cfg),
-        patch("minion_assist.minion.mcp_cfg", SimpleNamespace(servers=())),
-        patch("minion_assist.minion.channels_cfg", SimpleNamespace(matrix=None)),
-        patch("minion_assist.agents.session.run_turn", Mock()),
-        patch("minion_assist.minion.create_provider", return_value=Mock()),
-        patch("builtins.input", side_effect=iter(["quit"])),
-    ):
-        minion_mod.main()
-
-    # After startup with ephemeral_history=True, the JSONL must be empty.
-    assert stm.load("researcher") == []
-
-
-def test_non_ephemeral_history_preserves_history_at_startup(tmp_path):
-    """When ephemeral_history=False (default), pre-existing JSONL is kept."""
-    import minion_assist.minion as minion_mod
-
-    stm = ShortTermMemory(tmp_path / "sessions")
-    stm.append("researcher", {"role": "user", "content": "old question"})
-    stm.append("researcher", {"role": "assistant", "content": "old answer"})
-
+def _fake_agents_cfg(freshness_seconds=3600):
+    """Build a minimal fake agents_cfg dict matching the real AGENTS keys."""
     _provider = SimpleNamespace(base_url="", api="lmstudio", api_key="", name="lmstudio")
     _model = SimpleNamespace(id="test", context_window=8192, max_output_tokens=512)
-    _persistent_cfg = SimpleNamespace(
-        provider=_provider, model=_model, route_prefix="/research", ephemeral_history=False,
-    )
-    _main_cfg = SimpleNamespace(
-        provider=_provider, model=_model, route_prefix=None, ephemeral_history=False,
-    )
-    fake_agents_cfg = {"main": _main_cfg, "researcher": _persistent_cfg}
+    _cfg = SimpleNamespace(provider=_provider, model=_model, session_freshness_seconds=freshness_seconds)
+    return {
+        "main": SimpleNamespace(**{**vars(_cfg), "route_prefix": None}),
+        "researcher": SimpleNamespace(**{**vars(_cfg), "route_prefix": "/research"}),
+    }
+
+
+def test_freshness_zero_always_generates_new_session_id(tmp_path):
+    """session_freshness_seconds=0 must rotate to a new UUID on every startup."""
+    from minion_assist.minion import _resolve_session_id
+    store = SessionStore(tmp_path / "sessions.json")
+    # First startup.
+    id1 = _resolve_session_id("main", store, freshness_seconds=0)
+    # Second startup immediately after.
+    id2 = _resolve_session_id("main", store, freshness_seconds=0)
+    assert id1 != id2
+
+
+def test_freshness_long_window_reuses_session_id(tmp_path):
+    """Within the freshness window the same UUID must be returned."""
+    from minion_assist.minion import _resolve_session_id
+    store = SessionStore(tmp_path / "sessions.json")
+    id1 = _resolve_session_id("main", store, freshness_seconds=3600)
+    id2 = _resolve_session_id("main", store, freshness_seconds=3600)
+    assert id1 == id2
+
+
+def test_stale_session_rotates_to_new_uuid(tmp_path):
+    """When last_active is beyond the freshness window a new UUID must be issued."""
+    from minion_assist.minion import _resolve_session_id
+    from minion_assist.session.store import SessionStore as _Store, _now
+    import json, datetime as dt
+
+    store = _Store(tmp_path / "sessions.json")
+    # Create a session with last_active two hours ago.
+    old_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)).isoformat()
+    raw = {
+        "main": {
+            "agent_id": "main",
+            "created_at": old_ts,
+            "last_active": old_ts,
+            "turn_count": 0,
+            "parent_id": None,
+            "session_id": "old-uuid",
+        }
+    }
+    (tmp_path / "sessions.json").write_text(json.dumps(raw), encoding="utf-8")
+    store2 = _Store(tmp_path / "sessions.json")
+    new_id = _resolve_session_id("main", store2, freshness_seconds=3600)
+    assert new_id != "old-uuid"
+
+
+def test_session_files_stored_per_agent_subdirectory(tmp_path):
+    """After a turn, history lands in sessions/{agent_id}/{session_id}.jsonl."""
+    import minion_assist.minion as minion_mod
 
     with (
         patch("minion_assist.minion.workspace", tmp_path),
-        patch("minion_assist.minion.agents_cfg", fake_agents_cfg),
+        patch("minion_assist.minion.agents_cfg", _fake_agents_cfg()),
         patch("minion_assist.minion.mcp_cfg", SimpleNamespace(servers=())),
         patch("minion_assist.minion.channels_cfg", SimpleNamespace(matrix=None)),
         patch("minion_assist.agents.session.run_turn", Mock()),
         patch("minion_assist.minion.create_provider", return_value=Mock()),
-        patch("builtins.input", side_effect=iter(["quit"])),
+        patch("builtins.input", side_effect=iter(["hello", "quit"])),
     ):
         minion_mod.main()
 
-    # With ephemeral_history=False, the JSONL must still have the old messages.
-    history = stm.load("researcher")
-    assert any(m["content"] == "old question" for m in history)
+    sessions_dir = tmp_path / "sessions" / "main"
+    assert sessions_dir.is_dir(), "agent subdirectory must exist"
+    jsonl_files = list(sessions_dir.glob("*.jsonl"))
+    assert len(jsonl_files) == 1, "exactly one session file must exist"
+    # File must contain the user message.
+    history = ShortTermMemory(tmp_path / "sessions").load("main", jsonl_files[0].stem)
+    assert any(m["role"] == "user" and m["content"] == "hello" for m in history)

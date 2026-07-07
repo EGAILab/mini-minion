@@ -1,4 +1,4 @@
-"""JSONL-backed short-term conversation history per agent.
+"""JSONL-backed short-term conversation history per agent session.
 
 Short-term memory stores the full back-and-forth conversation between a user
 and an agent. It's "short-term" in the sense that it holds the *current
@@ -27,13 +27,15 @@ Each line in the JSONL file is an OpenAI-format message dict, e.g.:
 
 File layout
 -----------
-Files are stored at ``{base_dir}/{key}.jsonl``. The key is typically the agent
-ID (e.g. ``"main"`` → ``~/.minion-assist/sessions/main.jsonl``).
+Files are stored at ``{base_dir}/{agent_id}/{session_id}.jsonl``.
+Each agent has its own subdirectory; each session within that agent
+gets its own JSONL file identified by its UUID session ID.  Old session
+files remain on disk (for potential future resume) until pruned.
 
 Talks to
 --------
-- ``minion.py`` — creates this, loads history at startup, saves after each turn.
-- ``tools/memory.py`` — the long-term counterpart; this handles short-term only.
+- ``agents/session.py`` — loads history at session start, saves after each turn.
+- ``minion.py`` — creates this, resolves session ID at startup.
 """
 
 import json
@@ -42,45 +44,46 @@ from pathlib import Path
 
 
 class ShortTermMemory:
-    """Conversation history store backed by JSONL files.
+    """Conversation history store backed by per-session JSONL files.
+
+    Each agent has a subdirectory; each session within that agent has its
+    own ``{session_id}.jsonl`` file.  Old sessions remain on disk until
+    :meth:`prune_sessions` removes them.
 
     Args:
-        base_dir (Path): Directory where ``.jsonl`` history files are stored.
-            Created automatically if it doesn't exist.
+        base_dir (Path): Root directory where ``{agent_id}/`` subdirectories
+            are stored.  Created automatically if it doesn't exist.
     """
 
     def __init__(self, base_dir: Path) -> None:
         self._dir = base_dir
-        # Create the sessions directory if it doesn't exist.
-        # parents=True handles the case where ~/.minion-assist itself doesn't exist yet.
         self._dir.mkdir(parents=True, exist_ok=True)
 
-    def _path(self, key: str) -> Path:
-        """Return the filesystem path for a given agent's history file.
+    def _path(self, agent_id: str, session_id: str) -> Path:
+        """Return the filesystem path for a given agent + session history file.
 
         Args:
-            key (str): Agent ID, e.g. ``"main"`` or ``"researcher"``.
+            agent_id (str): Agent ID, e.g. ``"main"`` or ``"researcher"``.
+            session_id (str): Session UUID, e.g. ``"550e8400-e29b-41d4-a716-446655440000"``.
 
         Returns:
-            Path: Full path to the JSONL file, e.g. ``/home/user/.minion-assist/sessions/main.jsonl``.
+            Path: Full path to the JSONL file, e.g.
+                ``~/.minion-assist/sessions/main/550e8400-....jsonl``.
         """
-        return self._dir / f"{key}.jsonl"
+        return self._dir / agent_id / f"{session_id}.jsonl"
 
-    def load(self, key: str) -> list[dict]:
-        """Load the full conversation history for an agent.
-
-        Reads the JSONL file and parses each line as a message dict.
-        Skips blank lines to handle trailing newlines gracefully.
+    def load(self, agent_id: str, session_id: str) -> list[dict]:
+        """Load the conversation history for a specific session.
 
         Args:
-            key (str): Agent ID to load history for.
+            agent_id (str): Agent ID to load history for.
+            session_id (str): Session UUID to load.
 
         Returns:
             list[dict]: List of message dicts in chronological order.
-                Returns an empty list if the file doesn't exist yet
-                (first run / fresh start).
+                Returns an empty list if the file doesn't exist yet.
         """
-        p = self._path(key)
+        p = self._path(agent_id, session_id)
         if not p.exists():
             return []
         messages = []
@@ -91,25 +94,22 @@ class ShortTermMemory:
             try:
                 messages.append(json.loads(line))
             except json.JSONDecodeError:
-                # Skip corrupt lines; the rest of the history is still usable.
                 pass
         return messages
 
-    def save(self, key: str, messages: list[dict]) -> None:
-        """Overwrite the history file with the given message list.
-
-        This does a full rewrite of the file. Used after each conversation turn
-        to persist the complete updated history.
+    def save(self, agent_id: str, session_id: str, messages: list[dict]) -> None:
+        """Overwrite the session history file with the given message list.
 
         Uses a temp-file swap (write to .tmp then os.replace) so a crash
         mid-write cannot corrupt or truncate an existing history file.
 
         Args:
-            key (str): Agent ID.
+            agent_id (str): Agent ID.
+            session_id (str): Session UUID.
             messages (list[dict]): The complete message list to save.
-                Serializes each message as one JSON line.
         """
-        p = self._path(key)
+        p = self._path(agent_id, session_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
         tmp.write_text(
             "\n".join(json.dumps(m) for m in messages),
@@ -117,27 +117,64 @@ class ShortTermMemory:
         )
         os.replace(tmp, p)
 
-    def append(self, key: str, message: dict) -> None:
-        """Append a single message to the history file without reading the rest.
+    def append(self, agent_id: str, session_id: str, message: dict) -> None:
+        """Append a single message to the session history file.
 
-        More efficient than ``save()`` for adding one message at a time, because
-        it opens the file in append mode (``"a"``) rather than rewriting
-        everything. Useful for very long conversations.
+        More efficient than ``save()`` for adding one message at a time.
 
         Args:
-            key (str): Agent ID.
+            agent_id (str): Agent ID.
+            session_id (str): Session UUID.
             message (dict): The message dict to append.
         """
-        with self._path(key).open("a", encoding="utf-8") as f:
+        p = self._path(agent_id, session_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(message) + "\n")
 
-    def clear(self, key: str) -> None:
-        """Delete the history file for an agent, resetting their conversation.
+    def clear(self, agent_id: str, session_id: str) -> None:
+        """Delete the history file for a specific session.
 
         Args:
-            key (str): Agent ID whose history file should be removed.
+            agent_id (str): Agent ID.
+            session_id (str): Session UUID whose history file should be removed.
                 Does nothing if the file doesn't exist.
         """
-        p = self._path(key)
+        p = self._path(agent_id, session_id)
         if p.exists():
-            p.unlink()  # unlink() is Python's name for "delete a file"
+            p.unlink()
+
+    def list_sessions(self, agent_id: str) -> list[Path]:
+        """Return all session JSONL files for an agent, sorted oldest-first.
+
+        Args:
+            agent_id (str): Agent ID.
+
+        Returns:
+            list[Path]: Session file paths sorted by modification time (oldest first).
+                Returns an empty list when no sessions exist yet.
+        """
+        agent_dir = self._dir / agent_id
+        if not agent_dir.exists():
+            return []
+        files = sorted(agent_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        return files
+
+    def prune_sessions(self, agent_id: str, keep_n: int = 20) -> int:
+        """Delete old session files, keeping only the N most recent.
+
+        Args:
+            agent_id (str): Agent ID whose old sessions to prune.
+            keep_n (int): Number of most-recent session files to keep. Default 20.
+
+        Returns:
+            int: Number of files deleted.
+        """
+        files = self.list_sessions(agent_id)  # sorted oldest → newest
+        to_delete = files[:-keep_n] if len(files) > keep_n else []
+        for f in to_delete:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        return len(to_delete)

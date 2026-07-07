@@ -105,6 +105,35 @@ from .tools.spawn_subagent import SpawnSubagentTool, _make_subagent_registry
 from .workspace import agent_workspace_root, ensure_workspace
 
 
+def _resolve_session_id(
+    agent_id: str,
+    session_store: "SessionStore",
+    freshness_seconds: int,
+) -> str:
+    """Return the session UUID for an agent, rotating if the session is stale.
+
+    Mirrors openclaw's ``resolveSession()`` + ``evaluateSessionFreshness()``:
+    - freshness_seconds == 0  → always rotate (always fresh)
+    - elapsed < freshness_seconds → reuse existing session UUID
+    - elapsed >= freshness_seconds → rotate to a new UUID
+
+    Old session JSONL files are never deleted here; :meth:`ShortTermMemory.prune_sessions`
+    handles housekeeping separately.
+    """
+    from datetime import UTC, datetime  # noqa: PLC0415
+    info = session_store.get_or_create(agent_id)
+    if freshness_seconds == 0 or not info.session_id:
+        return session_store.new_session(agent_id)
+    try:
+        last_active = datetime.fromisoformat(info.last_active)
+        elapsed = (datetime.now(UTC) - last_active).total_seconds()
+        if elapsed <= freshness_seconds:
+            return info.session_id
+    except (ValueError, TypeError):
+        pass
+    return session_store.new_session(agent_id)
+
+
 def main() -> None:
     """Start the interactive minion-assist chat session.
 
@@ -335,8 +364,12 @@ def main() -> None:
                 preserve_tokens=child_preserve,
             )
 
+            # Subagents always get a fresh session UUID — they are ephemeral task
+            # runners that should not carry history from a previous invocation.
+            child_session_id = session_store.new_session(child_id)
             child_session = AgentSession(
                 agent_id=child_id,
+                session_id=child_session_id,
                 agent=sub_agent_def,
                 provider=child_provider,
                 max_output_tokens=child_model_cfg.model.max_output_tokens,
@@ -346,8 +379,6 @@ def main() -> None:
                 session_store=session_store,
                 workspace_root=child_workspace,
                 bootstrap_context=child_bootstrap_context,
-                # Suppress background memory extraction for subagents — they are
-                # short-lived task runners and the extra API call is wasteful.
                 enable_memory_extraction=False,
                 log_dir=_log_dir,
             )
@@ -455,15 +486,16 @@ def main() -> None:
             else None
         )
 
-        # ephemeral_history: wipe the JSONL before loading so this agent starts
-        # each process run with a clean slate.  Within the session it still
-        # accumulates turns normally (useful for multi-step /research tasks);
-        # old conversations from previous runs are not carried forward.
-        if cfg.ephemeral_history:
-            short_term.clear(agent_id)
+        # Session ID resolution — openclaw model:
+        # Reuse the last session UUID if the agent was active within the freshness
+        # window; otherwise rotate to a new UUID (new JSONL file, clean slate).
+        # Old session files remain on disk for history / future resume.
+        _session_id = _resolve_session_id(agent_id, session_store, cfg.session_freshness_seconds)
+        short_term.prune_sessions(agent_id, keep_n=20)
 
         sessions[agent_id] = AgentSession(
             agent_id=agent_id,
+            session_id=_session_id,
             agent=AGENTS[agent_id],
             provider=provider,
             max_output_tokens=cfg.model.max_output_tokens,
@@ -531,8 +563,10 @@ def main() -> None:
                     context_window=_cfg.model.context_window,
                     preserve_tokens=_cfg.model.max_output_tokens + _SNIP_SAFETY_BUFFER,
                 )
+                _dream_uuid = _ss.new_session(_session_id)
                 return AgentSession(
                     agent_id=_session_id,
+                    session_id=_dream_uuid,
                     agent=AGENTS[_aid],
                     provider=_provider,
                     max_output_tokens=_cfg.model.max_output_tokens,
@@ -540,8 +574,6 @@ def main() -> None:
                     compactor=_dream_compactor,
                     short_term=_st,
                     session_store=_ss,
-                    # Dream sessions do not extract facts into long-term memory.
-                    # Narrative reflection is the purpose; curation stays with heartbeat.
                     enable_memory_extraction=False,
                     bootstrap_context=lambda ws=_ws: _read_dream_bootstrap(ws),
                     log_dir=_log_dir,

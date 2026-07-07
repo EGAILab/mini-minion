@@ -38,6 +38,7 @@ Talks to
 
 import json
 import os
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -58,12 +59,17 @@ class SessionInfo:
         parent_id (str | None): Agent ID of the session this was forked from,
             or ``None`` if this is an original (not forked) session.
             Set by :meth:`SessionStore.get_or_create` when ``parent_id`` is passed.
+        session_id (str): UUID of the current active session for this agent.
+            Maps to the JSONL filename in ``sessions/{agent_id}/{session_id}.jsonl``.
+            Generated automatically by :meth:`SessionStore.get_or_create` and
+            rotated by :meth:`SessionStore.new_session`.
     """
     agent_id: str
     created_at: str
     last_active: str
     turn_count: int
     parent_id: str | None = None
+    session_id: str = ""  # UUID; empty on legacy records, populated by get_or_create
 
 
 class SessionStore:
@@ -118,18 +124,23 @@ class SessionStore:
         self._cache = data  # keep cache in sync with what was just written
 
     def get_or_create(
-        self, agent_id: str, parent_id: str | None = None
+        self, agent_id: str, parent_id: str | None = None, session_id: str | None = None
     ) -> SessionInfo:
         """Return the session for an agent, creating it if it doesn't exist.
 
         If this is the first time this agent has been seen, a new session record
-        is created with the current timestamp and turn_count=0.
+        is created with the current timestamp and turn_count=0.  A UUID session_id
+        is generated automatically when creating; existing records without a
+        session_id (legacy) also receive a generated UUID.
 
         Args:
             agent_id (str):           The agent to look up, e.g. ``"main"``.
             parent_id (str | None):   When creating a new session, record it as
                                       forked from this agent ID.  Ignored when
                                       the session already exists.
+            session_id (str | None):  When provided, store this UUID as the
+                                      session_id (used by fork()).  Ignored when
+                                      the session already has a session_id.
 
         Returns:
             SessionInfo: The existing or newly-created session record.
@@ -143,9 +154,43 @@ class SessionStore:
                 last_active=now,
                 turn_count=0,
                 parent_id=parent_id,
+                session_id=session_id or str(uuid.uuid4()),
             ))
             self._save(data)
+        elif not data[agent_id].get("session_id"):
+            # Migrate legacy records that predate the session_id field.
+            data[agent_id]["session_id"] = session_id or str(uuid.uuid4())
+            self._save(data)
         return SessionInfo(**data[agent_id])
+
+    def new_session(self, agent_id: str) -> str:
+        """Rotate to a fresh session UUID for an agent.
+
+        Generates a new UUID, updates the stored ``session_id``, and returns
+        the new ID.  The old session file (if any) is NOT deleted — it stays
+        on disk for history / future resume.
+
+        Args:
+            agent_id (str): The agent whose session should be rotated.
+
+        Returns:
+            str: The new session UUID.
+        """
+        data = self._load()
+        new_id = str(uuid.uuid4())
+        if agent_id in data:
+            data[agent_id]["session_id"] = new_id
+        else:
+            now = _now()
+            data[agent_id] = asdict(SessionInfo(
+                agent_id=agent_id,
+                created_at=now,
+                last_active=now,
+                turn_count=0,
+                session_id=new_id,
+            ))
+        self._save(data)
+        return new_id
 
     def touch(self, agent_id: str, increment_turns: bool = False) -> SessionInfo:
         """Update the session's last-active timestamp, optionally incrementing turns.

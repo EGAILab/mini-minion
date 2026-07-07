@@ -29,7 +29,7 @@ def _mock_provider(text="response text", finish_reason="stop"):
     return provider
 
 
-def _make_session(tmp_path, provider=None, agent_id="main"):
+def _make_session(tmp_path, provider=None, agent_id="main", session_id="test-session"):
     """Build an AgentSession wired to a tmp_path workspace."""
     if provider is None:
         provider = _mock_provider()
@@ -38,6 +38,7 @@ def _make_session(tmp_path, provider=None, agent_id="main"):
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     return AgentSession(
         agent_id=agent_id,
+        session_id=session_id,
         agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
@@ -77,7 +78,7 @@ def test_send_persists_history_to_disk(tmp_path):
     session = _make_session(tmp_path)
     session.send("persist me")
 
-    on_disk = ShortTermMemory(tmp_path / "sessions").load("main")
+    on_disk = ShortTermMemory(tmp_path / "sessions").load("main", "test-session")
     assert any(m["role"] == "user" and m["content"] == "persist me" for m in on_disk)
 
 
@@ -172,7 +173,7 @@ def test_send_persists_user_message_before_run_turn(tmp_path):
     except RuntimeError:
         pass
 
-    on_disk = ShortTermMemory(tmp_path / "sessions").load("main")
+    on_disk = ShortTermMemory(tmp_path / "sessions").load("main", "test-session")
     assert on_disk[0] == {"role": "user", "content": "my question"}
 
 
@@ -260,6 +261,7 @@ def test_max_tool_rounds_forwarded_to_run_turn(tmp_path):
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     session = AgentSession(
         agent_id="main",
+        session_id="test-session",
         agent=AgentConfig(name="Ada", soul="You are Ada.", max_tool_rounds=7),
         provider=provider,
         max_output_tokens=512,
@@ -325,6 +327,7 @@ def test_user_context_injected_into_system_prompt(tmp_path):
 
     session = AgentSession(
         agent_id="main",
+        session_id="test-session",
         agent=AgentConfig(name="Ada", soul="Base soul."),
         provider=provider,
         max_output_tokens=512,
@@ -361,6 +364,7 @@ def test_no_user_context_when_file_absent(tmp_path):
 
     session = AgentSession(
         agent_id="main",
+        session_id="test-session",
         agent=AgentConfig(name="Ada", soul="Base soul."),
         provider=provider,
         max_output_tokens=512,
@@ -404,6 +408,7 @@ def _make_session_with_tasks(tmp_path, tasks_dir, provider=None, agent_id="main"
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     return AgentSession(
         agent_id=agent_id,
+        session_id="test-session",
         agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
@@ -627,6 +632,7 @@ def test_enable_memory_extraction_false_suppresses_extraction(tmp_path):
 
     session = AgentSession(
         agent_id="main",
+        session_id="test-session",
         agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
@@ -660,6 +666,7 @@ def test_enable_memory_extraction_true_allows_extraction(tmp_path):
 
     session = AgentSession(
         agent_id="main",
+        session_id="test-session",
         agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,

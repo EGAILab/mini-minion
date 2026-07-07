@@ -400,6 +400,7 @@ def _make_session(tmp_path, bootstrap_context=None, provider=None):
 
     return AgentSession(
         agent_id="main",
+        session_id="test-session",
         agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,

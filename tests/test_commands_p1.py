@@ -25,7 +25,7 @@ def _mock_provider(text="ok"):
     return provider
 
 
-def _make_session(tmp_path, provider=None, agent_id="main"):
+def _make_session(tmp_path, provider=None, agent_id="main", session_id="test-session"):
     if provider is None:
         provider = _mock_provider()
     short_term = ShortTermMemory(tmp_path / "sessions")
@@ -33,6 +33,7 @@ def _make_session(tmp_path, provider=None, agent_id="main"):
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     return AgentSession(
         agent_id=agent_id,
+        session_id=session_id,
         agent=AgentConfig(name="Ada", soul="soul"),
         provider=provider,
         max_output_tokens=512,

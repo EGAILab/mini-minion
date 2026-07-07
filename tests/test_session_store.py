@@ -69,6 +69,11 @@ def test_session_info_is_dataclass():
     assert info.turn_count == 3
 
 
+def test_session_info_session_id_defaults_empty():
+    info = SessionInfo(agent_id="x", created_at="t1", last_active="t2", turn_count=0)
+    assert info.session_id == ""
+
+
 def test_store_persists_to_file(tmp_path):
     path = tmp_path / "sessions.json"
     store = SessionStore(path)
@@ -189,3 +194,74 @@ def test_existing_session_parent_id_not_overwritten(tmp_path):
 def test_session_info_parent_id_defaults_none():
     info = SessionInfo(agent_id="x", created_at="t1", last_active="t2", turn_count=0)
     assert info.parent_id is None
+
+
+# ---------------------------------------------------------------------------
+# session_id — UUID tracking
+# ---------------------------------------------------------------------------
+
+
+def test_get_or_create_generates_session_id(tmp_path):
+    """get_or_create must populate session_id with a UUID on first create."""
+    store = SessionStore(tmp_path / "sessions.json")
+    info = store.get_or_create("main")
+    assert info.session_id
+    assert len(info.session_id) == 36  # UUID format
+
+
+def test_get_or_create_preserves_existing_session_id(tmp_path):
+    """Calling get_or_create twice must not rotate the session_id."""
+    store = SessionStore(tmp_path / "sessions.json")
+    first = store.get_or_create("main")
+    second = store.get_or_create("main")
+    assert first.session_id == second.session_id
+
+
+def test_new_session_rotates_uuid(tmp_path):
+    """new_session must generate a different UUID from the current one."""
+    store = SessionStore(tmp_path / "sessions.json")
+    info = store.get_or_create("main")
+    original_id = info.session_id
+    new_id = store.new_session("main")
+    assert new_id != original_id
+    assert len(new_id) == 36
+
+
+def test_new_session_persists_across_reload(tmp_path):
+    """After new_session(), a fresh store instance reads the rotated session_id."""
+    path = tmp_path / "sessions.json"
+    store1 = SessionStore(path)
+    store1.get_or_create("main")
+    new_id = store1.new_session("main")
+
+    store2 = SessionStore(path)
+    info = store2.get_or_create("main")
+    assert info.session_id == new_id
+
+
+def test_new_session_creates_record_if_missing(tmp_path):
+    """new_session on an unknown agent creates the record and returns a UUID."""
+    store = SessionStore(tmp_path / "sessions.json")
+    new_id = store.new_session("fresh-agent")
+    assert new_id
+    info = store.get_or_create("fresh-agent")
+    assert info.session_id == new_id
+
+
+def test_get_or_create_migrates_legacy_record_without_session_id(tmp_path):
+    """A sessions.json written by older code (no session_id field) gets a UUID on first access."""
+    import json
+    path = tmp_path / "sessions.json"
+    # Write a legacy record without session_id.
+    path.write_text(json.dumps({"main": {
+        "agent_id": "main",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "last_active": "2026-01-01T00:00:00+00:00",
+        "turn_count": 5,
+        "parent_id": None,
+    }}), encoding="utf-8")
+
+    store = SessionStore(path)
+    info = store.get_or_create("main")
+    assert info.session_id  # must have been populated
+    assert info.turn_count == 5  # legacy data preserved

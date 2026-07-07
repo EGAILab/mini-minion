@@ -25,7 +25,7 @@ def _mock_provider(text="ok", tool_calls=None, finish_reason="stop"):
     return provider
 
 
-def _make_session(tmp_path, provider=None, agent_id="main"):
+def _make_session(tmp_path, provider=None, agent_id="main", session_id="test-session"):
     if provider is None:
         provider = _mock_provider()
     short_term = ShortTermMemory(tmp_path / "sessions")
@@ -33,6 +33,7 @@ def _make_session(tmp_path, provider=None, agent_id="main"):
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
     return AgentSession(
         agent_id=agent_id,
+        session_id=session_id,
         agent=AgentConfig(name="Ada", soul="You are Ada."),
         provider=provider,
         max_output_tokens=512,
@@ -186,8 +187,10 @@ def test_fork_creates_new_history_file(tmp_path):
 
     session.fork("forked")
 
+    store = SessionStore(tmp_path / "sessions.json")
+    forked_sid = store.get_or_create("forked").session_id
     short_term = ShortTermMemory(tmp_path / "sessions")
-    forked_history = short_term.load("forked")
+    forked_history = short_term.load("forked", forked_sid)
     assert len(forked_history) >= 2  # user + assistant
 
 

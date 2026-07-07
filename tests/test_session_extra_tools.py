@@ -45,6 +45,7 @@ def _make_session(response="test response", workspace=None):
 
     return AgentSession(
         agent_id="test",
+        session_id="test-session",
         agent=agent,
         provider=provider,
         max_output_tokens=512,

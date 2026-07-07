@@ -374,6 +374,7 @@ class AgentSession:
         self,
         *,
         agent_id: str,
+        session_id: str,
         agent: AgentConfig,
         provider: LLMProvider,
         max_output_tokens: int,
@@ -390,6 +391,7 @@ class AgentSession:
         log_dir: Path | None = None,
     ) -> None:
         self._agent_id = agent_id
+        self._session_id = session_id
         self._agent = agent
         self._provider = provider
         self._max_output_tokens = max_output_tokens
@@ -455,9 +457,9 @@ class AgentSession:
         )
 
         # Load prior history from disk so conversation survives restarts.
-        self._history: list[dict] = short_term.load(agent_id)
+        self._history: list[dict] = short_term.load(agent_id, session_id)
         # Create session record if this is the agent's first run.
-        session_store.get_or_create(agent_id)
+        session_store.get_or_create(agent_id, session_id=session_id)
 
     @property
     def provider(self) -> "LLMProvider":
@@ -632,7 +634,7 @@ class AgentSession:
         )
 
         # Persist the user message now — safe on disk even if the provider crashes.
-        self._short_term.save(self._agent_id, self._history)
+        self._short_term.save(self._agent_id, self._session_id, self._history)
 
         # Snapshot for rollback on mid-turn crash.
         snapshot_len = len(self._history)
@@ -713,7 +715,7 @@ class AgentSession:
             self._history.append({"role": "assistant", "content": error_text})
             raise
         finally:
-            self._short_term.save(self._agent_id, self._history)
+            self._short_term.save(self._agent_id, self._session_id, self._history)
 
         for msg in reversed(self._history):
             if msg.get("role") == "assistant" and msg.get("content"):
@@ -734,21 +736,19 @@ class AgentSession:
 
         Called by the ``/resume`` command via :func:`dispatch_command`.
         """
-        self._history = self._short_term.load(self._agent_id)
+        self._history = self._short_term.load(self._agent_id, self._session_id)
 
     def reset(self) -> None:
-        """Clear this agent's in-memory and persisted conversation history.
+        """Start a new session, keeping the old session file on disk.
 
-        Leaves long-term memory and task files untouched — only the current
-        conversation context is cleared, starting the agent fresh.
+        Generates a fresh UUID so the next turn writes to a new JSONL file.
+        The previous session file is preserved (for history / future resume).
+        Leaves long-term memory and task files untouched.
 
         Called by the /new command in minion.py via the slash command dispatcher.
         """
+        self._session_id = self._session_store.new_session(self._agent_id)
         self._history = []
-        self._short_term.clear(self._agent_id)
-        # If the provider maintains session state (e.g. CodexProvider's thread),
-        # reset it so the next turn starts a fresh context rather than continuing
-        # the old conversation inside the provider's session.
         if hasattr(self._provider, "reset_session"):
             self._provider.reset_session()
 
@@ -772,8 +772,7 @@ class AgentSession:
         )
         changed = self._history != before
         if changed:
-            # Persist the compacted history so it survives restarts.
-            self._short_term.save(self._agent_id, self._history)
+            self._short_term.save(self._agent_id, self._session_id, self._history)
         return changed
 
     def refresh_mcp_adapters(self, manager: object) -> int:
@@ -845,8 +844,9 @@ class AgentSession:
             new_agent_id (str): The ID to assign to the forked session.
                 Must not already exist in the session store.
         """
-        self._short_term.save(new_agent_id, list(self._history))
-        self._session_store.get_or_create(new_agent_id, parent_id=self._agent_id)
+        new_session_id = str(uuid.uuid4())
+        self._short_term.save(new_agent_id, new_session_id, list(self._history))
+        self._session_store.get_or_create(new_agent_id, parent_id=self._agent_id, session_id=new_session_id)
 
     def export(self, format: str = "md") -> str:
         """Export the conversation history as a Markdown or HTML transcript.

@@ -515,18 +515,19 @@ class AgentModelConfig:
         route_prefix (str | None): The command prefix that routes messages to this
             agent (e.g. ``"/research"``). ``None`` means this agent is the default
             fallback — it handles messages that match no other prefix.
-        ephemeral_history (bool): When ``True``, the agent's conversation history
-            is cleared at each process start.  Within a session the agent still
-            accumulates context from multiple turns (useful for multi-step research),
-            but old conversations from previous sessions are not carried forward.
-            Defaults to ``False`` (persistent history, like the main agent).
-            Recommended for task-oriented sub-agents (researchers, etc.) that should
-            start each session fresh rather than inheriting weeks-old context.
+        session_freshness_seconds (int): How long (in seconds) a session stays
+            "fresh" after its last interaction.  When the process starts, if the
+            agent's last session was active within this window the same session UUID
+            is reused (conversation continues).  If the window has elapsed a new
+            UUID is generated and the agent starts a fresh conversation.  Old
+            session files remain on disk.  ``0`` means always start fresh (never
+            reuse). Default 3600 (1 hour).  Set to 0 for task-oriented sub-agents
+            (researchers, etc.) that should start each session clean.
     """
     provider: ProviderConfig
     model: ModelConfig
     route_prefix: str | None = None  # None → default/fallback agent; field with default must come last
-    ephemeral_history: bool = False  # True → wipe JSONL at startup; False → persist across restarts
+    session_freshness_seconds: int = 3600  # 0 = always fresh; >0 = reuse if session idle < N seconds
 
 
 @dataclass(frozen=True)
@@ -887,12 +888,17 @@ def _resolve_all() -> dict[str, AgentModelConfig]:
         base = _resolve_provider(provider_name, model_id)
         # route_prefix is optional; absent or empty string both mean "default agent".
         route_prefix = agent_raw.get("route_prefix") or None
-        ephemeral_history = bool(agent_raw.get("ephemeral_history", False))
+        # session_freshness_seconds: how long a session stays alive between restarts.
+        # Backward compat: ephemeral_history:true maps to freshness=0 (always fresh).
+        if agent_raw.get("ephemeral_history"):
+            session_freshness_seconds = 0
+        else:
+            session_freshness_seconds = int(agent_raw.get("session_freshness_seconds", 3600))
         result[agent_id] = AgentModelConfig(
             provider=base.provider,
             model=base.model,
             route_prefix=route_prefix,
-            ephemeral_history=ephemeral_history,
+            session_freshness_seconds=session_freshness_seconds,
         )
     return result
 
