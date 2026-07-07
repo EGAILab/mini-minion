@@ -178,6 +178,79 @@ def test_history_no_match_prefix(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Tests: /session load — transcript display
+# ---------------------------------------------------------------------------
+
+def test_session_load_shows_transcript(tmp_path):
+    """Loading a session should render the conversation in the message."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [
+        {"role": "user", "content": "Hello from old session"},
+        {"role": "assistant", "content": "Hi there!"},
+    ])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    # Use a real session mock that returns proper history after switch
+    from unittest.mock import PropertyMock
+    session = MagicMock()
+    type(session).session_id = property(lambda s: "cur-001")
+    loaded = []
+
+    def _switch(sid):
+        loaded[:] = stm.load("main", sid)
+    session.switch_session.side_effect = _switch
+    type(session).history = property(lambda s: loaded)
+
+    ctx = CommandContext(
+        raw="/session 2",
+        command="/session",
+        args="2",
+        target_agent_id="main",
+        sessions={"main": session},
+        agents_cfg={},
+        short_term=stm,
+    )
+    result = dispatch_command(ctx)
+    assert result.handled
+    assert "Hello from old session" in result.message
+    assert "Hi there!" in result.message
+    assert "User:" in result.message
+    assert "Assistant:" in result.message
+
+
+def test_session_load_shows_name_in_header(tmp_path):
+    """Header should show the session name when one is set."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "hi"}])
+    stm.set_name("main", "old-001", "Auth work")
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [])
+
+    from unittest.mock import PropertyMock
+    session = MagicMock()
+    type(session).session_id = property(lambda s: "cur-001")
+    loaded = []
+
+    def _switch(sid):
+        loaded[:] = stm.load("main", sid)
+    session.switch_session.side_effect = _switch
+    type(session).history = property(lambda s: loaded)
+
+    ctx = CommandContext(
+        raw="/session 2",
+        command="/session",
+        args="2",
+        target_agent_id="main",
+        sessions={"main": session},
+        agents_cfg={},
+        short_term=stm,
+    )
+    result = dispatch_command(ctx)
+    assert "[Auth work]" in result.message
+
+
+# ---------------------------------------------------------------------------
 # Tests: /rename
 # ---------------------------------------------------------------------------
 

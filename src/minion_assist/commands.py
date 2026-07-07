@@ -345,6 +345,43 @@ def parse_command(text: str) -> tuple[str, str] | None:
     return command, args
 
 
+def _format_history(messages: list[dict], max_content: int = 600) -> str:
+    """Render a message list as a readable conversation transcript.
+
+    Each turn is shown as ``User:`` / ``Assistant:`` with content truncated
+    to *max_content* characters.  Tool calls and non-text content blocks are
+    summarised rather than printed in full.
+    """
+    lines: list[str] = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = [
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            tool_count = sum(
+                1 for b in content
+                if isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
+            )
+            content = "\n".join(text_parts)
+            if tool_count:
+                suffix = f"\n[{tool_count} tool call(s) not shown]"
+                content = (content + suffix).strip()
+        if not isinstance(content, str):
+            content = ""
+        content = content.strip()
+        if len(content) > max_content:
+            content = content[:max_content] + " … [truncated]"
+        if role == "user":
+            lines.append(f"User: {content}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {content}")
+    return "\n\n".join(lines)
+
+
 def dispatch_command(ctx: CommandContext) -> CommandResult:
     """Execute a slash command and return what minion.py should do next.
 
@@ -512,10 +549,16 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
             target_id = target_path.stem
             if target_id == current_id:
                 return CommandResult(handled=True, message="Already on that session.")
-            n = session.switch_session(target_id)
+            session.switch_session(target_id)
+            history = session.history
+            name = ctx.short_term.get_name(agent_id, target_id) if ctx.short_term else None
+            label = f"[{name}]" if name else target_id[:8]
+            header = f"=== Session {label} ({len(history)} messages) ==="
+            transcript = _format_history(history)
+            body = transcript if transcript else "(empty session)"
             return CommandResult(
                 handled=True,
-                message=f"Loaded session {target_id[:8]} ({n} messages).",
+                message=f"{header}\n\n{body}",
             )
 
         # --- /rename ---
