@@ -105,28 +105,75 @@ from .tools.spawn_subagent import SpawnSubagentTool, _make_subagent_registry
 from .workspace import agent_workspace_root, ensure_workspace
 
 
+def _build_reseed_context(messages: list[dict], max_chars: int) -> str | None:
+    """Format prior session messages as a system-prompt block for a fresh session.
+
+    Mirrors openclaw's ``buildCliSessionHistoryPrompt()``: only user and assistant
+    text turns are included; tool calls and tool results are omitted for readability.
+    Content exceeding ``max_chars`` is tail-truncated so recent turns survive.
+    """
+    lines: list[str] = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ).strip()
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if role == "user":
+            lines.append(f"User: {content.strip()}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {content.strip()}")
+    if not lines:
+        return None
+    history_text = "\n\n".join(lines)
+    if len(history_text) > max_chars:
+        history_text = (
+            "[Prior history truncated — older turns omitted]\n"
+            + history_text[-max_chars:]
+        )
+    return "\n".join([
+        "The following is a transcript of a prior session.",
+        "Use it as context to continue naturally.",
+        "",
+        "<prior_session_history>",
+        history_text,
+        "</prior_session_history>",
+    ])
+
+
 def _resolve_session_id(
     agent_id: str,
     session_store: "SessionStore",
+    short_term: "ShortTermMemory",
     reset_mode: str = "daily",
     reset_at_hour: int = 4,
     idle_minutes: int = 0,
-) -> str:
-    """Return the session UUID for an agent, rotating if the session is stale.
+    reseed_max_chars: int = 12_000,
+) -> tuple[str, str | None]:
+    """Return ``(session_id, reseed_context)`` for an agent.
 
     Mirrors openclaw's ``resolveSession()`` + ``evaluateSessionFreshness()``:
 
-    - ``"daily"`` mode: stale when ``last_active`` predates today's ``reset_at_hour``
-      (e.g. 4am).  Continuing a mid-day conversation always reuses the UUID.
+    - ``"daily"`` mode: stale when ``last_active`` predates today's ``reset_at_hour``.
     - ``"idle"`` mode: stale when ``last_active`` is older than ``idle_minutes``.
-      ``idle_minutes=0`` always rotates (never reuse).
+      ``idle_minutes=0`` always rotates.
 
-    Old session JSONL files are never deleted here; prune_sessions() handles housekeeping.
+    When stale, the old session's history is loaded and formatted as
+    ``reseed_context`` (a ``<prior_session_history>`` block) so the new session
+    can continue with context.  Returns ``(new_uuid, reseed_context_or_None)``.
+    When fresh, returns ``(existing_uuid, None)``.
+
+    Old session JSONL files are never deleted here; prune_sessions() handles that.
     """
     from datetime import UTC, datetime, timedelta  # noqa: PLC0415
     info = session_store.get_or_create(agent_id)
     if not info.session_id:
-        return session_store.new_session(agent_id)
+        return session_store.new_session(agent_id), None
 
     now = datetime.now(UTC)
     stale = False
@@ -134,7 +181,6 @@ def _resolve_session_id(
     if reset_mode == "daily":
         try:
             last_active = datetime.fromisoformat(info.last_active)
-            # Most-recent reset boundary: today at reset_at_hour, or yesterday's if not yet reached.
             boundary = now.replace(hour=reset_at_hour, minute=0, second=0, microsecond=0)
             if now < boundary:
                 boundary -= timedelta(days=1)
@@ -151,7 +197,13 @@ def _resolve_session_id(
             except (ValueError, TypeError):
                 stale = True
 
-    return session_store.new_session(agent_id) if stale else info.session_id
+    if not stale:
+        return info.session_id, None
+
+    # Build reseed context from the old session before rotating.
+    old_messages = short_term.load(agent_id, info.session_id)
+    reseed_context = _build_reseed_context(old_messages, max_chars=reseed_max_chars)
+    return session_store.new_session(agent_id), reseed_context
 
 
 def main() -> None:
@@ -510,17 +562,20 @@ def main() -> None:
         # Reuse the last session UUID if the agent was active within the freshness
         # window; otherwise rotate to a new UUID (new JSONL file, clean slate).
         # Old session files remain on disk for history / future resume.
-        _session_id = _resolve_session_id(
-            agent_id, session_store,
+        _reseed_max_chars = max(12_000, min(256_000, cfg.model.context_window * 32 // 100))
+        _session_id, _reseed_context = _resolve_session_id(
+            agent_id, session_store, short_term,
             reset_mode=cfg.session_reset_mode,
             reset_at_hour=cfg.session_reset_at_hour,
             idle_minutes=cfg.session_idle_minutes,
+            reseed_max_chars=_reseed_max_chars,
         )
         short_term.prune_sessions(agent_id, keep_n=20)
 
         sessions[agent_id] = AgentSession(
             agent_id=agent_id,
             session_id=_session_id,
+            reseed_context=_reseed_context,
             agent=AGENTS[agent_id],
             provider=provider,
             max_output_tokens=cfg.model.max_output_tokens,
@@ -531,12 +586,8 @@ def main() -> None:
             soul_suffix=_skills_suffix,
             long_term=long_term,
             tasks_dir=_tasks_dir,
-            # Respect config.json "memory.enable_extraction": false to suppress
-            # the background API call that extracts facts after each turn.
             enable_memory_extraction=memory_cfg.enable_extraction,
-            # Per-agent bootstrap: re-reads workspace files on each turn.
             bootstrap_context=_agent_bootstrap_context,
-            # Per-agent workspace root for Phase 5 attestation.
             workspace_root=_agent_workspace,
             log_dir=_log_dir,
         )

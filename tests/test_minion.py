@@ -254,24 +254,29 @@ def _fake_agents_cfg(reset_mode="daily", at_hour=4, idle_minutes=0):
 def test_idle_zero_always_generates_new_session_id(tmp_path):
     """idle mode with idle_minutes=0 must rotate to a new UUID on every startup."""
     from minion_assist.minion import _resolve_session_id
+    from minion_assist.memory.short_term import ShortTermMemory as _STM
     store = SessionStore(tmp_path / "sessions.json")
-    id1 = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=0)
-    id2 = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=0)
+    stm = _STM(tmp_path / "sessions")
+    id1, _ = _resolve_session_id("main", store, stm, reset_mode="idle", idle_minutes=0)
+    id2, _ = _resolve_session_id("main", store, stm, reset_mode="idle", idle_minutes=0)
     assert id1 != id2
 
 
 def test_idle_long_window_reuses_session_id(tmp_path):
     """idle mode within the window must reuse the same UUID."""
     from minion_assist.minion import _resolve_session_id
+    from minion_assist.memory.short_term import ShortTermMemory as _STM
     store = SessionStore(tmp_path / "sessions.json")
-    id1 = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=60)
-    id2 = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=60)
+    stm = _STM(tmp_path / "sessions")
+    id1, _ = _resolve_session_id("main", store, stm, reset_mode="idle", idle_minutes=60)
+    id2, _ = _resolve_session_id("main", store, stm, reset_mode="idle", idle_minutes=60)
     assert id1 == id2
 
 
 def test_idle_stale_session_rotates_to_new_uuid(tmp_path):
     """idle mode: when last_active exceeds idle_minutes a new UUID is issued."""
     from minion_assist.minion import _resolve_session_id
+    from minion_assist.memory.short_term import ShortTermMemory as _STM
     from minion_assist.session.store import SessionStore as _Store
     import json, datetime as dt
 
@@ -288,20 +293,20 @@ def test_idle_stale_session_rotates_to_new_uuid(tmp_path):
     }
     (tmp_path / "sessions.json").write_text(json.dumps(raw), encoding="utf-8")
     store = _Store(tmp_path / "sessions.json")
-    new_id = _resolve_session_id("main", store, reset_mode="idle", idle_minutes=60)
+    stm = _STM(tmp_path / "sessions")
+    new_id, _ = _resolve_session_id("main", store, stm, reset_mode="idle", idle_minutes=60)
     assert new_id != "old-uuid"
 
 
 def test_daily_reuses_session_started_after_reset_hour(tmp_path):
     """daily mode: session started after today's reset hour must be reused."""
     from minion_assist.minion import _resolve_session_id
+    from minion_assist.memory.short_term import ShortTermMemory as _STM
     from minion_assist.session.store import SessionStore as _Store
     import json, datetime as dt
 
-    # last_active = 2 hours ago but after today's 4am boundary.
     now = dt.datetime.now(dt.timezone.utc)
     recent_ts = (now - dt.timedelta(hours=2)).isoformat()
-    # Only run this test if 2 hours ago is still after 4am today.
     boundary = now.replace(hour=4, minute=0, second=0, microsecond=0)
     if now - dt.timedelta(hours=2) < boundary:
         pytest.skip("too early in the day for this test to be meaningful")
@@ -318,17 +323,19 @@ def test_daily_reuses_session_started_after_reset_hour(tmp_path):
     }
     (tmp_path / "sessions.json").write_text(json.dumps(raw), encoding="utf-8")
     store = _Store(tmp_path / "sessions.json")
-    reused = _resolve_session_id("main", store, reset_mode="daily", reset_at_hour=4)
+    stm = _STM(tmp_path / "sessions")
+    reused, reseed = _resolve_session_id("main", store, stm, reset_mode="daily", reset_at_hour=4)
     assert reused == "same-uuid"
+    assert reseed is None
 
 
 def test_daily_rotates_session_started_before_reset_hour(tmp_path):
     """daily mode: session with last_active before today's reset hour must rotate."""
     from minion_assist.minion import _resolve_session_id
+    from minion_assist.memory.short_term import ShortTermMemory as _STM
     from minion_assist.session.store import SessionStore as _Store
     import json, datetime as dt
 
-    # last_active = yesterday, well before any 4am boundary.
     old_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
     raw = {
         "main": {
@@ -342,8 +349,69 @@ def test_daily_rotates_session_started_before_reset_hour(tmp_path):
     }
     (tmp_path / "sessions.json").write_text(json.dumps(raw), encoding="utf-8")
     store = _Store(tmp_path / "sessions.json")
-    new_id = _resolve_session_id("main", store, reset_mode="daily", reset_at_hour=4)
+    stm = _STM(tmp_path / "sessions")
+    new_id, _ = _resolve_session_id("main", store, stm, reset_mode="daily", reset_at_hour=4)
     assert new_id != "yesterday-uuid"
+
+
+def test_reseed_context_included_on_rotation(tmp_path):
+    """On session rotation, reseed_context must contain prior history text."""
+    from minion_assist.minion import _resolve_session_id
+    from minion_assist.memory.short_term import ShortTermMemory as _STM
+    from minion_assist.session.store import SessionStore as _Store
+    import json, datetime as dt
+
+    old_sid = "old-session"
+    old_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+    raw = {
+        "main": {
+            "agent_id": "main",
+            "created_at": old_ts,
+            "last_active": old_ts,
+            "turn_count": 2,
+            "parent_id": None,
+            "session_id": old_sid,
+        }
+    }
+    (tmp_path / "sessions.json").write_text(json.dumps(raw), encoding="utf-8")
+    stm = _STM(tmp_path / "sessions")
+    stm.save("main", old_sid, [
+        {"role": "user", "content": "what is 2+2"},
+        {"role": "assistant", "content": "4"},
+    ])
+    store = _Store(tmp_path / "sessions.json")
+    new_id, reseed = _resolve_session_id("main", store, stm, reset_mode="daily", reset_at_hour=4)
+    assert new_id != old_sid
+    assert reseed is not None
+    assert "what is 2+2" in reseed
+    assert "4" in reseed
+    assert "<prior_session_history>" in reseed
+
+
+def test_reseed_context_none_when_no_prior_history(tmp_path):
+    """Rotation with empty prior history must return None reseed_context."""
+    from minion_assist.minion import _resolve_session_id
+    from minion_assist.memory.short_term import ShortTermMemory as _STM
+    from minion_assist.session.store import SessionStore as _Store
+    import json, datetime as dt
+
+    old_sid = "empty-session"
+    old_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+    raw = {
+        "main": {
+            "agent_id": "main",
+            "created_at": old_ts,
+            "last_active": old_ts,
+            "turn_count": 0,
+            "parent_id": None,
+            "session_id": old_sid,
+        }
+    }
+    (tmp_path / "sessions.json").write_text(json.dumps(raw), encoding="utf-8")
+    store = _Store(tmp_path / "sessions.json")
+    stm = _STM(tmp_path / "sessions")
+    _, reseed = _resolve_session_id("main", store, stm, reset_mode="daily", reset_at_hour=4)
+    assert reseed is None
 
 
 def test_session_files_stored_per_agent_subdirectory(tmp_path):

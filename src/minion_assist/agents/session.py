@@ -375,6 +375,7 @@ class AgentSession:
         *,
         agent_id: str,
         session_id: str,
+        reseed_context: str | None = None,
         agent: AgentConfig,
         provider: LLMProvider,
         max_output_tokens: int,
@@ -392,6 +393,8 @@ class AgentSession:
     ) -> None:
         self._agent_id = agent_id
         self._session_id = session_id
+        # Consumed on the first send() after a session rotation (openclaw reseed).
+        self._reseed_context: str | None = reseed_context
         self._agent = agent
         self._provider = provider
         self._max_output_tokens = max_output_tokens
@@ -610,9 +613,13 @@ class AgentSession:
             system += f"\n\n{budget_block}"
         if self._soul_suffix:
             system += f"\n\n{self._soul_suffix}"
-        # Per-turn system suffix from caller (e.g. group-chat context injection).
-        if system_suffix:
-            system += f"\n\n{system_suffix}"
+        # Reseed context: injected once on the first send() after a session rotation,
+        # then cleared so subsequent turns are not polluted with stale history.
+        _reseed = self._reseed_context
+        self._reseed_context = None
+        _effective_suffix = "\n\n".join(filter(None, [_reseed, system_suffix or ""]))
+        if _effective_suffix:
+            system += f"\n\n{_effective_suffix}"
 
         # Build compaction callbacks. The notify function tracks whether compaction
         # actually ran so TurnCompleted can report it.

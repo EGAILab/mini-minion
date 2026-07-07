@@ -687,3 +687,66 @@ def test_enable_memory_extraction_true_allows_extraction(tmp_path):
         session.send("hello")
 
     assert extraction_calls
+
+
+# ---------------------------------------------------------------------------
+# Reseed context injection
+# ---------------------------------------------------------------------------
+
+def test_reseed_context_injected_on_first_send(tmp_path):
+    """reseed_context must appear in the system prompt on the first send only."""
+    provider = _mock_provider()
+    session = AgentSession(
+        agent_id="main",
+        session_id="new-session",
+        reseed_context="<prior_session_history>\nUser: hi\nAssistant: hello\n</prior_session_history>",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=Compactor(context_window=100_000, preserve_tokens=2_000),
+        short_term=ShortTermMemory(tmp_path / "sessions"),
+        session_store=SessionStore(tmp_path / "sessions.json"),
+    )
+
+    captured: list[str] = []
+
+    def _capture(system, msgs, tools, max_tokens, on_token=None):
+        captured.append(system)
+        return LLMResponse(text="ok", finish_reason="stop")
+
+    provider.chat = Mock(side_effect=_capture)
+
+    session.send("first message")
+    session.send("second message")
+
+    assert "<prior_session_history>" in captured[0]
+    assert "<prior_session_history>" not in captured[1]
+
+
+def test_reseed_context_none_does_not_pollute_system(tmp_path):
+    """When reseed_context is None, the system prompt must not contain history tags."""
+    provider = _mock_provider()
+    session = AgentSession(
+        agent_id="main",
+        session_id="fresh",
+        reseed_context=None,
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=Compactor(context_window=100_000, preserve_tokens=2_000),
+        short_term=ShortTermMemory(tmp_path / "sessions"),
+        session_store=SessionStore(tmp_path / "sessions.json"),
+    )
+
+    captured: list[str] = []
+
+    def _capture(system, msgs, tools, max_tokens, on_token=None):
+        captured.append(system)
+        return LLMResponse(text="ok", finish_reason="stop")
+
+    provider.chat = Mock(side_effect=_capture)
+    session.send("hello")
+
+    assert "<prior_session_history>" not in captured[0]
