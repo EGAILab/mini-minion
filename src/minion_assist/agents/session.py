@@ -763,9 +763,13 @@ class AgentSession:
             int: Number of messages loaded from the target session.
         """
         with self._lock:
+            # Load the target session's messages from disk before touching any
+            # state — if the file is missing or corrupt, load() returns [] safely.
             messages = self._short_term.load(self._agent_id, session_id)
             self._session_id = session_id
             self._history = messages
+            # Update the session store so that on the next startup _resolve_session_id()
+            # picks up the correct UUID rather than rotating to a new one.
             self._session_store.set_session_id(self._agent_id, session_id)
             return len(messages)
 

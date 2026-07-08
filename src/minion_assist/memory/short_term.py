@@ -161,7 +161,13 @@ class ShortTermMemory:
         return files
 
     def _name_path(self, agent_id: str, session_id: str) -> Path:
-        """Return the path of the sidecar name file for a session."""
+        """Return the path of the sidecar name file for a session.
+
+        Names are stored as tiny plain-text files next to their JSONL counterpart,
+        e.g. ``sessions/main/abc-123.name`` alongside ``sessions/main/abc-123.jsonl``.
+        This keeps the name co-located with the history it describes and means
+        ``list_sessions()`` (which globs ``*.jsonl``) never accidentally picks them up.
+        """
         return self._dir / agent_id / f"{session_id}.name"
 
     def get_name(self, agent_id: str, session_id: str) -> str | None:
@@ -177,6 +183,7 @@ class ShortTermMemory:
         p = self._name_path(agent_id, session_id)
         if not p.exists():
             return None
+        # Strip whitespace so an accidental trailing newline doesn't count as a name.
         return p.read_text(encoding="utf-8").strip() or None
 
     def set_name(self, agent_id: str, session_id: str, name: str) -> None:
@@ -193,9 +200,12 @@ class ShortTermMemory:
         p = self._name_path(agent_id, session_id)
         name = name.strip()
         if not name:
+            # Empty name = clear the name — delete the sidecar file if it exists.
             if p.exists():
                 p.unlink()
             return
+        # Ensure the agent directory exists before writing (it may not exist yet
+        # if this is the very first session for this agent).
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(name, encoding="utf-8")
 

@@ -361,8 +361,11 @@ AgentSession.send(message, on_event=callback, stream=True/False)
 ```
 ~/.minion-assist/
 ├── sessions/
-│   ├── main.jsonl        ← Ada's conversation history
-│   └── researcher.jsonl  ← Elizabeth's conversation history
+│   ├── main/                    ← Ada's session files (one per conversation)
+│   │   ├── {uuid}.jsonl         ← conversation history for one session
+│   │   └── {uuid}.name          ← optional human-readable name for that session
+│   └── researcher/              ← Elizabeth's session files
+│       └── {uuid}.jsonl
 ├── memory/
 │   ├── main/             ← Ada's long-term notes (isolated per agent)
 │   │   ├── user_context.md     ← injected into system prompt every turn (optional)
@@ -404,8 +407,10 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/reset` | Alias for `/new` |
 | `/compact` | Force immediate context compaction for all agents |
 | `/status` | Show session metadata (turn counts, last active) for each agent |
-| `/sessions` | List all agent sessions with turn counts and last-active timestamps |
-| `/resume [agent_id]` | Switch the active agent (e.g. `/resume researcher`); defaults to current agent |
+| `/agents` | List all known agents with turn counts and last-active timestamps |
+| `/session [N\|uuid-prefix]` | List past conversation sessions for the active agent; restore one by index or UUID prefix |
+| `/rename [N] <name>` | Give the current session (or session N from /session) a descriptive name |
+| `/switch [agent_id]` | Switch the active agent routing target (e.g. `/switch researcher`); defaults to current agent |
 | `/diagnose` | Check each agent's provider configuration and API key status |
 | `/mcp-reload` | Reconnect all MCP servers and refresh tool adapters in every session |
 | `/mcp-list` | List connected MCP servers and their available tools |
@@ -1156,9 +1161,13 @@ When `long_term` is provided, `AgentSession`:
 - Searches long-term memory before each turn and injects the top-5 matching snippets as a `<relevant_memories>` block (capped at `memory_injection_tokens * 4` characters).
 - Fires background fact extraction after each successful turn (daemon thread — never blocks the REPL). Can be disabled via `enable_memory_extraction=False` (or `config.json` `"memory": {"enable_extraction": false}`).
 
-**`session.reload()`** — reloads conversation history from disk, replacing in-memory state. Called automatically by the `/resume` command to ensure the history is current after switching agents. Does not affect long-term memory, task files, or session metadata.
+**`session.reload()`** — reloads conversation history from disk, replacing in-memory state. Called automatically by the `/switch` command to ensure the history is current after switching agents. Does not affect long-term memory, task files, or session metadata.
 
 **`session.reset()`** — clears in-memory and persisted conversation history (used by `/new`). Does not affect long-term memory or task files.
+
+**`session.session_id`** — read-only property exposing the current session UUID.
+
+**`session.switch_session(session_id)`** — load a different session's history by UUID, making it the active session. Updates both in-memory state and the session store. Used by `/session <N>` to restore a past conversation. Returns the number of messages loaded.
 
 #### Runner (`runner.py`)
 
@@ -1522,16 +1531,19 @@ The `name:` field is required. `description:` is optional but must be non-empty 
 
 #### Short-term (`short_term.py`)
 
-Stores conversation history as JSONL files — one file per agent at `{base_dir}/{key}.jsonl`. Uses an atomic tmp-file swap on every `save()` so a crash mid-write never corrupts the existing history.
+Stores conversation history as JSONL files — one JSONL file per session under `{base_dir}/{agent_id}/{session_id}.jsonl`. Uses an atomic tmp-file swap on every `save()` so a crash mid-write never corrupts the existing history.
 
 ```python
 from minion_assist.memory import ShortTermMemory
 
 mem = ShortTermMemory(Path("~/.minion-assist/sessions").expanduser())
-mem.load("main")                          # list[dict] — full history
-mem.save("main", messages)               # atomic overwrite
-mem.append("main", {"role": "user", "content": "hi"})  # efficient append
-mem.clear("main")                        # delete history file
+mem.load("main", session_id)                         # list[dict] — full history
+mem.save("main", session_id, messages)               # atomic overwrite
+mem.append("main", session_id, {"role": "user", "content": "hi"})  # efficient append
+mem.clear("main", session_id)                        # delete history file
+mem.get_name("main", session_id)                     # str | None — display name if set
+mem.set_name("main", session_id, "Auth work")        # save a human-readable name
+mem.list_sessions("main")                            # list[Path] — all session files, oldest-first
 ```
 
 #### Long-term (`long_term.py`)
@@ -1580,6 +1592,7 @@ from minion_assist.session import SessionStore
 store = SessionStore(Path("~/.minion-assist/sessions.json"))
 info = store.get_or_create("main")   # SessionInfo(agent_id, created_at, last_active, turn_count)
 store.touch("main", increment_turns=True)
+store.set_session_id("main", session_id)  # point the store at a different existing session
 store.list_sessions()                 # list[SessionInfo]
 ```
 
@@ -1832,7 +1845,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **1173 cases** across all modules. One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **1480 cases** across all modules. One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic

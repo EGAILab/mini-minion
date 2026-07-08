@@ -231,6 +231,8 @@ class SessionStore:
             session_id (str): The new UUID to store (must be an existing session).
         """
         data = self._load()
+        # If the agent isn't in the store yet there's nothing to update —
+        # the record will be created with the correct UUID on the next turn.
         if agent_id not in data:
             return
         data[agent_id]["session_id"] = session_id

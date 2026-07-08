@@ -356,29 +356,47 @@ def _format_history(messages: list[dict], max_content: int = 600) -> str:
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
+
+        # LLM message content can be either a plain string OR a list of typed
+        # content blocks (e.g. {"type": "text", "text": "..."} for text,
+        # {"type": "tool_use", ...} for tool calls).  When it's a list we
+        # need to extract just the text parts manually.
         if isinstance(content, list):
+            # Gather text from all plain-text blocks; skip image / tool blocks.
             text_parts = [
                 b.get("text", "")
                 for b in content
                 if isinstance(b, dict) and b.get("type") == "text"
             ]
+            # Count tool-related blocks so we can mention them without dumping
+            # their full JSON (which is noisy and rarely useful to read).
             tool_count = sum(
                 1 for b in content
                 if isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
             )
             content = "\n".join(text_parts)
             if tool_count:
+                # Append a compact note so the reader knows tool activity happened.
                 suffix = f"\n[{tool_count} tool call(s) not shown]"
                 content = (content + suffix).strip()
+
+        # Guard against unexpected non-string values (shouldn't normally happen).
         if not isinstance(content, str):
             content = ""
         content = content.strip()
+
+        # Truncate very long messages so the terminal output stays readable.
         if len(content) > max_content:
             content = content[:max_content] + " … [truncated]"
+
         if role == "user":
             lines.append(f"User: {content}")
         elif role == "assistant":
             lines.append(f"Assistant: {content}")
+        # Roles like "tool" are intentionally skipped — they're included in the
+        # tool_count summary above, not printed as separate turns.
+
+    # Separate each turn with a blank line for readability.
     return "\n\n".join(lines)
 
 
@@ -485,26 +503,36 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
             current_id = getattr(ctx.sessions.get(agent_id), "session_id", None)
 
             if not ctx.args:
+                # ---- bare /session — print the session listing ----
                 label = "session" if len(paths) == 1 else "sessions"
                 lines = [f"History for {agent_id} ({len(paths)} {label}):"]
                 for i, p in enumerate(paths, 1):
+                    # Convert file modification time to a readable "YYYY-MM-DD HH:MM" string.
                     mtime = datetime.fromtimestamp(p.stat().st_mtime)
                     ts = mtime.strftime("%Y-%m-%d %H:%M")
+                    # Show only the first 8 chars of the UUID — long enough to be
+                    # unique in practice and short enough to read comfortably.
                     uuid_hint = p.stem[:8]
+                    # Count non-blank lines in the JSONL file; each line = one message.
                     msg_count = sum(1 for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip())
+                    # Mark the currently loaded session with * so the user knows
+                    # where they are before picking a different one.
                     is_current = p.stem == current_id
                     marker = "*" if is_current else " "
-                    # Name takes priority; fall back to first-message preview.
+                    # Prefer the human-readable name if one was set via /rename;
+                    # otherwise fall back to the first user message as a preview.
                     name = ctx.short_term.get_name(agent_id, p.stem) if ctx.short_term else None
                     if name:
                         label = f"  [{name}]"
                     else:
                         label = ""
                         try:
+                            # Scan lines until we find the first user message.
                             for ln in p.read_text(encoding="utf-8").splitlines():
                                 m = json.loads(ln.strip())
                                 if m.get("role") == "user":
                                     content = m.get("content", "")
+                                    # Content may be a list of blocks — extract the first text block.
                                     if isinstance(content, list):
                                         content = next(
                                             (b.get("text", "") for b in content
@@ -515,15 +543,16 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                                         label = f'  "{content[:50]}"'
                                     break
                         except Exception:
-                            pass
+                            pass  # silently skip corrupt JSONL — session still appears in list
                     lines.append(f"{marker} [{i}] {ts}  msgs={msg_count}  {uuid_hint}{label}")
                 lines.append("Use /session <N> or /session <uuid-prefix> to restore.")
                 return CommandResult(handled=True, message="\n".join(lines))
 
-            # Resolve arg: 1-based index or UUID prefix
+            # ---- /session <arg> — load a specific session ----
             arg = ctx.args.strip()
             target_path = None
             try:
+                # Try interpreting arg as a 1-based index into the listing above.
                 idx = int(arg)
                 if 1 <= idx <= len(paths):
                     target_path = paths[idx - 1]
@@ -533,10 +562,12 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                         message=f"Index {idx} out of range (1–{len(paths)}).",
                     )
             except ValueError:
+                # Not a number — try it as a UUID prefix (first N chars of the session UUID).
                 matches = [p for p in paths if p.stem.startswith(arg)]
                 if not matches:
                     return CommandResult(handled=True, message=f"No session matching '{arg}'.")
                 if len(matches) > 1:
+                    # More than one session starts with this prefix — ask for more chars.
                     return CommandResult(
                         handled=True,
                         message=f"Ambiguous prefix '{arg}' matches {len(matches)} sessions.",
@@ -546,11 +577,15 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
             session = ctx.sessions.get(agent_id)
             if session is None:
                 return CommandResult(handled=True, message=f"Agent '{agent_id}' not found.")
+            # p.stem is the UUID without the .jsonl extension.
             target_id = target_path.stem
             if target_id == current_id:
                 return CommandResult(handled=True, message="Already on that session.")
+            # Swap history — loads messages from disk and updates the session store
+            # so the next turn writes to the restored session file.
             session.switch_session(target_id)
             history = session.history
+            # Use the session name in the header if one exists, otherwise show UUID prefix.
             name = ctx.short_term.get_name(agent_id, target_id) if ctx.short_term else None
             label = f"[{name}]" if name else target_id[:8]
             header = f"=== Session {label} ({len(history)} messages) ==="
@@ -571,12 +606,15 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                     message="Usage: /rename <name>  or  /rename <N> <name>",
                 )
             agent_id = ctx.target_agent_id
-            # If first token is an int, treat it as a /session index; rest is the name.
+            # Split into at most two parts so multi-word names work:
+            #   "/rename 2 Auth debugging"  → tokens = ["2", "Auth debugging"]
+            #   "/rename Auth debugging"    → tokens = ["Auth", "debugging"] (no int prefix)
             tokens = ctx.args.split(None, 1)
             target_id: str | None = None
             name_part: str = ctx.args
             if len(tokens) >= 2:
                 try:
+                    # If the first token is a whole number, it's a /session index.
                     idx = int(tokens[0])
                     paths = list(reversed(ctx.short_term.list_sessions(agent_id)))
                     if not paths:
@@ -586,12 +624,13 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                             handled=True,
                             message=f"Index {idx} out of range (1–{len(paths)}).",
                         )
+                    # .stem strips the ".jsonl" extension to get the raw UUID.
                     target_id = paths[idx - 1].stem
                     name_part = tokens[1]
                 except ValueError:
-                    pass  # first token is not an int — use whole args as name
+                    pass  # first token is not a number — treat whole args as the name
             if target_id is None:
-                # Rename the current session.
+                # No index prefix — rename the session that is currently active.
                 session = ctx.sessions.get(agent_id)
                 target_id = getattr(session, "session_id", None)
                 if target_id is None:
@@ -599,6 +638,7 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
             name_part = name_part.strip()
             if not name_part:
                 return CommandResult(handled=True, message="Name cannot be empty.")
+            # Write a sidecar .name file next to the session's .jsonl file.
             ctx.short_term.set_name(agent_id, target_id, name_part)
             return CommandResult(
                 handled=True,
