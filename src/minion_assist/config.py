@@ -298,6 +298,17 @@ def _validate(raw: dict) -> list[ConfigIssue]:
         if pt is not None and (not isinstance(pt, int) or pt <= 0):
             issues.append(ConfigIssue("compaction.preserve_tokens", f"Expected positive integer, got {pt!r}."))
 
+    # --- database ---
+    database_raw = raw.get("database", {})
+    if database_raw and not isinstance(database_raw, dict):
+        issues.append(ConfigIssue("database", "Expected an object."))
+    elif isinstance(database_raw, dict) and database_raw:
+        db_url = database_raw.get("url")
+        if db_url is not None and not isinstance(db_url, str):
+            issues.append(ConfigIssue("database.url", f"Expected a string, got {type(db_url).__name__}."))
+        elif isinstance(db_url, str) and not db_url.strip():
+            issues.append(ConfigIssue("database.url", "Must be a non-empty connection string."))
+
     # --- memory ---
     memory_raw = raw.get("memory", {})
     if memory_raw and not isinstance(memory_raw, dict):
@@ -1287,6 +1298,21 @@ logging_cfg: LoggingConfig = _resolve_logging()
 
 
 @dataclass(frozen=True)
+class DatabaseConfig:
+    """Optional PostgreSQL connection for session + message storage with FTS/vector search.
+
+    Configured via the ``"database"`` section in ``config.json``::
+
+        "database": {"url": "postgresql://minion:minion@localhost:5433/minion_assist"}
+
+    When ``url`` is ``None`` (section absent or url omitted), the database is
+    disabled and the session_search tool is not registered.  File-based JSONL
+    fallback remains fully active regardless.
+    """
+    url: str | None = None
+
+
+@dataclass(frozen=True)
 class CodexConfig:
     """Controls behaviour specific to the Codex app-server provider.
 
@@ -1319,3 +1345,16 @@ def _resolve_codex() -> CodexConfig:
 # codex: controls Codex app-server provider behaviour.
 # Set "codex": {"allow_all_commands": true} to skip per-command approval prompts.
 codex_cfg: CodexConfig = _resolve_codex()
+
+def _resolve_database() -> DatabaseConfig:
+    """Read the ``"database"`` section from config.json and build a DatabaseConfig."""
+    raw = _raw.get("database", {})
+    if not isinstance(raw, dict):
+        return DatabaseConfig()
+    return DatabaseConfig(url=raw.get("url") or None)
+
+
+# database: optional PostgreSQL connection for session history + FTS search.
+# Configure in config.json: "database": {"url": "postgresql://user:pw@host/db"}
+# Omit the section (or leave url absent) to disable — file-based fallback remains active.
+database: DatabaseConfig = _resolve_database()

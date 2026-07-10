@@ -102,6 +102,21 @@ _DEFAULT_MEMORY_INJECTION_TOKENS = 600  # overridden per-instance in __init__
 
 _STATUS_ICON = {"done": "✓", "in_progress": "→", "blocked": "✗", "pending": "○"}
 
+
+def _msg_text(msg: dict) -> str | None:
+    """Extract plain text from an OpenAI-format message dict."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return "\n".join(parts) or None
+    return None
+
 # Tools that mutate the filesystem or shell state.  The verification loop
 # checks for these in the history slice appended by run_turn() so it knows
 # whether to call verify_fn.
@@ -390,6 +405,7 @@ class AgentSession:
         bootstrap_context: Callable[[], str] | None = None,
         workspace_root: Path | None = None,
         log_dir: Path | None = None,
+        db: object | None = None,
     ) -> None:
         self._agent_id = agent_id
         self._session_id = session_id
@@ -418,6 +434,8 @@ class AgentSession:
         self._workspace_root = workspace_root
         # Optional log directory for verbose LLM and tool call/result logging.
         self._log_dir = log_dir
+        # Optional PostgreSQL session/message store (None = disabled).
+        self._db = db
 
         # Compute injection limits proportionally from the model's context window.
         # This ensures every budget scales automatically when the model is switched.
@@ -463,6 +481,12 @@ class AgentSession:
         self._history: list[dict] = short_term.load(agent_id, session_id)
         # Create session record if this is the agent's first run.
         session_store.get_or_create(agent_id, session_id=session_id)
+        # Mirror session into PostgreSQL (no-op if db is None or session already exists).
+        if self._db is not None:
+            try:
+                self._db.upsert_session(session_id, agent_id)
+            except Exception:
+                pass
 
     @property
     def provider(self) -> "LLMProvider":
@@ -648,6 +672,17 @@ class AgentSession:
         # Persist the user message now — safe on disk even if the provider crashes.
         self._short_term.save(self._agent_id, self._session_id, self._history)
 
+        # Mirror user message to PostgreSQL (non-blocking — errors are swallowed).
+        if self._db is not None:
+            try:
+                _user_msg = self._history[-1]
+                self._db.add_message(
+                    self._session_id, "user", _msg_text(_user_msg),
+                    timestamp=time.time(),
+                )
+            except Exception:
+                pass
+
         # Snapshot for rollback on mid-turn crash.
         snapshot_len = len(self._history)
 
@@ -680,6 +715,27 @@ class AgentSession:
                 log_dir=self._log_dir,
             )
             _session_info = self._session_store.touch(self._agent_id, increment_turns=True)
+
+            # Mirror new assistant/tool messages to PostgreSQL.
+            if self._db is not None:
+                try:
+                    _ts = time.time()
+                    for _msg in self._history[snapshot_len:]:
+                        _role = _msg.get("role", "")
+                        _content = _msg_text(_msg)
+                        _tool_name = _msg.get("name") or _msg.get("tool_name")
+                        if _content or _tool_name:
+                            self._db.add_message(
+                                self._session_id, _role, _content,
+                                tool_name=_tool_name, timestamp=_ts,
+                            )
+                    self._db.update_session(
+                        self._session_id,
+                        last_active=_ts,
+                        turn_count=_session_info.turn_count,
+                    )
+                except Exception:
+                    pass
 
             # Fire background memory extraction from the last exchange.
             # Daemon thread — never blocks the REPL.

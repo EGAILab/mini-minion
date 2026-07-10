@@ -48,6 +48,7 @@ from .glob import GlobTool
 from .grep import GrepTool
 from .memory import NoteTool, SaveMemoryTool, SearchMemoryTool
 from .patch import PatchPreviewTool
+from .session_search import SessionSearchTool
 from .policy import PermissionPolicy
 from .read import ReadTool
 from .registry import ToolRegistry
@@ -75,6 +76,7 @@ def default_registry(
     ask_user_fn: "Callable[[str], str] | None" = None,
     write_confirm: "Callable[[str], bool] | None" = None,
     workspace_root: Path | None = None,
+    db: object | None = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` with all standard tools registered.
 
@@ -155,6 +157,10 @@ def default_registry(
         GitCommitTool(cwd=root, confirm=bash_confirm, policy=_policy),
     ]:
         registry.register(tool)
+
+    # Session search tool — only when a PostgreSQL db is connected.
+    if db is not None:
+        registry.register(SessionSearchTool(db))
 
     # Memory tools — only when a backend is provided.
     # SaveMemoryTool and NoteTool receive policy so /plan read-only mode blocks writes.
@@ -237,6 +243,7 @@ __all__ = [
     "PatchPreviewTool",
     "SaveMemoryTool",
     "SearchMemoryTool",
+    "SessionSearchTool",
     "TodoReadTool",
     "TodoWriteTool",
     "WebFetchTool",

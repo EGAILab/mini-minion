@@ -68,6 +68,9 @@
       }
     }
   },
+  "database": {
+    "url": "postgresql://minion:minion@localhost:5433/minion_assist"
+  },
   "mcp": {
     "servers": {
       "playwright": {

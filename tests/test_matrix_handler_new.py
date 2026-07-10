@@ -33,7 +33,8 @@ def _make_client(user_id="@bot:example.org"):
     return client
 
 
-def _make_handler(config=None, sessions=None, user_id="@bot:example.org"):
+def _make_handler(config=None, sessions=None, user_id="@bot:example.org", agents_cfg=None,
+                  session_store=None, mcp_manager=None, skills=None, short_term=None):
     config = config or _make_config(user_id=user_id)
     sessions = sessions or {"main": MagicMock()}
     outbound = MagicMock()
@@ -53,6 +54,11 @@ def _make_handler(config=None, sessions=None, user_id="@bot:example.org"):
         dedupe=dedupe,
         bot_loop=bot_loop,
         thread_binding_mgr=thread_mgr,
+        agents_cfg=agents_cfg,
+        session_store=session_store,
+        mcp_manager=mcp_manager,
+        skills=skills,
+        short_term=short_term,
     )
 
 
@@ -195,3 +201,158 @@ def test_room_config_reaction_level_mentions():
 def test_room_config_reaction_level_off_by_default_in_from_dict():
     cfg = MatrixRoomConfig.from_dict({})
     assert cfg.reaction_level == "off"
+
+
+# ---------------------------------------------------------------------------
+# Slash command dispatch
+# ---------------------------------------------------------------------------
+
+def _make_agents_cfg():
+    """Minimal agents_cfg dict for slash command tests."""
+    cfg = MagicMock()
+    cfg.route_prefix = None
+    return {"main": cfg}
+
+
+@pytest.mark.asyncio
+async def test_slash_command_new_clears_history():
+    session = MagicMock()
+    session.send.return_value = "response"
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="/new"),
+    )
+    session.reset.assert_called_once()
+    session.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_slash_command_reply_sent_to_room():
+    session = MagicMock()
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="/new"),
+    )
+    handler._outbound.send_text.assert_called_once()
+    call_args = handler._outbound.send_text.call_args
+    assert "Cleared" in call_args[0][1]
+
+
+@pytest.mark.asyncio
+async def test_slash_disallowed_command_quit_blocked():
+    session = MagicMock()
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="/quit"),
+    )
+    session.send.assert_not_called()
+    handler._outbound.send_text.assert_called_once()
+    assert "not available" in handler._outbound.send_text.call_args[0][1]
+
+
+@pytest.mark.asyncio
+async def test_slash_disallowed_command_export_blocked():
+    session = MagicMock()
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="/export /tmp/out.md"),
+    )
+    session.send.assert_not_called()
+    handler._outbound.send_text.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_unknown_slash_command_falls_through_to_llm():
+    session = MagicMock()
+    session.send.return_value = "I don't know that command"
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="/frobnicate"),
+    )
+    session.send.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_bang_prefix_new_clears_history():
+    """!new should work identically to /new (Element-safe prefix)."""
+    session = MagicMock()
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="!new"),
+    )
+    session.reset.assert_called_once()
+    session.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bang_prefix_session_dispatched():
+    """!session 2 should dispatch /session with args '2'."""
+    session = MagicMock()
+    handler = _make_handler(
+        sessions={"main": session}, agents_cfg=_make_agents_cfg(), short_term=MagicMock()
+    )
+    # short_term.list_sessions returns empty list → "No session history found" message
+    handler._short_term.list_sessions.return_value = []
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="!session 2"),
+    )
+    session.send.assert_not_called()
+    handler._outbound.send_text.assert_called_once()
+    assert "session" in handler._outbound.send_text.call_args[0][1].lower()
+
+
+@pytest.mark.asyncio
+async def test_bang_quit_blocked():
+    """!quit should be blocked just like /quit."""
+    session = MagicMock()
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="!quit"),
+    )
+    session.send.assert_not_called()
+    assert "not available" in handler._outbound.send_text.call_args[0][1]
+
+
+@pytest.mark.asyncio
+async def test_bang_plain_message_not_treated_as_command():
+    """A lone '!' or '! text' (space after !) is not a command."""
+    session = MagicMock()
+    session.send.return_value = "response"
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="! not a command"),
+    )
+    session.send.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_slash_command_skipped_when_agents_cfg_none():
+    """Without agents_cfg, /new goes to the LLM unchanged (backward compat)."""
+    session = MagicMock()
+    session.send.return_value = "response"
+    handler = _make_handler(sessions={"main": session}, agents_cfg=None)
+
+    await handler.handle_room_message(
+        _make_room(),
+        _make_event(body="/new"),
+    )
+    session.send.assert_called_once()
+    session.reset.assert_not_called()

@@ -88,6 +88,7 @@ from .config import extra_plugin_manifests
 from .config import dreaming as dreaming_cfg
 from .config import heartbeat as heartbeat_cfg
 from .config import codex_cfg, logging_cfg
+from .config import database as database_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
 from .config import multi_agent as multi_agent_cfg
@@ -332,6 +333,21 @@ def main() -> None:
             state_str = "OK" if status.state == "connected" else f"FAILED: {status.detail}"
             print(f"  MCP [{status.name}]: {state_str}")
 
+    # --- PostgreSQL session store (optional) ---
+    _db = None
+    if database_cfg.url:
+        try:
+            from .session.db import SessionDB  # noqa: PLC0415
+            _db = SessionDB(database_cfg.url)
+            print(f"Database connected: {database_cfg.url.split('@')[-1]}")
+            # One-time migration: replay existing JSONL files into the DB.
+            _replayed = _db.replay_jsonl(short_term, list(agents_cfg.keys()))
+            if _replayed:
+                print(f"  Migrated {_replayed} messages from JSONL to database.")
+        except Exception as _db_exc:
+            print(f"[minion-assist] Warning: database unavailable ({_db_exc}). Session search disabled.")
+            _db = None
+
     # --- Matrix channel setup (optional) ---
     # Runs in a background daemon thread; REPL continues on the main thread.
     # The channel is started after sessions are built so it can share them.
@@ -513,6 +529,7 @@ def main() -> None:
             mcp_manager=mcp_manager,
             ask_user_fn=_console_ask_user,
             workspace_root=_agent_workspace,
+            db=_db,
         )
         # Load user-defined tools from plugins.json manifests.
         # Done after default_registry() so plugins can override built-in tools
@@ -570,8 +587,6 @@ def main() -> None:
             idle_minutes=cfg.session_idle_minutes,
             reseed_max_chars=_reseed_max_chars,
         )
-        short_term.prune_sessions(agent_id, keep_n=20)
-
         sessions[agent_id] = AgentSession(
             agent_id=agent_id,
             session_id=_session_id,
@@ -590,6 +605,7 @@ def main() -> None:
             bootstrap_context=_agent_bootstrap_context,
             workspace_root=_agent_workspace,
             log_dir=_log_dir,
+            db=_db,
         )
 
         # Phase 4: build a relay function that tags subagent events with
@@ -660,7 +676,14 @@ def main() -> None:
     if channels_cfg.matrix is not None:
         from .matrix.channel import MatrixChannel  # noqa: PLC0415 — optional dependency
         _matrix_channel = MatrixChannel(channels_cfg.matrix, workspace)
-        _matrix_channel.start(sessions)
+        _matrix_channel.start(
+            sessions,
+            agents_cfg=agents_cfg,
+            session_store=session_store,
+            mcp_manager=mcp_manager,
+            skills=skills,
+            short_term=short_term,
+        )
         print("[matrix] Listener started.")
 
     # --- Heartbeat scheduler (optional) ---
@@ -798,7 +821,7 @@ def main() -> None:
     for agent_id, cfg_entry in agents_cfg.items():
         if cfg_entry.route_prefix:
             agent_name = AGENTS[agent_id].name
-            print(f"  {cfg_entry.route_prefix} <message>  → {agent_name}")
+            print(f"  {cfg_entry.route_prefix} <message>  -> {agent_name}")
 
     try:
         while True:

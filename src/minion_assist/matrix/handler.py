@@ -37,6 +37,10 @@ if TYPE_CHECKING:
     from .outbound import MatrixOutbound
     from .thread_bindings import MatrixThreadBindingManager
 
+# Commands that make no sense outside a CLI REPL and must not be forwarded to
+# the LLM or echoed back to the room as text.
+_MATRIX_DISALLOWED_COMMANDS = frozenset({"/quit", "/exit", "/export"})
+
 
 class MatrixMessageHandler:
     """Routes inbound Matrix room messages to AgentSession and delivers replies.
@@ -62,6 +66,11 @@ class MatrixMessageHandler:
         bot_loop: "BotLoopProtection",
         thread_binding_mgr: "MatrixThreadBindingManager",
         exec_approval_handler: "MatrixExecApprovalHandler | None" = None,
+        agents_cfg: dict | None = None,
+        session_store: object = None,
+        mcp_manager: object = None,
+        skills: dict | None = None,
+        short_term: object = None,
     ) -> None:
         self._client = client
         self._config = config
@@ -71,6 +80,11 @@ class MatrixMessageHandler:
         self._bot_loop = bot_loop
         self._thread_mgr = thread_binding_mgr
         self._exec_approval = exec_approval_handler
+        self._agents_cfg = agents_cfg
+        self._session_store = session_store
+        self._mcp_manager = mcp_manager
+        self._skills = skills
+        self._short_term = short_term
 
     async def handle_room_message(self, room, event) -> None:
         """Process one inbound Matrix room message event.
@@ -221,6 +235,46 @@ class MatrixMessageHandler:
         room_cfg=None,
     ) -> None:
         """Run the agent turn in a thread-pool thread and post the reply."""
+        # Slash command interception — only active when agents_cfg is provided.
+        # Supports both / and ! prefix.  Element Web blocks unknown /commands
+        # client-side (showing "Unrecognised command"); ! is the conventional
+        # Matrix bot prefix that always passes through to the room unmodified.
+        # We normalise !cmd → /cmd so parse_command can handle both uniformly.
+        if self._agents_cfg is not None:
+            from ..commands import CommandContext, dispatch_command, parse_command  # noqa: PLC0415
+            _cmd_text = (
+                "/" + text[1:]
+                if text.startswith("!") and len(text) > 1 and not text[1].isspace()
+                else text
+            )
+            parsed = parse_command(_cmd_text)
+            if parsed is not None:
+                cmd, args = parsed
+                if cmd in _MATRIX_DISALLOWED_COMMANDS:
+                    await self._outbound.send_text(
+                        room_id,
+                        f"`{cmd}` is not available in Matrix.",
+                        thread_id=thread_id,
+                    )
+                    return
+                ctx = CommandContext(
+                    raw=text,
+                    command=cmd,
+                    args=args,
+                    target_agent_id=agent_id,
+                    sessions=self._sessions,
+                    agents_cfg=self._agents_cfg,
+                    session_store=self._session_store,
+                    mcp_manager=self._mcp_manager,
+                    skills=self._skills,
+                    short_term=self._short_term,
+                )
+                result = dispatch_command(ctx)
+                if result.handled:
+                    if result.message:
+                        await self._outbound.send_text(room_id, result.message, thread_id=thread_id)
+                    return  # consumed — skip LLM
+
         session = self._sessions[agent_id]
         loop = asyncio.get_running_loop()
 

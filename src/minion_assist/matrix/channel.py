@@ -41,16 +41,39 @@ class MatrixChannel:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
         self._started = False
+        self._agents_cfg: dict | None = None
+        self._session_store: object = None
+        self._mcp_manager: object = None
+        self._skills: dict | None = None
+        self._short_term: object = None
 
-    def start(self, sessions: dict) -> None:
+    def start(
+        self,
+        sessions: dict,
+        agents_cfg: dict | None = None,
+        session_store: object = None,
+        mcp_manager: object = None,
+        skills: dict | None = None,
+        short_term: object = None,
+    ) -> None:
         """Start the Matrix listener in a background daemon thread.
 
         Args:
-            sessions: Dict mapping agent_id → ``AgentSession``.  Shared with REPL.
+            sessions:     Dict mapping agent_id → ``AgentSession``.  Shared with REPL.
+            agents_cfg:   Agent model config dict — enables slash command dispatch.
+            session_store: SessionStore instance (for /agents command).
+            mcp_manager:  McpClientManager instance (for /mcp-* commands).
+            skills:       Loaded skill map (for /skills command).
+            short_term:   ShortTermMemory instance (for /session and /rename commands).
         """
         if self._started:
             return
         self._started = True
+        self._agents_cfg = agents_cfg
+        self._session_store = session_store
+        self._mcp_manager = mcp_manager
+        self._skills = skills
+        self._short_term = short_term
         # daemon=True means the thread is killed automatically when the main
         # process exits — no need to call stop() on a clean REPL exit.
         self._thread = threading.Thread(
@@ -104,4 +127,9 @@ class MatrixChannel:
             sessions=sessions,
             stop_event=self._stop_event,
             workspace=self._workspace,
+            agents_cfg=self._agents_cfg,
+            session_store=self._session_store,
+            mcp_manager=self._mcp_manager,
+            skills=self._skills,
+            short_term=self._short_term,
         )

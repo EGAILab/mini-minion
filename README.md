@@ -17,6 +17,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 - [Multi-Agent Workspace](#multi-agent-workspace)
 - [Heartbeat & Proactive Features](#heartbeat--proactive-features)
 - [Dreaming](#dreaming)
+- [PostgreSQL Session Store](#postgresql-session-store)
 - [Module Reference](#module-reference)
   - [config](#config)
   - [providers](#providers)
@@ -45,8 +46,9 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 # Install dependencies (uv.lock is committed — this gives a reproducible environment)
 uv sync
 
-# Optional: install tiktoken for more accurate context-window token estimation
-uv add --optional tiktoken tiktoken
+# Optional extras
+uv sync --extra tiktoken   # more accurate token estimation
+uv sync --extra postgres   # PostgreSQL session store (psycopg3 driver)
 
 # Set up config (config lives in your home directory, not in the repo)
 cp config.example.json ~/.minion-assist/config.json
@@ -80,6 +82,7 @@ You: exit
 
 ```
 minion-assist/
+├── docker-compose.yml           # PostgreSQL + pgvector container (optional, for session search)
 ├── config.json                  # Provider, model, agent, routing, workspace, and MCP config
 ├── .env                         # API keys (never commit)
 ├── pyproject.toml               # Package metadata and dependencies
@@ -134,6 +137,7 @@ minion-assist/
 │   │   ├── find_definition.py   # FindDefinitionTool — AST-based symbol lookup across .py files
 │   │   ├── todo.py              # TodoWriteTool, TodoReadTool — session-scoped todo list
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool, NoteTool
+│   │   ├── session_search.py    # SessionSearchTool — FTS search across all past sessions (requires PostgreSQL)
 │   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
 │   │   ├── spawn_subagent.py    # SpawnSubagentTool — delegate tasks to child AgentSession; _make_subagent_registry
@@ -166,6 +170,7 @@ minion-assist/
 │   │   └── __init__.py
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
+│       ├── db.py                # SessionDB — PostgreSQL session + message store with FTS (optional)
 │       └── __init__.py
 └── tests/                       # pytest test suite (1104 tests, 2 skipped)
 ```
@@ -259,6 +264,7 @@ Example structure (see `config.example.json` for the full template):
 | `mcp.servers.<name>.args` | *(stdio only)* Arguments passed to the server command |
 | `mcp.servers.<name>.url` | *(sse / streamableHttp only)* URL of the MCP server endpoint |
 | `memory.enable_extraction` | *(Optional, default `true`)* Set to `false` to disable the background fact-extraction API call fired after each turn. Useful for expensive models where the extra call doubles token costs. |
+| `database.url` | *(Optional)* PostgreSQL connection string for session history storage and FTS search. Omit to run file-only. Example: `"postgresql://minion:minion@localhost:5433/minion_assist"`. |
 | `extra_plugin_manifests` | *(Optional)* List of additional `plugins.json` file paths to load beyond the two fixed locations (`~/.minion-assist/plugins.json` and `.minion-assist/plugins.json`). Paths support `~` expansion. |
 | `bootstrap.enabled` | *(Optional, default `true`)* Set to `false` to disable workspace bootstrap file injection entirely. |
 | `bootstrap.path` | *(Optional, default `null`)* Directory to search for bootstrap files. `null` uses `Path.cwd()` at runtime. |
@@ -333,8 +339,9 @@ AgentSession.send(message, on_event=callback, stream=True/False)
            │  │    no  → emit FinalAnswer → return                         │
            │  └────────────────────────────────────────────────────────────┘
            │
-           ├─ short_term.save(agent_id, messages)   ← persists history to JSONL
+           ├─ short_term.save(agent_id, messages)   ← persists history to JSONL (always)
            ├─ session_store.touch(agent_id, ...)    ← updates turn count / timestamp
+           ├─ db.add_message(...) [optional]        ← mirrors to PostgreSQL for FTS search
            └─ extract_and_save_async(long_term, provider, last_exchange)
                   daemon thread — extracts 0–3 key facts, appends to _auto_extracted.md
 ```
@@ -887,6 +894,66 @@ Scheduling uses Python's `zoneinfo` stdlib module (Python 3.9+) with the `tzdata
 
 ---
 
+## PostgreSQL Session Store
+
+minion-assist can mirror every conversation message into a PostgreSQL database, enabling full-text search across all historical sessions via the `session_search` tool.  The file-based JSONL store always remains active — PostgreSQL is an additive layer, not a replacement.
+
+### Setup
+
+```bash
+# Start PostgreSQL + pgvector via Docker Compose (port 5433 to avoid conflicts with a local postgres)
+docker compose up -d
+
+# Install the psycopg3 driver
+uv sync --extra postgres
+```
+
+> **Port note:** `docker-compose.yml` maps PostgreSQL to host port **5433** (not 5432) to avoid conflicting with any locally installed PostgreSQL instance. Adjust both `docker-compose.yml` and `config.json` if you want a different port.
+
+### Configuration
+
+Add a `"database"` section to `config.json` (or `~/.minion-assist/config.json`):
+
+```json
+{
+  "database": {
+    "url": "postgresql://minion:minion@localhost:5433/minion_assist"
+  }
+}
+```
+
+On next startup minion-assist will:
+1. Connect to the database and create the schema automatically.
+2. Migrate all existing JSONL session files into the database (one-time, skips already-imported sessions).
+3. Register the `session_search` tool in every agent's tool registry.
+4. Dual-write every new message to both JSONL and PostgreSQL.
+
+### Schema
+
+| Table | Description |
+|---|---|
+| `sessions` | One row per session: `id`, `agent_id`, `source`, `started_at`, `last_active`, `turn_count`, `title`, `parent_id` |
+| `messages` | Every message with a `tsvector` generated column for FTS, GIN-indexed. Columns: `id` (BIGSERIAL), `session_id`, `role`, `content`, `tool_name`, `timestamp`, `search_vector` |
+| `message_embeddings` | Optional — created only when the `vector` extension (pgvector) is available. Holds `vector(1536)` embeddings for future semantic search. |
+
+### `session_search` Tool Modes
+
+| Mode | Description |
+|---|---|
+| `DISCOVER` | FTS query across all sessions. Returns ranked matches with a snippet, ±3 message context window, and session bookends (first/last messages). Supports AND (default), OR, `"quoted phrase"`, `-exclude`, `prefix*`. |
+| `SCROLL` | Read messages around a specific message ID in one session. Accepts `anchor_message_id` (0 = end of session) and `window` (default 5, max 20). |
+| `BROWSE` | List the 20 most recent sessions with title, turn count, age, and first-message preview. |
+
+### Data directory
+
+When using `docker-compose.yml`, PostgreSQL data is persisted to `../data/` (relative to the compose file), which maps to `E:\AI\Projects\OpenMinds\Minions\Minion-Assist\data\` on this machine. The container is set to `restart: unless-stopped` so it starts automatically with Docker Desktop.
+
+### Graceful degradation
+
+If the database is unavailable at startup, minion-assist prints a warning and continues in file-only mode — `session_search` is simply not registered. No existing functionality is affected.
+
+---
+
 ## Module Reference
 
 ### `config`
@@ -1279,6 +1346,7 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `GitStatusTool` | `git_status` | Show git working-tree status (`git status --short --branch`): branch name, staged, modified, and untracked files. `is_read_only=True`. |
 | `GitDiffTool` | `git_diff` | Show a unified diff of changes. Optional `staged=true` for staged changes; optional `path` to limit to a file. `is_read_only=True`. |
 | `GitCommitTool` | `git_commit` | Stage files (optional `files` list) and create a git commit with the given `message`. Calls the `bash_confirm` callback before executing, same as `BashTool`. |
+| `SessionSearchTool` | `session_search` | Search, scroll, or browse past conversation sessions stored in PostgreSQL. Three modes: **DISCOVER** (FTS across all sessions — supports quoted phrases, `-exclude`, `prefix*`), **SCROLL** (paginate within a session by message ID), **BROWSE** (list recent sessions). Only registered when a `database.url` is configured. `is_read_only=True`. |
 | `McpStatusTool` | `mcp_status` | List all configured MCP servers and their connection status. |
 | `ListMcpResourcesTool` | `list_mcp_resources` | List resources available on a connected MCP server. |
 | `ReadMcpResourceTool` | `read_mcp_resource` | Read a specific resource from a connected MCP server. Output capped at 8 000 chars. |
@@ -1352,6 +1420,7 @@ reg = default_registry(
 | `mcp_manager` | `McpManager \| None` | `None` | If provided, registers `mcp_status`, `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, `get_mcp_prompt`, and one `mcp__<server>__<tool>` adapter per tool exposed by connected MCP servers. |
 | `ask_user_fn` | `Callable[[str], str] \| None` | `None` | Callback for `ask_user` tool. Called with the agent's question; returns the human's response. `None` = headless mode (tool returns an error instead of blocking). |
 | `write_confirm` | `Callable[[str], bool] \| None` | `None` | Human approval callback passed to `WriteTool` and `EditTool`. Called with a one-line description before each write (e.g. `"Write 120 chars to /path/to/foo.py"`). Return `False` to cancel. `None` = automatic writes without prompting. |
+| `db` | `SessionDB \| None` | `None` | If provided, registers `session_search` for FTS search across all historical sessions. Created by `minion.py` when `database.url` is configured. |
 
 ---
 
@@ -1584,6 +1653,8 @@ This captures key facts — user preferences, decisions, findings — without re
 
 **Directory:** `src/minion_assist/session/`
 
+#### `store.py` — session metadata
+
 Tracks lightweight metadata for each agent's session in `{workspace}/sessions.json`.
 
 ```python
@@ -1595,6 +1666,25 @@ store.touch("main", increment_turns=True)
 store.set_session_id("main", session_id)  # point the store at a different existing session
 store.list_sessions()                 # list[SessionInfo]
 ```
+
+#### `db.py` — PostgreSQL message store (optional)
+
+```python
+from minion_assist.session.db import SessionDB
+
+db = SessionDB("postgresql://minion:minion@localhost:5433/minion_assist")
+
+# Schema is created automatically on first connect
+db.upsert_session(session_id, agent_id)
+db.add_message(session_id, "user", "hello")
+db.search_messages("hello world")    # FTS — list[dict] ranked by ts_rank
+db.list_sessions(limit=20)           # newest-first summary list
+db.get_messages_around(session_id, anchor_id, window=5)  # context window for SCROLL
+db.get_session_bookends(session_id, n=3)   # (first_n, last_n) user/assistant messages
+db.replay_jsonl(short_term, agent_ids)     # one-time migration from JSONL files
+```
+
+Uses thread-local connections (`threading.local`) so one psycopg connection is held per OS thread without locking overhead. All writes use `autocommit=True`.
 
 ---
 
@@ -1855,9 +1945,11 @@ uv run pytest -v
 ### Dependency management
 
 ```bash
-uv sync                        # install all dependencies
-uv add <package>               # add a runtime dependency
-uv add --optional tiktoken tiktoken  # install optional tiktoken for better token estimation
-uv add --dev <package>         # add a dev dependency
-uv run <command>               # run a command in the project environment
+uv sync                          # install core dependencies
+uv sync --extra tiktoken         # + tiktoken for accurate token estimation
+uv sync --extra postgres         # + psycopg3 for PostgreSQL session store
+uv sync --extra tiktoken --extra postgres  # both extras
+uv add <package>                 # add a runtime dependency
+uv add --dev <package>           # add a dev dependency
+uv run <command>                 # run a command in the project environment
 ```

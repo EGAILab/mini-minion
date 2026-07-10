@@ -41,15 +41,25 @@ async def monitor_matrix(
     sessions: dict,
     stop_event: asyncio.Event,
     workspace: Path,
+    agents_cfg: dict | None = None,
+    session_store: object = None,
+    mcp_manager: object = None,
+    skills: dict | None = None,
+    short_term: object = None,
 ) -> None:
     """Run the Matrix sync loop until ``stop_event`` is set.
 
     Args:
-        config:     Active :class:`~minion_assist.matrix.config.MatrixConfig`.
-        sessions:   Dict mapping agent_id → ``AgentSession`` (shared with REPL).
-        stop_event: asyncio.Event; set by :class:`~minion_assist.matrix.channel.MatrixChannel`
-                    to initiate a clean shutdown.
-        workspace:  Root workspace path for database files.
+        config:       Active :class:`~minion_assist.matrix.config.MatrixConfig`.
+        sessions:     Dict mapping agent_id → ``AgentSession`` (shared with REPL).
+        stop_event:   asyncio.Event; set by :class:`~minion_assist.matrix.channel.MatrixChannel`
+                      to initiate a clean shutdown.
+        workspace:    Root workspace path for database files.
+        agents_cfg:   Agent model config dict — enables slash command dispatch when provided.
+        session_store: SessionStore instance (for /agents command).
+        mcp_manager:  McpClientManager instance (for /mcp-* commands).
+        skills:       Loaded skill map (for /skills command).
+        short_term:   ShortTermMemory instance (for /session and /rename commands).
     """
     # All database files live under workspace/matrix/ so they're easy to find
     # and back up alongside other workspace data.
@@ -91,6 +101,11 @@ async def monitor_matrix(
         bot_loop=bot_loop,
         thread_binding_mgr=thread_mgr,
         exec_approval_handler=exec_approval,
+        agents_cfg=agents_cfg,
+        session_store=session_store,
+        mcp_manager=mcp_manager,
+        skills=skills,
+        short_term=short_term,
     )
 
     try:
