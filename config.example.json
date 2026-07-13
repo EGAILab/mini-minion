@@ -71,6 +71,34 @@
   "database": {
     "url": "postgresql://minion:minion@localhost:5433/minion_assist"
   },
+  "voice": {
+    "enabled": false,
+    "vad": {
+      "threshold": 0.5,
+      "silence_ms": 700
+    },
+    "stt": {
+      "model": "parakeet",
+      "parakeet_model_id": "nvidia/parakeet-tdt-0.6b-v3",
+      "whisper_model_id": "distil-whisper/distil-large-v3",
+      "chunk_duration_s": 20,
+      "device": "cuda"
+    },
+    "tts": {
+      "model": "qwen3",
+      "qwen3_model_id": "Qwen/Qwen3-TTS-1.7B",
+      "qwen3_precision": "fp16",
+      "kokoro_voice": "af_heart",
+      "piper_model_path": "",
+      "voice_ref_audio": null,
+      "device": "cuda"
+    },
+    "audio": {
+      "input_device": null,
+      "output_device": null,
+      "sample_rate": 16000
+    }
+  },
   "mcp": {
     "servers": {
       "playwright": {
