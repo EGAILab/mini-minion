@@ -745,28 +745,6 @@ def main() -> None:
                 f"{dreaming_cfg.timezone})."
             )
 
-    # --- Voice mode (--voice flag) ---
-    # If the user passed --voice, hand off to VoiceSession instead of the text REPL.
-    # VoiceSession.run() blocks until Ctrl+C; we then fall through to the finally block.
-    if _args.voice:
-        from .voice.session import build_voice_session  # noqa: PLC0415
-        _target_agent_id = next(iter(sessions))
-        _voice_session = build_voice_session(
-            agent_session=sessions[_target_agent_id],
-            voice_config=voice_cfg,
-            on_event=_on_event,
-        )
-        try:
-            _voice_session.run()
-        except KeyboardInterrupt:
-            print("\n[voice] Goodbye.")
-        finally:
-            if _matrix_channel is not None:
-                _matrix_channel.stop()
-            if mcp_manager is not None:
-                mcp_manager.close_sync()
-        return
-
     use_streaming = streaming.chat_mode
 
     # --- Attachment state ---
@@ -850,6 +828,28 @@ def main() -> None:
                 print("\n  Compacting session history...")
             elif isinstance(event, CompactionFailed):
                 print(f"\n  [Warning] Compaction failed: {event.error}")
+
+    # --- Voice mode (--voice flag) ---
+    # Placed here so _on_event is already defined when VoiceSession is built.
+    # VoiceSession.run() blocks until Ctrl+C; we then fall through to cleanup.
+    if _args.voice:
+        from .voice.session import build_voice_session  # noqa: PLC0415
+        _target_agent_id = next(iter(sessions))
+        _voice_session = build_voice_session(
+            agent_session=sessions[_target_agent_id],
+            voice_config=voice_cfg,
+            on_event=_on_event,
+        )
+        try:
+            _voice_session.run()
+        except KeyboardInterrupt:
+            print("\n[voice] Goodbye.")
+        finally:
+            if _matrix_channel is not None:
+                _matrix_channel.stop()
+            if mcp_manager is not None:
+                mcp_manager.close_sync()
+        return
 
     # --- REPL loop ---
     print("Mini-Minion ready. Type /help for commands, /quit to quit.")
