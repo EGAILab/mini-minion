@@ -17,6 +17,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 - [Multi-Agent Workspace](#multi-agent-workspace)
 - [Heartbeat & Proactive Features](#heartbeat--proactive-features)
 - [Dreaming](#dreaming)
+- [Browser Tool](#browser-tool)
 - [PostgreSQL Session Store](#postgresql-session-store)
 - [Module Reference](#module-reference)
   - [config](#config)
@@ -138,6 +139,7 @@ minion-assist/
 │   │   ├── todo.py              # TodoWriteTool, TodoReadTool — session-scoped todo list
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool, NoteTool
 │   │   ├── session_search.py    # SessionSearchTool — FTS search across all past sessions (requires PostgreSQL)
+│   │   ├── browser.py           # BrowserTool — Playwright browser automation (start/navigate/evaluate/screenshot/pick/cookies/stop)
 │   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
 │   │   ├── spawn_subagent.py    # SpawnSubagentTool — delegate tasks to child AgentSession; _make_subagent_registry
@@ -894,6 +896,47 @@ Scheduling uses Python's `zoneinfo` stdlib module (Python 3.9+) with the `tzdata
 
 ---
 
+## Browser Tool
+
+The `browser` tool gives the agent direct Playwright Chromium control with a minimal token footprint, following the approach from [What if you don't need MCP?](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/). Instead of wrapping individual DOM operations (which balloons to 13k–18k tokens in a typical MCP server), the tool exposes a raw `evaluate` action and trusts the model's existing DOM API knowledge.
+
+### Setup
+
+```bash
+uv sync --extra browser
+uv run playwright install chromium
+```
+
+### Actions
+
+| Action | Description |
+|--------|-------------|
+| `start` | Launch Playwright Chromium (`headless=false` for a visible window; `connect_to_port=9222` to attach to an existing Chrome via CDP) |
+| `navigate` | Go to a URL, wait for `DOMContentLoaded` |
+| `evaluate` | Run arbitrary JavaScript in the page context — return value is captured as JSON |
+| `screenshot` | Capture the viewport as PNG; returns the file path (pass to a vision model) |
+| `pick` | Inject an interactive overlay; user hovers to highlight (red), clicks to select (blue), double-clicks to confirm; returns tag/id/class/text/html/parents for each selected element |
+| `cookies` | Dump all cookies from the page context (including HTTP-only) as JSON — useful for handing session tokens to a scraper |
+| `stop` | Close the browser and release Playwright resources |
+
+### Usage pattern
+
+```
+browser start headless=false
+browser navigate url="https://example.com"
+browser evaluate script="document.title"
+browser screenshot          # returns /tmp/browser_shot_xyz.png
+browser pick timeout=60     # user selects in the headed window, double-clicks to confirm
+browser cookies
+browser stop
+```
+
+### Graceful degradation
+
+If `playwright` is not installed, calling `action='start'` returns an install hint instead of crashing. All other tools are unaffected.
+
+---
+
 ## PostgreSQL Session Store
 
 minion-assist can mirror every conversation message into a PostgreSQL database, enabling full-text search across all historical sessions via the `session_search` tool.  The file-based JSONL store always remains active — PostgreSQL is an additive layer, not a replacement.
@@ -1339,6 +1382,7 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `FindDefinitionTool` | `find_definition` | Search `.py` files in the workspace for the definition of a named symbol (function, class, or variable) using Python's `ast` module. Returns `path:lineno: snippet` lines. `is_read_only=True`. |
 | `TodoWriteTool` | `todo_write` | Replace the current session todo list with a new array of items. Pass an empty list to clear. Blocked by `read_only_mode`. |
 | `TodoReadTool` | `todo_read` | Read the current session todo list as a numbered list. `is_read_only=True`. |
+| `BrowserTool` | `browser` | Control a Playwright Chromium browser. Seven actions: **start** (launch headed/headless or attach to existing Chrome via CDP port), **navigate** (go to URL, wait for DOMContentLoaded), **evaluate** (run arbitrary JavaScript in the page, returns JSON — the agent uses its full DOM API knowledge directly), **screenshot** (capture viewport as PNG, returns file path for vision), **pick** (inject interactive element picker — user hovers/clicks to select, double-clicks to confirm; returns tag/id/class/text/html/parents for each element), **cookies** (dump all cookies from the page context including HTTP-only), **stop** (close browser and free resources). Playwright is an optional dependency (`uv sync --extra browser`). |
 | `WebFetchTool` | `web_fetch` | Fetch a URL and return its text content. Strips HTML tags (skips `<script>`, `<style>`, `<head>`), collapses whitespace, and truncates at `max_chars` (default 8 000). Blocks SSRF targets (AWS metadata, GCP metadata). `is_read_only=True`. |
 | `WebSearchTool` | `web_search` | Search the web via DuckDuckGo. Returns numbered results with title, URL, and snippet. No API key required. Requires `ddgs` (already in `pyproject.toml`). Parameters: `query` (required), `max_results` (1–10, default 5), `region` (e.g. `"us-en"`, optional). `is_read_only=True` — concurrent batching supported. Query string is checked against SSRF markers when a policy is injected. |
 | `AskUserTool` | `ask_user` | Pause the agent and ask the human operator a question. Returns the human's typed response. When no `ask_user_fn` is provided (headless mode), returns an error instructing the agent to proceed without input. |

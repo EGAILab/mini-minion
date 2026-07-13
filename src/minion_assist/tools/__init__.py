@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from ..mcp.client import McpClientManager
 
 from .apply_patch import ApplyPatchTool
+from .browser import BrowserTool
 from .ask_user import AskUserTool
 from .audit import ApprovalDecision, AuditLog
 from .base import Tool, ToolSchema
@@ -123,6 +124,10 @@ def default_registry(
     _policy = policy or PermissionPolicy.default(workspace=root)
 
     registry = ToolRegistry()
+
+    # Browser tool — always registered; playwright is imported lazily inside the
+    # tool itself so the package is optional (uv add playwright to activate).
+    registry.register(BrowserTool())
 
     # Core file-system and shell tools — always registered.
     # Legacy tools (read/write/glob) now accept an optional policy so their
@@ -226,6 +231,7 @@ __all__ = [
     "Tool",
     "ToolSchema",
     "ToolRegistry",
+    "BrowserTool",
     "PermissionPolicy",
     "ApprovalDecision",
     "AuditLog",

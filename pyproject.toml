@@ -22,6 +22,7 @@ anthropic = ["anthropic>=0.40.0"]
 tiktoken  = ["tiktoken>=0.7.0"]
 matrix    = ["matrix-nio[e2e]>=0.21", "aiosqlite>=0.19", "linkify-it-py>=2.0"]
 postgres  = ["psycopg[binary]>=3.1"]
+browser   = ["playwright>=1.40.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
