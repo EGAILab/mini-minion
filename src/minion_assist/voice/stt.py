@@ -107,6 +107,9 @@ class ParakeetSTT(STTAdapter):
         # Move to the requested device if the model supports it.
         if hasattr(self._model, "to"):
             self._model.to(self._device)  # type: ignore[union-attr]
+        # Warm-up pass: compile CUDA kernels now so the first real utterance
+        # doesn't pay the JIT compilation cost (~1–2 s on first GPU call).
+        self._model.transcribe([np.zeros(1600, dtype=np.float32)])  # type: ignore[union-attr]
 
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16_000) -> str:
         """Transcribe using Parakeet.
@@ -124,7 +127,8 @@ class ParakeetSTT(STTAdapter):
         """
         self.load()
         # NeMo expects the audio as a list of arrays or file paths.
-        results = self._model.transcribe([audio])  # type: ignore[union-attr]
+        # verbose=False suppresses the per-batch tqdm progress bar.
+        results = self._model.transcribe([audio], verbose=False)  # type: ignore[union-attr]
         # Depending on NeMo version, results is either list[str] or list[Hypothesis].
         first = results[0]
         text = first.text if hasattr(first, "text") else str(first)

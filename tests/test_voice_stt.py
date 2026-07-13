@@ -128,12 +128,17 @@ def test_parakeet_load_missing_nemo_raises():
 # ---------------------------------------------------------------------------
 
 def test_parakeet_transcribe_calls_model_transcribe(mock_nemo):
-    """transcribe() should call model.transcribe() with a list containing the audio."""
+    """transcribe() should call model.transcribe() with a list containing the audio.
+
+    load() fires a warm-up call, so model.transcribe is called at least twice:
+    once during warm-up and once for the real audio.
+    """
     stt = ParakeetSTT()
     audio = np.zeros(16_000, dtype=np.float32)
     stt.transcribe(audio)
-    # _model is set to mock_nemo["model"] by from_pretrained().
-    mock_nemo["model"].transcribe.assert_called_once()
+    # Warm-up fires during load(), then the real transcription fires here.
+    assert mock_nemo["model"].transcribe.call_count >= 2
+    # The last call must carry the real audio.
     args = mock_nemo["model"].transcribe.call_args.args
     assert isinstance(args[0], list)
     assert len(args[0]) == 1
