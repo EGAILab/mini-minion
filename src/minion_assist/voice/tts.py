@@ -209,12 +209,12 @@ class KokoroTTS(TTSAdapter):
         """
         self.load()
         chunks: list[np.ndarray] = []
-        sample_rate = 24_000  # Kokoro's native output rate
-        for samples, sr, _ in self._pipeline(  # type: ignore[operator]
+        sample_rate = 24_000  # Kokoro's fixed output rate; not in the tuple
+        # Kokoro v1.x yields (graphemes, phonemes, audio) — audio is the 3rd element.
+        for _, _, samples in self._pipeline(  # type: ignore[operator]
             text, voice=self._voice, speed=self._speed
         ):
             chunks.append(np.asarray(samples, dtype=np.float32))
-            sample_rate = int(sr)
         if not chunks:
             return np.zeros(0, dtype=np.float32), sample_rate
         return np.concatenate(chunks), sample_rate

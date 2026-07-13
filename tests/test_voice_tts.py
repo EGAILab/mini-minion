@@ -58,8 +58,8 @@ def mock_kokoro(monkeypatch):
     """Inject a mock kokoro package."""
     mock_pipeline_instance = MagicMock()
     # Simulate generator: [(samples, sr, phonemes), ...]
-    chunk1 = (np.ones(12_000, dtype=np.float32) * 0.3, 24_000, "abc")
-    chunk2 = (np.ones(12_000, dtype=np.float32) * 0.7, 24_000, "def")
+    chunk1 = ("graphemes1", "phonemes1", np.ones(12_000, dtype=np.float32) * 0.3)
+    chunk2 = ("graphemes2", "phonemes2", np.ones(12_000, dtype=np.float32) * 0.7)
     mock_pipeline_instance.return_value = iter([chunk1, chunk2])
 
     mock_pipeline_cls = MagicMock(return_value=mock_pipeline_instance)
@@ -210,8 +210,8 @@ def test_kokoro_synthesise_concatenates_chunks(mock_kokoro):
     """synthesise() must concatenate all generator chunks into one array."""
     tts = KokoroTTS(voice="af_heart")
     # Re-configure the mock to return a fresh iterator on each call
-    chunk1 = (np.ones(12_000, dtype=np.float32) * 0.3, 24_000, "a")
-    chunk2 = (np.ones(12_000, dtype=np.float32) * 0.7, 24_000, "b")
+    chunk1 = ("gs1", "ps1", np.ones(12_000, dtype=np.float32) * 0.3)
+    chunk2 = ("gs2", "ps2", np.ones(12_000, dtype=np.float32) * 0.7)
     mock_kokoro["pipeline"].return_value = iter([chunk1, chunk2])
 
     samples, rate = tts.synthesise("hi there")
