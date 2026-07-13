@@ -124,8 +124,13 @@ class VoiceSession:
     def _loop(self) -> None:
         """Main voice loop: consume utterances, transcribe, respond, speak."""
         while self._running:
-            # Block until VAD emits a complete utterance (or stop() sends None).
-            utterance = self._utterance_queue.get()
+            # Poll with a short timeout so Ctrl+C (SIGINT) can be delivered
+            # on Windows — queue.get() with no timeout blocks in C and swallows
+            # KeyboardInterrupt until the next utterance arrives.
+            try:
+                utterance = self._utterance_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
             if utterance is None:
                 # Sentinel: we were asked to stop.
                 break
