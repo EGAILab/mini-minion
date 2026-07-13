@@ -1298,6 +1298,116 @@ logging_cfg: LoggingConfig = _resolve_logging()
 
 
 @dataclass(frozen=True)
+class VoiceVadConfig:
+    """VAD settings for the voice pipeline.
+
+    Attributes:
+        model: VAD engine to use.  ``"silero"`` is the only supported value.
+        threshold: Speech probability threshold (0.0–1.0).  Frames above this
+            value are treated as speech.  Silero recommends 0.5.
+        silence_ms: Minimum silence gap (ms) that triggers end-of-utterance.
+            Lower = snappier response but more premature cuts; higher = more
+            tolerant of pauses.  Default 700 ms.
+    """
+    model: str = "silero"
+    threshold: float = 0.5
+    silence_ms: int = 700
+
+
+@dataclass(frozen=True)
+class VoiceSttConfig:
+    """STT model settings for the voice pipeline.
+
+    Attributes:
+        model: Backend to use.  ``"parakeet"`` (default) or ``"whisper"``.
+        parakeet_model_id: HF model ID for Parakeet.
+        whisper_model_id: HF model ID for Distil-Whisper / Whisper.
+        chunk_duration_s: Maximum audio chunk duration sent to the STT model
+            at once.  Longer chunks may hit VRAM limits; shorter chunks
+            increase latency.  Default 20 seconds.
+        device: PyTorch device string.  ``"cuda"`` or ``"cpu"``.
+    """
+    model: str = "parakeet"
+    parakeet_model_id: str = "nvidia/parakeet-tdt-0.6b-v3"
+    whisper_model_id: str = "distil-whisper/distil-large-v3"
+    chunk_duration_s: int = 20
+    device: str = "cuda"
+
+
+@dataclass(frozen=True)
+class VoiceTtsConfig:
+    """TTS model settings for the voice pipeline.
+
+    Attributes:
+        model: Backend to use.  ``"qwen3"`` (default), ``"kokoro"``, or
+            ``"piper"``.
+        qwen3_model_id: HF model ID for Qwen3-TTS.
+        qwen3_precision: ``"fp16"`` (~4.5 GB VRAM) or ``"int4"`` (~1 GB VRAM).
+        kokoro_voice: Kokoro voice preset.  Default ``"af_heart"``
+            (American female).  See kokoro docs for all 54 English voices.
+        device: PyTorch device string.  ``"cuda"`` or ``"cpu"``.
+        voice_ref_audio: Path to a WAV file for Qwen3-TTS voice cloning.
+            ``None`` uses the model's built-in default voice.
+        piper_model_path: Path to a Piper ``.onnx`` file.  Required when
+            ``model = "piper"``.
+    """
+    model: str = "qwen3"
+    qwen3_model_id: str = "Qwen/Qwen3-TTS-1.7B"
+    qwen3_precision: str = "fp16"
+    kokoro_voice: str = "af_heart"
+    device: str = "cuda"
+    voice_ref_audio: str | None = None
+    piper_model_path: str = ""
+
+
+@dataclass(frozen=True)
+class VoiceAudioConfig:
+    """Audio device and sample-rate settings.
+
+    Attributes:
+        input_device: sounddevice device name or integer index for the
+            microphone.  ``None`` uses the system default.
+        output_device: sounddevice device name or index for the speaker.
+            ``None`` uses the system default.
+        sample_rate: Capture and synthesis rate in Hz.  Silero VAD and most
+            ASR models require 16 000.  Default 16 000.
+    """
+    input_device: str | None = None
+    output_device: str | None = None
+    sample_rate: int = 16_000
+
+
+@dataclass(frozen=True)
+class VoiceConfig:
+    """Top-level voice chat configuration.
+
+    Configured in ``config.json`` under the ``"voice"`` key::
+
+        "voice": {
+            "enabled": false,
+            "vad":   { "threshold": 0.5, "silence_ms": 700 },
+            "stt":   { "model": "parakeet", "device": "cuda" },
+            "tts":   { "model": "qwen3", "qwen3_precision": "fp16" },
+            "audio": { "sample_rate": 16000 }
+        }
+
+    Attributes:
+        enabled: When ``True``, ``minion-assist --voice`` launches in voice
+            mode automatically.  Mostly informational — the ``--voice`` flag
+            always works regardless of this setting.
+        vad: VAD model settings.
+        stt: Speech-to-text model settings.
+        tts: Text-to-speech model settings.
+        audio: Device and sample-rate settings.
+    """
+    enabled: bool = False
+    vad: VoiceVadConfig = field(default_factory=VoiceVadConfig)
+    stt: VoiceSttConfig = field(default_factory=VoiceSttConfig)
+    tts: VoiceTtsConfig = field(default_factory=VoiceTtsConfig)
+    audio: VoiceAudioConfig = field(default_factory=VoiceAudioConfig)
+
+
+@dataclass(frozen=True)
 class DatabaseConfig:
     """Optional PostgreSQL connection for session + message storage with FTS/vector search.
 
@@ -1358,3 +1468,59 @@ def _resolve_database() -> DatabaseConfig:
 # Configure in config.json: "database": {"url": "postgresql://user:pw@host/db"}
 # Omit the section (or leave url absent) to disable — file-based fallback remains active.
 database: DatabaseConfig = _resolve_database()
+
+
+def _resolve_voice() -> VoiceConfig:
+    """Read the ``"voice"`` section from config.json and build a VoiceConfig.
+
+    All sub-sections (vad, stt, tts, audio) have sensible defaults so the
+    entire voice section can be omitted from config.json.
+
+    Returns:
+        VoiceConfig: Immutable voice settings; defaults apply when absent.
+    """
+    raw = _raw.get("voice", {})
+    if not isinstance(raw, dict):
+        return VoiceConfig()
+
+    # Parse each sub-section, applying defaults for any missing keys.
+    vad_raw = raw.get("vad", {}) if isinstance(raw.get("vad"), dict) else {}
+    stt_raw = raw.get("stt", {}) if isinstance(raw.get("stt"), dict) else {}
+    tts_raw = raw.get("tts", {}) if isinstance(raw.get("tts"), dict) else {}
+    audio_raw = raw.get("audio", {}) if isinstance(raw.get("audio"), dict) else {}
+
+    return VoiceConfig(
+        enabled=bool(raw.get("enabled", False)),
+        vad=VoiceVadConfig(
+            model=str(vad_raw.get("model", "silero")),
+            threshold=float(vad_raw.get("threshold", 0.5)),
+            silence_ms=int(vad_raw.get("silence_ms", 700)),
+        ),
+        stt=VoiceSttConfig(
+            model=str(stt_raw.get("model", "parakeet")),
+            parakeet_model_id=str(stt_raw.get("parakeet_model_id", "nvidia/parakeet-tdt-0.6b-v3")),
+            whisper_model_id=str(stt_raw.get("whisper_model_id", "distil-whisper/distil-large-v3")),
+            chunk_duration_s=int(stt_raw.get("chunk_duration_s", 20)),
+            device=str(stt_raw.get("device", "cuda")),
+        ),
+        tts=VoiceTtsConfig(
+            model=str(tts_raw.get("model", "qwen3")),
+            qwen3_model_id=str(tts_raw.get("qwen3_model_id", "Qwen/Qwen3-TTS-1.7B")),
+            qwen3_precision=str(tts_raw.get("qwen3_precision", "fp16")),
+            kokoro_voice=str(tts_raw.get("kokoro_voice", "af_heart")),
+            device=str(tts_raw.get("device", "cuda")),
+            voice_ref_audio=tts_raw.get("voice_ref_audio") or None,
+            piper_model_path=str(tts_raw.get("piper_model_path", "")),
+        ),
+        audio=VoiceAudioConfig(
+            input_device=audio_raw.get("input_device") or None,
+            output_device=audio_raw.get("output_device") or None,
+            sample_rate=int(audio_raw.get("sample_rate", 16_000)),
+        ),
+    )
+
+
+# voice: controls the local speech-to-speech pipeline.
+# Enable with: "voice": {"enabled": true} in config.json, or pass --voice at runtime.
+# All sub-keys have defaults; the section can be omitted entirely.
+voice: VoiceConfig = _resolve_voice()

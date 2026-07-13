@@ -18,6 +18,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 - [Heartbeat & Proactive Features](#heartbeat--proactive-features)
 - [Dreaming](#dreaming)
 - [Browser Tool](#browser-tool)
+- [Voice Chat](#voice-chat)
 - [PostgreSQL Session Store](#postgresql-session-store)
 - [Module Reference](#module-reference)
   - [config](#config)
@@ -164,6 +165,13 @@ minion-assist/
 │   │   ├── auth.py              # Authentication — access token / password / SSO
 │   │   ├── config.py            # MatrixConfig and nested dataclasses
 │   │   ├── allowlist.py         # User-ID normalisation and wildcard allowlist check
+│   │   └── __init__.py
+│   ├── voice/                   # Optional voice pipeline (--voice flag; requires [voice] extra)
+│   │   ├── audio.py             # MicrophoneStream context manager, play_audio(), list_devices()
+│   │   ├── vad.py               # SileroVAD wrapper, VadCapture daemon thread, build_vad_capture()
+│   │   ├── stt.py               # STTAdapter ABC, ParakeetSTT, WhisperSTT, build_stt()
+│   │   ├── tts.py               # TTSAdapter ABC, Qwen3TTS, KokoroTTS, PiperTTS, build_tts()
+│   │   ├── session.py           # VoiceSession orchestrator, build_voice_session()
 │   │   └── __init__.py
 │   ├── memory/                  # Persistent memory storage
 │   │   ├── short_term.py        # JSONL conversation history (atomic writes)
@@ -934,6 +942,114 @@ browser stop
 ### Graceful degradation
 
 If `playwright` is not installed, calling `action='start'` returns an install hint instead of crashing. All other tools are unaffected.
+
+---
+
+## Voice Chat
+
+minion-assist supports a local, offline speech-to-speech pipeline.  All inference runs on GPU (no cloud APIs, no subscriptions).  The full pipeline fits comfortably within **12 GB VRAM**.
+
+```
+Microphone → Silero VAD → Parakeet TDT → AgentSession.send() → Qwen3-TTS → Speaker
+               (CPU)          (~2 GB)                              (~4.5 GB)
+```
+
+### Prerequisites
+
+```bash
+# Install voice dependencies
+uv sync --extra voice
+
+# Install PyTorch for your CUDA version (example: CUDA 12.1)
+uv pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# NeMo ASR (Parakeet) — large package, install separately
+uv pip install nemo_toolkit[asr]
+```
+
+### Usage
+
+```bash
+uv run minion-assist --voice
+```
+
+Voice mode replaces the text REPL.  Speak into your microphone; the pipeline transcribes, routes through the agent, and speaks the response aloud.  Press `Ctrl+C` to exit.
+
+### Pipeline components
+
+| Stage | Default | VRAM | Alternatives |
+|-------|---------|------|--------------|
+| VAD | Silero VAD 4.x | CPU (0 GB) | — |
+| STT | Parakeet TDT 0.6B v3 | ~2 GB | Distil-Whisper large-v3 int8 (~1.6 GB, multilingual) |
+| Agent | minion-assist agent loop | — | — |
+| TTS | Qwen3-TTS 1.7B FP16 | ~4.5 GB | Kokoro-82M (~2 GB, EN-only), Piper (CPU-only) |
+
+**Total GPU footprint: ~6.5 GB** — leaves ~5.5 GB headroom on a 12 GB card.
+
+### Configuration
+
+Add a `"voice"` section to `config.json`:
+
+```json
+{
+  "voice": {
+    "enabled": true,
+    "vad": {
+      "threshold": 0.5,
+      "silence_ms": 700,
+      "speech_pad_ms": 400
+    },
+    "stt": {
+      "model": "parakeet",
+      "parakeet_model_id": "nvidia/parakeet-tdt-0.6b-v3",
+      "whisper_model_id": "distil-whisper/distil-large-v3",
+      "device": "cuda"
+    },
+    "tts": {
+      "model": "qwen3",
+      "qwen3_model_id": "Qwen/Qwen3-TTS-1.7B",
+      "qwen3_precision": "fp16",
+      "kokoro_voice": "af_heart",
+      "piper_model_path": "",
+      "device": "cuda"
+    },
+    "audio": {
+      "input_device": null,
+      "output_device": null,
+      "sample_rate": 16000
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `vad.threshold` | Speech probability threshold (0–1, default `0.5`) |
+| `vad.silence_ms` | Silence duration that ends an utterance (default `700` ms) |
+| `vad.speech_pad_ms` | Padding added around detected speech (default `400` ms) |
+| `stt.model` | STT backend: `"parakeet"` (default) or `"whisper"` |
+| `stt.device` | PyTorch device string: `"cuda"` (default) or `"cpu"` |
+| `tts.model` | TTS backend: `"qwen3"` (default), `"kokoro"`, or `"piper"` |
+| `tts.qwen3_precision` | `"fp16"` (default) or `"fp32"` |
+| `tts.kokoro_voice` | Kokoro voice ID (default `"af_heart"`) |
+| `tts.piper_model_path` | Path to Piper `.onnx` model file (required when `model = "piper"`) |
+| `audio.input_device` | Sounddevice input device name or index (`null` = system default) |
+| `audio.output_device` | Sounddevice output device name or index (`null` = system default) |
+| `audio.sample_rate` | Microphone capture sample rate (default `16000` Hz) |
+
+### Module layout
+
+```
+src/minion_assist/voice/
+├── __init__.py      # package init and public symbols
+├── audio.py         # MicrophoneStream, play_audio(), list_devices(), stop_playback()
+├── vad.py           # SileroVAD, VadCapture (daemon thread), build_vad_capture()
+├── stt.py           # STTAdapter ABC, ParakeetSTT, WhisperSTT, build_stt()
+├── tts.py           # TTSAdapter ABC, Qwen3TTS, KokoroTTS, PiperTTS, build_tts()
+└── session.py       # VoiceSession (orchestrator), build_voice_session()
+```
+
+All ML packages (`silero_vad`, `torch`, `nemo`, `transformers`, `kokoro`, `piper`) are imported lazily inside `load()` methods — the voice package can be imported without any of the ML extras installed.
 
 ---
 
@@ -1979,7 +2095,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **1480 cases** across all modules. One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **1580 cases** across all modules. One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic
@@ -1992,7 +2108,9 @@ uv run pytest -v
 uv sync                          # install core dependencies
 uv sync --extra tiktoken         # + tiktoken for accurate token estimation
 uv sync --extra postgres         # + psycopg3 for PostgreSQL session store
-uv sync --extra tiktoken --extra postgres  # both extras
+uv sync --extra browser          # + playwright for browser tool
+uv sync --extra voice            # + silero-vad, sounddevice, torch, transformers for voice chat
+uv sync --extra tiktoken --extra postgres  # combine any extras
 uv add <package>                 # add a runtime dependency
 uv add --dev <package>           # add a dev dependency
 uv run <command>                 # run a command in the project environment

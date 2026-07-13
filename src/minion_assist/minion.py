@@ -93,7 +93,7 @@ from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
 from .config import multi_agent as multi_agent_cfg
 from .plugins import load_plugins
-from .config import streaming, workspace
+from .config import streaming, voice as voice_cfg, workspace
 from .mcp import McpClientManager
 from .context import Compactor, _SNIP_SAFETY_BUFFER
 from .memory import LongTermMemory, ShortTermMemory
@@ -214,9 +214,22 @@ def main() -> None:
     console event handler and bash confirmation callback, then runs the REPL
     until the user types ``exit``.
 
+    Pass ``--voice`` on the command line to start in voice chat mode instead of
+    the text REPL:  ``minion-assist --voice``.
+
     Streaming is enabled when ``config.json`` has ``"streaming": {"chat_mode": true}``.
     Context compaction is per-agent, sized to each model's ``context_window``.
     """
+    import argparse as _argparse  # noqa: PLC0415
+    _parser = _argparse.ArgumentParser(prog="minion-assist", add_help=False)
+    _parser.add_argument(
+        "--voice",
+        action="store_true",
+        help="Start in voice chat mode (speech-to-speech).",
+    )
+    # parse_known_args so unrecognised flags (e.g. from test runners) don't error.
+    _args, _ = _parser.parse_known_args()
+
     # Validate that AGENTS (definitions.py) and agents_cfg (config.json) have the same keys.
     _cfg_ids = set(agents_cfg)
     _def_ids = set(AGENTS)
@@ -731,6 +744,28 @@ def main() -> None:
                 f"(nightly at {dreaming_cfg.hour:02d}:{dreaming_cfg.minute:02d} "
                 f"{dreaming_cfg.timezone})."
             )
+
+    # --- Voice mode (--voice flag) ---
+    # If the user passed --voice, hand off to VoiceSession instead of the text REPL.
+    # VoiceSession.run() blocks until Ctrl+C; we then fall through to the finally block.
+    if _args.voice:
+        from .voice.session import build_voice_session  # noqa: PLC0415
+        _target_agent_id = next(iter(sessions))
+        _voice_session = build_voice_session(
+            agent_session=sessions[_target_agent_id],
+            voice_config=voice_cfg,
+            on_event=_on_event,
+        )
+        try:
+            _voice_session.run()
+        except KeyboardInterrupt:
+            print("\n[voice] Goodbye.")
+        finally:
+            if _matrix_channel is not None:
+                _matrix_channel.stop()
+            if mcp_manager is not None:
+                mcp_manager.close_sync()
+        return
 
     use_streaming = streaming.chat_mode
 
