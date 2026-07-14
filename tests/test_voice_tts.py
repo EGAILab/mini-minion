@@ -2,8 +2,8 @@
 
 All ML packages are mocked via sys.modules.  Tests cover:
 
-- Qwen3TTS.load() initialises the transformers pipeline with the right task
-- Qwen3TTS.synthesise() calls the pipeline and unpacks audio + sample_rate
+- Qwen3TTS.load() calls Qwen3TTSModel.from_pretrained() via qwen_tts library
+- Qwen3TTS.synthesise() calls generate_custom_voice() or generate_voice_clone()
 - KokoroTTS.load() initialises KPipeline with the right lang_code
 - KokoroTTS.synthesise() concatenates generator chunks
 - PiperTTS.load() calls PiperVoice.load() with model path
@@ -33,24 +33,43 @@ from minion_assist.voice.tts import (
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def mock_transformers_tts(monkeypatch):
-    """Inject a mock transformers pipeline for TTS."""
+def mock_qwen3_tts(monkeypatch):
+    """Inject a mock qwen_tts package (Qwen3TTSModel).
+
+    Qwen3TTS calls ``Qwen3TTSModel.from_pretrained()`` then
+    ``model.generate_custom_voice()`` or ``model.generate_voice_clone()``.
+    Both return ``(wavs_batch, sample_rate)`` where ``wavs_batch[0]`` is the
+    audio array.
+    """
     samples = np.ones(24_000, dtype=np.float32) * 0.5
-    mock_result = {"audio": samples, "sampling_rate": 24_000}
-    mock_pipe = MagicMock(return_value=mock_result)
-    mock_pipeline_fn = MagicMock(return_value=mock_pipe)
+
+    mock_model_instance = MagicMock()
+    mock_model_instance.generate_custom_voice.return_value = ([samples], 24_000)
+    mock_model_instance.generate_voice_clone.return_value = ([samples], 24_000)
+    mock_model_instance.generate_voice_design.return_value = ([samples], 24_000)
+    # synthesise() reads self._model.model.tts_model_type to pick the right method.
+    # Default to "custom_voice" so generate_custom_voice is called by default.
+    mock_model_instance.model.tts_model_type = "custom_voice"
+
+    mock_qwen_cls = MagicMock()
+    mock_qwen_cls.from_pretrained.return_value = mock_model_instance
+
+    mock_qwen_pkg = MagicMock()
+    mock_qwen_pkg.Qwen3TTSModel = mock_qwen_cls
 
     mock_torch = MagicMock()
+    mock_torch.bfloat16 = "bfloat16_dtype"
     mock_torch.float16 = "float16_dtype"
-    mock_torch.float32 = "float32_dtype"
 
-    mock_transformers = MagicMock()
-    mock_transformers.pipeline = mock_pipeline_fn
-
+    monkeypatch.setitem(sys.modules, "qwen_tts", mock_qwen_pkg)
     monkeypatch.setitem(sys.modules, "torch", mock_torch)
-    monkeypatch.setitem(sys.modules, "transformers", mock_transformers)
 
-    return {"pipe": mock_pipe, "pipeline_fn": mock_pipeline_fn, "result": mock_result}
+    return {
+        "model": mock_model_instance,
+        "cls": mock_qwen_cls,
+        "pkg": mock_qwen_pkg,
+        "torch": mock_torch,
+    }
 
 
 @pytest.fixture()
@@ -116,32 +135,38 @@ def test_tts_adapter_is_abstract():
 # Qwen3TTS.load()
 # ---------------------------------------------------------------------------
 
-def test_qwen3_load_calls_pipeline_with_tts_task(mock_transformers_tts):
-    """load() must call transformers.pipeline with 'text-to-speech'."""
-    tts = Qwen3TTS(model_id="Qwen/Qwen3-TTS-1.7B", device="cpu")
+def test_qwen3_load_calls_from_pretrained(mock_qwen3_tts):
+    """load() must call Qwen3TTSModel.from_pretrained with model_id and device."""
+    tts = Qwen3TTS(model_id="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", device="cpu")
     tts.load()
-    call_args = mock_transformers_tts["pipeline_fn"].call_args
-    assert call_args.args[0] == "text-to-speech"
+    mock_qwen3_tts["cls"].from_pretrained.assert_called_once_with(
+        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        device_map="cpu",
+        dtype=mock_qwen3_tts["torch"].bfloat16,
+    )
 
 
-def test_qwen3_load_passes_model_id(mock_transformers_tts):
-    tts = Qwen3TTS(model_id="Qwen/Qwen3-TTS-0.6B", device="cpu")
+def test_qwen3_load_passes_model_id(mock_qwen3_tts):
+    """load() must forward the configured model_id to from_pretrained."""
+    tts = Qwen3TTS(model_id="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", device="cpu")
     tts.load()
-    kwargs = mock_transformers_tts["pipeline_fn"].call_args.kwargs
-    assert kwargs["model"] == "Qwen/Qwen3-TTS-0.6B"
+    call_args = mock_qwen3_tts["cls"].from_pretrained.call_args
+    assert call_args.args[0] == "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
 
-def test_qwen3_load_is_idempotent(mock_transformers_tts):
+def test_qwen3_load_is_idempotent(mock_qwen3_tts):
+    """Calling load() twice must not create a second model instance."""
     tts = Qwen3TTS()
     tts.load()
     tts.load()
-    mock_transformers_tts["pipeline_fn"].assert_called_once()
+    mock_qwen3_tts["cls"].from_pretrained.assert_called_once()
 
 
-def test_qwen3_load_missing_transformers_raises():
-    with patch.dict(sys.modules, {"transformers": None, "torch": None}):
+def test_qwen3_load_missing_qwen_tts_raises():
+    """ImportError from qwen_tts must raise RuntimeError with install hint."""
+    with patch.dict(sys.modules, {"qwen_tts": None, "torch": None}):
         tts = Qwen3TTS()
-        with pytest.raises(RuntimeError, match="transformers"):
+        with pytest.raises(RuntimeError, match="qwen-tts"):
             tts.load()
 
 
@@ -149,7 +174,8 @@ def test_qwen3_load_missing_transformers_raises():
 # Qwen3TTS.synthesise()
 # ---------------------------------------------------------------------------
 
-def test_qwen3_synthesise_returns_ndarray_and_rate(mock_transformers_tts):
+def test_qwen3_synthesise_returns_ndarray_and_rate(mock_qwen3_tts):
+    """synthesise() must return (float32 ndarray, int sample_rate)."""
     tts = Qwen3TTS()
     samples, rate = tts.synthesise("hello")
     assert isinstance(samples, np.ndarray)
@@ -157,25 +183,49 @@ def test_qwen3_synthesise_returns_ndarray_and_rate(mock_transformers_tts):
     assert isinstance(rate, int)
 
 
-def test_qwen3_synthesise_calls_pipeline_with_text(mock_transformers_tts):
-    tts = Qwen3TTS()
+def test_qwen3_synthesise_calls_generate_custom_voice(mock_qwen3_tts):
+    """synthesise() without ref_audio must call generate_custom_voice."""
+    tts = Qwen3TTS(speaker="Vivian")
     tts.synthesise("say this")
-    mock_transformers_tts["pipe"].assert_called_once()
-    arg = mock_transformers_tts["pipe"].call_args.args[0]
-    assert arg == "say this"
+    mock_qwen3_tts["model"].generate_custom_voice.assert_called_once()
+    kwargs = mock_qwen3_tts["model"].generate_custom_voice.call_args.kwargs
+    assert kwargs["text"] == "say this"
+    assert kwargs["speaker"] == "Vivian"
 
 
-def test_qwen3_synthesise_returns_correct_sample_rate(mock_transformers_tts):
+def test_qwen3_synthesise_uses_voice_clone_when_model_type_base(mock_qwen3_tts):
+    """synthesise() with base model + ref_audio must call generate_voice_clone."""
+    mock_qwen3_tts["model"].model.tts_model_type = "base"
+    tts = Qwen3TTS(voice_ref_audio="/ref.wav", voice_ref_text="the transcript")
+    tts.synthesise("clone this")
+    mock_qwen3_tts["model"].generate_voice_clone.assert_called_once()
+    kwargs = mock_qwen3_tts["model"].generate_voice_clone.call_args.kwargs
+    assert kwargs["ref_audio"] == "/ref.wav"
+    assert kwargs["ref_text"] == "the transcript"
+    mock_qwen3_tts["model"].generate_custom_voice.assert_not_called()
+
+
+def test_qwen3_synthesise_base_model_without_ref_raises(mock_qwen3_tts):
+    """Base model without voice_ref_audio should raise a descriptive RuntimeError."""
+    mock_qwen3_tts["model"].model.tts_model_type = "base"
+    tts = Qwen3TTS()  # no voice_ref_audio
+    with pytest.raises(RuntimeError, match="voice_ref_audio"):
+        tts.synthesise("no ref set")
+
+
+def test_qwen3_synthesise_returns_correct_sample_rate(mock_qwen3_tts):
+    """synthesise() must return the sample_rate from the model output."""
     tts = Qwen3TTS()
     _, rate = tts.synthesise("test")
     assert rate == 24_000
 
 
-def test_qwen3_synthesise_auto_loads(mock_transformers_tts):
+def test_qwen3_synthesise_auto_loads(mock_qwen3_tts):
+    """synthesise() should call load() automatically on first use."""
     tts = Qwen3TTS()
-    assert tts._pipeline is None
+    assert tts._model is None
     tts.synthesise("hi")
-    assert tts._pipeline is not None
+    assert tts._model is not None
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +295,80 @@ def test_kokoro_synthesise_auto_loads(mock_kokoro):
 
 
 # ---------------------------------------------------------------------------
+# supports_streaming flag
+# ---------------------------------------------------------------------------
+
+def test_kokoro_supports_streaming_is_true():
+    """KokoroTTS.supports_streaming must be True — it yields chunks incrementally."""
+    assert KokoroTTS.supports_streaming is True
+
+
+def test_qwen3_supports_streaming_is_false():
+    """Qwen3TTS.supports_streaming must be False — it synthesises the full text at once."""
+    assert Qwen3TTS.supports_streaming is False
+
+
+# ---------------------------------------------------------------------------
+# TTSAdapter.synthesise_stream() default
+# ---------------------------------------------------------------------------
+
+def test_tts_adapter_synthesise_stream_delegates_to_synthesise(mock_qwen3_tts):
+    """The default synthesise_stream() must yield the result of synthesise() once."""
+    tts = Qwen3TTS()
+    chunks = list(tts.synthesise_stream("hello"))
+    assert len(chunks) == 1
+    samples, rate = chunks[0]
+    assert isinstance(samples, np.ndarray)
+    assert rate == 24_000
+
+
+# ---------------------------------------------------------------------------
+# KokoroTTS.synthesise_stream()
+# ---------------------------------------------------------------------------
+
+def test_kokoro_synthesise_stream_yields_chunks(mock_kokoro):
+    """synthesise_stream() must yield each pipeline chunk as (ndarray, sample_rate)."""
+    tts = KokoroTTS(voice="af_heart")
+    chunk1 = ("gs1", "ps1", np.ones(12_000, dtype=np.float32) * 0.3)
+    chunk2 = ("gs2", "ps2", np.ones(12_000, dtype=np.float32) * 0.7)
+    mock_kokoro["pipeline"].return_value = iter([chunk1, chunk2])
+
+    results = list(tts.synthesise_stream("hi there"))
+    assert len(results) == 2
+    for samples, rate in results:
+        assert isinstance(samples, np.ndarray)
+        assert samples.dtype == np.float32
+        assert rate == 24_000
+
+
+def test_kokoro_synthesise_stream_chunk_values(mock_kokoro):
+    """synthesise_stream() audio values must match the pipeline output exactly."""
+    tts = KokoroTTS()
+    audio = np.ones(8_000, dtype=np.float32) * 0.5
+    mock_kokoro["pipeline"].return_value = iter([("g", "p", audio)])
+
+    chunks = list(tts.synthesise_stream("test"))
+    np.testing.assert_array_almost_equal(chunks[0][0], audio)
+
+
+def test_kokoro_synthesise_stream_empty_generator(mock_kokoro):
+    """synthesise_stream() with an empty pipeline yields nothing."""
+    mock_kokoro["pipeline"].return_value = iter([])
+    tts = KokoroTTS()
+    results = list(tts.synthesise_stream("anything"))
+    assert results == []
+
+
+def test_kokoro_synthesise_stream_auto_loads(mock_kokoro):
+    """synthesise_stream() must call load() automatically on first use."""
+    mock_kokoro["pipeline"].return_value = iter([])
+    tts = KokoroTTS()
+    assert tts._pipeline is None
+    list(tts.synthesise_stream("hi"))
+    assert tts._pipeline is not None
+
+
+# ---------------------------------------------------------------------------
 # PiperTTS.load()
 # ---------------------------------------------------------------------------
 
@@ -310,7 +434,7 @@ def test_piper_synthesise_returns_sample_rate(mock_piper):
 # speak() integration
 # ---------------------------------------------------------------------------
 
-def test_speak_calls_play_audio(mock_transformers_tts):
+def test_speak_calls_play_audio(mock_qwen3_tts):
     """speak() must call play_audio() with the synthesised samples."""
     tts = Qwen3TTS()
     with patch("minion_assist.voice.audio.play_audio") as mock_play:
@@ -321,7 +445,7 @@ def test_speak_calls_play_audio(mock_transformers_tts):
         assert isinstance(samples_arg, np.ndarray)
 
 
-def test_speak_passes_sample_rate(mock_transformers_tts):
+def test_speak_passes_sample_rate(mock_qwen3_tts):
     """speak() must pass the sample_rate returned by synthesise()."""
     tts = Qwen3TTS()
     with patch("minion_assist.voice.audio.play_audio") as mock_play:
@@ -337,11 +461,13 @@ def test_speak_passes_sample_rate(mock_transformers_tts):
 class _FakeTtsQwen:
     class tts:
         model = "qwen3"
-        qwen3_model_id = "Qwen/Qwen3-TTS-1.7B"
+        qwen3_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
         qwen3_precision = "fp16"
+        qwen3_speaker = "Vivian"
         kokoro_voice = "af_heart"
         device = "cuda"
         voice_ref_audio = None
+        voice_ref_text = None
         piper_model_path = ""
 
 
@@ -395,6 +521,12 @@ def test_build_tts_passes_piper_model_path():
 def test_build_tts_passes_qwen3_precision():
     result = build_tts(_FakeTtsQwen)
     assert result._precision == "fp16"
+
+
+def test_build_tts_passes_qwen3_speaker():
+    """build_tts() must forward qwen3_speaker to Qwen3TTS._speaker."""
+    result = build_tts(_FakeTtsQwen)
+    assert result._speaker == "Vivian"
 
 
 def test_build_tts_defaults_on_empty_config():

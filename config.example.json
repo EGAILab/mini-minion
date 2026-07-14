@@ -73,22 +73,23 @@
   },
   "voice": {
     "enabled": false,
+    "language": "en",
     "vad": {
       "threshold": 0.5,
-      "silence_ms": 700
+      "silence_ms": 1200
     },
     "stt": {
-      "model": "parakeet",
+      "model": "whisper",
+      "whisper_model_id": "openai/whisper-large-v3",
       "parakeet_model_id": "nvidia/parakeet-tdt-0.6b-v3",
-      "whisper_model_id": "distil-whisper/distil-large-v3",
-      "chunk_duration_s": 20,
       "device": "cuda"
     },
     "tts": {
-      "model": "qwen3",
-      "qwen3_model_id": "Qwen/Qwen3-TTS-1.7B",
-      "qwen3_precision": "fp16",
+      "model": "kokoro",
       "kokoro_voice": "af_heart",
+      "qwen3_model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+      "qwen3_precision": "bf16",
+      "qwen3_speaker": "Vivian",
       "piper_model_path": "",
       "voice_ref_audio": null,
       "device": "cuda"

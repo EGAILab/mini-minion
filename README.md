@@ -427,6 +427,7 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/agents` | List all known agents with turn counts and last-active timestamps |
 | `/session [N\|uuid-prefix]` | List past conversation sessions for the active agent; restore one by index or UUID prefix |
 | `/rename [N] <name>` | Give the current session (or session N from /session) a descriptive name |
+| `/delete-session [N\|uuid-prefix]` | Permanently delete a past session (cannot delete the active session) |
 | `/switch [agent_id]` | Switch the active agent routing target (e.g. `/switch researcher`); defaults to current agent |
 | `/diagnose` | Check each agent's provider configuration and API key status |
 | `/mcp-reload` | Reconnect all MCP servers and refresh tool adapters in every session |
@@ -950,21 +951,22 @@ If `playwright` is not installed, calling `action='start'` returns an install hi
 minion-assist supports a local, offline speech-to-speech pipeline.  All inference runs on GPU (no cloud APIs, no subscriptions).  The full pipeline fits comfortably within **12 GB VRAM**.
 
 ```
-Microphone → Silero VAD → Parakeet TDT → AgentSession.send() → Qwen3-TTS → Speaker
-               (CPU)          (~2 GB)                              (~4.5 GB)
+Microphone → Silero VAD → Whisper large-v3 → AgentSession.send() → Kokoro TTS → Speaker
+               (CPU)           (~3 GB)                              (~2 GB, streaming)
 ```
 
 ### Prerequisites
 
 ```bash
-# Install voice dependencies
+# Install voice dependencies (includes Kokoro TTS, Whisper STT, Silero VAD)
 uv sync --extra voice
 
-# Install PyTorch for your CUDA version (example: CUDA 12.1)
-uv pip install torch --index-url https://download.pytorch.org/whl/cu121
+# PyTorch with CUDA is pinned in pyproject.toml — uv sync handles it automatically.
+# If you need a different CUDA version, override with:
+# uv pip install torch --index-url https://download.pytorch.org/whl/cu121
 
-# NeMo ASR (Parakeet) — large package, install separately
-uv pip install nemo_toolkit[asr]
+# Optional: Parakeet STT (English-only, faster than Whisper)
+# uv pip install nemo_toolkit[asr]
 ```
 
 ### Usage
@@ -980,11 +982,13 @@ Voice mode replaces the text REPL.  Speak into your microphone; the pipeline tra
 | Stage | Default | VRAM | Alternatives |
 |-------|---------|------|--------------|
 | VAD | Silero VAD 4.x | CPU (0 GB) | — |
-| STT | Parakeet TDT 0.6B v3 | ~2 GB | Distil-Whisper large-v3 int8 (~1.6 GB, multilingual) |
+| STT | Whisper large-v3 | ~3 GB | Parakeet TDT 0.6B v3 (~2 GB, EN-only), Distil-Whisper (~1.6 GB) |
 | Agent | minion-assist agent loop | — | — |
-| TTS | Qwen3-TTS 1.7B FP16 | ~4.5 GB | Kokoro-82M (~2 GB, EN-only), Piper (CPU-only) |
+| TTS | Kokoro-82M (streaming) | ~2 GB | Qwen3-TTS 1.7B FP16 (~4.5 GB), Piper (CPU-only) |
 
-**Total GPU footprint: ~6.5 GB** — leaves ~5.5 GB headroom on a 12 GB card.
+Kokoro streams audio chunk-by-chunk (`supports_streaming = True`) — the first audio chunk starts playing while the rest of the response is still being synthesised, giving near-zero first-word latency and immediate barge-in on speech detection.
+
+**Total GPU footprint: ~5 GB** — leaves ~7 GB headroom on a 12 GB card.
 
 ### Configuration
 
@@ -994,22 +998,22 @@ Add a `"voice"` section to `config.json`:
 {
   "voice": {
     "enabled": true,
+    "language": "en",
     "vad": {
       "threshold": 0.5,
-      "silence_ms": 700,
-      "speech_pad_ms": 400
+      "silence_ms": 1200
     },
     "stt": {
-      "model": "parakeet",
+      "model": "whisper",
+      "whisper_model_id": "openai/whisper-large-v3",
       "parakeet_model_id": "nvidia/parakeet-tdt-0.6b-v3",
-      "whisper_model_id": "distil-whisper/distil-large-v3",
       "device": "cuda"
     },
     "tts": {
-      "model": "qwen3",
+      "model": "kokoro",
+      "kokoro_voice": "af_heart",
       "qwen3_model_id": "Qwen/Qwen3-TTS-1.7B",
       "qwen3_precision": "fp16",
-      "kokoro_voice": "af_heart",
       "piper_model_path": "",
       "device": "cuda"
     },
@@ -1024,12 +1028,12 @@ Add a `"voice"` section to `config.json`:
 
 | Field | Description |
 |-------|-------------|
+| `language` | BCP-47 reply language injected as a prompt prefix on each voice turn (default `"en"`). Set to `""` to disable. Kokoro TTS is English-only so `"en"` is required. |
 | `vad.threshold` | Speech probability threshold (0–1, default `0.5`) |
-| `vad.silence_ms` | Silence duration that ends an utterance (default `700` ms) |
-| `vad.speech_pad_ms` | Padding added around detected speech (default `400` ms) |
-| `stt.model` | STT backend: `"parakeet"` (default) or `"whisper"` |
+| `vad.silence_ms` | Silence duration that ends an utterance (default `1200` ms). Increase for slower speakers; decrease for snappier response. |
+| `stt.model` | STT backend: `"whisper"` (default, multilingual) or `"parakeet"` (English-only, faster) |
 | `stt.device` | PyTorch device string: `"cuda"` (default) or `"cpu"` |
-| `tts.model` | TTS backend: `"qwen3"` (default), `"kokoro"`, or `"piper"` |
+| `tts.model` | TTS backend: `"kokoro"` (default), `"qwen3"`, or `"piper"` |
 | `tts.qwen3_precision` | `"fp16"` (default) or `"fp32"` |
 | `tts.kokoro_voice` | Kokoro voice ID (default `"af_heart"`) |
 | `tts.piper_model_path` | Path to Piper `.onnx` model file (required when `model = "piper"`) |

@@ -209,6 +209,31 @@ class ShortTermMemory:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(name, encoding="utf-8")
 
+    def delete_session(self, agent_id: str, session_id: str) -> bool:
+        """Delete a session's history file and its sidecar name file.
+
+        Does not touch ``sessions.json`` — that file only tracks the current
+        session pointer per agent and is managed by :class:`SessionStore`.
+
+        Args:
+            agent_id (str): Agent ID.
+            session_id (str): UUID of the session to delete.
+
+        Returns:
+            bool: ``True`` if the ``.jsonl`` file existed and was deleted,
+                ``False`` if the file was not found (already gone).
+        """
+        p = self._path(agent_id, session_id)
+        name_p = self._name_path(agent_id, session_id)
+        deleted = False
+        if p.exists():
+            p.unlink()
+            deleted = True
+        # Remove the sidecar name file regardless — it's meaningless without history.
+        if name_p.exists():
+            name_p.unlink()
+        return deleted
+
     def prune_sessions(self, agent_id: str, keep_n: int = 20) -> int:
         """Delete old session files, keeping only the N most recent.
 

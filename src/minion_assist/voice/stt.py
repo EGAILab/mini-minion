@@ -182,21 +182,39 @@ class WhisperSTT(STTAdapter):
             torch_dtype=dtype,
             device=self._device,
         )
+        # Whisper large-v3 ships with `forced_decoder_ids` in its generation_config
+        # which triggers a deprecation warning on every call.  Clear it here so
+        # callers can use the task/language API instead (see transcribe()).
+        gen_cfg = getattr(getattr(self._pipe, "model", None), "generation_config", None)
+        if gen_cfg is not None and getattr(gen_cfg, "forced_decoder_ids", None):
+            gen_cfg.forced_decoder_ids = None
+        # Same story for the feature extractor's return_token_timestamps flag.
+        fe = getattr(self._pipe, "feature_extractor", None)
+        if fe is not None and getattr(fe, "return_token_timestamps", False):
+            fe.return_token_timestamps = False
 
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16_000) -> str:
         """Transcribe using the Whisper pipeline.
+
+        Passes ``task="transcribe"`` and ``language=None`` explicitly so
+        transformers uses the task/language API rather than the deprecated
+        ``forced_decoder_ids`` path.  Setting ``language=None`` lets Whisper
+        auto-detect the input language, preserving full multilingual support.
 
         Args:
             audio: 1-D float32 audio array.
             sample_rate: Sampling rate of the audio (must be 16 000 for Whisper).
 
         Returns:
-            str: Transcribed text.
+            str: Transcribed text, in whatever language was spoken.
         """
         self.load()
         # transformers pipeline accepts a dict with 'array' and 'sampling_rate'.
         inputs = {"array": audio.astype(np.float32), "sampling_rate": sample_rate}
-        result = self._pipe(inputs)  # type: ignore[operator]
+        result = self._pipe(  # type: ignore[operator]
+            inputs,
+            generate_kwargs={"task": "transcribe", "language": None},
+        )
         return result["text"].strip()  # type: ignore[index]
 
 

@@ -193,6 +193,11 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
         description="List loaded skills available to the agent.",
         arg_hint="[name]",
     ),
+    CommandSpec(
+        name="/delete-session",
+        description="Permanently delete a past session file for the active agent.",
+        arg_hint="[N | uuid-prefix]",
+    ),
 ]
 
 
@@ -1004,6 +1009,94 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                 description = getattr(skill, "description", "") or "(no description)"
                 lines.append(f"  {skill_name} - {description}")
             return CommandResult(handled=True, message="\n".join(lines))
+
+        # --- /delete-session ---
+        if spec.name == "/delete-session":
+            if ctx.short_term is None:
+                return CommandResult(handled=True, message="Short-term memory not available.")
+            agent_id = ctx.target_agent_id
+            paths = list(reversed(ctx.short_term.list_sessions(agent_id)))
+            if not paths:
+                return CommandResult(
+                    handled=True,
+                    message=f"No session history found for '{agent_id}'.",
+                )
+            current_id = getattr(ctx.sessions.get(agent_id), "session_id", None)
+
+            if not ctx.args:
+                # Bare /delete-session — show the listing so the user can pick one.
+                label = "session" if len(paths) == 1 else "sessions"
+                lines = [f"History for {agent_id} ({len(paths)} {label}):"]
+                for i, p in enumerate(paths, 1):
+                    mtime = datetime.fromtimestamp(p.stat().st_mtime)
+                    ts = mtime.strftime("%Y-%m-%d %H:%M")
+                    uuid_hint = p.stem[:8]
+                    msg_count = sum(1 for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip())
+                    is_current = p.stem == current_id
+                    marker = "*" if is_current else " "
+                    name = ctx.short_term.get_name(agent_id, p.stem) if ctx.short_term else None
+                    if name:
+                        label = f"  [{name}]"
+                    else:
+                        label = ""
+                        try:
+                            for ln in p.read_text(encoding="utf-8").splitlines():
+                                m = json.loads(ln.strip())
+                                if m.get("role") == "user":
+                                    content = m.get("content", "")
+                                    if isinstance(content, list):
+                                        content = next(
+                                            (b.get("text", "") for b in content
+                                             if isinstance(b, dict) and b.get("type") == "text"),
+                                            "",
+                                        )
+                                    if content:
+                                        label = f'  "{content[:50]}"'
+                                    break
+                        except Exception:
+                            pass
+                    lines.append(f"{marker} [{i}] {ts}  msgs={msg_count}  {uuid_hint}{label}")
+                lines.append("Use /delete-session <N> or /delete-session <uuid-prefix> to delete.")
+                return CommandResult(handled=True, message="\n".join(lines))
+
+            # --- /delete-session <arg> — resolve the target then delete ---
+            arg = ctx.args.strip()
+            target_path = None
+            try:
+                idx = int(arg)
+                if 1 <= idx <= len(paths):
+                    target_path = paths[idx - 1]
+                else:
+                    return CommandResult(
+                        handled=True,
+                        message=f"Index {idx} out of range (1–{len(paths)}).",
+                    )
+            except ValueError:
+                matches = [p for p in paths if p.stem.startswith(arg)]
+                if not matches:
+                    return CommandResult(handled=True, message=f"No session matching '{arg}'.")
+                if len(matches) > 1:
+                    return CommandResult(
+                        handled=True,
+                        message=f"Ambiguous prefix '{arg}' matches {len(matches)} sessions.",
+                    )
+                target_path = matches[0]
+
+            target_id = target_path.stem
+            if target_id == current_id:
+                return CommandResult(
+                    handled=True,
+                    message=(
+                        "Cannot delete the active session. "
+                        "Use /session <N> to switch to a different session first."
+                    ),
+                )
+
+            # Fetch name before deleting so we can include it in the confirmation.
+            display_name = ctx.short_term.get_name(agent_id, target_id)
+            ctx.short_term.delete_session(agent_id, target_id)
+            hint = f"[{display_name}]" if display_name else target_id[:8]
+            return CommandResult(handled=True, message=f"Deleted session {hint}.")
 
     # --- Plugin commands ---
     # Check plugin-registered commands after all built-ins.  Plugins can shadow

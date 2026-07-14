@@ -60,7 +60,7 @@ class SileroVAD:
         self,
         threshold: float = 0.5,
         sample_rate: int = 16_000,
-        silence_ms: int = 700,
+        silence_ms: int = 1200,
         speech_pad_ms: int = 100,
     ) -> None:
         self._threshold = threshold
@@ -149,6 +149,11 @@ class VadCapture:
         self._thread: "threading.Thread | None" = None
         self._stop_event: "threading.Event | None" = None
         self._utterance_queue: "queue.Queue | None" = None
+        # Set the moment VAD detects speech START; cleared after the utterance
+        # is committed to the queue.  Lets _speak_streaming interrupt playback
+        # immediately when the user begins talking, rather than waiting for the
+        # full utterance + silence_ms to elapse.
+        self.speech_started: threading.Event = threading.Event()
 
     def start(self, utterance_queue: "queue.Queue[np.ndarray]") -> None:
         """Start the background capture + VAD thread.
@@ -195,6 +200,9 @@ class VadCapture:
                         # Speech started — begin buffering from a clean state.
                         in_speech = True
                         speech_buffer = [chunk]
+                        # Signal barge-in immediately so _speak_streaming can
+                        # abort TTS the instant the user starts talking.
+                        self.speech_started.set()
                     elif event is not None and "end" in event:
                         # Speech ended — emit the buffered utterance.
                         if in_speech and speech_buffer:
@@ -203,6 +211,8 @@ class VadCapture:
                             self._utterance_queue.put(utterance)
                         in_speech = False
                         speech_buffer = []
+                        # Clear the barge-in signal now that the utterance is queued.
+                        self.speech_started.clear()
                     elif in_speech:
                         # Mid-speech — keep buffering.
                         speech_buffer.append(chunk)

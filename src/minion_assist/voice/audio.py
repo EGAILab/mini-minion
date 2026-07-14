@@ -160,6 +160,9 @@ class MicrophoneStream:
             blocksize=self._blocksize,
             device=self._device,
             callback=_callback,
+            # High latency asks the OS for a larger internal ring buffer so the
+            # callback is not starved when the GIL is held during TTS GPU work.
+            latency="high",
         )
         self._stream.start()  # type: ignore[union-attr]
         return self

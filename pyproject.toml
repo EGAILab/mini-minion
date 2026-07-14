@@ -10,6 +10,8 @@ dependencies = [
     "mcp>=1.0.0",
     "openai>=1.0.0",
     "prompt-toolkit>=3.0.0",
+    "numpy>=1.26",
+    "psycopg[binary]>=3.1",
     "python-dotenv>=1.0.0",
     "python-frontmatter>=1.1.0",
     "markdown-it-py>=3.0",
@@ -26,9 +28,11 @@ browser   = ["playwright>=1.40.0"]
 voice     = [
     "silero-vad>=4.0",
     "sounddevice>=0.4",
-    "numpy>=1.26",
     "torch>=2.2",
     "transformers>=4.52",
+    "numba>=0.57",
+    "qwen-tts>=0.1",
+    "kokoro>=0.9",
 ]
 all       = ["anthropic>=0.40.0", "tiktoken>=0.7.0", "psycopg[binary]>=3.1", "playwright>=1.40.0",
              "silero-vad>=4.0", "sounddevice>=0.4", "numpy>=1.26", "torch>=2.2", "transformers>=4.52"]
@@ -49,6 +53,16 @@ dev = [
     "pytest>=9.0.3",
     "ruff>=0.9.0",
 ]
+
+# Tell uv to always fetch torch from the CUDA 12.8 index so uv sync
+# never silently installs the CPU-only PyPI wheel.
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.ruff]
 line-length = 100

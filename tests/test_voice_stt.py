@@ -245,6 +245,50 @@ def test_whisper_transcribe_auto_loads(mock_transformers_stt):
     assert stt._pipe is not None
 
 
+def test_whisper_transcribe_passes_task_transcribe(mock_transformers_stt):
+    """transcribe() must pass task='transcribe' in generate_kwargs to avoid forced_decoder_ids."""
+    stt = WhisperSTT()
+    stt.transcribe(np.zeros(512, dtype=np.float32))
+    call_kwargs = mock_transformers_stt["pipe"].call_args.kwargs
+    gen_kwargs = call_kwargs.get("generate_kwargs", {})
+    assert gen_kwargs.get("task") == "transcribe"
+
+
+def test_whisper_transcribe_passes_language_none(mock_transformers_stt):
+    """transcribe() must pass language=None so Whisper auto-detects the spoken language."""
+    stt = WhisperSTT()
+    stt.transcribe(np.zeros(512, dtype=np.float32))
+    call_kwargs = mock_transformers_stt["pipe"].call_args.kwargs
+    gen_kwargs = call_kwargs.get("generate_kwargs", {})
+    assert "language" in gen_kwargs
+    assert gen_kwargs["language"] is None
+
+
+def test_whisper_load_clears_forced_decoder_ids(mock_transformers_stt):
+    """load() must clear forced_decoder_ids on the model's generation_config."""
+    # Set up a mock generation_config with forced_decoder_ids present.
+    mock_gen_cfg = MagicMock()
+    mock_gen_cfg.forced_decoder_ids = [[1, 50259], [2, 50359]]  # typical Whisper value
+    mock_transformers_stt["pipe"].model.generation_config = mock_gen_cfg
+
+    stt = WhisperSTT()
+    stt.load()
+
+    assert mock_gen_cfg.forced_decoder_ids is None
+
+
+def test_whisper_load_clears_return_token_timestamps(mock_transformers_stt):
+    """load() must clear return_token_timestamps on the feature extractor."""
+    mock_fe = MagicMock()
+    mock_fe.return_token_timestamps = True
+    mock_transformers_stt["pipe"].feature_extractor = mock_fe
+
+    stt = WhisperSTT()
+    stt.load()
+
+    assert mock_fe.return_token_timestamps is False
+
+
 # ---------------------------------------------------------------------------
 # build_stt() factory
 # ---------------------------------------------------------------------------

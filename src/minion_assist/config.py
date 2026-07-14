@@ -1311,7 +1311,7 @@ class VoiceVadConfig:
     """
     model: str = "silero"
     threshold: float = 0.5
-    silence_ms: int = 700
+    silence_ms: int = 1200
 
 
 @dataclass(frozen=True)
@@ -1342,21 +1342,27 @@ class VoiceTtsConfig:
         model: Backend to use.  ``"qwen3"`` (default), ``"kokoro"``, or
             ``"piper"``.
         qwen3_model_id: HF model ID for Qwen3-TTS.
-        qwen3_precision: ``"fp16"`` (~4.5 GB VRAM) or ``"int4"`` (~1 GB VRAM).
+        qwen3_precision: ``"bf16"`` (default, ~3.4 GB VRAM) or ``"fp16"``.
+        qwen3_speaker: Preset speaker for ``generate_custom_voice``.  One of
+            the 9 Qwen3-TTS built-in voices, e.g. ``"Vivian"``.  Ignored when
+            ``voice_ref_audio`` is set.
         kokoro_voice: Kokoro voice preset.  Default ``"af_heart"``
             (American female).  See kokoro docs for all 54 English voices.
         device: PyTorch device string.  ``"cuda"`` or ``"cpu"``.
         voice_ref_audio: Path to a WAV file for Qwen3-TTS voice cloning.
-            ``None`` uses the model's built-in default voice.
+            ``None`` uses the preset ``qwen3_speaker`` voice.
+        voice_ref_text: Transcript of ``voice_ref_audio`` for better cloning.
         piper_model_path: Path to a Piper ``.onnx`` file.  Required when
             ``model = "piper"``.
     """
     model: str = "qwen3"
-    qwen3_model_id: str = "Qwen/Qwen3-TTS-1.7B"
-    qwen3_precision: str = "fp16"
+    qwen3_model_id: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    qwen3_precision: str = "bf16"
+    qwen3_speaker: str = "Vivian"
     kokoro_voice: str = "af_heart"
     device: str = "cuda"
     voice_ref_audio: str | None = None
+    voice_ref_text: str | None = None
     piper_model_path: str = ""
 
 
@@ -1395,12 +1401,18 @@ class VoiceConfig:
         enabled: When ``True``, ``minion-assist --voice`` launches in voice
             mode automatically.  Mostly informational — the ``--voice`` flag
             always works regardless of this setting.
+        language: BCP-47 language tag the agent should reply in (e.g. ``"en"``
+            for English).  ``VoiceSession`` injects a ``[Voice mode: reply in
+            {language} only.]`` prefix into each user message so the LLM uses
+            the TTS engine's supported language.  Set to ``""`` to disable.
+            Kokoro-82M is English-only, so the default is ``"en"``.
         vad: VAD model settings.
         stt: Speech-to-text model settings.
         tts: Text-to-speech model settings.
         audio: Device and sample-rate settings.
     """
     enabled: bool = False
+    language: str = "en"
     vad: VoiceVadConfig = field(default_factory=VoiceVadConfig)
     stt: VoiceSttConfig = field(default_factory=VoiceSttConfig)
     tts: VoiceTtsConfig = field(default_factory=VoiceTtsConfig)
@@ -1491,6 +1503,7 @@ def _resolve_voice() -> VoiceConfig:
 
     return VoiceConfig(
         enabled=bool(raw.get("enabled", False)),
+        language=str(raw.get("language", "en")),
         vad=VoiceVadConfig(
             model=str(vad_raw.get("model", "silero")),
             threshold=float(vad_raw.get("threshold", 0.5)),
@@ -1505,11 +1518,13 @@ def _resolve_voice() -> VoiceConfig:
         ),
         tts=VoiceTtsConfig(
             model=str(tts_raw.get("model", "qwen3")),
-            qwen3_model_id=str(tts_raw.get("qwen3_model_id", "Qwen/Qwen3-TTS-1.7B")),
-            qwen3_precision=str(tts_raw.get("qwen3_precision", "fp16")),
+            qwen3_model_id=str(tts_raw.get("qwen3_model_id", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")),
+            qwen3_precision=str(tts_raw.get("qwen3_precision", "bf16")),
+            qwen3_speaker=str(tts_raw.get("qwen3_speaker", "Vivian")),
             kokoro_voice=str(tts_raw.get("kokoro_voice", "af_heart")),
             device=str(tts_raw.get("device", "cuda")),
             voice_ref_audio=tts_raw.get("voice_ref_audio") or None,
+            voice_ref_text=tts_raw.get("voice_ref_text") or None,
             piper_model_path=str(tts_raw.get("piper_model_path", "")),
         ),
         audio=VoiceAudioConfig(

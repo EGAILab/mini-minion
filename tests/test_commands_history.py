@@ -1,4 +1,4 @@
-"""Tests for the /session and /rename slash commands."""
+"""Tests for the /session, /rename, and /delete-session slash commands."""
 
 import json
 import time
@@ -340,3 +340,157 @@ def test_set_name_empty_clears_name(tmp_path):
     assert stm.get_name("main", "ses-001") == "Temp name"
     stm.set_name("main", "ses-001", "")
     assert stm.get_name("main", "ses-001") is None
+
+
+# ---------------------------------------------------------------------------
+# Helpers for /delete-session
+# ---------------------------------------------------------------------------
+
+def _delete_ctx(
+    args: str,
+    stm: ShortTermMemory,
+    agent_id: str = "main",
+    session_id: str = "cur-001",
+) -> CommandContext:
+    """Build a CommandContext targeting /delete-session."""
+    session = _make_session_mock(session_id)
+    return CommandContext(
+        raw=f"/delete-session {args}".strip(),
+        command="/delete-session",
+        args=args,
+        target_agent_id=agent_id,
+        sessions={agent_id: session},
+        agents_cfg={},
+        short_term=stm,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests: /delete-session
+# ---------------------------------------------------------------------------
+
+def test_delete_session_no_sessions(tmp_path):
+    """/delete-session with no history should report no sessions found."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    result = dispatch_command(_delete_ctx("", stm))
+    assert result.handled
+    assert "No session history" in result.message
+
+
+def test_delete_session_no_short_term_returns_error():
+    """/delete-session should fail gracefully when short_term is None."""
+    ctx = CommandContext(
+        raw="/delete-session",
+        command="/delete-session",
+        args="",
+        target_agent_id="main",
+        sessions={"main": MagicMock()},
+        agents_cfg={},
+        short_term=None,
+    )
+    result = dispatch_command(ctx)
+    assert result.handled
+    assert "not available" in result.message
+
+
+def test_delete_session_no_arg_shows_listing(tmp_path):
+    """Bare /delete-session shows the session list with a usage hint."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "aaa-001", [{"role": "user", "content": "hello"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "bbb-002", [{"role": "user", "content": "world"}])
+
+    result = dispatch_command(_delete_ctx("", stm, session_id="bbb-002"))
+    assert result.handled
+    assert "History for main" in result.message
+    assert "[1]" in result.message
+    assert "[2]" in result.message
+    assert "Use /delete-session" in result.message
+
+
+def test_delete_session_by_index(tmp_path):
+    """/delete-session N removes the .jsonl file for that session."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    # [2] is the older session (old-001) in newest-first order
+    result = dispatch_command(_delete_ctx("2", stm, session_id="cur-001"))
+    assert result.handled
+    assert "Deleted session" in result.message
+    assert "old" in result.message  # uuid hint or name
+    # The .jsonl file should be gone
+    assert not (tmp_path / "sessions" / "main" / "old-001.jsonl").exists()
+
+
+def test_delete_session_by_uuid_prefix(tmp_path):
+    """/delete-session <prefix> resolves by UUID prefix and removes the file."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "xyz-999", [{"role": "user", "content": "x"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    result = dispatch_command(_delete_ctx("xyz", stm, session_id="cur-001"))
+    assert result.handled
+    assert "Deleted session" in result.message
+    assert not (tmp_path / "sessions" / "main" / "xyz-999.jsonl").exists()
+
+
+def test_delete_session_removes_name_sidecar(tmp_path):
+    """Deleting a session also removes its .name sidecar file."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    stm.set_name("main", "old-001", "Work session")
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    result = dispatch_command(_delete_ctx("2", stm, session_id="cur-001"))
+    assert result.handled
+    assert "Work session" in result.message  # name shown in confirmation
+    assert not (tmp_path / "sessions" / "main" / "old-001.jsonl").exists()
+    assert not (tmp_path / "sessions" / "main" / "old-001.name").exists()
+
+
+def test_delete_session_active_rejected(tmp_path):
+    """Attempting to delete the currently active session is refused."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "active"}])
+
+    # [1] is the only (and active) session
+    result = dispatch_command(_delete_ctx("1", stm, session_id="cur-001"))
+    assert result.handled
+    assert "Cannot delete the active session" in result.message
+    # The file must still exist
+    assert (tmp_path / "sessions" / "main" / "cur-001.jsonl").exists()
+
+
+def test_delete_session_index_out_of_range(tmp_path):
+    """/delete-session with an out-of-range index reports an error."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "aaa-001", [{"role": "user", "content": "a"}])
+
+    result = dispatch_command(_delete_ctx("5", stm))
+    assert result.handled
+    assert "out of range" in result.message
+
+
+def test_delete_session_ambiguous_prefix(tmp_path):
+    """/delete-session refuses when multiple sessions share the same prefix."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "abc-001", [{"role": "user", "content": "a"}])
+    _write_session(stm, "main", "abc-002", [{"role": "user", "content": "b"}])
+
+    result = dispatch_command(_delete_ctx("abc", stm))
+    assert result.handled
+    assert "Ambiguous" in result.message
+
+
+def test_delete_session_no_match_prefix(tmp_path):
+    """/delete-session reports an error when the prefix matches nothing."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "aaa-001", [{"role": "user", "content": "a"}])
+
+    result = dispatch_command(_delete_ctx("zzz", stm))
+    assert result.handled
+    assert "No session matching" in result.message
