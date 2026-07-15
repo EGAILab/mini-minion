@@ -278,7 +278,15 @@ class KokoroTTS(TTSAdapter):
             raise RuntimeError(
                 "kokoro not installed. Run: uv add kokoro && uv sync"
             )
-        self._pipeline = KPipeline(lang_code=self._lang_code)
+        import warnings  # noqa: PLC0415
+        with warnings.catch_warnings():
+            # Suppress internal Kokoro/PyTorch warnings that fire on model load:
+            # - LSTM dropout warning (single-layer model, not a real issue)
+            # - weight_norm deprecation (internal to Kokoro, not our code)
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            # Pass repo_id explicitly to suppress Kokoro's "defaulting to" warning.
+            self._pipeline = KPipeline(lang_code=self._lang_code, repo_id="hexgrad/Kokoro-82M")
 
     def synthesise(self, text: str) -> "tuple[np.ndarray, int]":
         """Synthesise speech using Kokoro.

@@ -75,7 +75,7 @@
     "enabled": false,
     "language": "en",
     "vad": {
-      "threshold": 0.5,
+      "threshold": 0.7,
       "silence_ms": 1200
     },
     "stt": {

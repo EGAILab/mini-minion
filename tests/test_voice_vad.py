@@ -344,4 +344,4 @@ def test_build_vad_capture_defaults_on_empty_config():
     """build_vad_capture() must not raise when config has no voice sub-keys."""
     vc = build_vad_capture(object())  # object() has no vad/audio attrs
     assert isinstance(vc, VadCapture)
-    assert vc._vad._threshold == 0.5  # default
+    assert vc._vad._threshold == 0.7  # default

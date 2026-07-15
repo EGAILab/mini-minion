@@ -58,7 +58,7 @@ class SileroVAD:
 
     def __init__(
         self,
-        threshold: float = 0.5,
+        threshold: float = 0.7,
         sample_rate: int = 16_000,
         silence_ms: int = 1200,
         speech_pad_ms: int = 100,
@@ -239,8 +239,8 @@ def build_vad_capture(voice_config: object) -> VadCapture:
     vad_cfg = getattr(voice_config, "vad", None)
     audio_cfg = getattr(voice_config, "audio", None)
 
-    threshold = getattr(vad_cfg, "threshold", 0.5) if vad_cfg else 0.5
-    silence_ms = getattr(vad_cfg, "silence_ms", 700) if vad_cfg else 700
+    threshold = getattr(vad_cfg, "threshold", 0.7) if vad_cfg else 0.7
+    silence_ms = getattr(vad_cfg, "silence_ms", 1200) if vad_cfg else 1200
     sample_rate = getattr(audio_cfg, "sample_rate", 16_000) if audio_cfg else 16_000
     device = getattr(audio_cfg, "input_device", None) if audio_cfg else None
 

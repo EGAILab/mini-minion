@@ -235,7 +235,7 @@ def test_qwen3_synthesise_auto_loads(mock_qwen3_tts):
 def test_kokoro_load_creates_kpipeline(mock_kokoro):
     tts = KokoroTTS(lang_code="a")
     tts.load()
-    mock_kokoro["cls"].assert_called_once_with(lang_code="a")
+    mock_kokoro["cls"].assert_called_once_with(lang_code="a", repo_id="hexgrad/Kokoro-82M")
 
 
 def test_kokoro_load_is_idempotent(mock_kokoro):

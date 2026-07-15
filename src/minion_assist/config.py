@@ -1310,7 +1310,7 @@ class VoiceVadConfig:
             tolerant of pauses.  Default 700 ms.
     """
     model: str = "silero"
-    threshold: float = 0.5
+    threshold: float = 0.7
     silence_ms: int = 1200
 
 
@@ -1506,8 +1506,8 @@ def _resolve_voice() -> VoiceConfig:
         language=str(raw.get("language", "en")),
         vad=VoiceVadConfig(
             model=str(vad_raw.get("model", "silero")),
-            threshold=float(vad_raw.get("threshold", 0.5)),
-            silence_ms=int(vad_raw.get("silence_ms", 700)),
+            threshold=float(vad_raw.get("threshold", 0.7)),
+            silence_ms=int(vad_raw.get("silence_ms", 1200)),
         ),
         stt=VoiceSttConfig(
             model=str(stt_raw.get("model", "parakeet")),

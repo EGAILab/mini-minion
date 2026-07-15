@@ -179,7 +179,7 @@ class WhisperSTT(STTAdapter):
         self._pipe = pipeline(
             "automatic-speech-recognition",
             model=self._model_id,
-            torch_dtype=dtype,
+            dtype=dtype,        # replaces deprecated torch_dtype= kwarg
             device=self._device,
         )
         # Whisper large-v3 ships with `forced_decoder_ids` in its generation_config
@@ -188,10 +188,19 @@ class WhisperSTT(STTAdapter):
         gen_cfg = getattr(getattr(self._pipe, "model", None), "generation_config", None)
         if gen_cfg is not None and getattr(gen_cfg, "forced_decoder_ids", None):
             gen_cfg.forced_decoder_ids = None
-        # Same story for the feature extractor's return_token_timestamps flag.
+        # The feature extractor's return_token_timestamps flag triggers a
+        # FutureWarning every time the pipeline calls it internally.  Clear
+        # the attribute and also install a persistent filter as a belt-and-
+        # suspenders guard for pipeline-internal calls we can't intercept.
         fe = getattr(self._pipe, "feature_extractor", None)
         if fe is not None and getattr(fe, "return_token_timestamps", False):
             fe.return_token_timestamps = False
+        import warnings  # noqa: PLC0415
+        warnings.filterwarnings(
+            "ignore",
+            message=".*return_token_timestamps.*",
+            category=FutureWarning,
+        )
 
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16_000) -> str:
         """Transcribe using the Whisper pipeline.
