@@ -159,6 +159,12 @@ class VadCapture:
         # immediately when the user begins talking, rather than waiting for the
         # full utterance + silence_ms to elapse.
         self.speech_started: threading.Event = threading.Event()
+        # Set by VoiceSession while TTS audio is playing through the speaker.
+        # When speech onset fires during TTS, the pre-buffer is discarded
+        # because it contains loudspeaker bleed-through rather than genuine
+        # pre-speech silence — including it causes STT to transcribe TTS audio
+        # mixed with the user's voice (e.g. "stop" → "C'est tout.").
+        self.tts_playing: threading.Event = threading.Event()
 
     def start(self, utterance_queue: "queue.Queue[np.ndarray]") -> None:
         """Start the background capture + VAD thread.
@@ -207,10 +213,16 @@ class VadCapture:
                     event = self._vad.process(chunk)
 
                     if event is not None and "start" in event:
-                        # Speech started — seed the buffer with recent pre-speech
-                        # audio so the first word is captured even if VAD fires late.
                         in_speech = True
-                        speech_buffer = list(pre_buffer) + [chunk]
+                        if self.tts_playing.is_set():
+                            # Barge-in: pre-buffer holds loudspeaker bleed-through,
+                            # not genuine pre-speech audio.  Discard it so STT
+                            # only sees the user's voice.
+                            speech_buffer = [chunk]
+                        else:
+                            # Normal onset: include pre-buffer so the first word
+                            # is captured even when VAD fires 32–96 ms late.
+                            speech_buffer = list(pre_buffer) + [chunk]
                         pre_buffer.clear()
                         # Signal barge-in immediately so _speak_streaming can
                         # abort TTS the instant the user starts talking.

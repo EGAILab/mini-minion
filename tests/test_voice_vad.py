@@ -209,8 +209,8 @@ def _run_capture_sync(capture: VadCapture, q: queue.Queue, chunks: list[np.ndarr
     def mock_loop():
         """Run the inner loop body with mocked MicrophoneStream.
 
-        Mirrors VadCapture._capture_loop() including the pre-buffer logic so
-        tests stay in sync with the real implementation.
+        Mirrors VadCapture._capture_loop() including the pre-buffer and
+        tts_playing logic so tests stay in sync with the real implementation.
         """
         import collections as _collections
         speech_buffer: list[np.ndarray] = []
@@ -222,7 +222,10 @@ def _run_capture_sync(capture: VadCapture, q: queue.Queue, chunks: list[np.ndarr
             event = capture._vad.process(chunk)
             if event is not None and "start" in event:
                 in_speech = True
-                speech_buffer = list(pre_buffer) + [chunk]
+                if capture.tts_playing.is_set():
+                    speech_buffer = [chunk]
+                else:
+                    speech_buffer = list(pre_buffer) + [chunk]
                 pre_buffer.clear()
             elif event is not None and "end" in event:
                 if in_speech and speech_buffer:
@@ -334,6 +337,57 @@ def test_capture_pre_buffer_bounded_by_pre_buffer_chunks():
     utterance = q.get_nowait()
     # At most PRE_BUFFER_CHUNKS silence + 1 start + 1 end = PRE_BUFFER_CHUNKS+2
     assert len(utterance) == 512 * (VadCapture.PRE_BUFFER_CHUNKS + 2)
+
+
+def test_capture_discards_pre_buffer_when_tts_playing():
+    """When tts_playing is set, the pre-buffer is discarded at speech onset.
+
+    This is the barge-in fix: the pre-buffer contains loudspeaker audio
+    bleeding into the mic during TTS playback.  Including it would cause
+    STT to transcribe a mix of TTS output and the user's voice (e.g.
+    saying "stop" transcribed as "C'est tout." when TTS was playing French).
+    """
+    tts_chunk = np.full(512, 0.9, dtype=np.float32)   # simulates TTS audio bleed
+    user_chunk = np.full(512, 0.4, dtype=np.float32)  # user says "stop"
+    end_chunk  = np.full(512, 0.3, dtype=np.float32)
+
+    # Two TTS-bleed chunks in pre-buffer, then user speaks during TTS
+    chunks = [tts_chunk, tts_chunk, user_chunk, end_chunk]
+    events = [None, None, {"start": 0}, {"end": 512}]
+
+    capture, q = _make_capture_with_events(events)
+    capture.tts_playing.set()  # TTS is active when speech fires
+    _run_capture_sync(capture, q, chunks)
+
+    utterance = q.get_nowait()
+    # Pre-buffer (2 × tts_chunk) must NOT appear — only user_chunk + end_chunk
+    assert len(utterance) == 512 * 2
+    assert np.all(utterance[:512]  == pytest.approx(0.4))  # user_chunk
+    assert np.all(utterance[512:]  == pytest.approx(0.3))  # end_chunk
+
+
+def test_capture_includes_pre_buffer_when_tts_not_playing():
+    """When tts_playing is clear (normal speech), pre-buffer is still included.
+
+    Regression guard: the barge-in fix must not break the normal-onset path.
+    """
+    silence_chunk = np.zeros(512, dtype=np.float32)
+    speech_chunk  = np.full(512, 0.5, dtype=np.float32)
+    end_chunk     = np.full(512, 0.2, dtype=np.float32)
+
+    chunks = [silence_chunk, speech_chunk, end_chunk]
+    events = [None, {"start": 0}, {"end": 512}]
+
+    capture, q = _make_capture_with_events(events)
+    # tts_playing is clear by default
+    _run_capture_sync(capture, q, chunks)
+
+    utterance = q.get_nowait()
+    # silence pre-buffer (1) + speech onset + end = 3 chunks
+    assert len(utterance) == 512 * 3
+    assert np.all(utterance[:512]   == 0.0)               # silence pre-buffer
+    assert np.all(utterance[512:1024] == pytest.approx(0.5))
+    assert np.all(utterance[1024:]  == pytest.approx(0.2))
 
 
 # ---------------------------------------------------------------------------

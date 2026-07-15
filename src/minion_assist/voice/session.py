@@ -279,6 +279,18 @@ class VoiceSession:
         if not text:
             return
 
+        # Signal the VAD capture thread that TTS audio is now playing so it
+        # can discard the pre-speech buffer on barge-in (the buffer would
+        # otherwise contain loudspeaker bleed-through, causing STT to
+        # transcribe a mix of TTS output and the user's voice).
+        self._vad_capture.tts_playing.set()
+        try:
+            self._speak_streaming_inner(text)
+        finally:
+            self._vad_capture.tts_playing.clear()
+
+    def _speak_streaming_inner(self, text: str) -> None:
+        """Inner implementation of _speak_streaming; called with tts_playing set."""
         cancelled = threading.Event()
         audio_q: "queue.Queue[tuple[np.ndarray, int] | None]" = queue.Queue(maxsize=2)
 
