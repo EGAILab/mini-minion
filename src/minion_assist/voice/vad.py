@@ -201,6 +201,9 @@ class VadCapture:
         # not lost — the model needs 1–3 chunks (~32–96 ms) to confirm onset.
         pre_buffer: collections.deque = collections.deque(maxlen=self.PRE_BUFFER_CHUNKS)
         in_speech = False
+        # Whether TTS was playing at the moment this utterance's "start" fired.
+        # Carried through to the "end" event so the queue item can be tagged.
+        onset_during_tts = False
 
         try:
             with MicrophoneStream(
@@ -214,10 +217,12 @@ class VadCapture:
 
                     if event is not None and "start" in event:
                         in_speech = True
-                        if self.tts_playing.is_set():
+                        # Record whether TTS was active at onset so the queue
+                        # consumer can discard contaminated utterances entirely.
+                        onset_during_tts = self.tts_playing.is_set()
+                        if onset_during_tts:
                             # Barge-in: pre-buffer holds loudspeaker bleed-through,
-                            # not genuine pre-speech audio.  Discard it so STT
-                            # only sees the user's voice.
+                            # not genuine pre-speech audio.  Discard it.
                             speech_buffer = [chunk]
                         else:
                             # Normal onset: include pre-buffer so the first word
@@ -228,13 +233,16 @@ class VadCapture:
                         # abort TTS the instant the user starts talking.
                         self.speech_started.set()
                     elif event is not None and "end" in event:
-                        # Speech ended — emit the buffered utterance.
+                        # Speech ended — emit the buffered utterance tagged with
+                        # whether TTS was playing at onset.  The consumer discards
+                        # tagged utterances rather than sending corrupted audio to STT.
                         if in_speech and speech_buffer:
                             speech_buffer.append(chunk)
                             utterance = np.concatenate(speech_buffer)
-                            self._utterance_queue.put(utterance)
+                            self._utterance_queue.put((utterance, onset_during_tts))
                         in_speech = False
                         speech_buffer = []
+                        onset_during_tts = False
                         # Clear the barge-in signal now that the utterance is queued.
                         self.speech_started.clear()
                     elif in_speech:

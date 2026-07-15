@@ -209,20 +209,23 @@ def _run_capture_sync(capture: VadCapture, q: queue.Queue, chunks: list[np.ndarr
     def mock_loop():
         """Run the inner loop body with mocked MicrophoneStream.
 
-        Mirrors VadCapture._capture_loop() including the pre-buffer and
-        tts_playing logic so tests stay in sync with the real implementation.
+        Mirrors VadCapture._capture_loop() including the pre-buffer,
+        tts_playing discard, and (audio, during_tts) queue tuple so tests
+        stay in sync with the real implementation.
         """
         import collections as _collections
         speech_buffer: list[np.ndarray] = []
         pre_buffer: _collections.deque = _collections.deque(maxlen=capture.PRE_BUFFER_CHUNKS)
         in_speech = False
+        onset_during_tts = False
         for chunk in chunk_holder["chunks"]:
             if stop_event.is_set():
                 break
             event = capture._vad.process(chunk)
             if event is not None and "start" in event:
                 in_speech = True
-                if capture.tts_playing.is_set():
+                onset_during_tts = capture.tts_playing.is_set()
+                if onset_during_tts:
                     speech_buffer = [chunk]
                 else:
                     speech_buffer = list(pre_buffer) + [chunk]
@@ -230,9 +233,10 @@ def _run_capture_sync(capture: VadCapture, q: queue.Queue, chunks: list[np.ndarr
             elif event is not None and "end" in event:
                 if in_speech and speech_buffer:
                     speech_buffer.append(chunk)
-                    q.put(np.concatenate(speech_buffer))
+                    q.put((np.concatenate(speech_buffer), onset_during_tts))
                 in_speech = False
                 speech_buffer = []
+                onset_during_tts = False
             elif in_speech:
                 speech_buffer.append(chunk)
             else:
@@ -251,7 +255,7 @@ def test_capture_emits_utterance_on_end_event():
     _run_capture_sync(capture, q, chunks)
 
     assert q.qsize() == 1
-    utterance = q.get_nowait()
+    utterance, _during_tts = q.get_nowait()
     assert isinstance(utterance, np.ndarray)
     # Three chunks concatenated (start, mid, end)
     assert len(utterance) == 512 * 3
@@ -287,7 +291,7 @@ def test_capture_includes_end_chunk_in_utterance():
     events = [{"start": 0}, {"end": 512}]
     capture, q = _make_capture_with_events(events)
     _run_capture_sync(capture, q, chunks)
-    utterance = q.get_nowait()
+    utterance, _during_tts = q.get_nowait()
     # Both chunks should be present
     assert len(utterance) == 1024
     assert utterance[0] == 1.0   # from start_chunk
@@ -310,7 +314,7 @@ def test_capture_includes_pre_buffer_before_start_event():
     capture, q = _make_capture_with_events(events)
     _run_capture_sync(capture, q, chunks)
 
-    utterance = q.get_nowait()
+    utterance, _during_tts = q.get_nowait()
     # pre_buffer (2 silence chunks) + start chunk + mid chunk + end chunk = 5 * 512
     assert len(utterance) == 512 * 5
     # First 1024 samples come from the silence pre-buffer
@@ -334,7 +338,7 @@ def test_capture_pre_buffer_bounded_by_pre_buffer_chunks():
     capture, q = _make_capture_with_events(events)
     _run_capture_sync(capture, q, chunks)
 
-    utterance = q.get_nowait()
+    utterance, _during_tts = q.get_nowait()
     # At most PRE_BUFFER_CHUNKS silence + 1 start + 1 end = PRE_BUFFER_CHUNKS+2
     assert len(utterance) == 512 * (VadCapture.PRE_BUFFER_CHUNKS + 2)
 
@@ -359,11 +363,12 @@ def test_capture_discards_pre_buffer_when_tts_playing():
     capture.tts_playing.set()  # TTS is active when speech fires
     _run_capture_sync(capture, q, chunks)
 
-    utterance = q.get_nowait()
+    utterance, during_tts = q.get_nowait()
     # Pre-buffer (2 × tts_chunk) must NOT appear — only user_chunk + end_chunk
     assert len(utterance) == 512 * 2
     assert np.all(utterance[:512]  == pytest.approx(0.4))  # user_chunk
     assert np.all(utterance[512:]  == pytest.approx(0.3))  # end_chunk
+    assert during_tts is True
 
 
 def test_capture_includes_pre_buffer_when_tts_not_playing():
@@ -382,12 +387,44 @@ def test_capture_includes_pre_buffer_when_tts_not_playing():
     # tts_playing is clear by default
     _run_capture_sync(capture, q, chunks)
 
-    utterance = q.get_nowait()
+    utterance, during_tts = q.get_nowait()
     # silence pre-buffer (1) + speech onset + end = 3 chunks
     assert len(utterance) == 512 * 3
     assert np.all(utterance[:512]   == 0.0)               # silence pre-buffer
     assert np.all(utterance[512:1024] == pytest.approx(0.5))
     assert np.all(utterance[1024:]  == pytest.approx(0.2))
+    assert during_tts is False
+
+
+def test_capture_tags_normal_utterance_with_during_tts_false():
+    """Queue items are tagged (audio, during_tts=False) for normal speech."""
+    chunk = np.ones(512, dtype=np.float32)
+    chunks = [chunk, chunk, chunk]
+    events = [{"start": 0}, None, {"end": 512}]
+
+    capture, q = _make_capture_with_events(events)
+    _run_capture_sync(capture, q, chunks)
+
+    _, during_tts = q.get_nowait()
+    assert during_tts is False
+
+
+def test_capture_tags_barge_in_utterance_with_during_tts_true():
+    """Queue items are tagged (audio, during_tts=True) when TTS is active at onset.
+
+    VoiceSession._loop uses this flag to discard the contaminated utterance
+    rather than sending garbage audio to STT.
+    """
+    chunk = np.ones(512, dtype=np.float32)
+    chunks = [chunk, chunk, chunk]
+    events = [{"start": 0}, None, {"end": 512}]
+
+    capture, q = _make_capture_with_events(events)
+    capture.tts_playing.set()
+    _run_capture_sync(capture, q, chunks)
+
+    _, during_tts = q.get_nowait()
+    assert during_tts is True
 
 
 # ---------------------------------------------------------------------------

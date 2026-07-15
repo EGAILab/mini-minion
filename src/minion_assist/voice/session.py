@@ -156,7 +156,10 @@ class VoiceSession:
         self._language = language
         # Controls whether the main loop keeps running (set to False by stop()).
         self._running = False
-        self._utterance_queue: "queue.Queue[np.ndarray | None]" = queue.Queue()
+        # Queue items are (audio, during_tts) tuples or None sentinel.
+        # during_tts=True means TTS was playing when the utterance started;
+        # those are discarded in _loop to avoid sending corrupted audio to STT.
+        self._utterance_queue: "queue.Queue[tuple[np.ndarray, bool] | None]" = queue.Queue()
 
     def run(self) -> None:
         """Start the voice loop and block until interrupted or ``stop()`` called.
@@ -209,9 +212,19 @@ class VoiceSession:
                 # Sentinel: we were asked to stop.
                 break
 
+            audio, during_tts = utterance
+            if during_tts:
+                # Utterance started while TTS was playing through the speaker.
+                # The mic picked up loudspeaker audio mixed with the user's voice,
+                # making STT output garbage (e.g. "stop" → "C'est tout." or
+                # random Japanese).  Discard it; the user can speak again cleanly
+                # once TTS has stopped.
+                print("[voice] barge-in utterance discarded (captured during TTS playback)", flush=True)
+                continue
+
             # --- Transcription ---
             try:
-                text = self._stt.transcribe(utterance).strip()
+                text = self._stt.transcribe(audio).strip()
             except Exception as exc:
                 print(f"[voice] STT error: {exc}", flush=True)
                 continue
