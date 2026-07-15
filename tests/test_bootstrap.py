@@ -21,6 +21,7 @@ from minion_assist.bootstrap import (
     _BOOTSTRAP_FILES,
     build_bootstrap_context_files,
     build_bootstrap_prompt_block,
+    clear_bootstrap_block_cache,
     load_bootstrap_files,
     render_bootstrap_pending_context,
     render_project_context,
@@ -659,3 +660,98 @@ def test_build_bootstrap_prompt_block_default_session_type_is_root(tmp_path):
     result_default = build_bootstrap_prompt_block(tmp_path, cfg)
 
     assert result_explicit == result_default
+
+
+# ---------------------------------------------------------------------------
+# build_bootstrap_prompt_block — mtime cache
+# ---------------------------------------------------------------------------
+
+def test_bootstrap_cache_returns_same_object_on_hit(tmp_path):
+    """Second call with unchanged files returns the same string (cache hit).
+
+    A cache hit means the exact same string object is returned without
+    re-reading any file.  We verify identity (``is``) not just equality.
+    """
+    clear_bootstrap_block_cache()
+    _write_file(tmp_path, "AGENTS.md", "agents content")
+    cfg = _make_config()
+
+    first = build_bootstrap_prompt_block(tmp_path, cfg)
+    second = build_bootstrap_prompt_block(tmp_path, cfg)
+
+    # Same string object — proves we returned the cache entry, not a rebuild.
+    assert first is second
+
+
+def test_bootstrap_cache_rebuilds_when_file_content_changes(tmp_path):
+    """Cache is invalidated when a bootstrap file is modified (mtime changes)."""
+    import time
+
+    clear_bootstrap_block_cache()
+    p = _write_file(tmp_path, "AGENTS.md", "original content")
+    cfg = _make_config()
+
+    first = build_bootstrap_prompt_block(tmp_path, cfg)
+    assert "original content" in first
+
+    # Force a new mtime by bumping it one second into the future.
+    # This is more reliable than sleeping because filesystem mtime resolution
+    # varies (1 s on FAT32, ~100 ns on NTFS, 1 ns on ext4).
+    new_mtime = p.stat().st_mtime + 1.0
+    p.write_text("updated content", encoding="utf-8")
+    import os
+    os.utime(p, (new_mtime, new_mtime))
+
+    second = build_bootstrap_prompt_block(tmp_path, cfg)
+
+    assert "updated content" in second
+    assert first is not second
+
+
+def test_bootstrap_cache_rebuilds_when_new_file_appears(tmp_path):
+    """Cache is invalidated when a new bootstrap file appears on disk."""
+    clear_bootstrap_block_cache()
+    _write_file(tmp_path, "AGENTS.md", "agents content")
+    cfg = _make_config()
+
+    first = build_bootstrap_prompt_block(tmp_path, cfg)
+    assert "soul content" not in first
+
+    # A new file appears — cache must miss and the new content must be included.
+    _write_file(tmp_path, "SOUL.md", "soul content")
+
+    second = build_bootstrap_prompt_block(tmp_path, cfg)
+
+    assert "soul content" in second
+    assert first is not second
+
+
+def test_bootstrap_cache_miss_on_different_config(tmp_path):
+    """Different config limits produce independent cache entries."""
+    clear_bootstrap_block_cache()
+    _write_file(tmp_path, "AGENTS.md", "a" * 100)
+    cfg_small = _make_config(max_chars=50)
+    cfg_large = _make_config(max_chars=200)
+
+    result_small = build_bootstrap_prompt_block(tmp_path, cfg_small)
+    result_large = build_bootstrap_prompt_block(tmp_path, cfg_large)
+
+    # Different char limits → different truncation → different blocks.
+    assert result_small is not result_large
+
+
+def test_clear_bootstrap_block_cache_forces_rebuild(tmp_path):
+    """clear_bootstrap_block_cache() causes the next call to rebuild from disk."""
+    clear_bootstrap_block_cache()
+    _write_file(tmp_path, "AGENTS.md", "content v1")
+    cfg = _make_config()
+
+    first = build_bootstrap_prompt_block(tmp_path, cfg)
+
+    # Clear the cache, then call again without touching any file.
+    # Even though mtimes haven't changed, the cache is gone so we rebuild.
+    clear_bootstrap_block_cache()
+    second = build_bootstrap_prompt_block(tmp_path, cfg)
+
+    # Content must be identical (same files) but objects will differ after rebuild.
+    assert first == second

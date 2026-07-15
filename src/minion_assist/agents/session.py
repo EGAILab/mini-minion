@@ -601,13 +601,17 @@ class AgentSession:
             self._history.append({"role": "user", "content": message})
 
         # Build the effective system prompt.
-        # Order: today's date → soul → bootstrap context → user context
-        #        → relevant memories → active task → context-budget warning → skills suffix.
+        # Order: soul → bootstrap context → user context → relevant memories
+        #        → active task → context-budget warning → skills suffix → today's date.
         # Important instructions are placed first (high priority) and last
         # (Lost in the Middle mitigation) for small models.
-        # The date is prepended first so the model never defaults to its training-data
-        # cutoff year when constructing time-sensitive queries (e.g. web searches).
-        system = f"Today's date: {date.today().isoformat()}\n\n{self._agent.soul}"
+        #
+        # The date is appended AFTER the static soul+bootstrap prefix rather than
+        # prepended, so the large stable prefix (soul + bootstrap ≈ 60 K chars)
+        # is byte-identical across turns and qualifies for OpenAI's automatic
+        # prompt caching (≥1024 tokens, 50% cost discount).  Prepending the date
+        # changes byte 0 daily, invalidating the entire cached prefix.
+        system = self._agent.soul
 
         # Bootstrap block — evaluated per turn so edits to workspace bootstrap files
         # (AGENTS.md, SOUL.md, TOOLS.md, etc.) are picked up without restarting.
@@ -642,6 +646,9 @@ class AgentSession:
             system += f"\n\n{budget_block}"
         if self._soul_suffix:
             system += f"\n\n{self._soul_suffix}"
+        # Append the current date last in the stable section so the model always
+        # has today's date without it breaking prompt-cache prefix alignment.
+        system += f"\n\nToday's date: {date.today().isoformat()}"
         # Reseed context: injected once on the first send() after a session rotation,
         # then cleared so subsequent turns are not polluted with stale history.
         _reseed = self._reseed_context

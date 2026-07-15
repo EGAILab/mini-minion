@@ -323,6 +323,8 @@ AgentSession.send(message, on_event=callback, stream=True/False)
     │          + <active_task> (current task progress, if a task is active)
     │          + <context_budget> warning (if history > 50% of context window)
     │          + <available_skills> suffix
+    │          + Today's date (appended last so the large stable prefix is
+    │            byte-identical across turns — enables OpenAI prompt caching)
     │
     ├─ compactor.compact(history, provider, on_compaction=..., on_compaction_failed=...)
     │      no-op when under budget; fires CompactionStarted / CompactionFailed events
@@ -1206,7 +1208,9 @@ Invalid config.json:
 
 **File:** `src/minion_assist/bootstrap.py`
 
-The workspace bootstrap prompt layer discovers recognized Markdown files under the configured root and injects them into every agent's system prompt as a `# Project Context` block.  Files are re-read on every turn so edits take effect without restarting the process.
+The workspace bootstrap prompt layer discovers recognized Markdown files under the configured root and injects them into every agent's system prompt as a `# Project Context` block.
+
+**Mtime cache:** file contents are cached in process memory and re-read from disk only when a file's modification time changes.  This avoids reading and concatenating ~60 K chars on every agent turn when workspace files are unchanged.  Call `clear_bootstrap_block_cache()` to force a rebuild (e.g. in tests).
 
 **Recognized files** (injected in this order, `HEARTBEAT.md` excluded):
 
@@ -1223,7 +1227,7 @@ The workspace bootstrap prompt layer discovers recognized Markdown files under t
 **Public API:**
 
 ```python
-from minion_assist.bootstrap import build_bootstrap_prompt_block, load_bootstrap_files
+from minion_assist.bootstrap import build_bootstrap_prompt_block, load_bootstrap_files, clear_bootstrap_block_cache
 
 # Typical usage (as a per-turn callable in AgentSession):
 block = build_bootstrap_prompt_block(Path.cwd(), bootstrap_cfg)

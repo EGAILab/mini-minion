@@ -85,6 +85,51 @@ _RAW_FILE_CAP: int = 2 * 1024 * 1024  # 2 MB
 # Set to True after the first warning is emitted; reset only on process restart.
 _truncation_warned: bool = False
 
+# ---------------------------------------------------------------------------
+# Bootstrap block cache — avoids rebuilding the 60 K-char block every turn
+# when workspace files have not changed on disk.
+#
+# Cache key: (resolved root path, config discriminator string, session_type).
+# Cache value: (snapshot of {filepath: mtime}, rendered block string).
+# On a hit, mtimes are re-checked; if any file changed the block is rebuilt.
+# ---------------------------------------------------------------------------
+_bootstrap_block_cache: dict[tuple[str, str, str], tuple[dict[str, float], str]] = {}
+
+
+def _get_bootstrap_mtimes(root: Path, allowed_names: tuple[str, ...] | None) -> dict[str, float]:
+    """Return {absolute_path_str: mtime} for each candidate bootstrap file that exists.
+
+    Only files that actually exist on disk appear in the result.  Absent files
+    are excluded rather than recorded as 0.0 so a file that appears or disappears
+    correctly invalidates the cache.
+
+    Args:
+        root: Bootstrap root directory.
+        allowed_names: Tuple of filenames to check, or None to check all in
+            ``_BOOTSTRAP_FILES``.
+
+    Returns:
+        Dict mapping absolute path string → ``st_mtime`` float.
+    """
+    names = allowed_names if allowed_names is not None else _BOOTSTRAP_FILES
+    mtimes: dict[str, float] = {}
+    for name in names:
+        p = root / name
+        try:
+            mtimes[str(p)] = p.stat().st_mtime
+        except OSError:
+            pass  # file absent — omit so its appearance triggers a cache miss
+    return mtimes
+
+
+def clear_bootstrap_block_cache() -> None:
+    """Clear the process-level bootstrap block cache.
+
+    Intended for use in tests that modify bootstrap files within a single
+    process and need to guarantee a cache miss on the next call.
+    """
+    _bootstrap_block_cache.clear()
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -439,6 +484,26 @@ def build_bootstrap_prompt_block(
         return ""
 
     allowed = _SUBAGENT_BOOTSTRAP_FILES if session_type == "subagent" else None
+
+    # Fast path: if no bootstrap file has changed on disk since the last build,
+    # return the cached block.  This avoids reading 7–8 files and concatenating
+    # ~60 K chars on every agent turn.
+    #
+    # Cache key discriminates on root, config limits, and session type so
+    # different roots, budget settings, or session types never share a slot.
+    config_key = (
+        f"{config.max_chars}:{config.total_max_chars}:{config.truncation_warning}"
+    )
+    cache_key = (str(root.resolve()), config_key, session_type)
+    current_mtimes = _get_bootstrap_mtimes(root, allowed)
+
+    cached = _bootstrap_block_cache.get(cache_key)
+    if cached is not None:
+        cached_mtimes, cached_block = cached
+        if cached_mtimes == current_mtimes:
+            return cached_block
+
+    # Cache miss — rebuild from disk.
     files = load_bootstrap_files(root, allowed_names=allowed)
     ctx_files = build_bootstrap_context_files(
         files,
@@ -447,6 +512,8 @@ def build_bootstrap_prompt_block(
     )
 
     if not ctx_files:
+        # Cache the empty result too so we don't hit disk again next turn.
+        _bootstrap_block_cache[cache_key] = (current_mtimes, "")
         return ""
 
     parts: list[str] = []
@@ -465,4 +532,6 @@ def build_bootstrap_prompt_block(
     if warning:
         parts.append(warning)
 
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+    _bootstrap_block_cache[cache_key] = (current_mtimes, result)
+    return result

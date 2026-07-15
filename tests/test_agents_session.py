@@ -750,3 +750,57 @@ def test_reseed_context_none_does_not_pollute_system(tmp_path):
     session.send("hello")
 
     assert "<prior_session_history>" not in captured[0]
+
+
+# ---------------------------------------------------------------------------
+# Prompt date position — OpenAI prompt-caching alignment
+# ---------------------------------------------------------------------------
+
+def test_date_appears_in_system_prompt(tmp_path):
+    """The system prompt must include today's date somewhere."""
+    from datetime import date
+
+    provider = _mock_provider()
+    session = _make_session(tmp_path, provider=provider)
+
+    captured: list[str] = []
+
+    def _capture(system, msgs, tools, max_tokens, on_token=None):
+        captured.append(system)
+        return LLMResponse(text="ok", finish_reason="stop")
+
+    provider.chat = Mock(side_effect=_capture)
+    session.send("hello")
+
+    today = date.today().isoformat()
+    assert today in captured[0], "system prompt must contain today's ISO date"
+
+
+def test_date_does_not_lead_system_prompt(tmp_path):
+    """The date must NOT be the very first thing in the system prompt.
+
+    The stable soul text must come before the date so that OpenAI's automatic
+    prompt caching can cache the large soul+bootstrap prefix across turns.
+    Prepending the date would change byte 0 daily and invalidate the cache.
+    """
+    from datetime import date
+
+    provider = _mock_provider()
+    session = _make_session(tmp_path, provider=provider)
+
+    captured: list[str] = []
+
+    def _capture(system, msgs, tools, max_tokens, on_token=None):
+        captured.append(system)
+        return LLMResponse(text="ok", finish_reason="stop")
+
+    provider.chat = Mock(side_effect=_capture)
+    session.send("hello")
+
+    today = date.today().isoformat()
+    date_pos = captured[0].index(today)
+    soul_pos = captured[0].index("You are Ada.")
+    assert soul_pos < date_pos, (
+        "soul text must appear before the date in the system prompt "
+        "so the stable prefix is byte-identical across turns (OpenAI prompt caching)"
+    )
