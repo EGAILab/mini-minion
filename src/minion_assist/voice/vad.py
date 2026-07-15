@@ -26,6 +26,7 @@ the voice extra is not installed; errors surface at runtime with install hints.
 """
 from __future__ import annotations
 
+import collections
 import queue
 import threading
 from typing import TYPE_CHECKING
@@ -136,6 +137,10 @@ class VadCapture:
 
     # Silero VAD requires exactly 512 samples per chunk at 16 kHz.
     BLOCKSIZE = 512
+    # Rolling pre-speech buffer size.  VAD onset lags ~1–3 chunks behind the
+    # first voiced sound; keeping 10 chunks (~320 ms) ensures the first word is
+    # always included even at high thresholds.
+    PRE_BUFFER_CHUNKS = 10
 
     def __init__(
         self,
@@ -184,6 +189,11 @@ class VadCapture:
         assert self._utterance_queue is not None
 
         speech_buffer: list[np.ndarray] = []
+        # Rolling buffer of the most recent PRE_BUFFER_CHUNKS audio chunks
+        # recorded *before* speech is detected.  When the VAD fires a "start"
+        # event, this audio is prepended to speech_buffer so the first word is
+        # not lost — the model needs 1–3 chunks (~32–96 ms) to confirm onset.
+        pre_buffer: collections.deque = collections.deque(maxlen=self.PRE_BUFFER_CHUNKS)
         in_speech = False
 
         try:
@@ -197,9 +207,11 @@ class VadCapture:
                     event = self._vad.process(chunk)
 
                     if event is not None and "start" in event:
-                        # Speech started — begin buffering from a clean state.
+                        # Speech started — seed the buffer with recent pre-speech
+                        # audio so the first word is captured even if VAD fires late.
                         in_speech = True
-                        speech_buffer = [chunk]
+                        speech_buffer = list(pre_buffer) + [chunk]
+                        pre_buffer.clear()
                         # Signal barge-in immediately so _speak_streaming can
                         # abort TTS the instant the user starts talking.
                         self.speech_started.set()
@@ -216,6 +228,9 @@ class VadCapture:
                     elif in_speech:
                         # Mid-speech — keep buffering.
                         speech_buffer.append(chunk)
+                    else:
+                        # Silence before speech — keep rolling pre-buffer full.
+                        pre_buffer.append(chunk)
 
         except Exception as exc:
             # Surface capture errors rather than silently dying.

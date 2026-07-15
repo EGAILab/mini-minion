@@ -207,8 +207,14 @@ def _run_capture_sync(capture: VadCapture, q: queue.Queue, chunks: list[np.ndarr
     call_count = [0]
 
     def mock_loop():
-        """Run the inner loop body with mocked MicrophoneStream."""
+        """Run the inner loop body with mocked MicrophoneStream.
+
+        Mirrors VadCapture._capture_loop() including the pre-buffer logic so
+        tests stay in sync with the real implementation.
+        """
+        import collections as _collections
         speech_buffer: list[np.ndarray] = []
+        pre_buffer: _collections.deque = _collections.deque(maxlen=capture.PRE_BUFFER_CHUNKS)
         in_speech = False
         for chunk in chunk_holder["chunks"]:
             if stop_event.is_set():
@@ -216,7 +222,8 @@ def _run_capture_sync(capture: VadCapture, q: queue.Queue, chunks: list[np.ndarr
             event = capture._vad.process(chunk)
             if event is not None and "start" in event:
                 in_speech = True
-                speech_buffer = [chunk]
+                speech_buffer = list(pre_buffer) + [chunk]
+                pre_buffer.clear()
             elif event is not None and "end" in event:
                 if in_speech and speech_buffer:
                     speech_buffer.append(chunk)
@@ -225,6 +232,8 @@ def _run_capture_sync(capture: VadCapture, q: queue.Queue, chunks: list[np.ndarr
                 speech_buffer = []
             elif in_speech:
                 speech_buffer.append(chunk)
+            else:
+                pre_buffer.append(chunk)
 
     mock_loop()
 
@@ -280,6 +289,51 @@ def test_capture_includes_end_chunk_in_utterance():
     assert len(utterance) == 1024
     assert utterance[0] == 1.0   # from start_chunk
     assert utterance[512] == 2.0  # from end_chunk
+
+
+def test_capture_includes_pre_buffer_before_start_event():
+    """Silence chunks recorded before speech onset are prepended to the utterance.
+
+    This verifies the fix for 'first word missed': VAD fires ~32-96 ms after
+    the first voiced sound, so pre-buffer audio closes the gap.
+    """
+    silence_chunk = np.zeros(512, dtype=np.float32)
+    speech_chunk = np.full(512, 0.5, dtype=np.float32)
+    end_chunk = np.full(512, 0.3, dtype=np.float32)
+    # Two silence chunks, then speech onset, one mid-speech, then end
+    chunks = [silence_chunk, silence_chunk, speech_chunk, speech_chunk, end_chunk]
+    events = [None, None, {"start": 0}, None, {"end": 512}]
+
+    capture, q = _make_capture_with_events(events)
+    _run_capture_sync(capture, q, chunks)
+
+    utterance = q.get_nowait()
+    # pre_buffer (2 silence chunks) + start chunk + mid chunk + end chunk = 5 * 512
+    assert len(utterance) == 512 * 5
+    # First 1024 samples come from the silence pre-buffer
+    assert np.all(utterance[:1024] == 0.0)
+    # Remaining 3 chunks: 2 speech (0.5) then 1 end (0.3)
+    assert np.all(utterance[1024:2048] == pytest.approx(0.5))
+    assert np.all(utterance[2048:] == pytest.approx(0.3))
+
+
+def test_capture_pre_buffer_bounded_by_pre_buffer_chunks():
+    """Pre-buffer never grows beyond PRE_BUFFER_CHUNKS chunks."""
+    # Fill with more silence chunks than PRE_BUFFER_CHUNKS, then speech
+    n_silence = VadCapture.PRE_BUFFER_CHUNKS + 5
+    silence_chunk = np.zeros(512, dtype=np.float32)
+    speech_chunk = np.ones(512, dtype=np.float32)
+    end_chunk = np.full(512, 2.0, dtype=np.float32)
+
+    chunks = [silence_chunk] * n_silence + [speech_chunk, end_chunk]
+    events = [None] * n_silence + [{"start": 0}, {"end": 512}]
+
+    capture, q = _make_capture_with_events(events)
+    _run_capture_sync(capture, q, chunks)
+
+    utterance = q.get_nowait()
+    # At most PRE_BUFFER_CHUNKS silence + 1 start + 1 end = PRE_BUFFER_CHUNKS+2
+    assert len(utterance) == 512 * (VadCapture.PRE_BUFFER_CHUNKS + 2)
 
 
 # ---------------------------------------------------------------------------

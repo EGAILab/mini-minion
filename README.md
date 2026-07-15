@@ -1031,6 +1031,7 @@ Add a `"voice"` section to `config.json`:
 | `language` | BCP-47 reply language injected as a prompt prefix on each voice turn (default `"en"`). Set to `""` to disable. Kokoro TTS is English-only so `"en"` is required. |
 | `vad.threshold` | Speech probability threshold (0–1, default `0.7`). Lower = more sensitive (may trigger on background audio); higher = only strong speech. |
 | `vad.silence_ms` | Silence duration that ends an utterance (default `1200` ms). Increase for slower speakers; decrease for snappier response. |
+| *(internal)* pre-speech buffer | A rolling 320 ms buffer (~10 chunks × 32 ms) kept before speech onset is always active. When the VAD fires, the buffered audio is prepended to the utterance so the first word is never clipped even if the model takes 1–3 chunks to confirm onset. Not configurable. |
 | `stt.model` | STT backend: `"whisper"` (default, multilingual) or `"parakeet"` (English-only, faster) |
 | `stt.device` | PyTorch device string: `"cuda"` (default) or `"cpu"` |
 | `tts.model` | TTS backend: `"kokoro"` (default), `"qwen3"`, or `"piper"` |
