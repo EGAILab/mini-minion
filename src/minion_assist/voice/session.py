@@ -135,6 +135,13 @@ class VoiceSession:
             so the agent replies in the TTS engine's supported language (e.g.
             ``"en"`` for Kokoro, which is English-only).  Pass ``""`` to
             disable the injection.
+        max_history_turns: Sliding-window size for voice turns.  Only the last
+            N user+assistant pairs are sent to the LLM; full history is still
+            persisted to disk.  ``None`` sends the full history (text-mode
+            behaviour).  Default 6 for lower latency.
+        skip_bootstrap: When ``True``, omit the bootstrap workspace context
+            block from the system prompt for every voice turn.  Saves ~15 000
+            tokens.  Default ``True``.
     """
 
     def __init__(
@@ -146,6 +153,8 @@ class VoiceSession:
         on_event: "Callable[[object], None] | None" = None,
         output_device: "str | int | None" = None,
         language: str = "en",
+        max_history_turns: "int | None" = 6,
+        skip_bootstrap: bool = True,
     ) -> None:
         self._agent_session = agent_session
         self._stt = stt
@@ -154,6 +163,8 @@ class VoiceSession:
         self._on_event = on_event
         self._output_device = output_device
         self._language = language
+        self._max_history_turns = max_history_turns
+        self._skip_bootstrap = skip_bootstrap
         # Controls whether the main loop keeps running (set to False by stop()).
         self._running = False
         # Queue items are (audio, during_tts) tuples or None sentinel.
@@ -246,6 +257,8 @@ class VoiceSession:
                 response = self._agent_session.send(
                     send_text,
                     on_event=self._on_event,
+                    max_history_turns=self._max_history_turns,
+                    skip_bootstrap=self._skip_bootstrap,
                 ) or ""
             except KeyboardInterrupt:
                 raise  # Let the caller handle Ctrl+C.
@@ -439,4 +452,6 @@ def build_voice_session(
         on_event=on_event,
         output_device=output_device,
         language=language,
+        max_history_turns=getattr(voice_config, "max_history_turns", 6),
+        skip_bootstrap=getattr(voice_config, "skip_bootstrap", True),
     )

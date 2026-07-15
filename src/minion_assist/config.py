@@ -1391,6 +1391,8 @@ class VoiceConfig:
 
         "voice": {
             "enabled": false,
+            "max_history_turns": 6,
+            "skip_bootstrap": true,
             "vad":   { "threshold": 0.5, "silence_ms": 700 },
             "stt":   { "model": "parakeet", "device": "cuda" },
             "tts":   { "model": "qwen3", "qwen3_precision": "fp16" },
@@ -1406,6 +1408,17 @@ class VoiceConfig:
             {language} only.]`` prefix into each user message so the LLM uses
             the TTS engine's supported language.  Set to ``""`` to disable.
             Kokoro-82M is English-only, so the default is ``"en"``.
+        max_history_turns: How many recent user+assistant turn pairs to send to
+            the LLM in voice mode.  Full history is still persisted to disk;
+            this only limits what the provider sees.  ``None`` disables the
+            sliding window (sends full history, same as text mode).  Default
+            is 6 — enough context for natural voice conversation while keeping
+            the message array small for lower latency.
+        skip_bootstrap: When ``True``, the bootstrap workspace context block
+            (AGENTS.md, SOUL.md, TOOLS.md, …) is omitted from the voice-mode
+            system prompt.  This shrinks the prompt by ~15 000 tokens and
+            reduces first-token latency.  Workspace files are irrelevant during
+            a voice conversation.  Default ``True``.
         vad: VAD model settings.
         stt: Speech-to-text model settings.
         tts: Text-to-speech model settings.
@@ -1413,6 +1426,8 @@ class VoiceConfig:
     """
     enabled: bool = False
     language: str = "en"
+    max_history_turns: int | None = 6
+    skip_bootstrap: bool = True
     vad: VoiceVadConfig = field(default_factory=VoiceVadConfig)
     stt: VoiceSttConfig = field(default_factory=VoiceSttConfig)
     tts: VoiceTtsConfig = field(default_factory=VoiceTtsConfig)
@@ -1501,9 +1516,14 @@ def _resolve_voice() -> VoiceConfig:
     tts_raw = raw.get("tts", {}) if isinstance(raw.get("tts"), dict) else {}
     audio_raw = raw.get("audio", {}) if isinstance(raw.get("audio"), dict) else {}
 
+    _max_turns_raw = raw.get("max_history_turns", 6)
+    _max_turns: int | None = None if _max_turns_raw is None else int(_max_turns_raw)
+
     return VoiceConfig(
         enabled=bool(raw.get("enabled", False)),
         language=str(raw.get("language", "en")),
+        max_history_turns=_max_turns,
+        skip_bootstrap=bool(raw.get("skip_bootstrap", True)),
         vad=VoiceVadConfig(
             model=str(vad_raw.get("model", "silero")),
             threshold=float(vad_raw.get("threshold", 0.7)),

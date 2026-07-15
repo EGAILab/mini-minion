@@ -76,6 +76,8 @@ def _make_session(
     # speech_started.is_set() must return False by default (no barge-in).
     mock_vad.speech_started = MagicMock()
     mock_vad.speech_started.is_set.return_value = False
+    # tts_playing is set/cleared by _speak_streaming to tag barge-in utterances.
+    mock_vad.tts_playing = MagicMock()
 
     mock_agent = MagicMock()
     mock_agent.send.return_value = agent_response
@@ -84,7 +86,9 @@ def _make_session(
     if utterances is None:
         utterances = [np.zeros(512, dtype=np.float32)]
     for item in utterances:
-        utterance_q.put(item)
+        # Queue holds (audio, during_tts) tuples or None sentinel.
+        # Wrap plain arrays as normal (non-TTS) utterances.
+        utterance_q.put((item, False) if item is not None else None)
     # Always put a sentinel so the loop exits after processing all utterances.
     utterance_q.put(None)
 
@@ -523,6 +527,8 @@ def test_speak_streaming_falls_back_without_sounddevice():
 
 class _FakeVoiceConfig:
     language = "en"
+    max_history_turns = 4
+    skip_bootstrap = True
     class vad:
         threshold = 0.5
         silence_ms = 700
@@ -717,3 +723,89 @@ def test_strip_markdown_plain_text_unchanged():
     """Plain prose with no markdown must pass through unmodified."""
     plain = "The weather today is nice."
     assert _strip_markdown(plain) == plain
+
+
+# ---------------------------------------------------------------------------
+# Voice responsiveness — max_history_turns and skip_bootstrap forwarding
+# ---------------------------------------------------------------------------
+
+def test_loop_passes_max_history_turns_to_agent():
+    """_loop() must forward max_history_turns to agent.send()."""
+    session, mocks = _make_session()
+    session._max_history_turns = 3
+
+    session._running = True
+    session._loop()
+
+    kwargs = mocks["agent"].send.call_args.kwargs
+    assert kwargs.get("max_history_turns") == 3
+
+
+def test_loop_passes_skip_bootstrap_to_agent():
+    """_loop() must forward skip_bootstrap to agent.send()."""
+    session, mocks = _make_session()
+    session._skip_bootstrap = True
+
+    session._running = True
+    session._loop()
+
+    kwargs = mocks["agent"].send.call_args.kwargs
+    assert kwargs.get("skip_bootstrap") is True
+
+
+def test_loop_skip_bootstrap_false_forwarded():
+    """skip_bootstrap=False must be forwarded faithfully (regression guard)."""
+    session, mocks = _make_session()
+    session._skip_bootstrap = False
+
+    session._running = True
+    session._loop()
+
+    kwargs = mocks["agent"].send.call_args.kwargs
+    assert kwargs.get("skip_bootstrap") is False
+
+
+def test_loop_max_history_turns_none_forwarded():
+    """max_history_turns=None (full history) must be forwarded faithfully."""
+    session, mocks = _make_session()
+    session._max_history_turns = None
+
+    session._running = True
+    session._loop()
+
+    kwargs = mocks["agent"].send.call_args.kwargs
+    assert kwargs.get("max_history_turns") is None
+
+
+def test_loop_discards_barge_in_utterance(capsys):
+    """_loop() must discard utterances where during_tts=True and not call STT."""
+    audio = np.zeros(512, dtype=np.float32)
+    # Put a contaminated utterance (during_tts=True) then a sentinel.
+    utterance_q: queue.Queue = queue.Queue()
+    utterance_q.put((audio, True))
+    utterance_q.put(None)
+
+    session, mocks = _make_session()
+    session._utterance_queue = utterance_q
+
+    session._running = True
+    session._loop()
+
+    mocks["stt"].transcribe.assert_not_called()
+    mocks["agent"].send.assert_not_called()
+    out = capsys.readouterr().out
+    assert "discarded" in out
+
+
+def test_build_voice_session_passes_max_history_turns():
+    """build_voice_session() must forward voice_config.max_history_turns to VoiceSession."""
+    mock_agent = MagicMock()
+    result = build_voice_session(mock_agent, _FakeVoiceConfig)
+    assert result._max_history_turns == 4
+
+
+def test_build_voice_session_passes_skip_bootstrap():
+    """build_voice_session() must forward voice_config.skip_bootstrap to VoiceSession."""
+    mock_agent = MagicMock()
+    result = build_voice_session(mock_agent, _FakeVoiceConfig)
+    assert result._skip_bootstrap is True

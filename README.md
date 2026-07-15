@@ -1023,7 +1023,9 @@ Add a `"voice"` section to `config.json`:
       "input_device": null,
       "output_device": null,
       "sample_rate": 16000
-    }
+    },
+    "max_history_turns": 6,
+    "skip_bootstrap": true
   }
 }
 ```
@@ -1043,6 +1045,8 @@ Add a `"voice"` section to `config.json`:
 | `audio.input_device` | Sounddevice input device name or index (`null` = system default) |
 | `audio.output_device` | Sounddevice output device name or index (`null` = system default) |
 | `audio.sample_rate` | Microphone capture sample rate (default `16000` Hz) |
+| `max_history_turns` | Sliding window for LLM context in voice mode. Only the last N user+assistant pairs are sent per turn; full history is still persisted to disk. `null` sends the full history. Default `6`. Reduces per-turn token cost and LLM latency. |
+| `skip_bootstrap` | When `true`, omit the bootstrap workspace context block (~15 000 tokens) from voice turns. Saves significant latency on every voice request. Default `true`. Set to `false` to restore file-aware answers in voice mode. |
 
 ### Module layout
 

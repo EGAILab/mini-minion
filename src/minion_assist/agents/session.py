@@ -522,6 +522,8 @@ class AgentSession:
         verify_fn: Callable[[], str] | None = None,
         extra_tools: list | None = None,
         system_suffix: str | None = None,
+        max_history_turns: int | None = None,
+        skip_bootstrap: bool = False,
     ) -> str | None:
         """Send a user message (with optional media attachments) and return the agent's text response.
 
@@ -549,6 +551,16 @@ class AgentSession:
             system_suffix (str | None): Optional text appended to the system
                 prompt for this turn only.  Used by the Matrix handler to inject
                 group-chat context without permanently modifying the soul suffix.
+            max_history_turns (int | None): When set, only the last N
+                user+assistant turn pairs are sent to the LLM.  Full history is
+                still persisted to disk normally; only the provider's context
+                window is limited.  ``None`` (default) sends the full history.
+                Voice mode passes a small value (e.g. 6) for lower latency.
+            skip_bootstrap (bool): When ``True``, the bootstrap workspace
+                context block is omitted from the system prompt for this turn.
+                Saves ~15 000 tokens and reduces first-token latency.  Voice
+                mode sets this to ``True`` because workspace files are irrelevant
+                during a voice conversation.
 
         Returns:
             str | None: The agent's final response text, or ``None`` if the
@@ -567,6 +579,8 @@ class AgentSession:
                 verify_fn=verify_fn,
                 extra_tools=extra_tools,
                 system_suffix=system_suffix,
+                max_history_turns=max_history_turns,
+                skip_bootstrap=skip_bootstrap,
             )
 
     def _send_locked(
@@ -578,6 +592,8 @@ class AgentSession:
         verify_fn: Callable[[], str] | None,
         extra_tools: list | None,
         system_suffix: str | None,
+        max_history_turns: int | None = None,
+        skip_bootstrap: bool = False,
     ) -> str | None:
         """Locked implementation of send() — called with self._lock already held."""
         _trace_id = str(uuid.uuid4())
@@ -613,11 +629,11 @@ class AgentSession:
         # changes byte 0 daily, invalidating the entire cached prefix.
         system = self._agent.soul
 
-        # Bootstrap block — evaluated per turn so edits to workspace bootstrap files
-        # (AGENTS.md, SOUL.md, TOOLS.md, etc.) are picked up without restarting.
-        # Positioned immediately after the static soul so stable workspace context
-        # appears before dynamic memory and task context.
-        if self._bootstrap_context is not None:
+        # Bootstrap block — workspace files (AGENTS.md, SOUL.md, TOOLS.md, …).
+        # Skipped in voice mode (skip_bootstrap=True) because workspace context
+        # is irrelevant during voice conversation and omitting it saves ~15 000
+        # tokens, meaningfully reducing first-token latency.
+        if not skip_bootstrap and self._bootstrap_context is not None:
             _bootstrap_block = self._bootstrap_context()
             if _bootstrap_block:
                 system += f"\n\n{_bootstrap_block}"
@@ -708,6 +724,19 @@ class AgentSession:
         else:
             _active_tools = self._tools
 
+        # Sliding window: voice mode passes max_history_turns so only the last N
+        # user+assistant pairs are sent to the LLM.  Full self._history is still
+        # persisted; only the provider's context is limited.  When run_turn appends
+        # new assistant/tool messages to the window slice, they are replayed back
+        # into self._history so persistence and PostgreSQL mirroring stay correct.
+        if max_history_turns is not None:
+            _window = max_history_turns * 2  # each turn = 1 user msg + 1 assistant msg
+            _turn_messages = list(self._history[max(0, len(self._history) - _window):])
+            _turn_slice_len = len(_turn_messages)
+        else:
+            _turn_messages = self._history
+            _turn_slice_len = 0  # unused when no window
+
         try:
             _usage = run_turn(
                 self._provider,
@@ -715,12 +744,17 @@ class AgentSession:
                 system,
                 self._max_output_tokens,
                 _active_tools,
-                self._history,
+                _turn_messages,
                 on_event=on_event,
                 stream=stream,
                 max_tool_rounds=self._agent.max_tool_rounds,
                 log_dir=self._log_dir,
             )
+
+            # Replay new messages back into full history when using a window slice.
+            if max_history_turns is not None:
+                for _msg in _turn_messages[_turn_slice_len:]:
+                    self._history.append(_msg)
             _session_info = self._session_store.touch(self._agent_id, increment_turns=True)
 
             # Mirror new assistant/tool messages to PostgreSQL.
