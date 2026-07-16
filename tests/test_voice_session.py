@@ -809,3 +809,17 @@ def test_build_voice_session_passes_skip_bootstrap():
     mock_agent = MagicMock()
     result = build_voice_session(mock_agent, _FakeVoiceConfig)
     assert result._skip_bootstrap is True
+
+
+def test_loop_prints_you_prompt_after_tts(capsys):
+    """_loop() must print '[you]' after TTS playback ends to signal the mic is open."""
+    session, mocks = _make_session(agent_response="hello back")
+
+    session._running = True
+    session._loop()
+
+    out = capsys.readouterr().out
+    # The prompt is printed after speak_streaming returns.
+    assert "[you]" in out
+    # The speak_streaming mock was called (TTS happened), then [you] appeared after.
+    assert mocks["speak_streaming"].call_count == 1

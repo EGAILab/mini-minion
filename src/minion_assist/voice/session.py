@@ -275,6 +275,9 @@ class VoiceSession:
             except Exception as exc:
                 print(f"[voice] TTS error: {exc}", flush=True)
 
+            # Signal that TTS is done and the mic is open again.
+            print("\n[you] ", end="", flush=True)
+
 
     def _speak_streaming(self, text: str) -> None:
         """Synthesise and play *text* with smooth continuous output.
