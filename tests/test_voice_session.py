@@ -811,18 +811,16 @@ def test_build_voice_session_passes_skip_bootstrap():
     assert result._skip_bootstrap is True
 
 
-def test_loop_prints_you_prompt_after_tts(capsys):
-    """_loop() must print '[you]' after TTS playback ends to signal the mic is open."""
-    session, mocks = _make_session(agent_response="hello back")
+def test_loop_prints_you_label_only_once(capsys):
+    """_loop() prints [label] exactly once per utterance — with the transcript, not again after TTS."""
+    session, mocks = _make_session(transcript="hello", agent_response="hello back")
 
     session._running = True
     session._loop()
 
     out = capsys.readouterr().out
-    # The prompt is printed after speak_streaming returns.
-    assert "[you]" in out
-    # The speak_streaming mock was called (TTS happened), then [you] appeared after.
-    assert mocks["speak_streaming"].call_count == 1
+    assert out.count("[you]") == 1
+    assert "[you] hello" in out
 
 
 # ---------------------------------------------------------------------------
@@ -842,16 +840,17 @@ def test_loop_uses_user_label_in_transcript_print(capsys):
     assert "[you]" not in out
 
 
-def test_loop_uses_user_label_in_post_tts_prompt(capsys):
-    """_loop() prints [<user_label>] after TTS ends, not [you]."""
-    session, _ = _make_session(agent_response="hi there")
+def test_loop_uses_user_label_in_transcript_only(capsys):
+    """_loop() prints [<user_label>] with the transcript — not a separate post-TTS line."""
+    session, _ = _make_session(transcript="hello", agent_response="hi there")
     session._user_label = "Bob"
 
     session._running = True
     session._loop()
 
     out = capsys.readouterr().out
-    assert "[Bob] " in out
+    assert out.count("[Bob]") == 1
+    assert "[Bob] hello" in out
 
 
 def test_loop_defaults_to_you_label(capsys):
