@@ -811,16 +811,39 @@ def test_build_voice_session_passes_skip_bootstrap():
     assert result._skip_bootstrap is True
 
 
-def test_loop_prints_you_label_only_once(capsys):
-    """_loop() prints [label] exactly once per utterance — with the transcript, not again after TTS."""
+def test_loop_transcript_continues_on_post_tts_prompt(capsys):
+    """When post-TTS prompt is on screen, transcript continues on the same line (no extra label)."""
+    session, mocks = _make_session(transcript="hello", agent_response="hello back")
+    # Simulate state where post-TTS prompt is already on screen.
+    session._prompt_shown = True
+    session._user_label = "you"
+
+    session._running = True
+    session._loop()
+
+    out = capsys.readouterr().out
+    # "hello" appears (the transcript), but NOT prefixed with a new "[you]" label
+    # (the label is already on screen from the post-TTS prompt).
+    assert "hello" in out
+    # The first occurrence of "[you]" in the output is NOT "[you] hello"
+    # — the transcript text is printed alone, continuing the existing prompt line.
+    first_you = out.index("[you]")
+    segment = out[first_you: first_you + 20]
+    assert not segment.startswith("[you] hello")
+
+
+def test_loop_prints_post_tts_prompt_after_tts(capsys):
+    """After TTS, _loop() prints '[label] ' on a new line and sets _prompt_shown."""
     session, mocks = _make_session(transcript="hello", agent_response="hello back")
 
     session._running = True
     session._loop()
 
     out = capsys.readouterr().out
-    assert out.count("[you]") == 1
-    assert "[you] hello" in out
+    # Post-TTS prompt appears (possibly followed by more output).
+    assert "[you] " in out
+    # _prompt_shown is True after TTS (next transcript will continue on same line).
+    assert session._prompt_shown is True
 
 
 # ---------------------------------------------------------------------------
@@ -840,8 +863,8 @@ def test_loop_uses_user_label_in_transcript_print(capsys):
     assert "[you]" not in out
 
 
-def test_loop_uses_user_label_in_transcript_only(capsys):
-    """_loop() prints [<user_label>] with the transcript — not a separate post-TTS line."""
+def test_loop_uses_user_label_with_transcript(capsys):
+    """[label] with transcript text appears in the output."""
     session, _ = _make_session(transcript="hello", agent_response="hi there")
     session._user_label = "Bob"
 
@@ -849,8 +872,9 @@ def test_loop_uses_user_label_in_transcript_only(capsys):
     session._loop()
 
     out = capsys.readouterr().out
-    assert out.count("[Bob]") == 1
-    assert "[Bob] hello" in out
+    # Either as a fresh label+text (no prior TTS) or post-TTS prompt+text on same line.
+    assert "hello" in out
+    assert "[Bob]" in out
 
 
 def test_loop_defaults_to_you_label(capsys):

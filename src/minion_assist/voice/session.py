@@ -170,6 +170,9 @@ class VoiceSession:
         self._max_history_turns = max_history_turns
         self._skip_bootstrap = skip_bootstrap
         self._user_label = user_label
+        # True while "[label] " is on-screen with no newline yet (after TTS ends).
+        # The next transcript print continues on the same line instead of repeating the label.
+        self._prompt_shown = False
         # Controls whether the main loop keeps running (set to False by stop()).
         self._running = False
         # Queue items are (audio, during_tts) tuples or None sentinel.
@@ -235,6 +238,9 @@ class VoiceSession:
                 # making STT output garbage (e.g. "stop" → "C'est tout." or
                 # random Japanese).  Discard it; the user can speak again cleanly
                 # once TTS has stopped.
+                if self._prompt_shown:
+                    print(flush=True)  # end the partial prompt line cleanly
+                    self._prompt_shown = False
                 print("[voice] barge-in utterance discarded (captured during TTS playback)", flush=True)
                 continue
 
@@ -242,13 +248,21 @@ class VoiceSession:
             try:
                 text = self._stt.transcribe(audio).strip()
             except Exception as exc:
+                if self._prompt_shown:
+                    print(flush=True)
+                    self._prompt_shown = False
                 print(f"[voice] STT error: {exc}", flush=True)
                 continue
 
             if not text:
                 continue
 
-            print(f"\n[{self._user_label}] {text}", flush=True)
+            if self._prompt_shown:
+                # "[label] " is already on screen; append the transcript on the same line.
+                print(text, flush=True)
+                self._prompt_shown = False
+            else:
+                print(f"\n[{self._user_label}] {text}", flush=True)
 
             # --- Agent turn ---
             # Prepend a language constraint so the LLM replies in the TTS
@@ -279,6 +293,11 @@ class VoiceSession:
                 self._speak_streaming(response)
             except Exception as exc:
                 print(f"[voice] TTS error: {exc}", flush=True)
+
+            # Show the label with no newline so the next transcript continues on the same line:
+            #   [Eric] <transcript text>
+            print(f"\n[{self._user_label}] ", end="", flush=True)
+            self._prompt_shown = True
 
 
     def _speak_streaming(self, text: str) -> None:
