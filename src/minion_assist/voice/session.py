@@ -142,6 +142,9 @@ class VoiceSession:
         skip_bootstrap: When ``True``, omit the bootstrap workspace context
             block from the system prompt for every voice turn.  Saves ~15 000
             tokens.  Default ``True``.
+        user_label: Name shown in ``[name]`` prompts during voice interaction.
+            Defaults to ``"you"``; ``build_voice_session`` sets this from the
+            ``Name:`` field in ``USER.md`` when a bootstrap root is supplied.
     """
 
     def __init__(
@@ -155,6 +158,7 @@ class VoiceSession:
         language: str = "en",
         max_history_turns: "int | None" = 6,
         skip_bootstrap: bool = True,
+        user_label: str = "you",
     ) -> None:
         self._agent_session = agent_session
         self._stt = stt
@@ -165,6 +169,7 @@ class VoiceSession:
         self._language = language
         self._max_history_turns = max_history_turns
         self._skip_bootstrap = skip_bootstrap
+        self._user_label = user_label
         # Controls whether the main loop keeps running (set to False by stop()).
         self._running = False
         # Queue items are (audio, during_tts) tuples or None sentinel.
@@ -243,7 +248,7 @@ class VoiceSession:
             if not text:
                 continue
 
-            print(f"\n[you] {text}", flush=True)
+            print(f"\n[{self._user_label}] {text}", flush=True)
 
             # --- Agent turn ---
             # Prepend a language constraint so the LLM replies in the TTS
@@ -276,7 +281,7 @@ class VoiceSession:
                 print(f"[voice] TTS error: {exc}", flush=True)
 
             # Signal that TTS is done and the mic is open again.
-            print("\n[you] ", end="", flush=True)
+            print(f"\n[{self._user_label}] ", end="", flush=True)
 
 
     def _speak_streaming(self, text: str) -> None:
@@ -425,6 +430,7 @@ def build_voice_session(
     agent_session: "AgentSession",
     voice_config: object,
     on_event: "Callable[[object], None] | None" = None,
+    bootstrap_root: "Path | None" = None,
 ) -> VoiceSession:
     """Build a fully configured ``VoiceSession`` from config.
 
@@ -435,10 +441,15 @@ def build_voice_session(
         agent_session: The target ``AgentSession`` from ``minion.py``.
         voice_config: A ``VoiceConfig`` instance from ``config.py``.
         on_event: Optional event callback for terminal output during agent turns.
+        bootstrap_root: Directory containing ``USER.md``.  When provided,
+            ``read_user_name()`` is called to personalise the ``[name]`` prompt
+            shown in the terminal.  Defaults to ``None`` (shows ``[you]``).
 
     Returns:
         VoiceSession: Ready to call ``.run()`` on.
     """
+    from pathlib import Path as _Path  # noqa: PLC0415
+
     from .stt import build_stt  # noqa: PLC0415
     from .tts import build_tts  # noqa: PLC0415
     from .vad import build_vad_capture  # noqa: PLC0415
@@ -446,6 +457,13 @@ def build_voice_session(
     audio_cfg = getattr(voice_config, "audio", None)
     output_device = getattr(audio_cfg, "output_device", None) if audio_cfg else None
     language = getattr(voice_config, "language", "en") or ""
+
+    user_label = "you"
+    if bootstrap_root is not None:
+        from ..bootstrap import read_user_name  # noqa: PLC0415
+        name = read_user_name(_Path(bootstrap_root))
+        if name:
+            user_label = name
 
     return VoiceSession(
         agent_session=agent_session,
@@ -457,4 +475,5 @@ def build_voice_session(
         language=language,
         max_history_turns=getattr(voice_config, "max_history_turns", 6),
         skip_bootstrap=getattr(voice_config, "skip_bootstrap", True),
+        user_label=user_label,
     )

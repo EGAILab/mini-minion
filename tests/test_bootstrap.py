@@ -23,6 +23,7 @@ from minion_assist.bootstrap import (
     build_bootstrap_prompt_block,
     clear_bootstrap_block_cache,
     load_bootstrap_files,
+    read_user_name,
     render_bootstrap_pending_context,
     render_project_context,
     render_truncation_warning,
@@ -649,6 +650,63 @@ def test_build_bootstrap_prompt_block_subagent_only_agents_and_tools(tmp_path):
 
     assert "AGENTS_CONTENT" in result
     assert "TOOLS_CONTENT" in result
+
+
+# ---------------------------------------------------------------------------
+# read_user_name()
+# ---------------------------------------------------------------------------
+
+def test_read_user_name_returns_none_when_no_file(tmp_path):
+    """Returns None when USER.md does not exist."""
+    assert read_user_name(tmp_path) is None
+
+
+def test_read_user_name_finds_name_colon_line(tmp_path):
+    """Extracts the name from a 'Name: <value>' line."""
+    _write_file(tmp_path, "USER.md", "Name: Alice\nOther: stuff\n")
+    assert read_user_name(tmp_path) == "Alice"
+
+
+def test_read_user_name_finds_name_with_dash_prefix(tmp_path):
+    """Extracts the name from '- Name: <value>' (list-item format)."""
+    _write_file(tmp_path, "USER.md", "- Name: Bob\n")
+    assert read_user_name(tmp_path) == "Bob"
+
+
+def test_read_user_name_finds_name_with_star_prefix(tmp_path):
+    """Extracts the name from '* Name: <value>' (bullet format)."""
+    _write_file(tmp_path, "USER.md", "* Name: Carol\n")
+    assert read_user_name(tmp_path) == "Carol"
+
+
+def test_read_user_name_case_insensitive(tmp_path):
+    """Key matching is case-insensitive ('name:' works as well as 'Name:')."""
+    _write_file(tmp_path, "USER.md", "name: Dave\n")
+    assert read_user_name(tmp_path) == "Dave"
+
+
+def test_read_user_name_falls_back_to_h1_heading(tmp_path):
+    """Falls back to the first H1 heading when no Name: key is present."""
+    _write_file(tmp_path, "USER.md", "# Eve\n\nSome content.\n")
+    assert read_user_name(tmp_path) == "Eve"
+
+
+def test_read_user_name_returns_none_when_no_match(tmp_path):
+    """Returns None when USER.md has no Name: line or H1 heading."""
+    _write_file(tmp_path, "USER.md", "Just some prose with no name field.\n")
+    assert read_user_name(tmp_path) is None
+
+
+def test_read_user_name_prefers_name_key_over_heading(tmp_path):
+    """Name: key takes priority over a H1 heading present in the same file."""
+    _write_file(tmp_path, "USER.md", "# Frank\nName: Grace\n")
+    assert read_user_name(tmp_path) == "Grace"
+
+
+def test_read_user_name_strips_whitespace(tmp_path):
+    """Trailing whitespace in the extracted name is stripped."""
+    _write_file(tmp_path, "USER.md", "Name:   Heidi   \n")
+    assert read_user_name(tmp_path) == "Heidi"
 
 
 def test_build_bootstrap_prompt_block_default_session_type_is_root(tmp_path):

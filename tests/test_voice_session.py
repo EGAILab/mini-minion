@@ -823,3 +823,67 @@ def test_loop_prints_you_prompt_after_tts(capsys):
     assert "[you]" in out
     # The speak_streaming mock was called (TTS happened), then [you] appeared after.
     assert mocks["speak_streaming"].call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# user_label — personalised [name] prompt
+# ---------------------------------------------------------------------------
+
+def test_loop_uses_user_label_in_transcript_print(capsys):
+    """_loop() prints [<user_label>] instead of [you] when user_label is set."""
+    session, _ = _make_session(transcript="hello")
+    session._user_label = "Alice"
+
+    session._running = True
+    session._loop()
+
+    out = capsys.readouterr().out
+    assert "[Alice] hello" in out
+    assert "[you]" not in out
+
+
+def test_loop_uses_user_label_in_post_tts_prompt(capsys):
+    """_loop() prints [<user_label>] after TTS ends, not [you]."""
+    session, _ = _make_session(agent_response="hi there")
+    session._user_label = "Bob"
+
+    session._running = True
+    session._loop()
+
+    out = capsys.readouterr().out
+    assert "[Bob] " in out
+
+
+def test_loop_defaults_to_you_label(capsys):
+    """_loop() falls back to '[you]' when user_label is the default."""
+    session, _ = _make_session()
+    assert session._user_label == "you"
+
+    session._running = True
+    session._loop()
+
+    out = capsys.readouterr().out
+    assert "[you]" in out
+
+
+def test_build_voice_session_reads_name_from_user_md(tmp_path):
+    """build_voice_session() sets user_label from USER.md Name: field."""
+    (tmp_path / "USER.md").write_text("Name: Carol\n", encoding="utf-8")
+
+    mock_agent = MagicMock()
+    result = build_voice_session(mock_agent, _FakeVoiceConfig, bootstrap_root=tmp_path)
+    assert result._user_label == "Carol"
+
+
+def test_build_voice_session_defaults_to_you_without_user_md(tmp_path):
+    """build_voice_session() defaults user_label to 'you' when USER.md absent."""
+    mock_agent = MagicMock()
+    result = build_voice_session(mock_agent, _FakeVoiceConfig, bootstrap_root=tmp_path)
+    assert result._user_label == "you"
+
+
+def test_build_voice_session_defaults_to_you_without_bootstrap_root():
+    """build_voice_session() defaults user_label to 'you' when bootstrap_root is None."""
+    mock_agent = MagicMock()
+    result = build_voice_session(mock_agent, _FakeVoiceConfig)
+    assert result._user_label == "you"

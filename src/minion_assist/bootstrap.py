@@ -49,6 +49,7 @@ Public API
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -535,3 +536,40 @@ def build_bootstrap_prompt_block(
     result = "\n\n".join(parts)
     _bootstrap_block_cache[cache_key] = (current_mtimes, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# User name extraction
+# ---------------------------------------------------------------------------
+
+# Patterns tried in order when extracting the user's name from USER.md.
+# 1. Key-value line:   "Name: Alice" / "- Name: Alice" / "* Name: Alice"
+# 2. First H1 heading: "# Alice"
+_NAME_KV_RE = re.compile(r"^[-*]?\s*[Nn]ame\s*:\s*(.+)", re.MULTILINE)
+_NAME_H1_RE = re.compile(r"^#\s+(.+)", re.MULTILINE)
+
+
+def read_user_name(root: Path) -> str | None:
+    """Return the user's name from USER.md in *root*, or ``None`` if not found.
+
+    Tries two patterns in order:
+    - A ``Name: <value>`` line (also accepts ``- Name:`` or ``* Name:``).
+    - The first top-level heading (``# <name>``).
+
+    Args:
+        root: Directory containing workspace bootstrap files.
+
+    Returns:
+        str | None: Stripped name string, or ``None`` when USER.md is absent
+            or contains no recognizable name field.
+    """
+    user_md = root / "USER.md"
+    try:
+        text = user_md.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    m = _NAME_KV_RE.search(text) or _NAME_H1_RE.search(text)
+    if m:
+        return m.group(1).strip() or None
+    return None

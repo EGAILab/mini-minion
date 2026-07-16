@@ -839,6 +839,7 @@ def main() -> None:
             agent_session=sessions[_target_agent_id],
             voice_config=voice_cfg,
             on_event=_on_event,
+            bootstrap_root=_bootstrap_root,
         )
         try:
             _voice_session.run()
