@@ -835,11 +835,16 @@ def main() -> None:
     if _args.voice:
         from .voice.session import build_voice_session  # noqa: PLC0415
         _target_agent_id = next(iter(sessions))
+        # Resolve the bootstrap root for the target agent (same logic as the
+        # session setup loop above).  _agent_bootstrap_root is not reliable here
+        # because it holds the last loop iteration's value, not the target agent's.
+        _voice_agent_workspace = agent_workspace_root(workspace, _target_agent_id)
+        _voice_bootstrap_root = _voice_agent_workspace if _voice_agent_workspace is not None else _bootstrap_root
         _voice_session = build_voice_session(
             agent_session=sessions[_target_agent_id],
             voice_config=voice_cfg,
             on_event=_on_event,
-            bootstrap_root=_bootstrap_root,
+            bootstrap_root=_voice_bootstrap_root,
         )
         try:
             _voice_session.run()
