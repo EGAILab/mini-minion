@@ -543,9 +543,10 @@ def build_bootstrap_prompt_block(
 # ---------------------------------------------------------------------------
 
 # Patterns tried in order when extracting the user's name from USER.md.
-# 1. Key-value line:   "Name: Alice" / "- Name: Alice" / "* Name: Alice"
+# 1. Key-value line, with optional markdown bold around the key and/or colon:
+#      "Name: Alice" / "- Name: Alice" / "- **Name:** Alice" / "**Name:** Alice"
 # 2. First H1 heading: "# Alice"
-_NAME_KV_RE = re.compile(r"^[-*]?\s*[Nn]ame\s*:\s*(.+)", re.MULTILINE)
+_NAME_KV_RE = re.compile(r"^[-*]?\s*\**[Nn]ame\**\s*:\**\s*(.+)", re.MULTILINE)
 _NAME_H1_RE = re.compile(r"^#\s+(.+)", re.MULTILINE)
 
 

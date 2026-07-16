@@ -697,6 +697,18 @@ def test_read_user_name_returns_none_when_no_match(tmp_path):
     assert read_user_name(tmp_path) is None
 
 
+def test_read_user_name_bold_key_with_colon_outside(tmp_path):
+    """Extracts name from '- **Name:** <value>' (bold key, colon inside bold)."""
+    _write_file(tmp_path, "USER.md", "- **Name:** Eric\n")
+    assert read_user_name(tmp_path) == "Eric"
+
+
+def test_read_user_name_bold_key_no_prefix(tmp_path):
+    """Extracts name from '**Name:** <value>' without list prefix."""
+    _write_file(tmp_path, "USER.md", "**Name:** Eric\n")
+    assert read_user_name(tmp_path) == "Eric"
+
+
 def test_read_user_name_prefers_name_key_over_heading(tmp_path):
     """Name: key takes priority over a H1 heading present in the same file."""
     _write_file(tmp_path, "USER.md", "# Frank\nName: Grace\n")
