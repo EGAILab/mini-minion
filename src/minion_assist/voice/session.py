@@ -197,6 +197,8 @@ class VoiceSession:
         self._running = True
         self._vad_capture.start(self._utterance_queue)  # type: ignore[arg-type]
         print("[voice] Ready — speak now. (Ctrl+C to quit)", flush=True)
+        print(f"[{self._user_label}] ", end="", flush=True)
+        self._prompt_shown = True
 
         try:
             self._loop()
