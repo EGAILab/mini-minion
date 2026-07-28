@@ -375,3 +375,38 @@ def test_get_raises_for_missing_file(tmp_path):
     locator = MemoryLocator(path=tmp_path / "memory" / "topics" / "missing.md")
     with pytest.raises(FileNotFoundError):
         repo.get(locator)
+
+
+# ---------------------------------------------------------------------------
+# list_indexable_files — Stage One Phase 3, slice A
+# ---------------------------------------------------------------------------
+
+def test_list_indexable_files_covers_every_source(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    (tmp_path / "MEMORY.md").write_text("durable root memory", encoding="utf-8")
+    repo.remember("project-goals", "topic content")
+    repo.remember_import("_auto_extracted", "import content")
+    repo.append_daily("daily entry", when=date(2026, 7, 20))
+
+    files = repo.list_indexable_files()
+
+    by_path = {rel: (kind, content) for kind, rel, content in files}
+    assert by_path["MEMORY.md"] == ("durable", "durable root memory")
+    assert by_path["memory/topics/project-goals.md"] == ("durable", "topic content")
+    assert by_path["memory/imports/_auto_extracted.md"] == ("import", "import content")
+    assert by_path["memory/2026-07-20.md"][0] == "daily"
+
+
+def test_list_indexable_files_excludes_dreams_and_user_and_missing_memory_md(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    (tmp_path / "DREAMS.md").write_text("dream content", encoding="utf-8")
+    (tmp_path / "USER.md").write_text("user content", encoding="utf-8")
+
+    files = repo.list_indexable_files()
+
+    assert files == []  # no MEMORY.md, no topics/imports/daily notes yet
+
+
+def test_list_indexable_files_returns_empty_list_for_a_fresh_repository(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    assert repo.list_indexable_files() == []

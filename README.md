@@ -181,6 +181,8 @@ minion-assist/
 │   │   ├── models.py            # MemoryHit, MemoryLocator, MemoryExcerpt, MemoryStatus
 │   │   ├── extractor.py         # Background fact extraction (degraded-mode path, no db)
 │   │   ├── capture_worker.py    # CaptureWorker — durable capture-job queue worker (needs db)
+│   │   ├── chunking.py          # Heading-aware Markdown chunker for the lexical index
+│   │   ├── postgres_index.py    # PostgresMemoryIndex — rebuildable lexical index (needs db)
 │   │   ├── migration.py         # Phase 0: legacy-root -> merged-root migration tooling
 │   │   ├── cli.py               # `minion-assist memory migrate` subcommand
 │   │   ├── baseline.py          # Retrieval recall/latency measurement vs. fixture corpus
@@ -1151,6 +1153,21 @@ job = db.claim_next_capture_job()   # SELECT ... FOR UPDATE SKIP LOCKED
 **Known, accepted gap:** `memory_proposals` rows are not yet surfaced anywhere — not in `search_memory`, not in `<relevant_memories>` injection. They sit inert until Stage One Phase 5 (consolidation) exists to review and promote them into curated notes. This is a deliberate scope boundary for slice C, not an oversight — see `minion-assist-docs/improve/memory-implementation-plan.md`.
 
 Without a configured database, `CaptureWorker` is never constructed and `AgentSession` falls back to the original per-turn daemon-thread path described above (`extract_and_save_async`).
+
+### Lexical memory index (Stage One Phase 3, slice A)
+
+`memory/postgres_index.py`'s `PostgresMemoryIndex` is a rebuildable full-text index over one agent's *memory files* (`MEMORY.md`, topic notes, daily notes, imports) — distinct from `SessionDB`'s message-level FTS above. It indexes a different corpus with a different lifecycle (curated notes, edited occasionally, not appended every turn), so it owns its own tables and its own connection to the same database rather than extending `SessionDB`:
+
+| Table | Description |
+|---|---|
+| `memory_chunks` | One row per indexed chunk. Columns: `id` (BIGSERIAL), `agent_id`, `source_kind` (`durable`/`daily`/`import`), `rel_path`, `chunk_index`, `heading_path`, `content`, `start_line`, `end_line`, `chunk_hash`, `search_vector` (weighted: heading text at FTS weight `A`, body at `B`). |
+| `memory_files` | Per-file reconciliation ledger, `PRIMARY KEY (agent_id, rel_path)`. Same role as `message_mirrors` above: lets a later slice diff "what's on disk" against "what's indexed" by content hash rather than reindexing everything unconditionally. |
+
+`memory/chunking.py`'s `chunk_markdown()` splits a file into heading-aware, token-bounded (~400 tokens), overlapping (~80 tokens) chunks before indexing — see its module docstring for why both heading-awareness and overlap matter. Token counting reuses `context.py`'s tiktoken-or-char/4-heuristic fallback pattern.
+
+`PostgresMemoryIndex.rebuild_agent(agent_id, indexable_files)` rebuilds one agent's entire index from `MemoryFileRepository.list_indexable_files()`'s listing — deleting chunks/ledger rows for any file no longer present, then reindexing everything else. `reindex_file()`/`remove_file()` handle one file at a time.
+
+**This slice only builds and rebuilds the index — nothing in the running app calls it yet.** No write-path sync, no startup reconciliation, no live filesystem watcher, and `MemoryService.search()` is unchanged (still the Phase 1 linear scan). Wiring the index into live search, keeping it in sync with on-disk edits, and crash-safe rebuild-and-swap are later Phase 3 slices — see `minion-assist-docs/improve/memory-implementation-plan.md`.
 
 ### `session_search` Tool Modes
 

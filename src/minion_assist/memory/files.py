@@ -287,6 +287,64 @@ class MemoryFileRepository:
         ]
 
     # -----------------------------------------------------------------
+    # Indexable file enumeration — Stage One Phase 3 (memory/postgres_index.py)
+    # -----------------------------------------------------------------
+
+    def list_indexable_files(self) -> list[tuple[str, str, str]]:
+        """Enumerate every file the Phase 3 lexical index should cover.
+
+        Per the plan's Phase 3 Task 4: index ``MEMORY.md``, dated notes,
+        topic pages, and imports; exclude ``DREAMS.md``, ``USER.md``, and
+        any other root-level file. There is no "reviewed" flag on imports
+        yet (that distinction is Phase 5's job), so every import is indexed
+        for now — still tagged ``"import"`` so a caller can filter it out.
+
+        Returns:
+            list[tuple[str, str, str]]: ``(source_kind, rel_path, content)``
+                triples. ``source_kind`` is one of ``"durable"`` (
+                ``MEMORY.md`` and topic notes), ``"daily"`` (
+                ``memory/YYYY-MM-DD.md``), or ``"import"`` (
+                ``memory/imports/*.md``). ``rel_path`` is relative to this
+                repository's root (:attr:`root`), stable across runs so it
+                can be used as an indexing key. Unreadable files (e.g. a
+                permissions error) are silently skipped, matching
+                :meth:`search`'s existing tolerance for a bad file.
+        """
+        results: list[tuple[str, str, str]] = []
+
+        memory_md = self._root / "MEMORY.md"
+        if memory_md.exists():
+            try:
+                results.append(("durable", "MEMORY.md", memory_md.read_text(encoding="utf-8")))
+            except OSError:
+                pass
+
+        for p in sorted(self._topics_dir.glob("*.md")):
+            try:
+                content = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            results.append(("durable", f"memory/topics/{p.name}", content))
+
+        for p in sorted(self._imports_dir.glob("*.md")):
+            try:
+                content = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            results.append(("import", f"memory/imports/{p.name}", content))
+
+        # Non-recursive glob on memory_dir itself only matches YYYY-MM-DD.md
+        # files directly inside it — see search()'s identical comment.
+        for p in sorted(self._memory_dir.glob("*.md")):
+            try:
+                content = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            results.append(("daily", f"memory/{p.name}", content))
+
+        return results
+
+    # -----------------------------------------------------------------
     # Bounded exact reads — new in Phase 1 (the plan's memory_get)
     # -----------------------------------------------------------------
 
