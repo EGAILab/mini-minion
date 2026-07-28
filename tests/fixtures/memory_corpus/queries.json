@@ -1,0 +1,42 @@
+[
+  {
+    "category": "preferences",
+    "query": "What editor and formatting preferences do I have?",
+    "expected_keys": ["user-preferences"]
+  },
+  {
+    "category": "changed_preferences",
+    "query": "Do I drink coffee or tea in the morning?",
+    "expected_keys": ["coffee-preference-change"]
+  },
+  {
+    "category": "names",
+    "query": "What is my dog's name?",
+    "expected_keys": ["people"]
+  },
+  {
+    "category": "names",
+    "query": "Who is my manager at work?",
+    "expected_keys": ["people"]
+  },
+  {
+    "category": "code_identifiers",
+    "query": "What function implements the Think-Act-Observe loop?",
+    "expected_keys": ["project-symbols"]
+  },
+  {
+    "category": "temporary_constraints",
+    "query": "When can we deploy to production?",
+    "expected_keys": ["deployment-constraint"]
+  },
+  {
+    "category": "untrusted_imports",
+    "query": "What is the API rate limit according to the wiki?",
+    "expected_keys": ["external-wiki-import"]
+  },
+  {
+    "category": "session_scoped_facts",
+    "query": "What ticket was I debugging this session?",
+    "expected_keys": ["session-2026-07-20-notes"]
+  }
+]

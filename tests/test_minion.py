@@ -436,3 +436,51 @@ def test_session_files_stored_per_agent_subdirectory(tmp_path):
     # File must contain the user message.
     history = ShortTermMemory(tmp_path / "sessions").load("main", jsonl_files[0].stem)
     assert any(m["role"] == "user" and m["content"] == "hello" for m in history)
+
+
+# ---------------------------------------------------------------------------
+# `minion-assist memory ...` CLI dispatch guard
+# ---------------------------------------------------------------------------
+# main() checks sys.argv[1] == "memory" before any REPL setup runs (agent
+# identity validation, skill discovery, session/provider construction, etc.)
+# and hands off to memory/cli.py instead. These tests verify the guard fires
+# and forwards the right arguments — memory/cli.py's own behavior is covered
+# by tests/memory/test_cli.py.
+
+def test_main_dispatches_memory_subcommand_before_repl_setup():
+    """`minion-assist memory migrate --apply` calls memory.cli.main and exits
+    with its return code, without touching any REPL setup (skills, sessions,
+    providers) along the way."""
+    import minion_assist.minion as minion_mod
+
+    with (
+        patch("sys.argv", ["minion-assist", "memory", "migrate", "--apply"]),
+        patch("minion_assist.memory.cli.main", return_value=0) as cli_main_mock,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            minion_mod.main()
+
+    cli_main_mock.assert_called_once_with(["migrate", "--apply"])
+    assert exc_info.value.code == 0
+
+
+def test_main_propagates_memory_cli_exit_code():
+    """A non-zero exit code from the memory CLI propagates through SystemExit."""
+    import minion_assist.minion as minion_mod
+
+    with (
+        patch("sys.argv", ["minion-assist", "memory", "migrate", "--rollback", "missing.json"]),
+        patch("minion_assist.memory.cli.main", return_value=1),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            minion_mod.main()
+
+    assert exc_info.value.code == 1
+
+
+def test_main_does_not_dispatch_for_non_memory_args(tmp_path):
+    """Without a leading 'memory' argv token, main() proceeds to the normal REPL path."""
+    _run_main(tmp_path, ["hello", "quit"])
+    # No SystemExit escaped and no exception — REPL setup ran as usual, already
+    # covered by the assertions in _run_main's other callers. This test exists
+    # to document that the guard is argv[1]-specific, not a blanket short-circuit.

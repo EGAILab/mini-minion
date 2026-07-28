@@ -1820,6 +1820,27 @@ After each successful turn, `AgentSession` fires `extract_and_save_async` in a d
 
 This captures key facts — user preferences, decisions, findings — without requiring the agent to explicitly call `save_memory`. Extraction never blocks the REPL and fails silently.
 
+#### Migration (`migration.py`, `cli.py`) — Stage One Phase 0
+
+Minion Assist has historically resolved two separate per-agent directories: `workspaces/{agent_id}/` (bootstrap files — `AGENTS.md`, `SOUL.md`, etc.) and `memory/{agent_id}/` (flat `LongTermMemory` notes). Stage One's memory implementation plan (see `minion-assist-docs/improve/memory-implementation-plan.md`) merges these into one root per agent. `memory/migration.py` and `memory/cli.py` implement that merge as a standalone, non-interactive CLI command — separate from the in-REPL `/` slash commands:
+
+```bash
+# Dry run (default) — reports what would happen, changes nothing.
+minion-assist memory migrate
+
+# Perform the merge. Legacy memory/{agent_id}/*.md notes are copied (never
+# moved or deleted) into workspaces/{agent_id}/{USER.md,memory/topics/,memory/imports/}.
+# Every destination file touched is backed up first.
+minion-assist memory migrate --apply
+
+# Undo a previous --apply using the manifest path it printed.
+minion-assist memory migrate --rollback "~/.minion-assist/memory-migration-backups/<timestamp>/migration-manifest.json"
+```
+
+Key mapping: `user_context` → `USER.md`; `_auto_extracted` and `_notes_YYYY-MM-DD` (unreviewed extractor/daily-log output) → `memory/imports/` (quarantined, not auto-promoted); every other note → `memory/topics/{key}.md`. A destination that already exists with *different* content than the source is classified as a conflict and is never auto-migrated — it must be resolved manually. See `docs/adr/0003-per-agent-memory-scope.md` for the full rationale.
+
+`memory/baseline.py` measures the current `LongTermMemory.search()` — recall and latency — against the checked-in fixture corpus at `tests/fixtures/memory_corpus/`, so later phases (PostgreSQL lexical index, embeddings) have a real number to compare against rather than an assumption. See `tests/fixtures/memory_corpus/README.md` for the recorded baseline and a known current gap (punctuation-sensitive matching).
+
 ---
 
 ### `session`

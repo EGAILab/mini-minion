@@ -219,7 +219,17 @@ def main() -> None:
 
     Streaming is enabled when ``config.json`` has ``"streaming": {"chat_mode": true}``.
     Context compaction is per-agent, sized to each model's ``context_window``.
+
+    ``minion-assist memory ...`` is a separate, non-interactive CLI subcommand
+    tree (see ``memory/cli.py``) — dispatched here, before any REPL setup, so
+    it never pays the cost of building sessions/providers/tools just to run a
+    migration report.
     """
+    import sys as _sys  # noqa: PLC0415
+    if len(_sys.argv) > 1 and _sys.argv[1] == "memory":
+        from .memory.cli import main as _memory_cli_main  # noqa: PLC0415
+        raise SystemExit(_memory_cli_main(_sys.argv[2:]))
+
     import argparse as _argparse  # noqa: PLC0415
     _parser = _argparse.ArgumentParser(prog="minion-assist", add_help=False)
     _parser.add_argument(
