@@ -30,6 +30,11 @@ def test_init_is_idempotent(tmp_path):
     assert (tmp_path / "memory" / "topics").is_dir()
 
 
+def test_root_property_returns_resolved_root(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    assert repo.root == tmp_path.resolve()
+
+
 # ---------------------------------------------------------------------------
 # _sanitize_key
 # ---------------------------------------------------------------------------
@@ -107,6 +112,19 @@ def test_list_keys_excludes_imports_and_daily_notes(tmp_path):
     (tmp_path / "memory" / "imports" / "imported.md").write_text("x", encoding="utf-8")
     repo.append_daily("daily entry")
     assert repo.list_keys() == ["topic-note"]
+
+
+def test_count_notes_reports_all_three_sources(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember("topic-note", "content")
+    (tmp_path / "memory" / "imports" / "imported.md").write_text("x", encoding="utf-8")
+    repo.append_daily("daily entry")
+    assert repo.count_notes() == {"topic": 1, "import": 1, "daily": 1}
+
+
+def test_count_notes_all_zero_for_empty_store(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    assert repo.count_notes() == {"topic": 0, "import": 0, "daily": 0}
 
 
 # ---------------------------------------------------------------------------

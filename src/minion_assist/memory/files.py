@@ -93,6 +93,11 @@ class MemoryFileRepository:
         for d in (self._memory_dir, self._topics_dir, self._imports_dir):
             d.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def root(self) -> Path:
+        """The agent's workspace root this repository reads/writes under."""
+        return self._root
+
     # -----------------------------------------------------------------
     # Explicit notes (memory/topics/) — replaces LongTermMemory.save/load/delete
     # -----------------------------------------------------------------
@@ -138,6 +143,18 @@ class MemoryFileRepository:
     def list_keys(self) -> list[str]:
         """Return every topic note's key, sorted alphabetically."""
         return [p.stem for p in sorted(self._topics_dir.glob("*.md"))]
+
+    def count_notes(self) -> dict[str, int]:
+        """Count notes by source — the primitive behind :class:`MemoryService`'s ``status()``.
+
+        Returns:
+            dict[str, int]: ``{"topic": N, "import": N, "daily": N}``.
+        """
+        return {
+            "topic": sum(1 for _ in self._topics_dir.glob("*.md")),
+            "import": sum(1 for _ in self._imports_dir.glob("*.md")),
+            "daily": sum(1 for _ in self._memory_dir.glob("*.md")),
+        }
 
     # -----------------------------------------------------------------
     # Daily notes (memory/YYYY-MM-DD.md) — the one merged daily-note path

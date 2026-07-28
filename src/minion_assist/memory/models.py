@@ -94,3 +94,26 @@ class MemoryExcerpt:
     end_line: int
     total_lines: int
     text: str
+
+
+@dataclass(frozen=True)
+class MemoryStatus:
+    """A snapshot of one agent's memory store — counts only, for now.
+
+    Returned by :meth:`MemoryService.status`. Deliberately minimal in Phase 1
+    (no jobs, no index health, no degraded-mode reporting — there is no
+    database or background worker yet). Later phases extend this rather than
+    replace it, once there is durable job/index state worth reporting on
+    (see ``docs/adr/0004-degraded-operation.md``).
+
+    Attributes:
+        root: The agent's workspace root this store reads from.
+        topic_count: Number of explicit notes under ``memory/topics/``.
+        import_count: Number of quarantined notes under ``memory/imports/``.
+        daily_count: Number of dated ``memory/YYYY-MM-DD.md`` files.
+    """
+
+    root: Path
+    topic_count: int
+    import_count: int
+    daily_count: int

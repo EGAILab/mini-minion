@@ -1862,6 +1862,23 @@ excerpt = repo.get(MemoryLocator(path=repo.resolve_path("memory/topics/project-g
 
 Two behavioral changes from `LongTermMemory`, both bug fixes rather than feature additions: `remember()` writes atomically (temp file + `os.replace`, so a crash mid-write can't corrupt a note — `LongTermMemory.save()`'s plain `write_text()` could), and `search()` spans three sources (`memory/topics/`, `memory/imports/`, and dated `memory/YYYY-MM-DD.md` files) instead of one flat directory, since the merged layout separates what used to be mixed together. Retrieval scoring itself (term-frequency + recency tiebreak, 20-result cap) is unchanged — Phase 1's goal is one canonical service with existing behavior, not better retrieval (that's Phase 3+).
 
+#### `MemoryService` (`service.py`) — Stage One Phase 1, slice 2
+
+**Also not yet wired in.** `MemoryService` is a thin facade over `MemoryFileRepository` — the one object `AgentSession`/tools will depend on once slice 3 rewires `minion.py` (currently they still hold a raw `LongTermMemory` reference). It translates `files.py`'s lower-level primitives into simpler calls: `get()` takes a plain path string instead of requiring the caller to build a `MemoryLocator`, and `status()` reports note counts without exposing the repository's directory layout.
+
+```python
+from minion_assist.memory.service import MemoryService
+from minion_assist.memory.files import MemoryFileRepository
+
+service = MemoryService(MemoryFileRepository(Path("~/.minion-assist/workspaces/main").expanduser()))
+service.remember("project-goals", "# Goals\n...")
+service.search("goals")                              # list[MemoryHit]
+service.get("memory/topics/project-goals.md", from_line=1, lines=20)  # MemoryExcerpt — no MemoryLocator needed
+service.status()                                       # MemoryStatus(topic_count=1, import_count=0, daily_count=0, ...)
+```
+
+One `MemoryService` per agent, each wrapping a repository rooted at that agent's own workspace directory, is the entire scope-enforcement story for now — Stage One's target design names several memory scopes (agent-private, user-shared, workspace, session-lineage, channel, import-quarantine), but only `agent-private` has a real caller today, so that's the only one enforced. See `docs/adr/0003-per-agent-memory-scope.md`.
+
 ---
 
 ### `session`
