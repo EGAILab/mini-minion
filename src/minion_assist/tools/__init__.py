@@ -48,7 +48,7 @@ from .find_definition import FindDefinitionTool
 from .git import GitCommitTool, GitDiffTool, GitStatusTool
 from .glob import GlobTool
 from .grep import GrepTool
-from .memory import SaveMemoryTool, SearchMemoryTool
+from .memory import MemoryGetTool, SaveMemoryTool, SearchMemoryTool
 from .patch import PatchPreviewTool
 from .session_search import SessionSearchTool
 from .policy import PermissionPolicy
@@ -177,6 +177,7 @@ def default_registry(
     if memory is not None:
         registry.register(SaveMemoryTool(memory, policy=_policy))
         registry.register(SearchMemoryTool(memory))
+        registry.register(MemoryGetTool(memory))
         # Lets the agent append notes to memory/YYYY-MM-DD.md without needing
         # to read -> edit -> write the whole file.
         registry.register(WriteDailyMemoryTool(memory, policy=_policy))
@@ -244,6 +245,7 @@ __all__ = [
     "GitDiffTool",
     "GitStatusTool",
     "GrepTool",
+    "MemoryGetTool",
     "PatchPreviewTool",
     "SaveMemoryTool",
     "SearchMemoryTool",

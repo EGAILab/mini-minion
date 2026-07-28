@@ -8,13 +8,29 @@ workspace without touching the real ~/.minion-assist config.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import minion_assist.config as config
 from minion_assist.memory import cli
+from minion_assist.memory.files import MemoryFileRepository
 
 
 def _patch_config(monkeypatch, tmp_path, agent_ids=("main",)):
     monkeypatch.setattr(config, "workspace", tmp_path)
     monkeypatch.setattr(config, "agents", {aid: {} for aid in agent_ids})
+    # _resolve_agent_root() falls back to bootstrap_cfg.path/cwd when an agent
+    # has no workspace directory (see test_doctor_warns_about_missing_workspace)
+    # — pin that fallback inside tmp_path so a test can never touch the real
+    # working directory's filesystem.
+    monkeypatch.setattr(config, "bootstrap", SimpleNamespace(path=str(tmp_path)))
+
+
+def _agent_root(tmp_path, agent_id: str):
+    """Pre-create workspaces/{agent_id}/ so agent_workspace_root() resolves it
+    directly, without falling back to bootstrap_cfg.path/cwd (irrelevant here)."""
+    root = tmp_path / "workspaces" / agent_id
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def test_migrate_dry_run_is_default(monkeypatch, tmp_path, capsys):
@@ -63,3 +79,180 @@ def test_main_rejects_unknown_subcommand():
     except SystemExit:
         parser_error_raised = True
     assert parser_error_raised
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+def test_status_reports_note_counts(monkeypatch, tmp_path, capsys):
+    root = _agent_root(tmp_path, "main")
+    MemoryFileRepository(root).remember("goal", "content")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["status"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "main:" in out
+    assert "1 topic" in out
+
+
+def test_status_filters_by_agent(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _agent_root(tmp_path, "researcher")
+    _patch_config(monkeypatch, tmp_path, agent_ids=("main", "researcher"))
+
+    exit_code = cli.main(["status", "--agent", "researcher"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "researcher:" in out
+    assert "main:" not in out
+
+
+def test_status_rejects_unknown_agent(monkeypatch, tmp_path):
+    _patch_config(monkeypatch, tmp_path)
+    try:
+        cli.main(["status", "--agent", "nope"])
+        raised = False
+    except SystemExit:
+        raised = True
+    assert raised
+
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+
+def test_list_shows_topic_keys(monkeypatch, tmp_path, capsys):
+    root = _agent_root(tmp_path, "main")
+    MemoryFileRepository(root).remember("project-goals", "content")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["list"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "project-goals" in out
+
+
+def test_list_empty_store_reports_zero(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["list"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "0 note(s)" in out
+
+
+# ---------------------------------------------------------------------------
+# get
+# ---------------------------------------------------------------------------
+
+def test_get_reads_bounded_slice(monkeypatch, tmp_path, capsys):
+    root = _agent_root(tmp_path, "main")
+    MemoryFileRepository(root).remember("note", "line1\nline2\nline3")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["get", "memory/topics/note.md", "--agent", "main", "--from-line", "2"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "line2" in out
+    assert "line3" in out
+    assert "line1" not in out
+    assert "lines 2-3 of 3" in out
+
+
+def test_get_reports_missing_file(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["get", "memory/topics/missing.md", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error" in out
+    assert "not found" in out.lower()
+
+
+def test_get_rejects_path_outside_root(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["get", "../../etc/passwd", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "outside the memory root" in out
+
+
+# ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+
+def test_search_finds_matching_note(monkeypatch, tmp_path, capsys):
+    root = _agent_root(tmp_path, "main")
+    MemoryFileRepository(root).remember("api-notes", "REST API best practices")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["search", "REST"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "api-notes" in out
+    assert "[topic]" in out
+
+
+def test_search_no_matches_reports_zero(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["search", "xyzzy"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "0 match(es)" in out
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+def test_doctor_reports_ok_when_nothing_pending(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "OK: no un-migrated legacy data found." in out
+
+
+def test_doctor_warns_about_pending_legacy_notes(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    legacy_dir = tmp_path / "memory" / "main"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "old-note.md").write_text("legacy content", encoding="utf-8")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "not yet migrated" in out
+
+
+def test_doctor_warns_about_missing_workspace(monkeypatch, tmp_path, capsys):
+    # No _agent_root() call — the agent has no workspace directory at all.
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "no workspace directory yet" in out

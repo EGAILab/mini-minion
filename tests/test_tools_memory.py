@@ -82,6 +82,8 @@ def test_default_registry_with_memory_has_memory_tools(tmp_path):
     names = {d["function"]["name"] for d in reg.definitions}
     assert "save_memory" in names
     assert "search_memory" in names
+    assert "memory_get" in names
+    assert "write_daily_memory" in names
 
 
 def test_default_registry_without_memory_has_no_memory_tools():
@@ -91,6 +93,8 @@ def test_default_registry_without_memory_has_no_memory_tools():
     names = {d["function"]["name"] for d in reg.definitions}
     assert "save_memory" not in names
     assert "search_memory" not in names
+    assert "memory_get" not in names
+    assert "write_daily_memory" not in names
 
 
 def test_search_memory_cap_note_shown_when_limit_hit(tmp_path):

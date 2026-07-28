@@ -35,12 +35,13 @@ intentionally a different tree from the tool sandbox boundary (``root`` /
 boundary here would incorrectly reject every memory write. Only the
 ``read_only_mode`` flag applies.
 
-Two-class design
-----------------
-:class:`SaveMemoryTool` and :class:`SearchMemoryTool` are separate because
-the LLM needs to distinguish between "write/replace a named note" and
-"search my memory" — they have completely different schemas and behaviors.
-Both receive the same
+Three-class design
+------------------
+:class:`SaveMemoryTool`, :class:`SearchMemoryTool`, and :class:`MemoryGetTool`
+are separate because the LLM needs to distinguish between "write/replace a
+named note", "search my memory" (relevance-ranked), and "read this exact
+file/line-range I already know about" (no ranking) — they have completely
+different schemas and behaviors. All three receive the same
 :class:`~minion_assist.memory.service.MemoryService` instance at construction
 time (dependency injection).
 
@@ -232,3 +233,90 @@ class SearchMemoryTool(Tool):
         if capped:
             output += f"\n\n(Results capped at {_SEARCH_MAX_RESULTS}. Use a more specific keyword to narrow results.)"
         return output
+
+
+class MemoryGetTool(Tool):
+    """Tool for reading an exact, bounded slice of a memory file — not a search.
+
+    Unlike :class:`SearchMemoryTool` (relevance-ranked, whole-note results),
+    this tool reads a *specific* file the agent already knows the path to
+    (e.g. one returned by :class:`SearchMemoryTool` or listed by
+    ``memory status``/``memory list``), optionally bounded to a line range —
+    the plan's ``memory_get`` (Stage One Phase 1, slice 5). It never ranks or
+    interprets content; it just cites exact lines.
+
+    Args:
+        memory (MemoryService): The memory backend to read from.
+    """
+
+    def __init__(self, memory: MemoryService) -> None:
+        self._memory = memory
+
+    @property
+    def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
+        return ToolSchema(
+            name="memory_get",
+            description=(
+                "Read an exact slice of a memory file by path, optionally bounded to a "
+                "line range. Use this for a specific file you already know the path to "
+                "(e.g. from search_memory or memory status/list) — not for searching."
+            ),
+            is_read_only=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Path to the memory file, relative to the agent's workspace "
+                            "root (e.g. 'memory/topics/project-goals.md' or 'MEMORY.md')."
+                        ),
+                    },
+                    "from_line": {
+                        "type": "integer",
+                        "description": "1-indexed starting line. Omit to start from the beginning.",
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Maximum lines to return. Omit to read to the end.",
+                    },
+                },
+                "required": ["path"],
+            },
+        )
+
+    def execute(self, **kwargs: object) -> str:
+        """Read a bounded slice of a memory file.
+
+        Args:
+            path (str): Path to the file, relative to the agent's workspace
+                root or absolute (must resolve inside it).
+            from_line (int, optional): 1-indexed starting line.
+            lines (int, optional): Maximum number of lines to return.
+
+        Returns:
+            str: The requested text with a citation header (path and line
+                range), or an error message if the path is invalid or the
+                file doesn't exist.
+        """
+        path = str(kwargs["path"])
+        from_line = kwargs.get("from_line")
+        lines = kwargs.get("lines")
+
+        try:
+            excerpt = self._memory.get(
+                path,
+                from_line=int(from_line) if from_line is not None else None,
+                lines=int(lines) if lines is not None else None,
+            )
+        except ValueError as exc:
+            return f"Error: {exc}"
+        except FileNotFoundError:
+            return f"Error: file not found: {path}"
+
+        header = (
+            f"[{excerpt.path} lines {excerpt.start_line}-{excerpt.end_line} "
+            f"of {excerpt.total_lines}]"
+        )
+        return f"{header}\n{excerpt.text}"

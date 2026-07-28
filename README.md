@@ -1513,6 +1513,7 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `SaveMemoryTool` | `save_memory` | Save a Markdown note to memory under a given key. Blocked by `read_only_mode`. |
 | `WriteDailyMemoryTool` | `write_daily_memory` | Append a quick timestamped bullet to today's daily log (`memory/YYYY-MM-DD.md`). No key needed — great for ephemeral observations. Blocked by `read_only_mode`. |
 | `SearchMemoryTool` | `search_memory` | Keyword search across memory. Results ranked by term frequency and recency. Capped at 20. `is_read_only=True`. |
+| `MemoryGetTool` | `memory_get` | Read an exact, bounded slice of a memory file by path (optional `from_line`/`lines`) — a targeted follow-up read, not a search. `is_read_only=True`. |
 | `SkillTool` | `skill` | Load a skill's instructions into context by name. Only registered when skills are discovered at startup. |
 | `ReadTaskTool` | `read_task` | Read the current task progress file — goal, steps, status, notes, and context. |
 | `UpdateTaskTool` | `update_task` | Create a new task (goal + steps) or update an existing one (step status, notes, context, or clear). |
@@ -1594,7 +1595,7 @@ reg = default_registry(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `memory` | `MemoryService \| None` | `None` | If provided, registers `save_memory`, `search_memory`, and `write_daily_memory` |
+| `memory` | `MemoryService \| None` | `None` | If provided, registers `save_memory`, `search_memory`, `memory_get`, and `write_daily_memory` |
 | `root` | `Path \| None` | `None` | Workspace root — `read`/`write`/`glob`/`edit`/`grep` reject paths outside this boundary |
 | `bash_confirm` | `Callable[[str], bool] \| None` | `None` | Simple bool callback called before every bash command; `None` = no confirmation |
 | `bash_approval` | `Callable[[str], ApprovalDecision] \| None` | `None` | Rich 4-option approval callback (ALLOW_ONCE, ALLOW_SESSION, DENY, ALWAYS_DENY). Takes priority over `bash_confirm` when both are set. The CLI wires this to a menu that also records decisions to the policy's audit log. |
@@ -1867,6 +1868,27 @@ minion-assist memory migrate --rollback "~/.minion-assist/memory-migration-backu
 ```
 
 Key mapping: `user_context` → `USER.md`; `_auto_extracted` and `_notes_YYYY-MM-DD` (unreviewed extractor/daily-log output) → `memory/imports/` (quarantined, not auto-promoted); every other note → `memory/topics/{key}.md`. A destination that already exists with *different* content than the source is classified as a conflict and is never auto-migrated — it must be resolved manually. See `docs/adr/0003-per-agent-memory-scope.md` for the full rationale.
+
+`memory/cli.py` also exposes read-only diagnostic subcommands (Stage One Phase 1, slice 5), each building the same `MemoryService` the running agent would use:
+
+```bash
+# Note counts for every configured agent, or one with --agent.
+minion-assist memory status [--agent main]
+
+# List explicit note keys (memory/topics/).
+minion-assist memory list [--agent main]
+
+# Exact, bounded read — same as the memory_get tool, from the shell.
+minion-assist memory get memory/topics/project-goals.md --agent main [--from-line N] [--lines N]
+
+# Keyword search across one or every agent's memory.
+minion-assist memory search "REST API" [--agent main]
+
+# Note counts plus a check for un-migrated legacy data (the closest thing
+# Phase 1 has to a health check — no database/job/index exists yet to
+# report on further; see docs/adr/0004-degraded-operation.md).
+minion-assist memory doctor [--agent main]
+```
 
 `memory/baseline.py` measures the legacy `LongTermMemory.search()` — recall and latency — against the checked-in fixture corpus at `tests/fixtures/memory_corpus/`, so later phases (PostgreSQL lexical index, embeddings) have a real number to compare against rather than an assumption. See `tests/fixtures/memory_corpus/README.md` for the recorded baseline and a known current gap (punctuation-sensitive matching).
 
