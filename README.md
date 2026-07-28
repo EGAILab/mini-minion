@@ -1841,6 +1841,27 @@ Key mapping: `user_context` → `USER.md`; `_auto_extracted` and `_notes_YYYY-MM
 
 `memory/baseline.py` measures the current `LongTermMemory.search()` — recall and latency — against the checked-in fixture corpus at `tests/fixtures/memory_corpus/`, so later phases (PostgreSQL lexical index, embeddings) have a real number to compare against rather than an assumption. See `tests/fixtures/memory_corpus/README.md` for the recorded baseline and a known current gap (punctuation-sensitive matching).
 
+#### `MemoryFileRepository` (`files.py`, `models.py`) — Stage One Phase 1, slice 1
+
+**Not yet wired into `AgentSession`/tools** — this is the first of several Phase 1 slices; `LongTermMemory` is still what's actually used at runtime today. `MemoryFileRepository` is the eventual replacement: it targets the *merged* per-agent layout (`workspaces/{agent_id}/memory/{topics,imports}/`, `workspaces/{agent_id}/memory/YYYY-MM-DD.md`) that Phase 0's migration produces, rather than the legacy flat `memory/{agent_id}/{key}.md` root.
+
+```python
+from minion_assist.memory.files import MemoryFileRepository
+from minion_assist.memory.models import MemoryLocator
+
+repo = MemoryFileRepository(Path("~/.minion-assist/workspaces/main").expanduser())
+repo.remember("project-goals", "# Goals\n...")          # -> memory/topics/project-goals.md
+repo.load("project-goals")                                # str | None
+repo.search("goals")                                       # list[MemoryHit] (topic + import + daily, tagged by source)
+repo.append_daily("did a thing")                           # -> memory/YYYY-MM-DD.md, timestamped bullet
+repo.delete("project-goals")                                # bool
+
+# Exact bounded read — new in Phase 1, no equivalent in LongTermMemory.
+excerpt = repo.get(MemoryLocator(path=repo.resolve_path("memory/topics/project-goals.md"), from_line=1, lines=20))
+```
+
+Two behavioral changes from `LongTermMemory`, both bug fixes rather than feature additions: `remember()` writes atomically (temp file + `os.replace`, so a crash mid-write can't corrupt a note — `LongTermMemory.save()`'s plain `write_text()` could), and `search()` spans three sources (`memory/topics/`, `memory/imports/`, and dated `memory/YYYY-MM-DD.md` files) instead of one flat directory, since the merged layout separates what used to be mixed together. Retrieval scoring itself (term-frequency + recency tiebreak, 20-result cap) is unchanged — Phase 1's goal is one canonical service with existing behavior, not better retrieval (that's Phase 3+).
+
 ---
 
 ### `session`
