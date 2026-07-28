@@ -393,6 +393,7 @@ class AgentSession:
         workspace_root: Path | None = None,
         log_dir: Path | None = None,
         db: object | None = None,
+        model_id: str = "",
     ) -> None:
         self._agent_id = agent_id
         self._session_id = session_id
@@ -423,6 +424,11 @@ class AgentSession:
         self._log_dir = log_dir
         # Optional PostgreSQL session/message store (None = disabled).
         self._db = db
+        # Model identifier string — included in durable capture jobs'
+        # idempotency key (Stage One Phase 2, slice C) so a model change
+        # produces a fresh extraction instead of silently reusing results
+        # keyed under the old model.
+        self._model_id = model_id
 
         # Compute injection limits proportionally from the model's context window.
         # This ensures every budget scales automatically when the model is switched.
@@ -567,6 +573,9 @@ class AgentSession:
         _trace_id = str(uuid.uuid4())
         _start = time.monotonic()
         _compacted = False
+        # PostgreSQL ids of mirrored user/assistant messages this turn — used to
+        # enqueue a durable capture job's source range (Stage One Phase 2, slice C).
+        _mirrored_ua_ids: list[int] = []
 
         # Phase 5: workspace attestation — verify the workspace dir is still present.
         # Raises WorkspaceVanishedError immediately so the provider is never called
@@ -692,10 +701,12 @@ class AgentSession:
         if self._db is not None:
             try:
                 _user_msg = self._history[-1]
-                self._db.mirror_message(
+                _uid = self._db.mirror_message(
                     self._session_id, _user_msg[EVENT_ID_KEY], "user", _msg_text(_user_msg),
                     timestamp=time.time(),
                 )
+                if _uid is not None:
+                    _mirrored_ua_ids.append(_uid)
             except Exception:
                 pass
 
@@ -762,10 +773,12 @@ class AgentSession:
                         _content = _msg_text(_msg)
                         _tool_name = _msg.get("name") or _msg.get("tool_name")
                         if _content or _tool_name:
-                            self._db.mirror_message(
+                            _mid = self._db.mirror_message(
                                 self._session_id, ensure_event_id(_msg), _role, _content,
                                 tool_name=_tool_name, timestamp=_ts,
                             )
+                            if _mid is not None and _role in ("user", "assistant") and _content:
+                                _mirrored_ua_ids.append(_mid)
                     self._db.update_session(
                         self._session_id,
                         last_active=_ts,
@@ -774,17 +787,40 @@ class AgentSession:
                 except Exception:
                     pass
 
-            # Fire background memory extraction from the last exchange.
-            # Daemon thread — never blocks the REPL.
+            # Trigger memory extraction from the last exchange.
             # Skipped when enable_memory_extraction=False (e.g. expensive models,
             # config.json "memory": {"enable_extraction": false}).
             if self._memory is not None and self._enable_memory_extraction:
-                from ..memory.extractor import extract_and_save_async
-                _last = [
-                    m for m in self._history[-6:]
-                    if m.get("role") in ("user", "assistant") and m.get("content")
-                ]
-                extract_and_save_async(self._memory, self._provider, _last[-2:])
+                if self._db is not None:
+                    # Durable capture job (Stage One Phase 2, slice C) — replaces
+                    # the daemon-thread extractor when a database is configured.
+                    # Enqueue is a no-op if this exact (session, id-range, prompt
+                    # version, model) was already enqueued — see session/db.py's
+                    # "Durable capture jobs" docstring.
+                    _job_ids = _mirrored_ua_ids[-2:]
+                    if _job_ids:
+                        from ..memory.extractor import _EXTRACTION_PROMPT_VERSION
+                        _from_id, _to_id = min(_job_ids), max(_job_ids)
+                        _idem_key = (
+                            f"{self._agent_id}:{self._session_id}:{_from_id}-{_to_id}:"
+                            f"{_EXTRACTION_PROMPT_VERSION}:{self._model_id}"
+                        )
+                        try:
+                            self._db.enqueue_capture_job(
+                                self._agent_id, self._session_id, _from_id, _to_id, _idem_key,
+                            )
+                        except Exception:
+                            pass
+                else:
+                    # Degraded path: no database configured, so there is no
+                    # durable queue to enqueue into. Daemon thread — never
+                    # blocks the REPL.
+                    from ..memory.extractor import extract_and_save_async
+                    _last = [
+                        m for m in self._history[-6:]
+                        if m.get("role") in ("user", "assistant") and m.get("content")
+                    ]
+                    extract_and_save_async(self._memory, self._provider, _last[-2:])
 
             # Emit TurnCompleted — ignored by CLI, consumed by structured log handlers.
             if on_event:

@@ -179,7 +179,8 @@ minion-assist/
 │   │   ├── files.py             # MemoryFileRepository — merged workspace-root note store
 │   │   ├── service.py           # MemoryService — facade AgentSession/tools depend on
 │   │   ├── models.py            # MemoryHit, MemoryLocator, MemoryExcerpt, MemoryStatus
-│   │   ├── extractor.py         # Background fact extraction after each turn
+│   │   ├── extractor.py         # Background fact extraction (degraded-mode path, no db)
+│   │   ├── capture_worker.py    # CaptureWorker — durable capture-job queue worker (needs db)
 │   │   ├── migration.py         # Phase 0: legacy-root -> merged-root migration tooling
 │   │   ├── cli.py               # `minion-assist memory migrate` subcommand
 │   │   ├── baseline.py          # Retrieval recall/latency measurement vs. fixture corpus
@@ -363,10 +364,14 @@ AgentSession.send(message, on_event=callback, stream=True/False)
            ├─ short_term.save(agent_id, messages)   ← persists history to JSONL (always)
            ├─ session_store.touch(agent_id, ...)    ← updates turn count / timestamp
            ├─ db.mirror_message(...) [optional]     ← idempotent PostgreSQL mirror for FTS search
-           └─ extract_and_save_async(memory, provider, last_exchange)
+           └─ [if db configured] db.enqueue_capture_job(...) — durable queue row,
+                  processed later by the standalone CaptureWorker thread (Phase 2 slice C)
+              [else] extract_and_save_async(memory, provider, last_exchange)
                   daemon thread — extracts 0–3 key facts, appends to quarantined
                   memory/imports/_auto_extracted.md (see MemoryService.remember_import)
 ```
+
+`CaptureWorker` (`memory/capture_worker.py`) is a single background thread, started once at process startup (not per turn), that polls `memory_capture_jobs` for due work and records extracted facts as `memory_proposals` rows. See "Durable capture-job queue" under PostgreSQL Integration for the full schema and design rationale.
 
 **Event system:** `run_turn` and `AgentSession` emit structured event objects to the `on_event` callback rather than calling `print()` or `input()` directly. This makes the agent runtime usable headlessly (tests, scripts, web APIs) — pass `on_event=None` for silent execution.
 
@@ -1110,6 +1115,7 @@ On every startup minion-assist will:
 2. Reconcile every JSONL session file against `message_mirrors` (Stage One Phase 2, slice A) — mirrors exactly the messages that aren't mirrored yet. Safe to run every time, not just once: a session partially mirrored by a prior crash is completed here rather than left behind.
 3. Register the `session_search` tool in every agent's tool registry.
 4. Dual-write every new message to both JSONL and PostgreSQL, idempotently (see below).
+5. Start one `CaptureWorker` background thread that services the durable capture-job queue for every agent (see below).
 
 ### Schema
 
@@ -1119,12 +1125,32 @@ On every startup minion-assist will:
 | `messages` | Every message with a `tsvector` generated column for FTS, GIN-indexed. Columns: `id` (BIGSERIAL), `session_id`, `role`, `content`, `tool_name`, `timestamp`, `search_vector` |
 | `message_embeddings` | Optional — created only when the `vector` extension (pgvector) is available. Holds `vector(1536)` embeddings for future semantic search. |
 | `message_mirrors` | Idempotency ledger, `PRIMARY KEY (session_id, event_id)`. Every mirror attempt is keyed by a message's stable `event_id` (see below) — mirroring the same message twice is a no-op, not a duplicate row. |
+| `memory_capture_jobs` | Durable fact-extraction queue. Columns: `id` (BIGSERIAL), `agent_id`, `session_id`, `source_from_message_id`, `source_to_message_id`, `idempotency_key` (UNIQUE), `state` (`pending`/`running`/`done`/`failed`), `attempts`, `run_after`, `last_error`, `created_at`, `updated_at`. |
+| `memory_proposals` | Unreviewed extracted claims. Columns: `id` (BIGSERIAL), `job_id`, `agent_id`, `claim_text`, `created_at`. |
 
 ### Idempotent mirroring (Stage One Phase 2, slice A)
 
 Every message dict carries an internal `_event_id` (`messages.py`'s `EVENT_ID_KEY`/`ensure_event_id()`) — a UUID assigned the first time a database is configured for that message, persisted to JSONL from then on. `SessionDB.mirror_message(session_id, event_id, ...)` checks `message_mirrors` before inserting, so the same message is never mirrored twice. This key is internal-only: `providers/openai_compatible.py`'s message-preparation function strips it before any request reaches the LLM API (the only provider conversion that rebuilds a message via dict-spread; Anthropic's and Codex's converters already extract named fields one at a time and drop it naturally).
 
 Without a configured database, no `_event_id` is assigned at all — there's nothing to mirror, so assigning one would just be unused noise in the JSONL file.
+
+### Durable capture-job queue (Stage One Phase 2, slice C)
+
+When a database is configured, `AgentSession` no longer fires a per-turn daemon thread for fact extraction. Instead, after each turn it calls `db.enqueue_capture_job(...)`, writing one durable row to `memory_capture_jobs` keyed by `(agent_id, session_id, source_from_message_id, source_to_message_id, prompt_version, model_id)` — enqueuing the same turn twice (e.g. after a crash-and-restart replays it) is a no-op, not a duplicate job.
+
+One `CaptureWorker` (`memory/capture_worker.py`), started once at process startup — not per turn — polls this queue continuously:
+
+```python
+job = db.claim_next_capture_job()   # SELECT ... FOR UPDATE SKIP LOCKED
+```
+
+`FOR UPDATE SKIP LOCKED` lets the claim be a single atomic statement even if more than one worker process is running — a row already being processed is simply skipped, never double-claimed. On success the worker calls `db.complete_capture_job(job_id, facts)`, writing each fact as its own `memory_proposals` row. On failure it calls `db.fail_capture_job(job_id, error, backoff_seconds, max_attempts)`, which reschedules `run_after` with exponential backoff (`2.0 * 2**attempts` seconds) and permanently marks the job `failed` after 5 attempts.
+
+`extract_facts(provider, exchange)` (`memory/extractor.py`) is the shared prompt/parsing primitive both the degraded-mode daemon thread and `CaptureWorker` call — but the two wrap it differently on purpose. The daemon thread swallows provider exceptions (fire-and-forget best-effort). `CaptureWorker` lets them propagate, since its own retry/backoff loop needs to see the failure to reschedule the job.
+
+**Known, accepted gap:** `memory_proposals` rows are not yet surfaced anywhere — not in `search_memory`, not in `<relevant_memories>` injection. They sit inert until Stage One Phase 5 (consolidation) exists to review and promote them into curated notes. This is a deliberate scope boundary for slice C, not an oversight — see `minion-assist-docs/improve/memory-implementation-plan.md`.
+
+Without a configured database, `CaptureWorker` is never constructed and `AgentSession` falls back to the original per-turn daemon-thread path described above (`extract_and_save_async`).
 
 ### `session_search` Tool Modes
 
@@ -1140,7 +1166,7 @@ When using `docker-compose.yml`, PostgreSQL data is persisted to `../data/` (rel
 
 ### Graceful degradation
 
-If the database is unavailable at startup, minion-assist prints a warning and continues in file-only mode — `session_search` is simply not registered. No existing functionality is affected.
+If the database is unavailable at startup, minion-assist prints a warning and continues in file-only mode — `session_search` is not registered and `CaptureWorker` is never started. Fact extraction still happens via the original per-turn daemon thread (`extract_and_save_async`). No existing functionality is affected.
 
 ---
 
@@ -1417,7 +1443,7 @@ md = session.export(format="md")   # "md" (default) or "html"
 
 When `memory` is provided, `AgentSession`:
 - Searches memory before each turn and injects the top-5 matching snippets as a `<relevant_memories>` block (capped at `memory_injection_tokens * 4` characters).
-- Fires background fact extraction after each successful turn (daemon thread — never blocks the REPL). Can be disabled via `enable_memory_extraction=False` (or `config.json` `"memory": {"enable_extraction": false}`).
+- Fires background fact extraction after each successful turn — enqueues a durable `memory_capture_jobs` row for `CaptureWorker` if a database is configured, otherwise falls back to a fire-and-forget daemon thread (never blocks the REPL either way). Can be disabled via `enable_memory_extraction=False` (or `config.json` `"memory": {"enable_extraction": false}`).
 
 (Stable user-profile injection — formerly a separate `<user_context>` block loaded once at init from a `user_context` note — is handled by `bootstrap.py`'s live `USER.md` mechanism instead; see the `memory` module reference below.)
 
@@ -1848,18 +1874,25 @@ One `MemoryService` per agent, each wrapping a repository rooted at that agent's
 
 **Retired: the `user_context` reserved key.** `AgentSession` used to load a separate `user_context.md` note once at construction and inject it as a static `<user_context>` block. That duplicated `bootstrap.py`'s live `USER.md` injection once Phase 0 migrated `user_context.md` → `USER.md`, so it was removed in Phase 1 — write to `USER.md` directly (or via the `write`/`edit` tools) to give the agent persistent background about yourself; it's re-read live every turn, no restart needed.
 
-#### Background extractor (`extractor.py`)
+#### Background extractor (`extractor.py`) and durable capture (`capture_worker.py`)
 
 ```python
-from minion_assist.memory.extractor import extract_and_save_async
+from minion_assist.memory.extractor import extract_and_save_async, extract_facts
 
-# Fire after a successful turn — returns immediately (daemon thread)
+# Degraded mode (no database configured) — fire after a successful turn,
+# returns immediately (daemon thread), fails silently.
 extract_and_save_async(memory, provider, last_exchange)
+
+# The shared primitive both paths call — does NOT catch provider exceptions,
+# so CaptureWorker's own retry/backoff loop can see failures and reschedule.
+facts: list[str] = extract_facts(provider, exchange)
 ```
 
-After each successful turn, `AgentSession` fires `extract_and_save_async` in a daemon thread. The function sends the last user↔assistant exchange to the provider with a short extraction prompt and appends any discovered facts (0–3 per turn, max 100 chars each) to a rolling, quarantined `memory/imports/_auto_extracted.md` file (capped at 50 entries, via `MemoryService.remember_import`/`load_import`).
+Without a configured database, `AgentSession` fires `extract_and_save_async` in a daemon thread after each successful turn. It calls `extract_facts()` internally but swallows any exception — a best-effort, fire-and-forget note. Discovered facts (0–3 per turn, max 100 chars each) are appended to a rolling, quarantined `memory/imports/_auto_extracted.md` file (capped at 50 entries, via `MemoryService.remember_import`/`load_import`).
 
-This captures key facts — user preferences, decisions, findings — without requiring the agent to explicitly call `save_memory`. Extraction never blocks the REPL and fails silently.
+With a configured database, `AgentSession` instead enqueues a `memory_capture_jobs` row and the standalone `CaptureWorker` thread (see "Durable capture-job queue" under PostgreSQL Integration) claims it, calls `extract_facts()`, and writes results as `memory_proposals` rows — durable across restarts, with retry/backoff on failure, but not yet surfaced in `search_memory` (a known, accepted gap until Stage One Phase 5).
+
+Either way, this captures key facts — user preferences, decisions, findings — without requiring the agent to explicitly call `save_memory`. Extraction never blocks the REPL.
 
 #### Legacy store (`long_term.py`)
 

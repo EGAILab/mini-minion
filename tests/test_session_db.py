@@ -16,6 +16,7 @@ in the shared dev database.
 
 from __future__ import annotations
 
+import time
 import uuid
 
 import pytest
@@ -50,10 +51,49 @@ def session_id():
     return f"test-{uuid.uuid4()}"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _purge_stale_test_rows():
+    """Purge leftover rows before this file's tests run at all.
+
+    claim_next_capture_job() is a genuinely global queue operation (by
+    design — one worker services every session), so any *other* pending row
+    can be claimed instead of the one a test just enqueued, since both are
+    "the oldest pending job" from the query's point of view. Per-test
+    cleanup alone can't fix this — it only runs after a test that actually
+    completes, and it only ever touches rows the *same* test created.
+
+    In practice this isn't limited to interrupted-run leftovers: other test
+    files (e.g. test_minion.py) build real AgentSessions against the actual
+    configured database and enqueue genuine capture jobs under plain
+    session-id UUIDs (not prefixed 'test-') as a side effect of exercising
+    send(). memory_capture_jobs/memory_proposals are new tables introduced
+    by this feature — nothing pre-existing could have meaningful data in
+    them — so it's safe to wipe them unconditionally rather than filtering
+    by session_id prefix, which would otherwise miss exactly this case.
+    messages/message_mirrors/sessions predate this feature, so those stay
+    scoped to this file's own 'test-' prefixed rows.
+    """
+    conn = _psycopg.connect(_DB_URL, autocommit=True)
+    conn.execute("DELETE FROM memory_proposals")
+    conn.execute("DELETE FROM memory_capture_jobs")
+    conn.execute("DELETE FROM message_mirrors WHERE session_id LIKE 'test-%'")
+    conn.execute("DELETE FROM messages WHERE session_id LIKE 'test-%'")
+    conn.execute("DELETE FROM sessions WHERE id LIKE 'test-%'")
+    conn.close()
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_after(db, session_id):
     yield
     conn = db._conn()
+    conn.execute(
+        """
+        DELETE FROM memory_proposals
+        WHERE job_id IN (SELECT id FROM memory_capture_jobs WHERE session_id = %s)
+        """,
+        (session_id,),
+    )
+    conn.execute("DELETE FROM memory_capture_jobs WHERE session_id = %s", (session_id,))
     conn.execute("DELETE FROM message_mirrors WHERE session_id = %s", (session_id,))
     conn.execute("DELETE FROM messages WHERE session_id = %s", (session_id,))
     conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
@@ -181,3 +221,143 @@ def test_reconcile_all_sessions_skips_agents_with_no_sessions(db, tmp_path):
     short_term = ShortTermMemory(tmp_path)
     total = db.reconcile_all_sessions(short_term, ["nonexistent-agent"])
     assert total == 0
+
+
+# ---------------------------------------------------------------------------
+# get_messages_in_range
+# ---------------------------------------------------------------------------
+
+def test_get_messages_in_range_returns_ordered_messages(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first", timestamp=1.0)
+    id2 = db.mirror_message(session_id, "e2", "assistant", "second", timestamp=2.0)
+
+    messages = db.get_messages_in_range(session_id, id1, id2)
+
+    assert [m["content"] for m in messages] == ["first", "second"]
+
+
+def test_get_messages_in_range_excludes_outside_range(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first", timestamp=1.0)
+    db.mirror_message(session_id, "e2", "assistant", "second", timestamp=2.0)
+
+    messages = db.get_messages_in_range(session_id, id1, id1)
+
+    assert [m["content"] for m in messages] == ["first"]
+
+
+# ---------------------------------------------------------------------------
+# Durable capture jobs (Stage One Phase 2, slice C)
+# ---------------------------------------------------------------------------
+
+def test_enqueue_capture_job_returns_job_id(db, session_id):
+    job_id = db.enqueue_capture_job(
+        "main", session_id, source_from_message_id=1, source_to_message_id=2,
+        idempotency_key=f"key-{session_id}",
+    )
+    assert job_id is not None
+
+
+def test_enqueue_capture_job_idempotent(db, session_id):
+    key = f"key-{session_id}"
+    first = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=key)
+    second = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=key)
+
+    assert first is not None
+    assert second is None  # no-op, not a duplicate job
+
+
+def test_claim_next_capture_job_returns_a_pending_job(db, session_id):
+    db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+
+    job = db.claim_next_capture_job()
+
+    assert job is not None
+    assert job["agent_id"] == "main"
+    assert job["session_id"] == session_id
+    assert job["source_from_message_id"] == 1
+    assert job["source_to_message_id"] == 2
+    assert job["attempts"] == 0
+
+
+def test_claim_next_capture_job_does_not_reclaim_running_job(db, session_id):
+    db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    first_claim = db.claim_next_capture_job()
+
+    second_claim = db.claim_next_capture_job()
+
+    assert first_claim is not None
+    assert second_claim is None  # already claimed (state='running'), not due again
+
+
+def test_complete_capture_job_records_proposals_and_marks_done(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+
+    db.complete_capture_job(job_id, ["User prefers dark mode.", "User's dog is named Biscuit."])
+
+    state_row = db._conn().execute(
+        "SELECT state FROM memory_capture_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert state_row[0] == "done"
+    proposal_rows = db._conn().execute(
+        "SELECT claim_text FROM memory_proposals WHERE job_id = %s ORDER BY id", (job_id,)
+    ).fetchall()
+    assert [r[0] for r in proposal_rows] == [
+        "User prefers dark mode.", "User's dog is named Biscuit.",
+    ]
+
+
+def test_complete_capture_job_with_no_proposals_still_marks_done(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+
+    db.complete_capture_job(job_id, [])
+
+    state_row = db._conn().execute(
+        "SELECT state FROM memory_capture_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert state_row[0] == "done"
+
+
+def test_fail_capture_job_reschedules_with_backoff(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+
+    db.fail_capture_job(job_id, "boom", backoff_seconds=100.0, max_attempts=5)
+
+    row = db._conn().execute(
+        "SELECT state, attempts, run_after, last_error FROM memory_capture_jobs WHERE id = %s",
+        (job_id,),
+    ).fetchone()
+    assert row[0] == "pending"  # eligible for retry
+    assert row[1] == 1
+    assert row[2] > time.time()  # scheduled in the future
+    assert row[3] == "boom"
+
+
+def test_fail_capture_job_gives_up_after_max_attempts(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+
+    for _ in range(3):
+        db.claim_next_capture_job()
+        db.fail_capture_job(job_id, "boom", backoff_seconds=-1.0, max_attempts=3)
+
+    row = db._conn().execute(
+        "SELECT state, attempts FROM memory_capture_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "failed"
+    assert row[1] == 3
+
+
+def test_failed_job_is_reclaimable_after_backoff_expires(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+    db.fail_capture_job(job_id, "boom", backoff_seconds=-1.0, max_attempts=5)  # already due
+
+    job = db.claim_next_capture_job()
+
+    assert job is not None
+    assert job["id"] == job_id
+    assert job["attempts"] == 1

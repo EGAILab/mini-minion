@@ -12,7 +12,9 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-from minion_assist.memory.extractor import _MAX_ROLLING_ENTRIES, _worker
+import pytest
+
+from minion_assist.memory.extractor import _MAX_ROLLING_ENTRIES, _worker, extract_facts
 from minion_assist.memory.files import MemoryFileRepository
 from minion_assist.memory.service import MemoryService
 from minion_assist.providers.base import LLMResponse
@@ -105,3 +107,33 @@ def test_worker_swallows_provider_exceptions(tmp_path):
     _worker(service, provider, _EXCHANGE)
 
     assert service.load_import("_auto_extracted") is None
+
+
+# ---------------------------------------------------------------------------
+# extract_facts (Stage One Phase 2, slice C — the shared primitive)
+# ---------------------------------------------------------------------------
+# Unlike _worker, extract_facts() does NOT catch provider exceptions — the
+# durable capture worker's own retry/backoff loop needs them to propagate.
+
+def test_extract_facts_returns_parsed_lines():
+    provider = _provider_returning("fact one\nfact two")
+    assert extract_facts(provider, _EXCHANGE) == ["fact one", "fact two"]
+
+
+def test_extract_facts_returns_empty_list_for_nothing():
+    provider = _provider_returning("NOTHING")
+    assert extract_facts(provider, _EXCHANGE) == []
+
+
+def test_extract_facts_caps_at_three():
+    provider = _provider_returning("one\ntwo\nthree\nfour")
+    assert extract_facts(provider, _EXCHANGE) == ["one", "two", "three"]
+
+
+def test_extract_facts_propagates_provider_exceptions():
+    """The durable capture worker relies on this to trigger its retry/backoff."""
+    provider = Mock()
+    provider.chat = Mock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        extract_facts(provider, _EXCHANGE)

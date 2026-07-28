@@ -532,6 +532,9 @@ def main() -> None:
     _dream_session_factory: "Callable[[], AgentSession] | None" = None
     _dream_workspace_dir: "Path | None" = None
     sessions: dict[str, AgentSession] = {}
+    # Populated below, per agent — the durable capture worker (Stage One
+    # Phase 2, slice C) looks up a provider by agent_id here.
+    _providers_by_agent: dict[str, object] = {}
     for agent_id, cfg in agents_cfg.items():
         # Per-agent workspace root: resolved before building the memory service
         # and calling default_registry() so both point at the same directory
@@ -638,7 +641,11 @@ def main() -> None:
             workspace_root=_agent_workspace,
             log_dir=_log_dir,
             db=_db,
+            model_id=cfg.model.id,
         )
+        # Tracked so the durable capture worker (Stage One Phase 2, slice C)
+        # can look up the right provider per job — it isn't tied to one agent.
+        _providers_by_agent[agent_id] = provider
 
         # Phase 4: build a relay function that tags subagent events with
         # [sub:{agent_id}] and forwards them to the parent's terminal handler.
@@ -704,6 +711,16 @@ def main() -> None:
                 )
 
             _dream_session_factory = _dream_factory
+
+    # --- Durable capture worker (optional — only when a database is configured) ---
+    # Stage One Phase 2, slice C: replaces the per-turn daemon-thread extractor.
+    # One worker for the whole process, not per agent — it looks up the right
+    # provider per job via _providers_by_agent.
+    _capture_worker = None
+    if _db is not None:
+        from .memory.capture_worker import CaptureWorker  # noqa: PLC0415
+        _capture_worker = CaptureWorker(_db, lambda aid: _providers_by_agent[aid])
+        _capture_worker.start()
 
     if channels_cfg.matrix is not None:
         from .matrix.channel import MatrixChannel  # noqa: PLC0415 — optional dependency
@@ -794,6 +811,8 @@ def main() -> None:
         # Close MCP sessions before exiting so subprocess stdio transports shut down
         if mcp_manager is not None:
             mcp_manager.close_sync()
+        if _capture_worker is not None:
+            _capture_worker.stop()
         sys.exit(0)
 
     if hasattr(signal, "SIGTERM"):
@@ -876,6 +895,8 @@ def main() -> None:
                 _matrix_channel.stop()
             if mcp_manager is not None:
                 mcp_manager.close_sync()
+            if _capture_worker is not None:
+                _capture_worker.stop()
         return
 
     # --- REPL loop ---
@@ -1027,6 +1048,8 @@ def main() -> None:
         # Always close MCP sessions on exit — cleans up subprocess stdio transports.
         if mcp_manager is not None:
             mcp_manager.close_sync()
+        if _capture_worker is not None:
+            _capture_worker.stop()
 
 
 if __name__ == "__main__":
