@@ -4,14 +4,16 @@ Stage One Phase 1, slice 2.
 
 Why a facade over ``MemoryFileRepository``?
 --------------------------------------------
-Today, ``AgentSession`` and every memory tool (``SaveMemoryTool``,
-``NoteTool``, ``SearchMemoryTool``, ``WriteDailyMemoryTool``) each hold their
-own reference to a raw :class:`~minion_assist.memory.long_term.LongTermMemory`
-instance and call its methods directly. That means every consumer has to
-know the storage layer's internals (how a key becomes a filename, where
-daily notes live) and there is no single place to add cross-cutting
-behavior (status reporting, future scope checks) without touching every
-call site.
+Before this existed, ``AgentSession`` and every memory tool
+(``SaveMemoryTool``, ``NoteTool``, ``SearchMemoryTool``,
+``WriteDailyMemoryTool``) each held their own reference to a raw
+:class:`~minion_assist.memory.long_term.LongTermMemory` instance and called
+its methods directly. That meant every consumer had to know the storage
+layer's internals (how a key becomes a filename, where daily notes live)
+and there was no single place to add cross-cutting behavior (status
+reporting, future scope checks) without touching every call site.
+``NoteTool`` was later retired (Phase 1, slice 4) once
+``WriteDailyMemoryTool`` absorbed its responsibility.
 
 ``MemoryService`` is that single place. It wraps one
 :class:`~minion_assist.memory.files.MemoryFileRepository` per agent and

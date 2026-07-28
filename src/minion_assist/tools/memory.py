@@ -1,4 +1,4 @@
-"""Tools for saving, searching, and quick-noting in memory.
+"""Tools for saving and searching memory.
 
 These tools give the agent the ability to persist knowledge between
 conversations and recall it later — turning the agent from a stateless
@@ -8,14 +8,15 @@ How memory works
 -----------------
 Memory is backed by plain Markdown files on disk, under the agent's
 workspace root (``workspaces/{agent_id}/memory/``). Explicit notes
-(``save_memory``) live under ``memory/topics/{key}.md``; quick daily notes
-(``note``, until it is retired in a later Phase 1 slice) live quarantined
-under ``memory/imports/_notes_{date}.md`` — see
-``docs/adr/0003-per-agent-memory-scope.md``.
+(``save_memory``) live under ``memory/topics/{key}.md`` — see
+``docs/adr/0003-per-agent-memory-scope.md``. Quick daily notes go through the
+separate ``write_daily_memory`` tool (``tools/write_daily_memory.py``); a
+``note`` tool used to duplicate that with its own quarantined daily file and
+was retired in Phase 1, slice 4.
 
 The agent decides *when* to save and *what* to save — the system prompt (soul)
 encourages it to persist important findings. This is not automatic; the agent
-must call ``save_memory`` or ``note`` explicitly.
+must call ``save_memory`` explicitly.
 
 ``search_memory`` splits the query into individual terms and returns notes
 where any term appears in the note content or note key. When nothing matches,
@@ -23,7 +24,7 @@ it lists the available note keys so the agent can refine its search.
 
 read_only_mode and memory tools
 ---------------------------------
-:class:`SaveMemoryTool` and :class:`NoteTool` respect ``read_only_mode`` from
+:class:`SaveMemoryTool` respects ``read_only_mode`` from
 :class:`PermissionPolicy`.  When ``read_only_mode`` is active (e.g. the user
 ran ``/plan``), attempts to write memory return an error.
 
@@ -34,12 +35,12 @@ intentionally a different tree from the tool sandbox boundary (``root`` /
 boundary here would incorrectly reject every memory write. Only the
 ``read_only_mode`` flag applies.
 
-Three-class design
-------------------
-:class:`SaveMemoryTool`, :class:`NoteTool`, and :class:`SearchMemoryTool` are
-separate because the LLM needs to distinguish between "write/replace a named
-note", "quickly append a timestamped bullet", and "search my memory" — they
-have completely different schemas and behaviors. All three receive the same
+Two-class design
+----------------
+:class:`SaveMemoryTool` and :class:`SearchMemoryTool` are separate because
+the LLM needs to distinguish between "write/replace a named note" and
+"search my memory" — they have completely different schemas and behaviors.
+Both receive the same
 :class:`~minion_assist.memory.service.MemoryService` instance at construction
 time (dependency injection).
 
@@ -54,7 +55,6 @@ Talks to
 
 from __future__ import annotations
 
-from datetime import date, datetime
 from typing import TYPE_CHECKING
 
 from ..memory.service import _SEARCH_MAX_RESULTS, MemoryService
@@ -71,8 +71,9 @@ class SaveMemoryTool(Tool):
     wants to be able to recall in future conversations.  The note replaces any
     existing note with the same key — it is a full overwrite.
 
-    For quick one-line observations that don't need a named key, use
-    :class:`NoteTool` instead.
+    For quick one-line observations that don't need a named key, use the
+    ``write_daily_memory`` tool instead
+    (:class:`~minion_assist.tools.write_daily_memory.WriteDailyMemoryTool`).
 
     Args:
         memory (MemoryService): The memory backend that stores notes as
@@ -145,96 +146,6 @@ class SaveMemoryTool(Tool):
 
         self._memory.remember(key, content)
         return f"Saved memory: {key}"
-
-
-class NoteTool(Tool):
-    """Tool for appending a quick timestamped note to a daily log in memory.
-
-    Unlike :class:`SaveMemoryTool`, ``note`` does not require a key — it
-    appends a timestamped bullet point to the current day's log file
-    (``_notes_{date}.md``, quarantined under ``memory/imports/`` since
-    nobody has reviewed it — see ``docs/adr/0003-per-agent-memory-scope.md``).
-    Use it for quick observations that don't need a dedicated named note.
-
-    This mirrors the ``hermes-agent`` pattern of lightweight ephemeral logging
-    alongside named memory notes.
-
-    Note: this tool overlaps with ``write_daily_memory``
-    (``tools/write_daily_memory.py``), which writes to a *different* daily
-    file (``memory/YYYY-MM-DD.md``, unquarantined). The two are slated to be
-    consolidated into one in a later Phase 1 slice.
-
-    Args:
-        memory (MemoryService): The memory backend. Injected at construction.
-        policy (PermissionPolicy | None): Optional permission policy.  Only
-            ``read_only_mode`` is checked (see :class:`SaveMemoryTool`).
-    """
-
-    def __init__(
-        self,
-        memory: MemoryService,
-        policy: "PermissionPolicy | None" = None,
-    ) -> None:
-        self._memory = memory
-        self._policy = policy
-
-    @property
-    def schema(self) -> ToolSchema:
-        """Describe this tool to the LLM."""
-        return ToolSchema(
-            name="note",
-            description=(
-                "Append a quick timestamped note to today's daily log in memory. "
-                "Use for short observations that don't need a named key. "
-                "For structured notes use save_memory instead."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "The note text to append (one or a few sentences).",
-                    },
-                },
-                "required": ["text"],
-            },
-        )
-
-    def execute(self, **kwargs: object) -> str:
-        """Append a timestamped bullet to today's daily note file.
-
-        The daily file is stored under the key ``_notes_{YYYY-MM-DD}``, which
-        maps to the file ``_notes_{YYYY-MM-DD}.md`` in the memory directory.
-        Each call appends one line: ``- HH:MM: {text}``.
-
-        Args:
-            text (str): The note content to append.
-
-        Returns:
-            str: Confirmation, e.g. ``"Note saved to _notes_2026-06-10."``.
-        """
-        if self._policy is not None and self._policy.read_only_mode:
-            return (
-                "Error: read-only mode is active — memory writes are not permitted. "
-                "Use /auto to disable."
-            )
-
-        text = str(kwargs["text"]).strip()
-        if not text:
-            return "Error: 'text' must be a non-empty string."
-
-        today = date.today().isoformat()
-        # The key uses an underscore prefix so it groups visually below user notes.
-        key = f"_notes_{today}"
-
-        # Load existing log for today, then append the new bullet. Quarantined
-        # (remember_import/load_import) rather than a curated topic note — see
-        # the class docstring.
-        existing = self._memory.load_import(key) or ""
-        now = datetime.now().strftime("%H:%M")
-        separator = "\n" if existing.strip() else ""
-        self._memory.remember_import(key, existing + separator + f"- {now}: {text}")
-        return f"Note saved to {key}."
 
 
 class SearchMemoryTool(Tool):

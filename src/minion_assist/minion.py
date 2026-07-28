@@ -558,7 +558,6 @@ def main() -> None:
             agent_id=agent_id,
             mcp_manager=mcp_manager,
             ask_user_fn=_console_ask_user,
-            workspace_root=_agent_workspace,
             db=_db,
         )
         # Load user-defined tools from plugins.json manifests.

@@ -1,9 +1,12 @@
-"""Tests for SaveMemoryTool and NoteTool policy (read_only_mode) integration."""
+"""Tests for SaveMemoryTool and WriteDailyMemoryTool policy (read_only_mode) integration."""
+
+from datetime import date
 
 from minion_assist.memory.files import MemoryFileRepository
 from minion_assist.memory.service import MemoryService
-from minion_assist.tools.memory import NoteTool, SaveMemoryTool
+from minion_assist.tools.memory import SaveMemoryTool
 from minion_assist.tools.policy import PermissionPolicy
+from minion_assist.tools.write_daily_memory import WriteDailyMemoryTool
 
 
 def _service(tmp_path) -> MemoryService:
@@ -61,68 +64,63 @@ def test_save_memory_read_only_error_suggests_auto(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# NoteTool policy tests
+# WriteDailyMemoryTool policy tests
 # ---------------------------------------------------------------------------
-# NoteTool writes quarantined content (memory/imports/), not curated topic
-# notes — see docs/adr/0003-per-agent-memory-scope.md — so these tests check
-# list_import_keys()/load_import() rather than list_keys()/load().
+# Since Phase 1 slice 4, WriteDailyMemoryTool absorbed the retired `note`
+# tool's responsibility (and its read_only_mode check — write_daily_memory
+# did not check policy at all before the merge).
 
-def test_note_tool_no_policy_appends(tmp_path):
-    """When no policy is passed, NoteTool appends to today's daily log."""
+def test_write_daily_memory_no_policy_appends(tmp_path):
+    """When no policy is passed, WriteDailyMemoryTool appends without restriction."""
     mem = _service(tmp_path)
-    tool = NoteTool(mem)
-    result = tool.execute(text="quick observation")
-    assert "Note saved" in result
-    # Verify something was actually stored with a _notes_ key.
-    all_keys = mem.list_import_keys()
-    assert any(k.startswith("_notes_") for k in all_keys)
+    tool = WriteDailyMemoryTool(mem)
+    result = tool.execute(content="quick observation")
+    assert "Appended" in result
 
 
-def test_note_tool_policy_read_write_allowed(tmp_path):
-    """When policy read_only_mode=False, NoteTool appends normally."""
+def test_write_daily_memory_policy_read_write_allowed(tmp_path):
+    """When policy read_only_mode=False, WriteDailyMemoryTool appends normally."""
     mem = _service(tmp_path)
-    tool = NoteTool(mem, policy=_make_policy(read_only=False))
-    result = tool.execute(text="hello")
-    assert "Note saved" in result
+    tool = WriteDailyMemoryTool(mem, policy=_make_policy(read_only=False))
+    result = tool.execute(content="hello")
+    assert "Appended" in result
 
 
-def test_note_tool_policy_read_only_blocked(tmp_path):
-    """When policy read_only_mode=True, NoteTool returns an error and does not write."""
+def test_write_daily_memory_policy_read_only_blocked(tmp_path):
+    """When policy read_only_mode=True, WriteDailyMemoryTool returns an error and does not write."""
     mem = _service(tmp_path)
-    tool = NoteTool(mem, policy=_make_policy(read_only=True))
-    result = tool.execute(text="should not appear")
+    tool = WriteDailyMemoryTool(mem, policy=_make_policy(read_only=True))
+    result = tool.execute(content="should not appear")
     assert "Error" in result
     assert "read-only" in result.lower()
-    # Nothing should be stored.
-    assert mem.list_import_keys() == []
+    assert mem.status().daily_count == 0
 
 
-def test_note_tool_empty_text_rejected(tmp_path):
-    """NoteTool rejects empty text even without a policy."""
+def test_write_daily_memory_empty_content_rejected(tmp_path):
+    """WriteDailyMemoryTool rejects empty content even without a policy."""
     mem = _service(tmp_path)
-    tool = NoteTool(mem)
-    result = tool.execute(text="")
-    assert "Error" in result
+    tool = WriteDailyMemoryTool(mem)
+    result = tool.execute(content="")
+    assert "Empty" in result
 
 
-def test_note_tool_appends_multiple_entries(tmp_path):
-    """Calling NoteTool twice appends both bullets to today's log."""
+def test_write_daily_memory_appends_multiple_entries(tmp_path):
+    """Calling WriteDailyMemoryTool twice appends both entries to today's log."""
     mem = _service(tmp_path)
-    tool = NoteTool(mem)
-    tool.execute(text="first note")
-    tool.execute(text="second note")
-    all_keys = mem.list_import_keys()
-    note_key = next(k for k in all_keys if k.startswith("_notes_"))
-    content = mem.load_import(note_key)
+    tool = WriteDailyMemoryTool(mem)
+    tool.execute(content="first note")
+    tool.execute(content="second note")
+    path = tmp_path / "memory" / f"{date.today().isoformat()}.md"
+    content = path.read_text(encoding="utf-8")
     assert "first note" in content
     assert "second note" in content
 
 
-def test_note_tool_schema():
-    """NoteTool.schema has the expected name and required 'text' parameter."""
+def test_write_daily_memory_schema():
+    """WriteDailyMemoryTool.schema has the expected name and required 'content' parameter."""
     mem = MemoryService.__new__(MemoryService)
-    tool = NoteTool(mem)
+    tool = WriteDailyMemoryTool(mem)
     schema = tool.schema
-    assert schema.name == "note"
-    assert "text" in schema.parameters["properties"]
-    assert "text" in schema.parameters.get("required", [])
+    assert schema.name == "write_daily_memory"
+    assert "content" in schema.parameters["properties"]
+    assert "content" in schema.parameters.get("required", [])

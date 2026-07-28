@@ -48,7 +48,7 @@ from .find_definition import FindDefinitionTool
 from .git import GitCommitTool, GitDiffTool, GitStatusTool
 from .glob import GlobTool
 from .grep import GrepTool
-from .memory import NoteTool, SaveMemoryTool, SearchMemoryTool
+from .memory import SaveMemoryTool, SearchMemoryTool
 from .patch import PatchPreviewTool
 from .session_search import SessionSearchTool
 from .policy import PermissionPolicy
@@ -77,7 +77,6 @@ def default_registry(
     policy: "PermissionPolicy | None" = None,
     ask_user_fn: "Callable[[str], str] | None" = None,
     write_confirm: "Callable[[str], bool] | None" = None,
-    workspace_root: Path | None = None,
     db: object | None = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` with all standard tools registered.
@@ -171,19 +170,16 @@ def default_registry(
         registry.register(SessionSearchTool(db))
 
     # Memory tools — only when a backend is provided.
-    # SaveMemoryTool and NoteTool receive policy so /plan read-only mode blocks writes.
-    # Note: only read_only_mode is checked (not check_write) because memory files
-    # live under the agent's own workspace root, outside the tool sandbox boundary.
+    # SaveMemoryTool and WriteDailyMemoryTool receive policy so /plan read-only
+    # mode blocks writes. Note: only read_only_mode is checked (not check_write)
+    # because memory files live under the agent's own workspace root, outside
+    # the tool sandbox boundary.
     if memory is not None:
         registry.register(SaveMemoryTool(memory, policy=_policy))
         registry.register(SearchMemoryTool(memory))
-        registry.register(NoteTool(memory, policy=_policy))
-
-    # Daily memory tool — only when an agent workspace root is provided.
-    # Lets the agent append notes to memory/YYYY-MM-DD.md without needing to
-    # read → edit → write the whole file.
-    if workspace_root is not None:
-        registry.register(WriteDailyMemoryTool(workspace_root))
+        # Lets the agent append notes to memory/YYYY-MM-DD.md without needing
+        # to read -> edit -> write the whole file.
+        registry.register(WriteDailyMemoryTool(memory, policy=_policy))
 
     # Skill tool — only when at least one skill was discovered.
     if skills:
@@ -248,7 +244,6 @@ __all__ = [
     "GitDiffTool",
     "GitStatusTool",
     "GrepTool",
-    "NoteTool",
     "PatchPreviewTool",
     "SaveMemoryTool",
     "SearchMemoryTool",

@@ -138,7 +138,8 @@ minion-assist/
 │   │   ├── apply_patch.py       # ApplyPatchTool — apply a unified diff patch via git apply
 │   │   ├── find_definition.py   # FindDefinitionTool — AST-based symbol lookup across .py files
 │   │   ├── todo.py              # TodoWriteTool, TodoReadTool — session-scoped todo list
-│   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool, NoteTool
+│   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
+│   │   ├── write_daily_memory.py # WriteDailyMemoryTool — daily log append
 │   │   ├── session_search.py    # SessionSearchTool — FTS search across all past sessions (requires PostgreSQL)
 │   │   ├── browser.py           # BrowserTool — Playwright browser automation (start/navigate/evaluate/screenshot/pick/cookies/stop)
 │   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
@@ -1509,9 +1510,9 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `WriteTool` | `write` | Write content to a file, creating parent directories as needed. Paths outside the workspace root are rejected. |
 | `GlobTool` | `glob` | Find files matching a glob pattern, sorted newest-first. Skips `.git`/`.venv`/`__pycache__`/etc. Caps at 200 results. |
 | `BashTool` | `bash` | Run a shell command — PowerShell on Windows, bash on Unix. Calls the injected `confirm` callable before executing; pass `None` to skip confirmation. |
-| `SaveMemoryTool` | `save_memory` | Save a Markdown note to long-term memory under a given key. Blocked by `read_only_mode`. |
-| `NoteTool` | `note` | Append a quick timestamped bullet to today's daily log in memory (`_notes_YYYY-MM-DD.md`). No key needed — great for ephemeral observations. Blocked by `read_only_mode`. |
-| `SearchMemoryTool` | `search_memory` | Keyword search across long-term memory. Results ranked by term frequency and recency. Capped at 20. `is_read_only=True`. |
+| `SaveMemoryTool` | `save_memory` | Save a Markdown note to memory under a given key. Blocked by `read_only_mode`. |
+| `WriteDailyMemoryTool` | `write_daily_memory` | Append a quick timestamped bullet to today's daily log (`memory/YYYY-MM-DD.md`). No key needed — great for ephemeral observations. Blocked by `read_only_mode`. |
+| `SearchMemoryTool` | `search_memory` | Keyword search across memory. Results ranked by term frequency and recency. Capped at 20. `is_read_only=True`. |
 | `SkillTool` | `skill` | Load a skill's instructions into context by name. Only registered when skills are discovered at startup. |
 | `ReadTaskTool` | `read_task` | Read the current task progress file — goal, steps, status, notes, and context. |
 | `UpdateTaskTool` | `update_task` | Create a new task (goal + steps) or update an existing one (step status, notes, context, or clear). |
@@ -1593,7 +1594,7 @@ reg = default_registry(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `memory` | `MemoryService \| None` | `None` | If provided, registers `save_memory`, `search_memory`, and `note` |
+| `memory` | `MemoryService \| None` | `None` | If provided, registers `save_memory`, `search_memory`, and `write_daily_memory` |
 | `root` | `Path \| None` | `None` | Workspace root — `read`/`write`/`glob`/`edit`/`grep` reject paths outside this boundary |
 | `bash_confirm` | `Callable[[str], bool] \| None` | `None` | Simple bool callback called before every bash command; `None` = no confirmation |
 | `bash_approval` | `Callable[[str], ApprovalDecision] \| None` | `None` | Rich 4-option approval callback (ALLOW_ONCE, ALLOW_SESSION, DENY, ALWAYS_DENY). Takes priority over `bash_confirm` when both are set. The CLI wires this to a menu that also records decisions to the policy's audit log. |
@@ -1817,8 +1818,7 @@ service.delete("project-goals")                         # bool
 service.get("memory/topics/project-goals.md", from_line=1, lines=20)   # MemoryExcerpt
 
 # Quarantined, unreviewed notes — searchable but never auto-promoted (see
-# docs/adr/0003-per-agent-memory-scope.md). Used by the background extractor
-# and the `note` tool.
+# docs/adr/0003-per-agent-memory-scope.md). Used by the background extractor.
 service.remember_import("_auto_extracted", "fact one\nfact two")
 service.load_import("_auto_extracted")                  # str | None
 service.list_import_keys()                              # list[str]
