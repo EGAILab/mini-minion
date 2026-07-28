@@ -97,7 +97,10 @@ def test_user_message_persisted_on_exception(tmp_path):
     _run_main(tmp_path, ["my question", "quit"], run_turn_effect=RuntimeError("boom"))
 
     history = _load_history(tmp_path, "main")
-    assert history[0] == {"role": "user", "content": "my question"}
+    # _event_id (Phase 2 slice A's mirroring identity) is expected now —
+    # check role/content only.
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "my question"
 
 
 def test_successful_turn_persists_history(tmp_path):

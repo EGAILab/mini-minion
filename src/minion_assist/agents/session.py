@@ -87,7 +87,13 @@ from pathlib import Path
 from ..context import Compactor, _estimate_tokens
 from ..memory.service import MemoryService
 from ..memory.short_term import ShortTermMemory
-from ..messages import content_text, make_user_content, strip_media_data
+from ..messages import (
+    EVENT_ID_KEY,
+    content_text,
+    ensure_event_id,
+    make_user_content,
+    strip_media_data,
+)
 from ..providers.base import LLMProvider
 from ..session import SessionStore
 from ..tools import ToolRegistry
@@ -577,6 +583,14 @@ class AgentSession:
             self._history.append({"role": "user", "content": stored_content})
         else:
             self._history.append({"role": "user", "content": message})
+        # Assign this message's stable mirror identity BEFORE the save() below
+        # persists it to JSONL — so the ID is never lost to a crash between
+        # here and the PostgreSQL mirror call (see session/db.py's "Idempotent
+        # mirroring" docstring, Stage One Phase 2, slice A). Only when a
+        # database is actually configured — an id nothing will ever mirror is
+        # just noise in the JSONL file.
+        if self._db is not None:
+            ensure_event_id(self._history[-1])
 
         # Build the effective system prompt.
         # Order: soul → bootstrap context → user context → relevant memories
@@ -659,11 +673,12 @@ class AgentSession:
         self._short_term.save(self._agent_id, self._session_id, self._history)
 
         # Mirror user message to PostgreSQL (non-blocking — errors are swallowed).
+        # Idempotent: keyed by the event_id already assigned (and persisted) above.
         if self._db is not None:
             try:
                 _user_msg = self._history[-1]
-                self._db.add_message(
-                    self._session_id, "user", _msg_text(_user_msg),
+                self._db.mirror_message(
+                    self._session_id, _user_msg[EVENT_ID_KEY], "user", _msg_text(_user_msg),
                     timestamp=time.time(),
                 )
             except Exception:
@@ -721,6 +736,9 @@ class AgentSession:
             _session_info = self._session_store.touch(self._agent_id, increment_turns=True)
 
             # Mirror new assistant/tool messages to PostgreSQL.
+            # Event IDs are assigned here (before the `finally: short_term.save()`
+            # below persists them to JSONL) and mirroring is idempotent — see
+            # session/db.py's "Idempotent mirroring" docstring.
             if self._db is not None:
                 try:
                     _ts = time.time()
@@ -729,8 +747,8 @@ class AgentSession:
                         _content = _msg_text(_msg)
                         _tool_name = _msg.get("name") or _msg.get("tool_name")
                         if _content or _tool_name:
-                            self._db.add_message(
-                                self._session_id, _role, _content,
+                            self._db.mirror_message(
+                                self._session_id, ensure_event_id(_msg), _role, _content,
                                 tool_name=_tool_name, timestamp=_ts,
                             )
                     self._db.update_session(

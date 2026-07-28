@@ -19,14 +19,15 @@ import pytest
 
 from minion_assist.messages import (
     ALLOWED_IMAGE_TYPES,
+    EVENT_ID_KEY,
     content_has_images,
     content_text,
     content_to_summary_text,
+    ensure_event_id,
     make_user_content,
     materialize_image_data,
     strip_media_data,
 )
-
 
 # ---------------------------------------------------------------------------
 # Minimal PNG bytes for tests that need a real image file.
@@ -326,3 +327,36 @@ class TestAllowedImageTypes:
 
     def test_pdf_not_allowed(self):
         assert "application/pdf" not in ALLOWED_IMAGE_TYPES
+
+
+# ---------------------------------------------------------------------------
+# ensure_event_id
+# ---------------------------------------------------------------------------
+
+class TestEnsureEventId:
+    def test_assigns_id_to_message_without_one(self):
+        msg = {"role": "user", "content": "hi"}
+        event_id = ensure_event_id(msg)
+        assert msg[EVENT_ID_KEY] == event_id
+        assert event_id  # non-empty string
+
+    def test_is_idempotent_on_repeated_calls(self):
+        msg = {"role": "user", "content": "hi"}
+        first = ensure_event_id(msg)
+        second = ensure_event_id(msg)
+        assert first == second
+
+    def test_preserves_existing_id(self):
+        msg = {"role": "user", "content": "hi", EVENT_ID_KEY: "already-set"}
+        assert ensure_event_id(msg) == "already-set"
+
+    def test_different_messages_get_different_ids(self):
+        msg1 = {"role": "user", "content": "a"}
+        msg2 = {"role": "user", "content": "b"}
+        assert ensure_event_id(msg1) != ensure_event_id(msg2)
+
+    def test_mutates_dict_in_place(self):
+        msg = {"role": "user", "content": "hi"}
+        assert EVENT_ID_KEY not in msg
+        ensure_event_id(msg)
+        assert EVENT_ID_KEY in msg

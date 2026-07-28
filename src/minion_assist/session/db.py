@@ -9,12 +9,42 @@ Schema (created automatically on first connect):
   messages(id BIGSERIAL, session_id, role, content, tool_name, timestamp,
            search_vector tsvector GENERATED ALWAYS AS ...)
   message_embeddings(message_id, embedding vector(N))  — only when pgvector available
+  message_mirrors(session_id, event_id, message_id, mirrored_at) — idempotency
+           ledger for mirroring (Stage One Phase 2, slice A)
+
+Idempotent mirroring (Stage One Phase 2, slice A)
+---------------------------------------------------
+``add_message()`` alone has no notion of "already mirrored" — calling it
+twice with the same content creates two rows. :meth:`mirror_message` adds
+that: every mirror attempt is keyed by ``(session_id, event_id)``, where
+``event_id`` is a message's stable identity (``messages.py``'s
+``EVENT_ID_KEY`` / ``ensure_event_id()`` — a UUID embedded in the message
+dict, assigned once and persisted to JSONL from then on). Calling
+``mirror_message()`` again with the same ``(session_id, event_id)`` is a
+no-op, not a duplicate insert.
+
+This replaces the old ``replay_jsonl()``, which skipped an entire session
+the moment it found *any* row already mirrored for that session — meaning a
+crash after mirroring 2 of 20 messages left the other 18 unmirrored
+forever, silently. :meth:`reconcile_session` / :meth:`reconcile_all_sessions`
+mirror exactly the messages still missing, every time they run, so a partial
+mirror from any prior crash is always completed rather than left behind.
+
+Concurrency note: :meth:`mirror_message` checks-then-inserts without wrapping
+both steps in one transaction. This is safe under this codebase's actual
+concurrency model — a session's messages are only ever mirrored from that
+session's own ``AgentSession.send()``, which is serialized by
+``AgentSession._lock`` — but would need a real transaction (or an
+``INSERT ... ON CONFLICT`` upsert) if two processes ever mirrored the same
+session concurrently.
 """
 from __future__ import annotations
 
 import threading
 import time
 from typing import Any
+
+from ..messages import EVENT_ID_KEY, ensure_event_id
 
 # Thread-local connection cache — one psycopg connection per OS thread.
 _local = threading.local()
@@ -120,6 +150,18 @@ class SessionDB:
                 ON message_embeddings USING hnsw (embedding vector_cosine_ops)
             """)
 
+        # Idempotency ledger for mirroring — see the module docstring's
+        # "Idempotent mirroring" section.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS message_mirrors (
+                session_id  TEXT NOT NULL,
+                event_id    TEXT NOT NULL,
+                message_id  BIGINT NOT NULL,
+                mirrored_at DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (session_id, event_id)
+            )
+        """)
+
     # ------------------------------------------------------------------
     # Session operations
     # ------------------------------------------------------------------
@@ -221,7 +263,13 @@ class SessionDB:
         tool_name: str | None = None,
         timestamp: float | None = None,
     ) -> int:
-        """Insert a message row; returns the new message id."""
+        """Insert a message row unconditionally; returns the new message id.
+
+        No idempotency check — calling this twice with the same content
+        creates two rows. Use :meth:`mirror_message` for the idempotent
+        version (mirroring live turns and reconciliation both go through
+        that, not this).
+        """
         row = self._conn().execute(
             """
             INSERT INTO messages (session_id, role, content, tool_name, timestamp)
@@ -231,6 +279,52 @@ class SessionDB:
             (session_id, role, content, tool_name, timestamp or time.time()),
         ).fetchone()
         return row[0] if row else -1
+
+    def is_mirrored(self, session_id: str, event_id: str) -> bool:
+        """Return ``True`` if this exact message has already been mirrored."""
+        row = self._conn().execute(
+            "SELECT 1 FROM message_mirrors WHERE session_id = %s AND event_id = %s",
+            (session_id, event_id),
+        ).fetchone()
+        return row is not None
+
+    def mirror_message(
+        self,
+        session_id: str,
+        event_id: str,
+        role: str,
+        content: str | None,
+        tool_name: str | None = None,
+        timestamp: float | None = None,
+    ) -> int | None:
+        """Idempotently insert a message, keyed by ``(session_id, event_id)``.
+
+        Args:
+            session_id: The session this message belongs to.
+            event_id: The message's stable identity (``messages.py``'s
+                ``ensure_event_id()``).
+            role, content, tool_name, timestamp: Same as :meth:`add_message`.
+
+        Returns:
+            int | None: The new message row's id, or ``None`` if this exact
+                ``(session_id, event_id)`` was already mirrored (a no-op,
+                not an error — see the module docstring's concurrency note
+                for why this check-then-insert is safe here).
+        """
+        if self.is_mirrored(session_id, event_id):
+            return None
+        message_id = self.add_message(
+            session_id, role, content, tool_name=tool_name, timestamp=timestamp
+        )
+        self._conn().execute(
+            """
+            INSERT INTO message_mirrors (session_id, event_id, message_id, mirrored_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (session_id, event_id) DO NOTHING
+            """,
+            (session_id, event_id, message_id, time.time()),
+        )
+        return message_id
 
     def search_messages(self, query: str, limit: int = 10) -> list[dict]:
         """FTS search across all message content. Returns ranked matches."""
@@ -317,48 +411,90 @@ class SessionDB:
         return [to_dict(r) for r in first], [to_dict(r) for r in last]
 
     # ------------------------------------------------------------------
-    # Migration
+    # Reconciliation (Stage One Phase 2, slice A)
     # ------------------------------------------------------------------
 
-    def replay_jsonl(
+    def reconcile_session(
+        self,
+        session_id: str,
+        agent_id: str,
+        messages: list[dict],
+        mtime: float,
+    ) -> int:
+        """Mirror every message in ``messages`` that isn't mirrored yet.
+
+        Unlike the old ``replay_jsonl()``, this never skips a session just
+        because it already has some rows — it checks each message
+        individually via :meth:`mirror_message`'s idempotency, so a crash
+        that left a session partially mirrored is completed here rather
+        than left behind forever.
+
+        Messages without an existing event ID are assigned one in place
+        (``messages.py``'s ``ensure_event_id()``) — callers MUST persist
+        ``messages`` back to JSONL if this mutated any message, or those
+        IDs will be regenerated (and mirrored as "new") on the next call.
+        :meth:`reconcile_all_sessions` handles this automatically.
+
+        Args:
+            session_id: The session being reconciled.
+            agent_id: The owning agent — used to upsert the session row.
+            messages: The session's full message list, as loaded from JSONL.
+            mtime: Used as the session's ``started_at``/mirrored timestamp
+                when a value isn't otherwise available.
+
+        Returns:
+            int: Number of messages newly mirrored by this call.
+        """
+        self.upsert_session(session_id, agent_id, started_at=mtime)
+
+        mirrored = 0
+        for msg in messages:
+            role = msg.get("role", "")
+            if not role:
+                continue
+            event_id = ensure_event_id(msg)
+            content = _msg_text(msg)
+            tool_name = msg.get("name") or msg.get("tool_name")
+            result = self.mirror_message(
+                session_id, event_id, role, content, tool_name=tool_name, timestamp=mtime
+            )
+            if result is not None:
+                mirrored += 1
+        return mirrored
+
+    def reconcile_all_sessions(
         self,
         short_term: object,
         agent_ids: list[str],
     ) -> int:
-        """One-time migration: replay existing JSONL session files into the DB.
+        """Reconcile every JSONL session file for every agent against ``message_mirrors``.
 
-        Skips sessions that already have rows in the messages table.
-        Returns total number of messages inserted.
+        Runs at startup (replacing the old one-time ``replay_jsonl()``) and
+        is safe to call repeatedly — already-mirrored messages are no-ops.
+        Re-saves a session's JSONL file via ``short_term.save()`` whenever
+        :meth:`reconcile_session` assigned any message a new event ID, so
+        the ID is never lost to a subsequent restart.
+
+        Args:
+            short_term: The agent's ``ShortTermMemory`` instance (duck-typed
+                — only ``list_sessions``/``load``/``save`` are used).
+            agent_ids: Every configured agent ID to reconcile.
+
+        Returns:
+            int: Total number of messages newly mirrored across all sessions.
         """
-        import json  # noqa: PLC0415
-
         total = 0
         for agent_id in agent_ids:
             for path in short_term.list_sessions(agent_id):
                 session_id = path.stem
-                # Skip sessions already in DB
-                count = self._conn().execute(
-                    "SELECT count(*) FROM messages WHERE session_id = %s", (session_id,)
-                ).fetchone()[0]
-                if count:
+                messages = short_term.load(agent_id, session_id)
+                if not messages:
                     continue
 
+                ids_before = [m.get(EVENT_ID_KEY) for m in messages]
                 mtime = path.stat().st_mtime
-                self.upsert_session(session_id, agent_id, started_at=mtime)
+                total += self.reconcile_session(session_id, agent_id, messages, mtime)
 
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    content = _msg_text(msg)
-                    tool_name = msg.get("name") or msg.get("tool_name")
-                    role = msg.get("role", "")
-                    if not role:
-                        continue
-                    self.add_message(session_id, role, content, tool_name=tool_name, timestamp=mtime)
-                    total += 1
+                if [m.get(EVENT_ID_KEY) for m in messages] != ids_before:
+                    short_term.save(agent_id, session_id, messages)
         return total

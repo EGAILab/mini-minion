@@ -24,9 +24,49 @@ gives a single place to extend the format.
 """
 from __future__ import annotations
 
+import uuid
+
 ALLOWED_IMAGE_TYPES: frozenset[str] = frozenset({
     "image/png", "image/jpeg", "image/webp", "image/gif",
 })
+
+# Key used to give a message dict a stable identity across process restarts,
+# so PostgreSQL mirroring (session/db.py's message_mirrors table) can tell
+# "already mirrored this exact message" apart from "new message" — see
+# Stage One Phase 2, slice A (memory-implementation-plan.md).
+#
+# Leading underscore marks this as minion-assist-internal metadata, not part
+# of the OpenAI/Anthropic wire format. It rides along in JSONL and in-memory
+# history, but MUST be stripped before any message list reaches a provider's
+# chat() call — see providers/openai_compatible.py's _prepare_messages_for_openai(),
+# the only provider that rebuilds messages via dict-spread (Anthropic's and
+# Codex's converters already extract named fields one at a time and would
+# drop this key naturally).
+EVENT_ID_KEY = "_event_id"
+
+
+def ensure_event_id(msg: dict) -> str:
+    """Return ``msg``'s stable event ID, assigning one if it doesn't have one yet.
+
+    Mutates ``msg`` in place (adds :data:`EVENT_ID_KEY`) so the assignment is
+    visible to every other reference to the same dict — in particular,
+    ``AgentSession._history`` holds the same object, so the next
+    ``ShortTermMemory.save()`` call persists the newly assigned ID to JSONL.
+
+    Idempotent: calling this again on the same dict returns the same ID.
+
+    Args:
+        msg: A message dict (user/assistant/tool message from history).
+
+    Returns:
+        str: The message's event ID (a UUID4 string), new or existing.
+    """
+    existing = msg.get(EVENT_ID_KEY)
+    if existing:
+        return existing
+    new_id = str(uuid.uuid4())
+    msg[EVENT_ID_KEY] = new_id
+    return new_id
 
 
 def content_has_images(content: str | list) -> bool:

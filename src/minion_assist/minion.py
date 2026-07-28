@@ -363,10 +363,12 @@ def main() -> None:
             from .session.db import SessionDB  # noqa: PLC0415
             _db = SessionDB(database_cfg.url)
             print(f"Database connected: {database_cfg.url.split('@')[-1]}")
-            # One-time migration: replay existing JSONL files into the DB.
-            _replayed = _db.replay_jsonl(short_term, list(agents_cfg.keys()))
-            if _replayed:
-                print(f"  Migrated {_replayed} messages from JSONL to database.")
+            # Reconcile every session's JSONL against message_mirrors — mirrors
+            # exactly what's missing (including a partial mirror left by a prior
+            # crash), never skips a whole session just because it has some rows.
+            _reconciled = _db.reconcile_all_sessions(short_term, list(agents_cfg.keys()))
+            if _reconciled:
+                print(f"  Mirrored {_reconciled} messages from JSONL to database.")
         except Exception as _db_exc:
             print(f"[minion-assist] Warning: database unavailable ({_db_exc}). Session search disabled.")
             _db = None

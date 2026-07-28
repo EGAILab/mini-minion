@@ -194,3 +194,10 @@ class TestPrepareMessagesForOpenAI:
         _prepare_messages_for_openai(messages)
         # The original list object should be unchanged.
         assert messages[0]["content"] is original_content
+
+    def test_strips_internal_event_id_key(self):
+        """_event_id (session/db.py mirroring metadata) must never reach the API."""
+        messages = [{"role": "user", "content": "hi", "_event_id": "abc-123"}]
+        result = _prepare_messages_for_openai(messages)
+        assert "_event_id" not in result[0]
+        assert result[0]["content"] == "hi"

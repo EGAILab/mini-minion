@@ -38,7 +38,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from .base import LLMResponse, TokenUsage, ToolCall
-from ..messages import content_has_images, materialize_image_data
+from ..messages import EVENT_ID_KEY, content_has_images, materialize_image_data
 from ..llm_logger import log_request, log_response
 
 
@@ -98,6 +98,13 @@ def _prepare_messages_for_openai(messages: list[dict]) -> list[dict]:
     string content (all existing text-only turns) passes through unchanged —
     this guarantees zero behavior change for text-only conversations.
 
+    Also strips ``EVENT_ID_KEY`` (``messages.py``'s internal mirroring
+    metadata — see Stage One Phase 2, slice A): this is the only provider
+    conversion in the codebase that rebuilds a message via dict-spread
+    (``{**msg, ...}``), so it is the one place an internal-only key could
+    otherwise leak into the API request. Anthropic's and Codex's converters
+    already extract named fields one at a time and drop it naturally.
+
     Args:
         messages: Conversation history in minion-assist's internal format.
 
@@ -110,7 +117,8 @@ def _prepare_messages_for_openai(messages: list[dict]) -> list[dict]:
         if isinstance(content, list):
             # Only multimodal messages need conversion — string content is unchanged.
             content = _convert_content_for_openai(content)
-        prepared.append({**msg, "content": content})
+        cleaned = {k: v for k, v in msg.items() if k != EVENT_ID_KEY}
+        prepared.append({**cleaned, "content": content})
     return prepared
 
 

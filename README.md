@@ -360,7 +360,7 @@ AgentSession.send(message, on_event=callback, stream=True/False)
            │
            ├─ short_term.save(agent_id, messages)   ← persists history to JSONL (always)
            ├─ session_store.touch(agent_id, ...)    ← updates turn count / timestamp
-           ├─ db.add_message(...) [optional]        ← mirrors to PostgreSQL for FTS search
+           ├─ db.mirror_message(...) [optional]     ← idempotent PostgreSQL mirror for FTS search
            └─ extract_and_save_async(memory, provider, last_exchange)
                   daemon thread — extracts 0–3 key facts, appends to quarantined
                   memory/imports/_auto_extracted.md (see MemoryService.remember_import)
@@ -1103,11 +1103,11 @@ Add a `"database"` section to `config.json` (or `~/.minion-assist/config.json`):
 }
 ```
 
-On next startup minion-assist will:
+On every startup minion-assist will:
 1. Connect to the database and create the schema automatically.
-2. Migrate all existing JSONL session files into the database (one-time, skips already-imported sessions).
+2. Reconcile every JSONL session file against `message_mirrors` (Stage One Phase 2, slice A) — mirrors exactly the messages that aren't mirrored yet. Safe to run every time, not just once: a session partially mirrored by a prior crash is completed here rather than left behind.
 3. Register the `session_search` tool in every agent's tool registry.
-4. Dual-write every new message to both JSONL and PostgreSQL.
+4. Dual-write every new message to both JSONL and PostgreSQL, idempotently (see below).
 
 ### Schema
 
@@ -1116,6 +1116,13 @@ On next startup minion-assist will:
 | `sessions` | One row per session: `id`, `agent_id`, `source`, `started_at`, `last_active`, `turn_count`, `title`, `parent_id` |
 | `messages` | Every message with a `tsvector` generated column for FTS, GIN-indexed. Columns: `id` (BIGSERIAL), `session_id`, `role`, `content`, `tool_name`, `timestamp`, `search_vector` |
 | `message_embeddings` | Optional — created only when the `vector` extension (pgvector) is available. Holds `vector(1536)` embeddings for future semantic search. |
+| `message_mirrors` | Idempotency ledger, `PRIMARY KEY (session_id, event_id)`. Every mirror attempt is keyed by a message's stable `event_id` (see below) — mirroring the same message twice is a no-op, not a duplicate row. |
+
+### Idempotent mirroring (Stage One Phase 2, slice A)
+
+Every message dict carries an internal `_event_id` (`messages.py`'s `EVENT_ID_KEY`/`ensure_event_id()`) — a UUID assigned the first time a database is configured for that message, persisted to JSONL from then on. `SessionDB.mirror_message(session_id, event_id, ...)` checks `message_mirrors` before inserting, so the same message is never mirrored twice. This key is internal-only: `providers/openai_compatible.py`'s message-preparation function strips it before any request reaches the LLM API (the only provider conversion that rebuilds a message via dict-spread; Anthropic's and Codex's converters already extract named fields one at a time and drop it naturally).
+
+Without a configured database, no `_event_id` is assigned at all — there's nothing to mirror, so assigning one would just be unused noise in the JSONL file.
 
 ### `session_search` Tool Modes
 
@@ -1921,12 +1928,15 @@ db = SessionDB("postgresql://minion:minion@localhost:5433/minion_assist")
 
 # Schema is created automatically on first connect
 db.upsert_session(session_id, agent_id)
-db.add_message(session_id, "user", "hello")
+db.add_message(session_id, "user", "hello")      # raw insert — no idempotency check
+db.mirror_message(session_id, event_id, "user", "hello")  # idempotent — what session.py actually uses
+db.is_mirrored(session_id, event_id)             # bool
 db.search_messages("hello world")    # FTS — list[dict] ranked by ts_rank
 db.list_sessions(limit=20)           # newest-first summary list
 db.get_messages_around(session_id, anchor_id, window=5)  # context window for SCROLL
 db.get_session_bookends(session_id, n=3)   # (first_n, last_n) user/assistant messages
-db.replay_jsonl(short_term, agent_ids)     # one-time migration from JSONL files
+db.reconcile_session(session_id, agent_id, messages, mtime)  # mirror exactly what's missing
+db.reconcile_all_sessions(short_term, agent_ids)  # every JSONL session, run on every startup
 ```
 
 Uses thread-local connections (`threading.local`) so one psycopg connection is held per OS thread without locking overhead. All writes use `autocommit=True`.

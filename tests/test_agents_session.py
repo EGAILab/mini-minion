@@ -15,6 +15,7 @@ from minion_assist.context import Compactor
 from minion_assist.memory.files import MemoryFileRepository
 from minion_assist.memory.service import MemoryService
 from minion_assist.memory.short_term import ShortTermMemory
+from minion_assist.messages import EVENT_ID_KEY
 from minion_assist.providers.base import LLMResponse
 from minion_assist.session import SessionStore
 from minion_assist.tools import ToolRegistry
@@ -158,8 +159,10 @@ def test_send_rolls_back_partial_messages_on_exception(tmp_path):
     history = session.history
     # Must not contain the partial assistant message with empty tool_calls
     assert not any("tool_calls" in m for m in history)
-    # User message + error record only
-    assert history[0] == {"role": "user", "content": "hello"}
+    # User message + error record only. _event_id (Phase 2 slice A's mirroring
+    # identity) is expected on every message now — check role/content only.
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "hello"
     assert "Provider error" in history[1]["content"]
 
 
@@ -175,7 +178,10 @@ def test_send_persists_user_message_before_run_turn(tmp_path):
         pass
 
     on_disk = ShortTermMemory(tmp_path / "sessions").load("main", "test-session")
-    assert on_disk[0] == {"role": "user", "content": "my question"}
+    # _event_id (Phase 2 slice A's mirroring identity) is expected now —
+    # check role/content only.
+    assert on_disk[0]["role"] == "user"
+    assert on_disk[0]["content"] == "my question"
 
 
 # ---------------------------------------------------------------------------
@@ -809,3 +815,87 @@ def test_date_does_not_lead_system_prompt(tmp_path):
         "soul text must appear before the date in the system prompt "
         "so the stable prefix is byte-identical across turns (OpenAI prompt caching)"
     )
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL mirroring (Stage One Phase 2, slice A)
+# ---------------------------------------------------------------------------
+
+def _make_session_with_mock_db(tmp_path, mock_db):
+    """Build an AgentSession wired to a mock SessionDB, for mirroring tests."""
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    return AgentSession(
+        agent_id="main",
+        session_id="test-session",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=_mock_provider(),
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        db=mock_db,
+    )
+
+
+def test_no_event_ids_assigned_without_a_database(tmp_path):
+    """Without db=, nothing will ever mirror — assigning ids would just be JSONL noise."""
+    session = _make_session(tmp_path)
+    session.send("hello")
+
+    assert not any(EVENT_ID_KEY in m for m in session.history)
+
+
+def test_every_history_message_gets_an_event_id_when_db_configured(tmp_path):
+    """Every message (user + assistant) has _event_id assigned when db is set."""
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=1)
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("hello")
+
+    assert all(EVENT_ID_KEY in m for m in session.history)
+
+
+def test_event_ids_are_unique_per_message(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=1)
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("hello")
+
+    ids = [m[EVENT_ID_KEY] for m in session.history]
+    assert len(ids) == len(set(ids))
+
+
+def test_db_mirror_message_called_for_user_and_assistant(tmp_path):
+    """Mirroring uses mirror_message() (idempotent), never the raw add_message()."""
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=1)
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("hello")
+
+    assert mock_db.mirror_message.called
+    assert not mock_db.add_message.called
+    # The event_id passed to mirror_message must match what's on the message.
+    mirrored_event_ids = {call.args[1] for call in mock_db.mirror_message.call_args_list}
+    history_event_ids = {m[EVENT_ID_KEY] for m in session.history}
+    assert mirrored_event_ids == history_event_ids
+
+
+def test_second_turn_does_not_reassign_event_ids_from_first_turn(tmp_path):
+    """Historical messages keep their event_id across subsequent turns."""
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=1)
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("first")
+    ids_after_first = {m[EVENT_ID_KEY] for m in session.history}
+
+    session.send("second")
+    ids_after_second = {m[EVENT_ID_KEY] for m in session.history}
+
+    assert ids_after_first.issubset(ids_after_second)
