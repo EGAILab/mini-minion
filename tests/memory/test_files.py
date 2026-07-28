@@ -128,6 +128,44 @@ def test_count_notes_all_zero_for_empty_store(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# remember_import / load_import / list_import_keys (memory/imports/)
+# ---------------------------------------------------------------------------
+
+def test_remember_import_writes_to_imports_dir(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember_import("_auto_extracted", "fact one\nfact two")
+    path = tmp_path / "memory" / "imports" / "_auto_extracted.md"
+    assert path.read_text(encoding="utf-8") == "fact one\nfact two"
+
+
+def test_remember_import_overwrites_existing(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember_import("_auto_extracted", "first")
+    repo.remember_import("_auto_extracted", "second")
+    assert repo.load_import("_auto_extracted") == "second"
+
+
+def test_load_import_returns_none_for_missing_note(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    assert repo.load_import("does-not-exist") is None
+
+
+def test_list_import_keys_returns_sorted_import_keys(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember_import("zeta", "z")
+    repo.remember_import("alpha", "a")
+    assert repo.list_import_keys() == ["alpha", "zeta"]
+
+
+def test_list_import_keys_excludes_topics_and_daily_notes(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember("topic-note", "content")
+    repo.remember_import("import-note", "content")
+    repo.append_daily("daily entry")
+    assert repo.list_import_keys() == ["import-note"]
+
+
+# ---------------------------------------------------------------------------
 # append_daily
 # ---------------------------------------------------------------------------
 

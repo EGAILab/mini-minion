@@ -157,6 +157,35 @@ class MemoryFileRepository:
         }
 
     # -----------------------------------------------------------------
+    # Quarantined notes (memory/imports/) — unreviewed, never auto-promoted
+    # -----------------------------------------------------------------
+    #
+    # Used by the background extractor's rolling "_auto_extracted" note and
+    # (until it is retired in a later Phase 1 slice) the "note" tool's daily
+    # quick-log — both write content nobody has reviewed yet, which per
+    # docs/adr/0003-per-agent-memory-scope.md must stay searchable but must
+    # never be auto-promoted into curated memory/topics/ pages.
+
+    def remember_import(self, key: str, content: str) -> None:
+        """Save quarantined, unreviewed content under ``memory/imports/{key}.md``.
+
+        Args:
+            key: Note identifier, e.g. ``"_auto_extracted"``.
+            content: Markdown text to store.
+        """
+        path = self._imports_dir / f"{_sanitize_key(key)}.md"
+        _atomic_write_text(path, content)
+
+    def load_import(self, key: str) -> str | None:
+        """Load quarantined content by key, or ``None`` if it doesn't exist."""
+        path = self._imports_dir / f"{_sanitize_key(key)}.md"
+        return path.read_text(encoding="utf-8") if path.exists() else None
+
+    def list_import_keys(self) -> list[str]:
+        """Return every quarantined note's key, sorted alphabetically."""
+        return [p.stem for p in sorted(self._imports_dir.glob("*.md"))]
+
+    # -----------------------------------------------------------------
     # Daily notes (memory/YYYY-MM-DD.md) — the one merged daily-note path
     # -----------------------------------------------------------------
 

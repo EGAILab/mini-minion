@@ -1,11 +1,16 @@
 """Tests for SaveMemoryTool and SearchMemoryTool."""
 
-from minion_assist.memory.long_term import LongTermMemory
+from minion_assist.memory.files import MemoryFileRepository
+from minion_assist.memory.service import MemoryService
 from minion_assist.tools.memory import SaveMemoryTool, SearchMemoryTool
 
 
+def _service(tmp_path) -> MemoryService:
+    return MemoryService(MemoryFileRepository(tmp_path))
+
+
 def test_save_memory_tool_schema():
-    mem = LongTermMemory.__new__(LongTermMemory)
+    mem = MemoryService.__new__(MemoryService)
     tool = SaveMemoryTool(mem)
     schema = tool.schema
     assert schema.name == "save_memory"
@@ -15,7 +20,7 @@ def test_save_memory_tool_schema():
 
 
 def test_search_memory_tool_schema():
-    mem = LongTermMemory.__new__(LongTermMemory)
+    mem = MemoryService.__new__(MemoryService)
     tool = SearchMemoryTool(mem)
     schema = tool.schema
     assert schema.name == "search_memory"
@@ -23,7 +28,7 @@ def test_search_memory_tool_schema():
 
 
 def test_save_memory_saves_and_returns_confirmation(tmp_path):
-    mem = LongTermMemory(tmp_path)
+    mem = _service(tmp_path)
     tool = SaveMemoryTool(mem)
     result = tool.execute(key="my-note", content="# Hello\nworld")
     assert "my-note" in result
@@ -31,8 +36,8 @@ def test_save_memory_saves_and_returns_confirmation(tmp_path):
 
 
 def test_search_memory_finds_saved_content(tmp_path):
-    mem = LongTermMemory(tmp_path)
-    mem.save("api-notes", "REST API best practices")
+    mem = _service(tmp_path)
+    mem.remember("api-notes", "REST API best practices")
     tool = SearchMemoryTool(mem)
     result = tool.execute(query="REST")
     assert "api-notes" in result
@@ -41,7 +46,7 @@ def test_search_memory_finds_saved_content(tmp_path):
 
 def test_search_memory_no_results_empty_memory(tmp_path):
     """Empty memory returns a 'memory is empty' message."""
-    mem = LongTermMemory(tmp_path)
+    mem = _service(tmp_path)
     tool = SearchMemoryTool(mem)
     result = tool.execute(query="xyzzy")
     assert "xyzzy" in result
@@ -50,8 +55,8 @@ def test_search_memory_no_results_empty_memory(tmp_path):
 
 def test_search_memory_no_results_lists_available_keys(tmp_path):
     """When notes exist but nothing matches, available keys are listed."""
-    mem = LongTermMemory(tmp_path)
-    mem.save("daughter-profile", "age 10, likes art")
+    mem = _service(tmp_path)
+    mem.remember("daughter-profile", "age 10, likes art")
     tool = SearchMemoryTool(mem)
     result = tool.execute(query="Isabella")
     assert "No memories" in result
@@ -61,25 +66,25 @@ def test_search_memory_no_results_lists_available_keys(tmp_path):
 
 def test_search_memory_multi_term_finds_note(tmp_path):
     """Multi-term query with any matching term returns the note."""
-    mem = LongTermMemory(tmp_path)
-    mem.save("daughter-math-challenge", "# Parent Help\n10-year-old girl dislikes math")
+    mem = _service(tmp_path)
+    mem.remember("daughter-math-challenge", "# Parent Help\n10-year-old girl dislikes math")
     tool = SearchMemoryTool(mem)
     result = tool.execute(query="daughter vibe coding")
     assert "daughter-math-challenge" in result
     assert "Parent Help" in result
 
 
-def test_default_registry_with_long_term_has_memory_tools(tmp_path):
+def test_default_registry_with_memory_has_memory_tools(tmp_path):
     from minion_assist.tools import default_registry
 
-    mem = LongTermMemory(tmp_path)
-    reg = default_registry(long_term=mem)
+    mem = _service(tmp_path)
+    reg = default_registry(memory=mem)
     names = {d["function"]["name"] for d in reg.definitions}
     assert "save_memory" in names
     assert "search_memory" in names
 
 
-def test_default_registry_without_long_term_has_no_memory_tools():
+def test_default_registry_without_memory_has_no_memory_tools():
     from minion_assist.tools import default_registry
 
     reg = default_registry()
@@ -90,11 +95,11 @@ def test_default_registry_without_long_term_has_no_memory_tools():
 
 def test_search_memory_cap_note_shown_when_limit_hit(tmp_path):
     """SearchMemoryTool output must include a cap hint when _SEARCH_MAX_RESULTS notes match."""
-    from minion_assist.memory.long_term import _SEARCH_MAX_RESULTS
+    from minion_assist.memory.service import _SEARCH_MAX_RESULTS
 
-    mem = LongTermMemory(tmp_path)
+    mem = _service(tmp_path)
     for i in range(_SEARCH_MAX_RESULTS + 5):
-        mem.save(f"note-{i}", "keyword content")
+        mem.remember(f"note-{i}", "keyword content")
     tool = SearchMemoryTool(mem)
     result = tool.execute(query="keyword")
     assert "capped" in result.lower()

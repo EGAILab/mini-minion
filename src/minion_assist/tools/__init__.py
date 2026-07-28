@@ -10,7 +10,7 @@ Why a factory function?
 injected at construction:
 
 - :class:`SaveMemoryTool` / :class:`SearchMemoryTool` need a
-  :class:`LongTermMemory` instance.
+  :class:`~minion_assist.memory.service.MemoryService` instance.
 - :class:`ReadTaskTool` / :class:`UpdateTaskTool` need the path to the agent's
   task JSON file (derived from ``tasks_dir`` + ``agent_id``).
 - :class:`BashTool` accepts an optional confirmation callback and a working
@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..mcp.client import McpClientManager
+    from ..memory.service import MemoryService
 
 from .apply_patch import ApplyPatchTool
 from .browser import BrowserTool
@@ -65,7 +66,7 @@ from .write_daily_memory import WriteDailyMemoryTool
 
 
 def default_registry(
-    long_term: "LongTermMemory | None" = None,
+    memory: "MemoryService | None" = None,
     root: Path | None = None,
     bash_confirm: "Callable[[str], bool] | None" = None,
     bash_approval: "Callable[[str], ApprovalDecision] | None" = None,
@@ -82,7 +83,9 @@ def default_registry(
     """Build a :class:`ToolRegistry` with all standard tools registered.
 
     Args:
-        long_term:    If provided, also registers memory tools with this backend.
+        memory:       If provided, also registers memory tools with this
+                      :class:`~minion_assist.memory.service.MemoryService`
+                      backend.
         root:         Workspace root path. File tools reject paths outside this
                       boundary.  Pass ``None`` to disable path restriction.
         bash_confirm: Optional callable passed to :class:`BashTool`.  Called
@@ -170,11 +173,11 @@ def default_registry(
     # Memory tools — only when a backend is provided.
     # SaveMemoryTool and NoteTool receive policy so /plan read-only mode blocks writes.
     # Note: only read_only_mode is checked (not check_write) because memory files
-    # live at ~/.minion-assist/memory/ which is outside the workspace boundary.
-    if long_term is not None:
-        registry.register(SaveMemoryTool(long_term, policy=_policy))
-        registry.register(SearchMemoryTool(long_term))
-        registry.register(NoteTool(long_term, policy=_policy))
+    # live under the agent's own workspace root, outside the tool sandbox boundary.
+    if memory is not None:
+        registry.register(SaveMemoryTool(memory, policy=_policy))
+        registry.register(SearchMemoryTool(memory))
+        registry.register(NoteTool(memory, policy=_policy))
 
     # Daily memory tool — only when an agent workspace root is provided.
     # Lets the agent append notes to memory/YYYY-MM-DD.md without needing to

@@ -1,7 +1,13 @@
 """Background memory extraction — non-blocking, fires after each turn.
 
 Extracts 0–3 concise facts from the last user↔assistant exchange and appends
-them to a rolling ``_auto_extracted`` note in long-term memory.
+them to a rolling ``_auto_extracted`` note.
+
+The note is quarantined (``memory/imports/_auto_extracted.md``, via
+:meth:`MemoryService.remember_import`), not a curated topic page — nobody
+has reviewed these facts, so per
+``docs/adr/0003-per-agent-memory-scope.md`` they stay searchable but are
+never auto-promoted.
 
 Design
 ------
@@ -14,7 +20,8 @@ Design
 
 Talks to
 --------
-- ``memory/long_term.py`` — appends extracted facts via :class:`LongTermMemory`.
+- ``memory/service.py`` — appends extracted facts via
+  :meth:`MemoryService.remember_import`/:meth:`MemoryService.load_import`.
 - ``providers/base.py``   — calls ``provider.chat()`` for the extraction LLM call.
 - ``agents/session.py``   — :func:`extract_and_save_async` is called after each
                             successful turn.
@@ -27,7 +34,7 @@ import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..memory.long_term import LongTermMemory
+    from ..memory.service import MemoryService
     from ..providers.base import LLMProvider
 
 _log = logging.getLogger("minion_assist.extractor")
@@ -49,14 +56,14 @@ _MAX_ROLLING_ENTRIES = 50
 
 
 def extract_and_save_async(
-    memory: "LongTermMemory",
+    memory: "MemoryService",
     provider: "LLMProvider",
     last_exchange: list[dict],
 ) -> None:
     """Trigger background memory extraction. Returns immediately.
 
     Args:
-        memory:        The agent's :class:`LongTermMemory` instance.
+        memory:        The agent's :class:`MemoryService` instance.
         provider:      The agent's LLM provider (same one used for the turn).
         last_exchange: The last 1–2 messages (ideally last user + last assistant).
                        Extraction is skipped if fewer than 2 messages are provided.
@@ -73,7 +80,7 @@ def extract_and_save_async(
 
 
 def _worker(
-    memory: "LongTermMemory",
+    memory: "MemoryService",
     provider: "LLMProvider",
     exchange: list[dict],
 ) -> None:
@@ -99,11 +106,11 @@ def _worker(
         _log.debug("Memory extraction failed: %s: %s", type(exc).__name__, exc)
 
 
-def _append(memory: "LongTermMemory", facts: list[str]) -> None:
-    """Append new facts to the rolling ``_auto_extracted`` note."""
-    existing = memory.load("_auto_extracted") or ""
+def _append(memory: "MemoryService", facts: list[str]) -> None:
+    """Append new facts to the rolling, quarantined ``_auto_extracted`` note."""
+    existing = memory.load_import("_auto_extracted") or ""
     lines = [ln for ln in existing.splitlines() if ln.strip()]
     # Trim oldest entries to stay within the cap.
     lines = lines[-((_MAX_ROLLING_ENTRIES - len(facts))):]
     lines.extend(facts)
-    memory.save("_auto_extracted", "\n".join(lines))
+    memory.remember_import("_auto_extracted", "\n".join(lines))

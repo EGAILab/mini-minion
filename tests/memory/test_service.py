@@ -51,6 +51,32 @@ def test_list_keys_returns_sorted_keys(service):
 
 
 # ---------------------------------------------------------------------------
+# Quarantined notes (remember_import / load_import / list_import_keys)
+# ---------------------------------------------------------------------------
+
+def test_remember_import_and_load_import_round_trip(service):
+    service.remember_import("_auto_extracted", "fact one\nfact two")
+    assert service.load_import("_auto_extracted") == "fact one\nfact two"
+
+
+def test_load_import_returns_none_for_missing_note(service):
+    assert service.load_import("does-not-exist") is None
+
+
+def test_list_import_keys_returns_sorted_keys(service):
+    service.remember_import("zeta", "z")
+    service.remember_import("alpha", "a")
+    assert service.list_import_keys() == ["alpha", "zeta"]
+
+
+def test_import_notes_are_separate_from_topic_notes(service):
+    service.remember("topic-note", "content")
+    service.remember_import("import-note", "content")
+    assert service.list_keys() == ["topic-note"]
+    assert service.list_import_keys() == ["import-note"]
+
+
+# ---------------------------------------------------------------------------
 # search
 # ---------------------------------------------------------------------------
 

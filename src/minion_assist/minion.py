@@ -96,7 +96,7 @@ from .plugins import load_plugins
 from .config import streaming, voice as voice_cfg, workspace
 from .mcp import McpClientManager
 from .context import Compactor, _SNIP_SAFETY_BUFFER
-from .memory import LongTermMemory, ShortTermMemory
+from .memory import MemoryFileRepository, MemoryService, ShortTermMemory
 from .providers import create_provider
 from .session import SessionStore
 from .skills import discover_skills, format_skills_prompt
@@ -530,10 +530,9 @@ def main() -> None:
     _dream_workspace_dir: "Path | None" = None
     sessions: dict[str, AgentSession] = {}
     for agent_id, cfg in agents_cfg.items():
-        long_term = LongTermMemory(workspace / "memory" / agent_id)
-
-        # Per-agent workspace root: resolved before default_registry() so
-        # WriteDailyMemoryTool can be given the correct workspace path.
+        # Per-agent workspace root: resolved before building the memory service
+        # and calling default_registry() so both point at the same directory
+        # (and WriteDailyMemoryTool gets the correct workspace path too).
         _agent_workspace = agent_workspace_root(workspace, agent_id)
         if _agent_workspace is not None:
             ensure_workspace(_agent_workspace)
@@ -541,8 +540,16 @@ def main() -> None:
         else:
             _agent_bootstrap_root = _bootstrap_root
 
+        # Memory lives under the agent's own workspace root (merged Stage One
+        # Phase 0 layout: memory/{topics,imports}/, dated daily files) rather
+        # than the legacy shared ~/.minion-assist/memory/{agent_id}/ directory.
+        # Falls back to _bootstrap_root (same fallback bootstrap context uses)
+        # so memory tools are always available, even for an agent with no
+        # dedicated or shared workspace directory configured.
+        memory_service = MemoryService(MemoryFileRepository(_agent_bootstrap_root))
+
         tools = default_registry(
-            long_term=long_term,
+            memory=memory_service,
             root=_tool_root,
             bash_confirm=_console_confirm,
             bash_approval=_console_approve,
@@ -622,7 +629,7 @@ def main() -> None:
             short_term=short_term,
             session_store=session_store,
             soul_suffix=_skills_suffix,
-            long_term=long_term,
+            memory=memory_service,
             tasks_dir=_tasks_dir,
             enable_memory_extraction=memory_cfg.enable_extraction,
             bootstrap_context=_agent_bootstrap_context,

@@ -12,7 +12,8 @@ from minion_assist.agents.events import (
 )
 from minion_assist.agents.session import AgentSession
 from minion_assist.context import Compactor
-from minion_assist.memory.long_term import LongTermMemory
+from minion_assist.memory.files import MemoryFileRepository
+from minion_assist.memory.service import MemoryService
 from minion_assist.memory.short_term import ShortTermMemory
 from minion_assist.providers.base import LLMResponse
 from minion_assist.session import SessionStore
@@ -312,13 +313,17 @@ def test_send_emits_compaction_failed_event_on_summarisation_error(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# User context injection
+# Relevant-memory injection
 # ---------------------------------------------------------------------------
+# Stable user-profile injection (formerly a separate <user_context> block
+# loaded once at __init__ from a "user_context" note) was retired in Phase 1
+# — bootstrap.py's live USER.md handling already covers it, every turn, with
+# no restart needed. See docs/adr/0003-per-agent-memory-scope.md.
 
-def test_user_context_injected_into_system_prompt(tmp_path):
-    """When user_context.md exists, its content must appear in the system prompt."""
-    long_term = LongTermMemory(tmp_path / "memory")
-    long_term.save("user_context", "User is a Python expert.")
+def test_relevant_memory_injected_into_system_prompt(tmp_path):
+    """A note matching the user's message must appear in the system prompt."""
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert.")
 
     short_term = ShortTermMemory(tmp_path / "sessions")
     session_store = SessionStore(tmp_path / "sessions.json")
@@ -335,7 +340,7 @@ def test_user_context_injected_into_system_prompt(tmp_path):
         compactor=compactor,
         short_term=short_term,
         session_store=session_store,
-        long_term=long_term,
+        memory=memory,
     )
 
     captured_system: list[str] = []
@@ -345,17 +350,17 @@ def test_user_context_injected_into_system_prompt(tmp_path):
         return LLMResponse(text="ok", finish_reason="stop")
 
     provider.chat = Mock(side_effect=_capture)
-    session.send("hello")
+    session.send("Tell me about Python")
 
     assert len(captured_system) == 1
     assert "User is a Python expert." in captured_system[0]
-    assert "user_context" in captured_system[0].lower()
+    assert "<relevant_memories>" in captured_system[0]
 
 
-def test_no_user_context_when_file_absent(tmp_path):
-    """When user_context.md is absent, the system prompt must not contain the block."""
-    long_term = LongTermMemory(tmp_path / "memory")
-    # Do NOT save user_context — file absent
+def test_no_relevant_memories_block_when_nothing_matches(tmp_path):
+    """When no note matches the message, the system prompt has no memories block."""
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    # No notes saved at all.
 
     short_term = ShortTermMemory(tmp_path / "sessions")
     session_store = SessionStore(tmp_path / "sessions.json")
@@ -372,7 +377,7 @@ def test_no_user_context_when_file_absent(tmp_path):
         compactor=compactor,
         short_term=short_term,
         session_store=session_store,
-        long_term=long_term,
+        memory=memory,
     )
 
     captured_system: list[str] = []
@@ -384,7 +389,7 @@ def test_no_user_context_when_file_absent(tmp_path):
     provider.chat = Mock(side_effect=_capture)
     session.send("hello")
 
-    assert "<user_context>" not in captured_system[0]
+    assert "<relevant_memories>" not in captured_system[0]
 
 
 # ---------------------------------------------------------------------------
@@ -624,7 +629,7 @@ def test_reload_is_idempotent(tmp_path):
 
 def test_enable_memory_extraction_false_suppresses_extraction(tmp_path):
     """When enable_memory_extraction=False, the extraction daemon thread is never started."""
-    long_term = LongTermMemory(tmp_path / "memory")
+    memory = MemoryService(MemoryFileRepository(tmp_path))
     short_term = ShortTermMemory(tmp_path / "sessions")
     session_store = SessionStore(tmp_path / "sessions.json")
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
@@ -640,7 +645,7 @@ def test_enable_memory_extraction_false_suppresses_extraction(tmp_path):
         compactor=compactor,
         short_term=short_term,
         session_store=session_store,
-        long_term=long_term,
+        memory=memory,
         enable_memory_extraction=False,
     )
 
@@ -658,7 +663,7 @@ def test_enable_memory_extraction_false_suppresses_extraction(tmp_path):
 
 def test_enable_memory_extraction_true_allows_extraction(tmp_path):
     """When enable_memory_extraction=True (default), extraction is triggered after a turn."""
-    long_term = LongTermMemory(tmp_path / "memory")
+    memory = MemoryService(MemoryFileRepository(tmp_path))
     short_term = ShortTermMemory(tmp_path / "sessions")
     session_store = SessionStore(tmp_path / "sessions.json")
     compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
@@ -674,7 +679,7 @@ def test_enable_memory_extraction_true_allows_extraction(tmp_path):
         compactor=compactor,
         short_term=short_term,
         session_store=session_store,
-        long_term=long_term,
+        memory=memory,
         enable_memory_extraction=True,
     )
 

@@ -175,8 +175,14 @@ minion-assist/
 │   │   └── __init__.py
 │   ├── memory/                  # Persistent memory storage
 │   │   ├── short_term.py        # JSONL conversation history (atomic writes)
-│   │   ├── long_term.py         # Markdown notes store (ranked keyword search)
+│   │   ├── files.py             # MemoryFileRepository — merged workspace-root note store
+│   │   ├── service.py           # MemoryService — facade AgentSession/tools depend on
+│   │   ├── models.py            # MemoryHit, MemoryLocator, MemoryExcerpt, MemoryStatus
 │   │   ├── extractor.py         # Background fact extraction after each turn
+│   │   ├── migration.py         # Phase 0: legacy-root -> merged-root migration tooling
+│   │   ├── cli.py               # `minion-assist memory migrate` subcommand
+│   │   ├── baseline.py          # Retrieval recall/latency measurement vs. fixture corpus
+│   │   ├── long_term.py         # Legacy Markdown notes store (superseded by MemoryService)
 │   │   └── __init__.py
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
@@ -316,9 +322,9 @@ router.resolve()
 AgentSession.send(message, on_event=callback, stream=True/False)
     │
     ├─ Build system prompt:
-    │     soul + bootstrap Project Context (AGENTS.md, SOUL.md, TOOLS.md, …)
+    │     soul + bootstrap Project Context (AGENTS.md, SOUL.md, TOOLS.md,
+    │            USER.md, MEMORY.md, …) — read live every turn, no restart needed
     │          + <bootstrap_pending> guidance (if BOOTSTRAP.md present)
-    │          + <user_context> (if user_context.md exists)
     │          + <relevant_memories> (proactive search — top-5 snippets)
     │          + <active_task> (current task progress, if a task is active)
     │          + <context_budget> warning (if history > 50% of context window)
@@ -354,8 +360,9 @@ AgentSession.send(message, on_event=callback, stream=True/False)
            ├─ short_term.save(agent_id, messages)   ← persists history to JSONL (always)
            ├─ session_store.touch(agent_id, ...)    ← updates turn count / timestamp
            ├─ db.add_message(...) [optional]        ← mirrors to PostgreSQL for FTS search
-           └─ extract_and_save_async(long_term, provider, last_exchange)
-                  daemon thread — extracts 0–3 key facts, appends to _auto_extracted.md
+           └─ extract_and_save_async(memory, provider, last_exchange)
+                  daemon thread — extracts 0–3 key facts, appends to quarantined
+                  memory/imports/_auto_extracted.md (see MemoryService.remember_import)
 ```
 
 **Event system:** `run_turn` and `AgentSession` emit structured event objects to the `on_event` callback rather than calling `print()` or `input()` directly. This makes the agent runtime usable headlessly (tests, scripts, web APIs) — pass `on_event=None` for silent execution.
@@ -385,14 +392,17 @@ AgentSession.send(message, on_event=callback, stream=True/False)
 │   │   └── {uuid}.name          ← optional human-readable name for that session
 │   └── researcher/              ← Elizabeth's session files
 │       └── {uuid}.jsonl
-├── memory/
-│   ├── main/             ← Ada's long-term notes (isolated per agent)
-│   │   ├── user_context.md     ← injected into system prompt every turn (optional)
-│   │   ├── _auto_extracted.md  ← rolling facts extracted automatically after turns
-│   │   ├── project-goals.md
-│   │   └── api-research.md
-│   └── researcher/       ← Elizabeth's long-term notes (isolated)
-│       └── findings.md
+├── workspaces/                  ← per-agent memory + bootstrap root (see "Multi-Agent Workspace")
+│   ├── main/
+│   │   ├── AGENTS.md, SOUL.md, USER.md, MEMORY.md, DREAMS.md  ← bootstrap files
+│   │   └── memory/
+│   │       ├── YYYY-MM-DD.md    ← daily notes (write_daily_memory)
+│   │       ├── topics/          ← explicit save_memory notes (project-goals.md, …)
+│   │       └── imports/         ← quarantined, unreviewed (_auto_extracted.md, note tool)
+│   └── researcher/
+│       └── memory/topics/findings.md
+├── memory/                      ← LEGACY per-agent notes root, pre-Stage-One-Phase-0.
+│   └── main/project-goals.md    ← migrated via `minion-assist memory migrate --apply`
 ├── tasks/
 │   ├── main.json         ← Ada's active task progress file (created on demand)
 │   └── researcher.json   ← Elizabeth's active task progress file
@@ -1370,7 +1380,7 @@ session = AgentSession(
     short_term=short_term,
     session_store=session_store,
     soul_suffix="",              # optional skills block appended each turn
-    long_term=long_term,         # enables memory injection and background extraction
+    memory=memory_service,       # enables memory injection and background extraction
     memory_injection_tokens=600, # token budget for proactive memory injection (default 600)
     enable_memory_extraction=True,  # False to suppress the background extraction API call
 )
@@ -1395,10 +1405,11 @@ session.fork("backup")   # copies history to "backup" agent_id
 md = session.export(format="md")   # "md" (default) or "html"
 ```
 
-When `long_term` is provided, `AgentSession`:
-- Loads `user_context.md` from the memory directory at init and injects it into the system prompt on every turn as a `<user_context>` block.
-- Searches long-term memory before each turn and injects the top-5 matching snippets as a `<relevant_memories>` block (capped at `memory_injection_tokens * 4` characters).
+When `memory` is provided, `AgentSession`:
+- Searches memory before each turn and injects the top-5 matching snippets as a `<relevant_memories>` block (capped at `memory_injection_tokens * 4` characters).
 - Fires background fact extraction after each successful turn (daemon thread — never blocks the REPL). Can be disabled via `enable_memory_extraction=False` (or `config.json` `"memory": {"enable_extraction": false}`).
+
+(Stable user-profile injection — formerly a separate `<user_context>` block loaded once at init from a `user_context` note — is handled by `bootstrap.py`'s live `USER.md` mechanism instead; see the `memory` module reference below.)
 
 **`session.reload()`** — reloads conversation history from disk, replacing in-memory state. Called automatically by the `/switch` command to ensure the history is current after switching agents. Does not affect long-term memory, task files, or session metadata.
 
@@ -1553,7 +1564,7 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 
 ```python
 from minion_assist.tools import default_registry
-from minion_assist.memory import LongTermMemory
+from minion_assist.memory import MemoryFileRepository, MemoryService
 from minion_assist.skills import discover_skills
 from pathlib import Path
 
@@ -1568,7 +1579,7 @@ reg = default_registry(
 
 # With memory and task tools (8 tools total)
 reg = default_registry(
-    long_term=LongTermMemory(some_path),
+    memory=MemoryService(MemoryFileRepository(agent_workspace_path)),
     root=Path.cwd(),
     tasks_dir=Path("~/.minion-assist/tasks").expanduser(),
     agent_id="main",
@@ -1582,7 +1593,7 @@ reg = default_registry(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `long_term` | `LongTermMemory \| None` | `None` | If provided, registers `save_memory` and `search_memory` |
+| `memory` | `MemoryService \| None` | `None` | If provided, registers `save_memory`, `search_memory`, and `note` |
 | `root` | `Path \| None` | `None` | Workspace root — `read`/`write`/`glob`/`edit`/`grep` reject paths outside this boundary |
 | `bash_confirm` | `Callable[[str], bool] \| None` | `None` | Simple bool callback called before every bash command; `None` = no confirmation |
 | `bash_approval` | `Callable[[str], ApprovalDecision] \| None` | `None` | Rich 4-option approval callback (ALLOW_ONCE, ALLOW_SESSION, DENY, ALWAYS_DENY). Takes priority over `bash_confirm` when both are set. The CLI wires this to a menu that also records decisions to the policy's audit log. |
@@ -1788,24 +1799,38 @@ mem.set_name("main", session_id, "Auth work")        # save a human-readable nam
 mem.list_sessions("main")                            # list[Path] — all session files, oldest-first
 ```
 
-#### Long-term (`long_term.py`)
+#### `MemoryService` (`service.py`, `files.py`, `models.py`) — Stage One Phase 1
 
-Stores notes as Markdown files — one file per key at `{base_dir}/{key}.md`. Forward slashes in keys are replaced with underscores.
+**This is what `AgentSession` and the memory tools actually use at runtime today** (wired in as of Phase 1 slice 3 — `minion.py` builds one `MemoryService` per agent and passes it to `default_registry(memory=...)` and `AgentSession(memory=...)`). It targets the *merged* per-agent layout Stage One Phase 0's migration produces: `workspaces/{agent_id}/memory/{topics,imports}/` and dated `workspaces/{agent_id}/memory/YYYY-MM-DD.md` files, rather than the legacy flat `memory/{agent_id}/{key}.md` root.
 
 ```python
-from minion_assist.memory import LongTermMemory
+from minion_assist.memory import MemoryFileRepository, MemoryService
 
-mem = LongTermMemory(Path("~/.minion-assist/memory/main").expanduser())
-mem.save("api-research", "# REST vs GraphQL\n...")
-mem.load("api-research")       # str or None
-mem.search("GraphQL REST")     # list[tuple[key, content]] — ranked results
-mem.list_keys()                # list[str]
-mem.delete("api-research")     # bool
+service = MemoryService(MemoryFileRepository(Path("~/.minion-assist/workspaces/main").expanduser()))
+service.remember("project-goals", "# Goals\n...")   # -> memory/topics/project-goals.md
+service.load("project-goals")                         # str | None
+service.search("goals")                                # list[MemoryHit] (topic + import + daily, tagged by source)
+service.append_daily("did a thing")                    # -> memory/YYYY-MM-DD.md, timestamped bullet
+service.delete("project-goals")                         # bool
+
+# Exact bounded read — no equivalent in the legacy LongTermMemory store.
+service.get("memory/topics/project-goals.md", from_line=1, lines=20)   # MemoryExcerpt
+
+# Quarantined, unreviewed notes — searchable but never auto-promoted (see
+# docs/adr/0003-per-agent-memory-scope.md). Used by the background extractor
+# and the `note` tool.
+service.remember_import("_auto_extracted", "fact one\nfact two")
+service.load_import("_auto_extracted")                  # str | None
+service.list_import_keys()                              # list[str]
+
+service.status()   # MemoryStatus(topic_count=1, import_count=1, daily_count=1, ...)
 ```
 
-`search()` splits the query on whitespace, filters out stop-word candidates (terms shorter than 3 characters), and ranks results by term-match frequency. Notes matching more query terms rank above those matching fewer. Among ties, newer files rank slightly higher. Results are capped at 20 (`_SEARCH_MAX_RESULTS`).
+`search()` splits the query on whitespace, filters out stop-word candidates (terms shorter than 3 characters), and ranks results by term-match frequency. Notes matching more query terms rank above those matching fewer. Among ties, newer files rank slightly higher. Results are capped at 20 (`_SEARCH_MAX_RESULTS`). This scoring is unchanged from the legacy `LongTermMemory.search()` — Phase 1's goal was one canonical service with existing retrieval behavior, not better retrieval (that's Phase 3+). Two real fixes did land alongside the move: `remember()` now writes atomically (temp file + `os.replace`, so a crash mid-write can't corrupt a note), and `search()` now spans three sources (`memory/topics/`, `memory/imports/`, and dated daily files) instead of one flat directory.
 
-**Reserved key: `user_context`** — `AgentSession` loads this key at startup and injects its content into the system prompt every turn. Write to it with `save_memory(key="user_context", content="...")` to give the agent persistent background about yourself.
+One `MemoryService` per agent, each wrapping a repository rooted at that agent's own workspace directory, is the entire scope-enforcement story for now — Stage One's target design names several memory scopes (agent-private, user-shared, workspace, session-lineage, channel, import-quarantine), but only `agent-private` has a real caller today, so that's the only one enforced.
+
+**Retired: the `user_context` reserved key.** `AgentSession` used to load a separate `user_context.md` note once at construction and inject it as a static `<user_context>` block. That duplicated `bootstrap.py`'s live `USER.md` injection once Phase 0 migrated `user_context.md` → `USER.md`, so it was removed in Phase 1 — write to `USER.md` directly (or via the `write`/`edit` tools) to give the agent persistent background about yourself; it's re-read live every turn, no restart needed.
 
 #### Background extractor (`extractor.py`)
 
@@ -1813,12 +1838,16 @@ mem.delete("api-research")     # bool
 from minion_assist.memory.extractor import extract_and_save_async
 
 # Fire after a successful turn — returns immediately (daemon thread)
-extract_and_save_async(long_term, provider, last_exchange)
+extract_and_save_async(memory, provider, last_exchange)
 ```
 
-After each successful turn, `AgentSession` fires `extract_and_save_async` in a daemon thread. The function sends the last user↔assistant exchange to the provider with a short extraction prompt and appends any discovered facts (0–3 per turn, max 100 chars each) to a rolling `_auto_extracted.md` file (capped at 50 entries).
+After each successful turn, `AgentSession` fires `extract_and_save_async` in a daemon thread. The function sends the last user↔assistant exchange to the provider with a short extraction prompt and appends any discovered facts (0–3 per turn, max 100 chars each) to a rolling, quarantined `memory/imports/_auto_extracted.md` file (capped at 50 entries, via `MemoryService.remember_import`/`load_import`).
 
 This captures key facts — user preferences, decisions, findings — without requiring the agent to explicitly call `save_memory`. Extraction never blocks the REPL and fails silently.
+
+#### Legacy store (`long_term.py`)
+
+`LongTermMemory` is the store `MemoryService` superseded — flat Markdown files at `{base_dir}/{key}.md`, one per key. Nothing in the runtime wiring constructs it anymore; it's kept because `memory/migration.py`'s Phase 0 tooling reads *from* this exact format (the legacy `memory/{agent_id}/` root), and because it still has its own tests (`tests/test_memory_long_term.py`).
 
 #### Migration (`migration.py`, `cli.py`) — Stage One Phase 0
 
@@ -1839,45 +1868,7 @@ minion-assist memory migrate --rollback "~/.minion-assist/memory-migration-backu
 
 Key mapping: `user_context` → `USER.md`; `_auto_extracted` and `_notes_YYYY-MM-DD` (unreviewed extractor/daily-log output) → `memory/imports/` (quarantined, not auto-promoted); every other note → `memory/topics/{key}.md`. A destination that already exists with *different* content than the source is classified as a conflict and is never auto-migrated — it must be resolved manually. See `docs/adr/0003-per-agent-memory-scope.md` for the full rationale.
 
-`memory/baseline.py` measures the current `LongTermMemory.search()` — recall and latency — against the checked-in fixture corpus at `tests/fixtures/memory_corpus/`, so later phases (PostgreSQL lexical index, embeddings) have a real number to compare against rather than an assumption. See `tests/fixtures/memory_corpus/README.md` for the recorded baseline and a known current gap (punctuation-sensitive matching).
-
-#### `MemoryFileRepository` (`files.py`, `models.py`) — Stage One Phase 1, slice 1
-
-**Not yet wired into `AgentSession`/tools** — this is the first of several Phase 1 slices; `LongTermMemory` is still what's actually used at runtime today. `MemoryFileRepository` is the eventual replacement: it targets the *merged* per-agent layout (`workspaces/{agent_id}/memory/{topics,imports}/`, `workspaces/{agent_id}/memory/YYYY-MM-DD.md`) that Phase 0's migration produces, rather than the legacy flat `memory/{agent_id}/{key}.md` root.
-
-```python
-from minion_assist.memory.files import MemoryFileRepository
-from minion_assist.memory.models import MemoryLocator
-
-repo = MemoryFileRepository(Path("~/.minion-assist/workspaces/main").expanduser())
-repo.remember("project-goals", "# Goals\n...")          # -> memory/topics/project-goals.md
-repo.load("project-goals")                                # str | None
-repo.search("goals")                                       # list[MemoryHit] (topic + import + daily, tagged by source)
-repo.append_daily("did a thing")                           # -> memory/YYYY-MM-DD.md, timestamped bullet
-repo.delete("project-goals")                                # bool
-
-# Exact bounded read — new in Phase 1, no equivalent in LongTermMemory.
-excerpt = repo.get(MemoryLocator(path=repo.resolve_path("memory/topics/project-goals.md"), from_line=1, lines=20))
-```
-
-Two behavioral changes from `LongTermMemory`, both bug fixes rather than feature additions: `remember()` writes atomically (temp file + `os.replace`, so a crash mid-write can't corrupt a note — `LongTermMemory.save()`'s plain `write_text()` could), and `search()` spans three sources (`memory/topics/`, `memory/imports/`, and dated `memory/YYYY-MM-DD.md` files) instead of one flat directory, since the merged layout separates what used to be mixed together. Retrieval scoring itself (term-frequency + recency tiebreak, 20-result cap) is unchanged — Phase 1's goal is one canonical service with existing behavior, not better retrieval (that's Phase 3+).
-
-#### `MemoryService` (`service.py`) — Stage One Phase 1, slice 2
-
-**Also not yet wired in.** `MemoryService` is a thin facade over `MemoryFileRepository` — the one object `AgentSession`/tools will depend on once slice 3 rewires `minion.py` (currently they still hold a raw `LongTermMemory` reference). It translates `files.py`'s lower-level primitives into simpler calls: `get()` takes a plain path string instead of requiring the caller to build a `MemoryLocator`, and `status()` reports note counts without exposing the repository's directory layout.
-
-```python
-from minion_assist.memory.service import MemoryService
-from minion_assist.memory.files import MemoryFileRepository
-
-service = MemoryService(MemoryFileRepository(Path("~/.minion-assist/workspaces/main").expanduser()))
-service.remember("project-goals", "# Goals\n...")
-service.search("goals")                              # list[MemoryHit]
-service.get("memory/topics/project-goals.md", from_line=1, lines=20)  # MemoryExcerpt — no MemoryLocator needed
-service.status()                                       # MemoryStatus(topic_count=1, import_count=0, daily_count=0, ...)
-```
-
-One `MemoryService` per agent, each wrapping a repository rooted at that agent's own workspace directory, is the entire scope-enforcement story for now — Stage One's target design names several memory scopes (agent-private, user-shared, workspace, session-lineage, channel, import-quarantine), but only `agent-private` has a real caller today, so that's the only one enforced. See `docs/adr/0003-per-agent-memory-scope.md`.
+`memory/baseline.py` measures the legacy `LongTermMemory.search()` — recall and latency — against the checked-in fixture corpus at `tests/fixtures/memory_corpus/`, so later phases (PostgreSQL lexical index, embeddings) have a real number to compare against rather than an assumption. See `tests/fixtures/memory_corpus/README.md` for the recorded baseline and a known current gap (punctuation-sensitive matching).
 
 ---
 

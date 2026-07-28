@@ -96,6 +96,27 @@ class MemoryService:
         return self._files.list_keys()
 
     # -----------------------------------------------------------------
+    # Quarantined notes — unreviewed, never auto-promoted (see files.py)
+    # -----------------------------------------------------------------
+
+    def remember_import(self, key: str, content: str) -> None:
+        """Save quarantined, unreviewed content under ``key``.
+
+        Used by the background extractor and (until retired) the ``note``
+        tool — content nobody has reviewed yet, searchable but never
+        auto-promoted. See ``docs/adr/0003-per-agent-memory-scope.md``.
+        """
+        self._files.remember_import(key, content)
+
+    def load_import(self, key: str) -> str | None:
+        """Load quarantined content by key, or ``None`` if it doesn't exist."""
+        return self._files.load_import(key)
+
+    def list_import_keys(self) -> list[str]:
+        """Return every quarantined note's key, sorted alphabetically."""
+        return self._files.list_import_keys()
+
+    # -----------------------------------------------------------------
     # Search and recall
     # -----------------------------------------------------------------
 
