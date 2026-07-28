@@ -44,12 +44,20 @@ Talks to
 - ``context.py`` — :meth:`Compactor.peek_compaction_head` supplies the
   messages :meth:`flush_head` writes out before they're summarized away
   (Stage One Phase 2, slice B).
+- ``memory/postgres_index.py`` — :class:`PostgresMemoryIndex`, the optional
+  lexical index this service keeps in sync on every write (Stage One
+  Phase 3, slice B). Only imported under ``TYPE_CHECKING``: constructing
+  one requires ``psycopg``, which this module must not require just to be
+  imported (matching ``agents/session.py``'s and ``minion.py``'s existing
+  "optional database" pattern).
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..messages import format_message_excerpt
 from .files import MemoryFileRepository
@@ -64,6 +72,11 @@ from .models import (
     MemoryStatus,
 )
 
+if TYPE_CHECKING:
+    from .postgres_index import PostgresMemoryIndex
+
+_log = logging.getLogger("minion_assist.memory_service")
+
 # Mirrors MemoryFileRepository's / LongTermMemory's default search cap.
 _SEARCH_MAX_RESULTS = 20
 
@@ -75,10 +88,52 @@ class MemoryService:
         files: The repository backing this service. Construct one
             ``MemoryService`` per agent, each wrapping a repository rooted
             at that agent's own workspace directory.
+        index: The optional lexical index to keep in sync on every write
+            (Stage One Phase 3, slice B). ``None`` (the default, and every
+            existing call site before this slice) means no database is
+            configured — writes behave exactly as before, index sync is
+            simply skipped.
+        agent_id: Required whenever ``index`` is given — the partition key
+            :class:`PostgresMemoryIndex` uses to keep agents' chunks apart.
+            Ignored if ``index`` is ``None``.
     """
 
-    def __init__(self, files: MemoryFileRepository) -> None:
+    def __init__(
+        self,
+        files: MemoryFileRepository,
+        *,
+        index: PostgresMemoryIndex | None = None,
+        agent_id: str | None = None,
+    ) -> None:
         self._files = files
+        self._index = index
+        self._agent_id = agent_id
+
+    def _sync_index(self, source_kind: str, path: Path, content: str | None) -> None:
+        """Update the lexical index for one file, if one is configured.
+
+        ``content=None`` means the file was deleted (remove it from the
+        index); otherwise ``content`` is the file's new full text.
+
+        Never raises — an index-update failure must not block the memory
+        write that already succeeded on disk. This is a best-effort,
+        immediate sync; the periodic/startup reconciliation pass (also
+        Phase 3 slice B) heals anything missed here, the same self-healing
+        split responsibility as message mirroring (Phase 2 slice A).
+        """
+        if self._index is None or self._agent_id is None:
+            return
+        rel_path = path.relative_to(self._files.root).as_posix()
+        try:
+            if content is None:
+                self._index.remove_file(self._agent_id, rel_path)
+            else:
+                self._index.reindex_file(self._agent_id, rel_path, source_kind, content)
+        except Exception as exc:
+            _log.debug(
+                "Memory index sync failed for %s (%s): %s: %s",
+                rel_path, self._agent_id, type(exc).__name__, exc,
+            )
 
     # -----------------------------------------------------------------
     # Explicit notes
@@ -91,7 +146,8 @@ class MemoryService:
             key: Note identifier, e.g. ``"project-goals"``.
             content: Markdown text to store.
         """
-        self._files.remember(key, content)
+        path = self._files.remember(key, content)
+        self._sync_index("durable", path, content)
 
     def load(self, key: str) -> str | None:
         """Load an explicit note's content by key, or ``None`` if it doesn't exist."""
@@ -99,7 +155,10 @@ class MemoryService:
 
     def delete(self, key: str) -> bool:
         """Delete an explicit note. Returns ``True`` if a file was removed."""
-        return self._files.delete(key)
+        removed = self._files.delete(key)
+        if removed:
+            self._sync_index("durable", self._files.topic_path(key), None)
+        return removed
 
     def list_keys(self) -> list[str]:
         """Return every explicit note's key, sorted alphabetically."""
@@ -116,7 +175,8 @@ class MemoryService:
         tool — content nobody has reviewed yet, searchable but never
         auto-promoted. See ``docs/adr/0003-per-agent-memory-scope.md``.
         """
-        self._files.remember_import(key, content)
+        path = self._files.remember_import(key, content)
+        self._sync_index("import", path, content)
 
     def load_import(self, key: str) -> str | None:
         """Load quarantined content by key, or ``None`` if it doesn't exist."""
@@ -165,7 +225,15 @@ class MemoryService:
         Returns:
             Path: The daily note file that was written to.
         """
-        return self._files.append_daily(text, when=when)
+        path = self._files.append_daily(text, when=when)
+        if self._index is not None and self._agent_id is not None:
+            # append_daily() only returns the file it touched, not its full
+            # new content (it appends rather than replacing) — the index
+            # needs the whole file re-chunked, so read it back once here.
+            # A daily note append isn't a hot path, so the extra read is a
+            # non-issue.
+            self._sync_index("daily", path, path.read_text(encoding="utf-8"))
+        return path
 
     # -----------------------------------------------------------------
     # Exact bounded reads

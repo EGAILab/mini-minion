@@ -50,7 +50,7 @@ uv sync
 
 # Optional extras
 uv sync --extra tiktoken   # more accurate token estimation
-uv sync --extra postgres   # PostgreSQL session store (psycopg3 driver)
+uv sync --extra postgres   # PostgreSQL session store + memory index (psycopg3, watchdog)
 
 # Set up config (config lives in your home directory, not in the repo)
 cp config.example.json ~/.minion-assist/config.json
@@ -183,6 +183,7 @@ minion-assist/
 │   │   ├── capture_worker.py    # CaptureWorker — durable capture-job queue worker (needs db)
 │   │   ├── chunking.py          # Heading-aware Markdown chunker for the lexical index
 │   │   ├── postgres_index.py    # PostgresMemoryIndex — rebuildable lexical index (needs db)
+│   │   ├── watcher.py           # MemoryIndexWatcher — live debounced fs sync (needs db+watchdog)
 │   │   ├── migration.py         # Phase 0: legacy-root -> merged-root migration tooling
 │   │   ├── cli.py               # `minion-assist memory migrate` subcommand
 │   │   ├── baseline.py          # Retrieval recall/latency measurement vs. fixture corpus
@@ -1094,7 +1095,7 @@ minion-assist can mirror every conversation message into a PostgreSQL database, 
 # Start PostgreSQL + pgvector via Docker Compose (port 5433 to avoid conflicts with a local postgres)
 docker compose up -d
 
-# Install the psycopg3 driver
+# Install the psycopg3 driver + watchdog (for the memory index's live filesystem watcher)
 uv sync --extra postgres
 ```
 
@@ -1167,7 +1168,17 @@ Without a configured database, `CaptureWorker` is never constructed and `AgentSe
 
 `PostgresMemoryIndex.rebuild_agent(agent_id, indexable_files)` rebuilds one agent's entire index from `MemoryFileRepository.list_indexable_files()`'s listing — deleting chunks/ledger rows for any file no longer present, then reindexing everything else. `reindex_file()`/`remove_file()` handle one file at a time.
 
-**This slice only builds and rebuilds the index — nothing in the running app calls it yet.** No write-path sync, no startup reconciliation, no live filesystem watcher, and `MemoryService.search()` is unchanged (still the Phase 1 linear scan). Wiring the index into live search, keeping it in sync with on-disk edits, and crash-safe rebuild-and-swap are later Phase 3 slices — see `minion-assist-docs/improve/memory-implementation-plan.md`.
+### Keeping the index in sync (Stage One Phase 3, slice B)
+
+Three layers keep `memory_chunks`/`memory_files` current, from cheapest/fastest to broadest-coverage:
+
+1. **Write-path sync.** `MemoryService`'s write methods (`remember`, `remember_import`, `append_daily`, `delete`) call `PostgresMemoryIndex.reindex_file()`/`remove_file()` directly, right after the disk write succeeds — the single file just touched, nothing more. Covers everything the app itself writes, with no lag. Never raises: a failed sync here is logged (`minion_assist.memory_service`, debug level) and swallowed, not surfaced to the caller.
+2. **Startup reconciliation.** On every startup (when a database is configured), `minion.py` calls `PostgresMemoryIndex.reconcile_agent(agent_id, ...)` for every configured agent — hash-diffs the agent's current files against the `memory_files` ledger, reindexing only what's new or changed and removing what's gone. Prints `Reindexed N memory file(s) for agent '{agent_id}'.` when anything actually changed. Catches any edit made while the process wasn't running.
+3. **Live filesystem watcher.** `memory/watcher.py`'s `MemoryIndexWatcher` — one background thread (started at process startup, alongside `CaptureWorker`) watching every configured agent's workspace root via the optional `watchdog` package (installed with the `postgres` extra). Catches an edit made *while the process is running* but outside the app itself (e.g. hand-editing `MEMORY.md` in a text editor) — the one gap write-path sync can't close. Filesystem events are debounced per agent (~1 second of quiet) before triggering `reconcile_agent()`, so one save that fires several OS-level events (e.g. a temp-file-then-rename) triggers one reconcile, not several.
+
+`reconcile_agent()` (used by both layer 2 and layer 3) is the "targeted" counterpart to `rebuild_agent()`: it only touches files whose content hash actually changed, the same "diff by hash, heal exactly what's missing or stale" shape as `session/db.py`'s `reconcile_session`/`reconcile_all_sessions` for message mirrors.
+
+**`MemoryService.search()` is still unchanged** (the Phase 1 linear scan) — wiring the index into live search, corpus filters, citations, and crash-safe rebuild-and-swap are Phase 3 slice C. Without a configured database, none of the above run: `_memory_index`/`_memory_watcher` are simply `None`, and `MemoryService` behaves exactly as it did before Phase 3.
 
 ### `session_search` Tool Modes
 
@@ -2266,7 +2277,7 @@ uv run pytest -v
 ```bash
 uv sync                          # install core dependencies
 uv sync --extra tiktoken         # + tiktoken for accurate token estimation
-uv sync --extra postgres         # + psycopg3 for PostgreSQL session store
+uv sync --extra postgres         # + psycopg3 + watchdog for PostgreSQL session store & memory index
 uv sync --extra browser          # + playwright for browser tool
 uv sync --extra voice            # + silero-vad, sounddevice, torch, transformers for voice chat
 uv sync --extra tiktoken --extra postgres  # combine any extras

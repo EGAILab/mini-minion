@@ -255,6 +255,56 @@ class PostgresMemoryIndex:
             total += self.reindex_file(agent_id, rel_path, source_kind, content)
         return total
 
+    def reconcile_agent(self, agent_id: str, indexable_files: list[tuple[str, str, str]]) -> int:
+        """Bring one agent's index up to date by content hash, touching only what changed.
+
+        Unlike :meth:`rebuild_agent` (which unconditionally reindexes every
+        file — the primitive Phase 3 slice C's crash-safe force-reindex
+        builds on), this only reindexes a file whose content hash differs
+        from what's already in the ``memory_files`` ledger, and only
+        removes ledger/chunk rows for files no longer present. A file
+        that's unchanged since the last reconciliation costs one hash
+        comparison, not a full rechunk-and-reinsert.
+
+        This is what startup catch-up, ``MemoryService``'s write-path sync,
+        and the live filesystem watcher (Phase 3 slice B) all call — the
+        same "diff by hash, heal exactly what's missing or stale" shape as
+        ``session/db.py``'s ``reconcile_session``/``reconcile_all_sessions``
+        for message mirrors.
+
+        Args:
+            agent_id: The agent to reconcile.
+            indexable_files: ``(source_kind, rel_path, content)`` triples —
+                typically :meth:`MemoryFileRepository.list_indexable_files`'s
+                current return value.
+
+        Returns:
+            int: How many files were actually reindexed or removed (0 means
+                the index was already fully up to date).
+        """
+        conn = self._conn()
+        current = {
+            rel_path: (source_kind, content) for source_kind, rel_path, content in indexable_files
+        }
+
+        existing_rows = conn.execute(
+            "SELECT rel_path, content_hash FROM memory_files WHERE agent_id = %s", (agent_id,)
+        ).fetchall()
+        existing_hashes = {rel_path: content_hash for rel_path, content_hash in existing_rows}
+
+        touched = 0
+        for rel_path in existing_hashes:
+            if rel_path not in current:
+                self.remove_file(agent_id, rel_path)
+                touched += 1
+
+        for rel_path, (source_kind, content) in current.items():
+            if existing_hashes.get(rel_path) != _hash_text(content):
+                self.reindex_file(agent_id, rel_path, source_kind, content)
+                touched += 1
+
+        return touched
+
     # ------------------------------------------------------------------
     # Inspection (used by tests and later slices' status reporting)
     # ------------------------------------------------------------------

@@ -374,6 +374,22 @@ def main() -> None:
             print(f"[minion-assist] Warning: database unavailable ({_db_exc}). Session search disabled.")
             _db = None
 
+    # --- Lexical memory index (optional — only when a database is configured) ---
+    # Stage One Phase 3: rebuildable PostgreSQL FTS over memory files (MEMORY.md,
+    # topic notes, daily notes, imports). Its own class/schema, separate from
+    # SessionDB above — see memory/postgres_index.py's module docstring.
+    _memory_index = None
+    if _db is not None:
+        try:
+            from .memory.postgres_index import PostgresMemoryIndex  # noqa: PLC0415
+            _memory_index = PostgresMemoryIndex(database_cfg.url)
+        except Exception as _idx_exc:
+            print(
+                f"[minion-assist] Warning: memory index unavailable ({_idx_exc}). "
+                "Lexical memory search disabled."
+            )
+            _memory_index = None
+
     # --- Matrix channel setup (optional) ---
     # Runs in a background daemon thread; REPL continues on the main thread.
     # The channel is started after sessions are built so it can share them.
@@ -535,6 +551,9 @@ def main() -> None:
     # Populated below, per agent — the durable capture worker (Stage One
     # Phase 2, slice C) looks up a provider by agent_id here.
     _providers_by_agent: dict[str, object] = {}
+    # Populated below, per agent — the memory index watcher (Stage One
+    # Phase 3, slice B) watches every agent's own workspace root.
+    _agent_files_repos: dict[str, MemoryFileRepository] = {}
     for agent_id, cfg in agents_cfg.items():
         # Per-agent workspace root: resolved before building the memory service
         # and calling default_registry() so both point at the same directory
@@ -552,7 +571,18 @@ def main() -> None:
         # Falls back to _bootstrap_root (same fallback bootstrap context uses)
         # so memory tools are always available, even for an agent with no
         # dedicated or shared workspace directory configured.
-        memory_service = MemoryService(MemoryFileRepository(_agent_bootstrap_root))
+        _agent_files_repo = MemoryFileRepository(_agent_bootstrap_root)
+        _agent_files_repos[agent_id] = _agent_files_repo
+        if _memory_index is not None:
+            # Startup catch-up: reconcile by content hash rather than
+            # unconditionally reindexing, so an unchanged file since the
+            # last run costs one hash comparison, not a full rechunk.
+            _reindexed = _memory_index.reconcile_agent(
+                agent_id, _agent_files_repo.list_indexable_files()
+            )
+            if _reindexed:
+                print(f"  Reindexed {_reindexed} memory file(s) for agent '{agent_id}'.")
+        memory_service = MemoryService(_agent_files_repo, index=_memory_index, agent_id=agent_id)
 
         tools = default_registry(
             memory=memory_service,
@@ -722,6 +752,25 @@ def main() -> None:
         _capture_worker = CaptureWorker(_db, lambda aid: _providers_by_agent[aid])
         _capture_worker.start()
 
+    # --- Memory index watcher (optional — only when a database is configured) ---
+    # Stage One Phase 3, slice B: catches on-disk edits made outside the app
+    # (e.g. hand-editing MEMORY.md in a text editor). Write-path sync already
+    # covers everything the app itself writes — see memory/watcher.py's
+    # module docstring for why this is a narrow gap-closer, not the primary
+    # sync mechanism.
+    _memory_watcher = None
+    if _memory_index is not None:
+        try:
+            from .memory.watcher import MemoryIndexWatcher  # noqa: PLC0415
+            _memory_watcher = MemoryIndexWatcher(_memory_index, _agent_files_repos)
+            _memory_watcher.start()
+        except Exception as _watcher_exc:
+            print(
+                f"[minion-assist] Warning: memory index watcher unavailable ({_watcher_exc}). "
+                "On-disk edits made outside the app won't be reindexed until next startup."
+            )
+            _memory_watcher = None
+
     if channels_cfg.matrix is not None:
         from .matrix.channel import MatrixChannel  # noqa: PLC0415 — optional dependency
         _matrix_channel = MatrixChannel(channels_cfg.matrix, workspace)
@@ -813,6 +862,8 @@ def main() -> None:
             mcp_manager.close_sync()
         if _capture_worker is not None:
             _capture_worker.stop()
+        if _memory_watcher is not None:
+            _memory_watcher.stop()
         sys.exit(0)
 
     if hasattr(signal, "SIGTERM"):
@@ -897,6 +948,8 @@ def main() -> None:
                 mcp_manager.close_sync()
             if _capture_worker is not None:
                 _capture_worker.stop()
+            if _memory_watcher is not None:
+                _memory_watcher.stop()
         return
 
     # --- REPL loop ---
@@ -1050,6 +1103,8 @@ def main() -> None:
             mcp_manager.close_sync()
         if _capture_worker is not None:
             _capture_worker.stop()
+        if _memory_watcher is not None:
+            _memory_watcher.stop()
 
 
 if __name__ == "__main__":

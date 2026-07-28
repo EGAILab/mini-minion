@@ -164,3 +164,69 @@ def test_rebuild_agent_does_not_touch_another_agents_files(index, agent_id):
         assert index.chunk_count(other_agent) == 1
     finally:
         index.remove_file(other_agent, "MEMORY.md")
+
+
+# ---------------------------------------------------------------------------
+# reconcile_agent
+# ---------------------------------------------------------------------------
+
+def test_reconcile_agent_indexes_new_files(index, agent_id):
+    touched = index.reconcile_agent(agent_id, [("durable", "MEMORY.md", "new content")])
+
+    assert touched == 1
+    assert index.indexed_files(agent_id) == ["MEMORY.md"]
+
+
+def test_reconcile_agent_is_a_no_op_when_nothing_changed(index, agent_id):
+    files = [("durable", "MEMORY.md", "stable content")]
+    index.reconcile_agent(agent_id, files)
+
+    touched = index.reconcile_agent(agent_id, files)  # same content, same hash
+
+    assert touched == 0
+
+
+def test_reconcile_agent_reindexes_only_the_file_whose_content_changed(index, agent_id):
+    files = [
+        ("durable", "MEMORY.md", "memory content"),
+        ("durable", "memory/topics/goals.md", "goals content"),
+    ]
+    index.reconcile_agent(agent_id, files)
+
+    changed = [
+        ("durable", "MEMORY.md", "memory content"),  # unchanged
+        ("durable", "memory/topics/goals.md", "updated goals content"),  # changed
+    ]
+    touched = index.reconcile_agent(agent_id, changed)
+
+    assert touched == 1
+    [chunk] = index._conn().execute(
+        "SELECT content FROM memory_chunks WHERE agent_id = %s AND rel_path = %s",
+        (agent_id, "memory/topics/goals.md"),
+    ).fetchall()
+    assert chunk[0] == "updated goals content"
+
+
+def test_reconcile_agent_removes_files_no_longer_present(index, agent_id):
+    index.reconcile_agent(agent_id, [("durable", "MEMORY.md", "content")])
+
+    touched = index.reconcile_agent(agent_id, [])
+
+    assert touched == 1
+    assert index.indexed_files(agent_id) == []
+
+
+def test_reconcile_agent_does_not_reindex_files_it_only_removes_or_only_adds(index, agent_id):
+    index.reconcile_agent(agent_id, [
+        ("durable", "MEMORY.md", "stays the same"),
+        ("daily", "memory/2026-07-20.md", "will be removed"),
+    ])
+
+    touched = index.reconcile_agent(agent_id, [
+        ("durable", "MEMORY.md", "stays the same"),
+        ("import", "memory/imports/new.md", "brand new file"),
+    ])
+
+    # One removed (2026-07-20.md), one added (new.md), MEMORY.md untouched.
+    assert touched == 2
+    assert sorted(index.indexed_files(agent_id)) == ["MEMORY.md", "memory/imports/new.md"]

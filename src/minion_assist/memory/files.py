@@ -102,16 +102,34 @@ class MemoryFileRepository:
     # Explicit notes (memory/topics/) — replaces LongTermMemory.save/load/delete
     # -----------------------------------------------------------------
 
-    def remember(self, key: str, content: str) -> None:
+    def topic_path(self, key: str) -> Path:
+        """Resolve the on-disk path for a topic note key (doesn't require the file to exist).
+
+        Exposed publicly (not just used internally) so callers like
+        ``MemoryService`` can compute a topic's path — e.g. to tell
+        :class:`~minion_assist.memory.postgres_index.PostgresMemoryIndex`
+        which file was just deleted — without duplicating
+        :func:`_sanitize_key`'s filename rules.
+        """
+        return self._topics_dir / f"{_sanitize_key(key)}.md"
+
+    def remember(self, key: str, content: str) -> Path:
         """Save a note under ``memory/topics/{key}.md``, overwriting any existing note.
 
         Args:
             key: Note identifier, e.g. ``"project-goals"``. Sanitized via
                 :func:`_sanitize_key` before use as a filename.
             content: Markdown text to store.
+
+        Returns:
+            Path: The file that was written — lets a caller (e.g.
+                ``MemoryService``, for Phase 3 slice B's write-path index
+                sync) compute a path relative to :attr:`root` without
+                re-deriving the sanitized filename itself.
         """
-        path = self._topics_dir / f"{_sanitize_key(key)}.md"
+        path = self.topic_path(key)
         _atomic_write_text(path, content)
+        return path
 
     def load(self, key: str) -> str | None:
         """Load a topic note's content by key.
@@ -122,7 +140,7 @@ class MemoryFileRepository:
         Returns:
             str | None: The note's text, or ``None`` if no such note exists.
         """
-        path = self._topics_dir / f"{_sanitize_key(key)}.md"
+        path = self.topic_path(key)
         return path.read_text(encoding="utf-8") if path.exists() else None
 
     def delete(self, key: str) -> bool:
@@ -134,7 +152,7 @@ class MemoryFileRepository:
         Returns:
             bool: ``True`` if a file was deleted, ``False`` if it didn't exist.
         """
-        path = self._topics_dir / f"{_sanitize_key(key)}.md"
+        path = self.topic_path(key)
         if path.exists():
             path.unlink()
             return True
@@ -166,15 +184,20 @@ class MemoryFileRepository:
     # docs/adr/0003-per-agent-memory-scope.md must stay searchable but must
     # never be auto-promoted into curated memory/topics/ pages.
 
-    def remember_import(self, key: str, content: str) -> None:
+    def remember_import(self, key: str, content: str) -> Path:
         """Save quarantined, unreviewed content under ``memory/imports/{key}.md``.
 
         Args:
             key: Note identifier, e.g. ``"_auto_extracted"``.
             content: Markdown text to store.
+
+        Returns:
+            Path: The file that was written — see :meth:`remember`'s return
+                value for why.
         """
         path = self._imports_dir / f"{_sanitize_key(key)}.md"
         _atomic_write_text(path, content)
+        return path
 
     def load_import(self, key: str) -> str | None:
         """Load quarantined content by key, or ``None`` if it doesn't exist."""

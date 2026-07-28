@@ -9,6 +9,7 @@ work, rather than re-testing MemoryFileRepository's own behavior in detail
 from __future__ import annotations
 
 from datetime import date
+from unittest.mock import Mock
 
 import pytest
 
@@ -19,6 +20,14 @@ from minion_assist.memory.service import MemoryService
 @pytest.fixture
 def service(tmp_path):
     return MemoryService(MemoryFileRepository(tmp_path))
+
+
+@pytest.fixture
+def indexed_service(tmp_path):
+    """A MemoryService wired to a mock index — Stage One Phase 3, slice B."""
+    mock_index = Mock()
+    svc = MemoryService(MemoryFileRepository(tmp_path), index=mock_index, agent_id="main")
+    return svc, mock_index
 
 
 # ---------------------------------------------------------------------------
@@ -212,3 +221,85 @@ def test_flush_head_multiple_messages_all_included(service, tmp_path):
     content = (tmp_path / "memory" / f"{today}.md").read_text(encoding="utf-8")
     assert "first message" in content
     assert "second message" in content
+
+
+# ---------------------------------------------------------------------------
+# Write-path index sync (Stage One Phase 3, slice B)
+# ---------------------------------------------------------------------------
+
+def test_remember_without_index_never_touches_index(service):
+    # No index configured — must behave exactly like before this slice
+    # (nothing to assert on an index that doesn't exist; this just
+    # documents that remember() still works with no index/agent_id).
+    service.remember("project-goals", "content")
+    assert service.load("project-goals") == "content"
+
+
+def test_remember_reindexes_the_written_file(indexed_service):
+    svc, mock_index = indexed_service
+    svc.remember("project-goals", "# Goals\nShip it.")
+
+    mock_index.reindex_file.assert_called_once_with(
+        "main", "memory/topics/project-goals.md", "durable", "# Goals\nShip it."
+    )
+
+
+def test_remember_import_reindexes_as_the_import_corpus(indexed_service):
+    svc, mock_index = indexed_service
+    svc.remember_import("_auto_extracted", "fact one")
+
+    mock_index.reindex_file.assert_called_once_with(
+        "main", "memory/imports/_auto_extracted.md", "import", "fact one"
+    )
+
+
+def test_delete_removes_from_index_only_when_a_file_was_actually_deleted(indexed_service):
+    svc, mock_index = indexed_service
+    svc.remember("project-goals", "content")
+    mock_index.reset_mock()
+
+    deleted = svc.delete("project-goals")
+
+    assert deleted is True
+    mock_index.remove_file.assert_called_once_with("main", "memory/topics/project-goals.md")
+
+
+def test_delete_of_nonexistent_key_does_not_call_the_index(indexed_service):
+    svc, mock_index = indexed_service
+    deleted = svc.delete("never-existed")
+
+    assert deleted is False
+    mock_index.remove_file.assert_not_called()
+
+
+def test_append_daily_reindexes_with_the_files_full_current_content(indexed_service):
+    svc, mock_index = indexed_service
+    svc.append_daily("first entry", when=date(2026, 7, 20))
+    mock_index.reset_mock()
+
+    svc.append_daily("second entry", when=date(2026, 7, 20))
+
+    args = mock_index.reindex_file.call_args.args
+    assert args[0] == "main"
+    assert args[1] == "memory/2026-07-20.md"
+    assert args[2] == "daily"
+    assert "first entry" in args[3]  # full file content, not just the new entry
+    assert "second entry" in args[3]
+
+
+def test_index_sync_failure_never_raises_out_of_remember(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.reindex_file.side_effect = RuntimeError("db unavailable")
+
+    svc.remember("project-goals", "content")  # must not raise
+
+    assert svc.load("project-goals") == "content"  # the actual write still succeeded
+
+
+def test_index_ignored_when_agent_id_is_missing(tmp_path):
+    mock_index = Mock()
+    svc = MemoryService(MemoryFileRepository(tmp_path), index=mock_index)  # no agent_id
+
+    svc.remember("project-goals", "content")
+
+    mock_index.reindex_file.assert_not_called()

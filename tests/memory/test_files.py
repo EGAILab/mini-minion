@@ -62,6 +62,17 @@ def test_remember_writes_to_topics_dir(tmp_path):
     assert path.read_text(encoding="utf-8") == "# Goals\nShip Phase 1."
 
 
+def test_remember_returns_the_path_it_wrote(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    returned = repo.remember("project-goals", "content")
+    assert returned == tmp_path / "memory" / "topics" / "project-goals.md"
+
+
+def test_topic_path_matches_remembers_actual_write_location(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    assert repo.topic_path("api/notes") == tmp_path / "memory" / "topics" / "api_notes.md"
+
+
 def test_remember_sanitizes_key(tmp_path):
     repo = MemoryFileRepository(tmp_path)
     repo.remember("api/rest-notes", "content")
@@ -136,6 +147,12 @@ def test_remember_import_writes_to_imports_dir(tmp_path):
     repo.remember_import("_auto_extracted", "fact one\nfact two")
     path = tmp_path / "memory" / "imports" / "_auto_extracted.md"
     assert path.read_text(encoding="utf-8") == "fact one\nfact two"
+
+
+def test_remember_import_returns_the_path_it_wrote(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    returned = repo.remember_import("_auto_extracted", "content")
+    assert returned == tmp_path / "memory" / "imports" / "_auto_extracted.md"
 
 
 def test_remember_import_overwrites_existing(tmp_path):

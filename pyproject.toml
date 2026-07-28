@@ -23,7 +23,10 @@ dependencies = [
 anthropic = ["anthropic>=0.40.0"]
 tiktoken  = ["tiktoken>=0.7.0"]
 matrix    = ["matrix-nio[e2e]>=0.21", "aiosqlite>=0.19", "linkify-it-py>=2.0"]
-postgres  = ["psycopg[binary]>=3.1"]
+postgres  = [
+    "psycopg[binary]>=3.1",
+    "watchdog>=6.0.0",
+]
 browser   = ["playwright>=1.40.0"]
 voice     = [
     "silero-vad>=4.0",
@@ -34,7 +37,8 @@ voice     = [
     "qwen-tts>=0.1",
     "kokoro>=0.9",
 ]
-all       = ["anthropic>=0.40.0", "tiktoken>=0.7.0", "psycopg[binary]>=3.1", "playwright>=1.40.0",
+all       = ["anthropic>=0.40.0", "tiktoken>=0.7.0", "psycopg[binary]>=3.1", "watchdog>=6.0.0",
+             "playwright>=1.40.0",
              "silero-vad>=4.0", "sounddevice>=0.4", "numpy>=1.26", "torch>=2.2", "transformers>=4.52"]
 
 [tool.pytest.ini_options]
