@@ -140,6 +140,53 @@ def strip_media_data(content: str | list) -> str | list:
     return result
 
 
+# Per-message character cap for format_message_excerpt() — generous enough to
+# capture real content, small enough that one huge message can't make a
+# flush note unreadable. Unlike Compactor's _max_head_content, this is a
+# fixed constant, not proportional to a model's context window: the flush
+# excerpt is a human-readable daily note, not an LLM prompt, so there is no
+# token budget to scale against.
+_EXCERPT_MAX_CHARS = 1_000
+
+
+def format_message_excerpt(messages: list[dict]) -> str:
+    """Render a list of messages as a plain-text transcript excerpt.
+
+    Used for durable, human-readable checkpoints — e.g. Stage One Phase 2's
+    pre-compaction flush, which appends this to a daily note *before*
+    ``Compactor`` summarizes and discards the same messages. This is
+    deliberately not an LLM prompt: no token-budget tuning, no summarization
+    call, just a direct rendering of who said/did what, so it can never fail
+    the way an LLM call can and adds no latency.
+
+    Args:
+        messages: The messages to render, in order.
+
+    Returns:
+        str: One line per message (or per tool call within a message),
+            joined with newlines. Empty string if ``messages`` renders to
+            nothing (e.g. an empty list).
+    """
+    lines: list[str] = []
+    for msg in messages:
+        role = msg.get("role", "unknown")
+        content = content_to_summary_text(msg.get("content") or "")
+
+        if role == "tool":
+            lines.append(f"[tool result]: {content[:_EXCERPT_MAX_CHARS]}")
+        elif role == "assistant":
+            if content:
+                lines.append(f"[assistant]: {content[:_EXCERPT_MAX_CHARS]}")
+            for tc in msg.get("tool_calls", []):
+                fn = tc.get("function", {})
+                args_preview = fn.get("arguments", "")[:200]
+                lines.append(f"[tool call]: {fn.get('name')}({args_preview})")
+        elif content:
+            lines.append(f"[{role}]: {content[:_EXCERPT_MAX_CHARS]}")
+
+    return "\n".join(lines)
+
+
 def make_user_content(text: str, attachments: list) -> str | list:
     """Build the user message content from text and a list of MediaAttachment.
 

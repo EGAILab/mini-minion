@@ -204,6 +204,25 @@ class CompactionFailed:
     error: str
 
 
+@dataclass
+class MemoryFlushed:
+    """Emitted after a pre-compaction flush attempt (Stage One Phase 2, slice B).
+
+    Fired right before :class:`CompactionStarted`/compaction actually runs,
+    whenever a memory backend is configured and compaction is about to
+    summarize away part of history. See
+    :meth:`~minion_assist.memory.service.MemoryService.flush_head`.
+
+    Attributes:
+        status: One of ``"flushed"``, ``"empty"``, or ``"failed"`` — see
+            :class:`~minion_assist.memory.models.FlushOutcome`.
+        detail: Exception description when ``status == "failed"``; empty
+            otherwise.
+    """
+    status: str
+    detail: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Hook event objects — used by ToolRegistry's plugin-facing hook system.
 # ---------------------------------------------------------------------------

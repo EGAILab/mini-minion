@@ -209,6 +209,106 @@ def test_send_emits_compaction_started_event(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Pre-compaction flush (Stage One Phase 2, slice B)
+# ---------------------------------------------------------------------------
+
+def _make_session_with_memory(tmp_path, memory):
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    return AgentSession(
+        agent_id="main",
+        session_id="test-session",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=_mock_provider(),
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        memory=memory,
+    )
+
+
+def test_flush_head_writes_daily_note_before_compaction(tmp_path):
+    """Compaction's about-to-be-summarized head is flushed to a daily note first."""
+    memory = MemoryService(MemoryFileRepository(tmp_path / "workspace"))
+    session = _make_session_with_memory(tmp_path, memory)
+    session._history = [
+        {"role": "user", "content": "important context to preserve"},
+        {"role": "assistant", "content": "old reply"},
+    ]
+
+    with patch.object(session._compactor, "needs_compaction", return_value=True):
+        with patch.object(session._compactor, "_summarise", return_value="Summary."):
+            session.send("trigger compaction")
+
+    from datetime import date as _date
+    daily_file = tmp_path / "workspace" / "memory" / f"{_date.today().isoformat()}.md"
+    assert daily_file.exists()
+    assert "important context to preserve" in daily_file.read_text(encoding="utf-8")
+
+
+def test_memory_flushed_event_emitted_when_memory_configured(tmp_path):
+    memory = MemoryService(MemoryFileRepository(tmp_path / "workspace"))
+    session = _make_session_with_memory(tmp_path, memory)
+    session._history = [
+        {"role": "user", "content": "old message"},
+        {"role": "assistant", "content": "old reply"},
+    ]
+    events: list[object] = []
+
+    with patch.object(session._compactor, "needs_compaction", return_value=True):
+        with patch.object(session._compactor, "_summarise", return_value="Summary."):
+            session.send("trigger compaction", on_event=events.append)
+
+    from minion_assist.agents.events import MemoryFlushed
+    flush_events = [e for e in events if isinstance(e, MemoryFlushed)]
+    assert len(flush_events) == 1
+    assert flush_events[0].status == "flushed"
+
+
+def test_no_memory_flushed_event_without_memory_configured(tmp_path):
+    """Without memory=, no flush is attempted — nothing to flush to."""
+    session = _make_session(tmp_path)
+    session._history = [
+        {"role": "user", "content": "old message"},
+        {"role": "assistant", "content": "old reply"},
+    ]
+    events: list[object] = []
+
+    with patch.object(session._compactor, "needs_compaction", return_value=True):
+        with patch.object(session._compactor, "_summarise", return_value="Summary."):
+            session.send("trigger compaction", on_event=events.append)
+
+    from minion_assist.agents.events import MemoryFlushed
+    assert not any(isinstance(e, MemoryFlushed) for e in events)
+
+
+def test_turn_completes_even_if_flush_fails(tmp_path):
+    """A failed flush must not block or fail the turn — it's reported, not raised."""
+    memory = MemoryService(MemoryFileRepository(tmp_path / "workspace"))
+    session = _make_session_with_memory(tmp_path, memory)
+    session._history = [
+        {"role": "user", "content": "old message"},
+        {"role": "assistant", "content": "old reply"},
+    ]
+    events: list[object] = []
+
+    from minion_assist.memory.models import FlushOutcome
+    with patch.object(memory, "flush_head", return_value=FlushOutcome(status="failed", detail="disk full")):
+        with patch.object(session._compactor, "needs_compaction", return_value=True):
+            with patch.object(session._compactor, "_summarise", return_value="Summary."):
+                result = session.send("trigger compaction", on_event=events.append)
+
+    assert result is not None  # turn completed normally
+    from minion_assist.agents.events import MemoryFlushed
+    flush_events = [e for e in events if isinstance(e, MemoryFlushed)]
+    assert flush_events[0].status == "failed"
+    assert flush_events[0].detail == "disk full"
+
+
+# ---------------------------------------------------------------------------
 # Session store integration
 # ---------------------------------------------------------------------------
 

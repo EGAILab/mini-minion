@@ -117,3 +117,39 @@ class MemoryStatus:
     topic_count: int
     import_count: int
     daily_count: int
+
+
+# Status values for FlushOutcome. Kept as plain strings (not an enum) to
+# match the rest of this module's style (see MemoryHit.source) and because
+# the plan's own language ("succeeded, found nothing, failed transiently, or
+# was skipped") maps directly onto these four cases.
+FLUSH_STATUS_FLUSHED = "flushed"
+FLUSH_STATUS_EMPTY = "empty"
+FLUSH_STATUS_FAILED = "failed"
+FLUSH_STATUS_SKIPPED = "skipped"
+
+
+@dataclass(frozen=True)
+class FlushOutcome:
+    """The result of one :meth:`MemoryService.flush_head` call.
+
+    Stage One Phase 2, slice B: before :class:`~minion_assist.context.Compactor`
+    summarizes and discards old history, its content is flushed to a durable
+    daily note first — so a failed or lossy summarization can never be the
+    only place that context existed. This is always computed (never silently
+    skipped) whenever a memory backend is configured and compaction is about
+    to run; see ``agents/session.py``'s pre-compaction flush integration.
+
+    Attributes:
+        status: One of :data:`FLUSH_STATUS_FLUSHED` (content was written),
+            :data:`FLUSH_STATUS_EMPTY` (nothing worth writing — the head
+            rendered to blank text), :data:`FLUSH_STATUS_FAILED` (writing
+            raised an exception — reported, never lets the exception
+            propagate and block the turn), or :data:`FLUSH_STATUS_SKIPPED`
+            (no memory backend configured; nothing to flush to).
+        detail: Human-readable detail — empty for "flushed"/"empty"/
+            "skipped", the exception description for "failed".
+    """
+
+    status: str
+    detail: str = ""

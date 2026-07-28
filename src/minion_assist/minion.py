@@ -74,6 +74,7 @@ from .agents.events import (
     CompactionStarted,
     FinalAnswer,
     MaxRoundsReached,
+    MemoryFlushed,
     StreamingStarted,
     ThoughtEmitted,
     TokenStreamed,
@@ -846,6 +847,8 @@ def main() -> None:
                 print("\n  Compacting session history...")
             elif isinstance(event, CompactionFailed):
                 print(f"\n  [Warning] Compaction failed: {event.error}")
+            elif isinstance(event, MemoryFlushed) and event.status == "failed":
+                print(f"\n  [Warning] Pre-compaction memory flush failed: {event.detail}")
 
     # --- Voice mode (--voice flag) ---
     # Placed here so _on_event is already defined when VoiceSession is built.

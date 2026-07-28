@@ -36,16 +36,14 @@ nothing in the codebase yet produces a request tagged with any other scope
 no-current-caller abstraction the project's simplicity rule warns against.
 Add real scope enforcement when a real cross-agent/channel use case exists.
 
-Not yet wired in
------------------
-This is slice 2 of Phase 1 — ``AgentSession`` and the tools still use
-``LongTermMemory`` directly. Wiring happens in slice 3.
-
 Talks to
 --------
 - ``memory/files.py`` — :class:`MemoryFileRepository`, the actual storage
   backend this service wraps.
 - ``memory/models.py`` — the typed request/result objects passed through.
+- ``context.py`` — :meth:`Compactor.peek_compaction_head` supplies the
+  messages :meth:`flush_head` writes out before they're summarized away
+  (Stage One Phase 2, slice B).
 """
 
 from __future__ import annotations
@@ -53,8 +51,18 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+from ..messages import format_message_excerpt
 from .files import MemoryFileRepository
-from .models import MemoryExcerpt, MemoryHit, MemoryLocator, MemoryStatus
+from .models import (
+    FLUSH_STATUS_EMPTY,
+    FLUSH_STATUS_FAILED,
+    FLUSH_STATUS_FLUSHED,
+    FlushOutcome,
+    MemoryExcerpt,
+    MemoryHit,
+    MemoryLocator,
+    MemoryStatus,
+)
 
 # Mirrors MemoryFileRepository's / LongTermMemory's default search cap.
 _SEARCH_MAX_RESULTS = 20
@@ -217,3 +225,46 @@ class MemoryService:
             import_count=counts["import"],
             daily_count=counts["daily"],
         )
+
+    # -----------------------------------------------------------------
+    # Pre-compaction flush (Stage One Phase 2, slice B)
+    # -----------------------------------------------------------------
+
+    def flush_head(self, head: list[dict]) -> FlushOutcome:
+        """Append a deterministic transcript excerpt of ``head`` to today's daily note.
+
+        Called by ``agents/session.py`` right before
+        :meth:`~minion_assist.context.Compactor.compact` summarizes and
+        discards these same messages — so their raw content survives even if
+        summarization itself fails immediately afterward. Deliberately makes
+        no LLM call: :func:`~minion_assist.messages.format_message_excerpt`
+        is pure text rendering, so this can't fail the way an LLM call can,
+        and adds no latency to the turn.
+
+        Never raises — a failure to write is reported via the returned
+        :class:`FlushOutcome`, not an exception, so it can never block the
+        turn that triggered it.
+
+        Args:
+            head: The messages about to be summarized away (typically
+                ``Compactor.peek_compaction_head()``'s result).
+
+        Returns:
+            FlushOutcome: ``FLUSH_STATUS_EMPTY`` if ``head`` is empty or
+                renders to blank text, ``FLUSH_STATUS_FLUSHED`` on a
+                successful write, or ``FLUSH_STATUS_FAILED`` with the
+                exception description if the write itself raised.
+        """
+        if not head:
+            return FlushOutcome(status=FLUSH_STATUS_EMPTY)
+
+        text = format_message_excerpt(head)
+        if not text.strip():
+            return FlushOutcome(status=FLUSH_STATUS_EMPTY)
+
+        try:
+            self._files.append_daily(f"[Pre-compaction checkpoint]\n{text}")
+        except Exception as exc:
+            return FlushOutcome(status=FLUSH_STATUS_FAILED, detail=f"{type(exc).__name__}: {exc}")
+
+        return FlushOutcome(status=FLUSH_STATUS_FLUSHED)

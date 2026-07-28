@@ -99,7 +99,7 @@ from ..session import SessionStore
 from ..tools import ToolRegistry
 from ..workspace import WorkspaceVanishedError, check_workspace
 from .definitions import AgentConfig
-from .events import CompactionFailed, CompactionStarted, TurnCompleted
+from .events import CompactionFailed, CompactionStarted, MemoryFlushed, TurnCompleted
 from .runner import run_turn
 
 # This limit is now computed per-instance from the model's context window
@@ -661,6 +661,21 @@ class AgentSession:
         _on_compaction_failed = (
             (lambda err: on_event(CompactionFailed(error=err))) if on_event else None
         )
+
+        # Pre-compaction flush (Stage One Phase 2, slice B): if compact() is
+        # about to summarize away part of history, write a deterministic,
+        # non-LLM transcript excerpt of exactly that part to today's daily
+        # note FIRST — so a failed or lossy summarization can never be the
+        # only place that content existed. Read-only peek; never mutates
+        # history and never calls the provider.
+        if self._memory is not None:
+            _flush_head = self._compactor.peek_compaction_head(self._history)
+            if _flush_head is not None:
+                _flush_outcome = self._memory.flush_head(_flush_head)
+                if on_event:
+                    on_event(MemoryFlushed(
+                        status=_flush_outcome.status, detail=_flush_outcome.detail
+                    ))
 
         self._history = self._compactor.compact(
             self._history,

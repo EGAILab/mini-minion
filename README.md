@@ -333,6 +333,8 @@ AgentSession.send(message, on_event=callback, stream=True/False)
     │          + Today's date (appended last so the large stable prefix is
     │            byte-identical across turns — enables OpenAI prompt caching)
     │
+    ├─ [if memory configured] compactor.peek_compaction_head(history) → memory.flush_head(head)
+    │      pre-compaction flush (Phase 2 slice B) — deterministic, no LLM call, fires MemoryFlushed
     ├─ compactor.compact(history, provider, on_compaction=..., on_compaction_failed=...)
     │      no-op when under budget; fires CompactionStarted / CompactionFailed events
     │
@@ -1832,6 +1834,12 @@ service.load_import("_auto_extracted")                  # str | None
 service.list_import_keys()                              # list[str]
 
 service.status()   # MemoryStatus(topic_count=1, import_count=1, daily_count=1, ...)
+
+# Pre-compaction flush (Stage One Phase 2, slice B): called by AgentSession
+# right before Compactor.compact() summarizes and discards `head`. Pure text
+# rendering (messages.format_message_excerpt) — no LLM call, so this can't
+# fail the way summarization can, and adds no latency to the turn.
+service.flush_head(head)   # FlushOutcome(status="flushed"|"empty"|"failed", detail="")
 ```
 
 `search()` splits the query on whitespace, filters out stop-word candidates (terms shorter than 3 characters), and ranks results by term-match frequency. Notes matching more query terms rank above those matching fewer. Among ties, newer files rank slightly higher. Results are capped at 20 (`_SEARCH_MAX_RESULTS`). This scoring is unchanged from the legacy `LongTermMemory.search()` — Phase 1's goal was one canonical service with existing retrieval behavior, not better retrieval (that's Phase 3+). Two real fixes did land alongside the move: `remember()` now writes atomically (temp file + `os.replace`, so a crash mid-write can't corrupt a note), and `search()` now spans three sources (`memory/topics/`, `memory/imports/`, and dated daily files) instead of one flat directory.
@@ -1967,6 +1975,12 @@ messages = compactor.compact(
     on_compaction=lambda: print("Compacting..."),
     on_compaction_failed=lambda err: print(f"Compaction failed: {err}"),
 )
+
+# Read-only peek — returns the messages compact() would summarize away right
+# now, or None if compaction isn't needed. Never mutates messages, never
+# calls the provider. Used by AgentSession for the pre-compaction flush
+# (Stage One Phase 2, slice B) — see the `memory` module reference below.
+head = compactor.peek_compaction_head(messages)
 ```
 
 **Token estimation:** uses `tiktoken` (cl100k_base encoding) when installed — install with `uv add --optional tiktoken tiktoken`. Falls back to a 4-char-per-token heuristic.

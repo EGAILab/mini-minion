@@ -24,6 +24,7 @@ from minion_assist.messages import (
     content_text,
     content_to_summary_text,
     ensure_event_id,
+    format_message_excerpt,
     make_user_content,
     materialize_image_data,
     strip_media_data,
@@ -360,3 +361,68 @@ class TestEnsureEventId:
         assert EVENT_ID_KEY not in msg
         ensure_event_id(msg)
         assert EVENT_ID_KEY in msg
+
+
+# ---------------------------------------------------------------------------
+# format_message_excerpt
+# ---------------------------------------------------------------------------
+
+class TestFormatMessageExcerpt:
+    def test_empty_list_returns_empty_string(self):
+        assert format_message_excerpt([]) == ""
+
+    def test_user_message_rendered(self):
+        result = format_message_excerpt([{"role": "user", "content": "hello there"}])
+        assert "[user]: hello there" in result
+
+    def test_assistant_message_rendered(self):
+        result = format_message_excerpt([{"role": "assistant", "content": "hi back"}])
+        assert "[assistant]: hi back" in result
+
+    def test_tool_result_rendered(self):
+        result = format_message_excerpt([{"role": "tool", "content": "file contents"}])
+        assert "[tool result]: file contents" in result
+
+    def test_assistant_tool_call_rendered(self):
+        msg = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "read", "arguments": '{"path": "x.py"}'}}
+            ],
+        }
+        result = format_message_excerpt([msg])
+        assert "[tool call]: read(" in result
+        assert "x.py" in result
+
+    def test_multiple_messages_joined_by_newline(self):
+        messages = [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+        ]
+        result = format_message_excerpt(messages)
+        assert result == "[user]: one\n[assistant]: two"
+
+    def test_long_content_truncated(self):
+        long_text = "x" * 5000
+        result = format_message_excerpt([{"role": "user", "content": long_text}])
+        # Should not include all 5000 chars.
+        assert len(result) < 5000
+
+    def test_empty_content_message_omitted(self):
+        """A message with no content and no tool_calls contributes no line."""
+        result = format_message_excerpt([{"role": "user", "content": ""}])
+        assert result == ""
+
+    def test_image_content_never_leaks_base64(self):
+        block = {
+            "type": "image",
+            "media_type": "image/png",
+            "path": "/tmp/shot.png",
+            "size_bytes": 10,
+            "source_name": "shot.png",
+            "data": "SECRETBASE64",
+        }
+        result = format_message_excerpt([{"role": "user", "content": [block]}])
+        assert "SECRETBASE64" not in result
+        assert "shot.png" in result

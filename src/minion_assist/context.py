@@ -291,6 +291,27 @@ class Compactor:
         total = sum(_estimate_tokens(m) for m in messages)
         return total > self._usable_tokens
 
+    def peek_compaction_head(self, messages: list[dict]) -> list[dict] | None:
+        """Return the messages :meth:`compact` would summarize away right now, without compacting.
+
+        Stage One Phase 2, slice B: lets a caller flush the head's content to
+        a durable note *before* calling :meth:`compact`, so a failed or lossy
+        summarization call can never be the only place that content existed.
+        Read-only — never mutates ``messages`` and never calls the provider.
+
+        Args:
+            messages: Full in-memory conversation history.
+
+        Returns:
+            list[dict] | None: The head messages that would be summarized,
+                or ``None`` if compaction is not needed (or would have
+                nothing to summarize) right now.
+        """
+        if not self.needs_compaction(messages):
+            return None
+        head, _tail = self._select(messages)
+        return head or None
+
     def compact(
         self,
         messages: list[dict],

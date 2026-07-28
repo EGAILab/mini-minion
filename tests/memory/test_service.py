@@ -163,3 +163,52 @@ def test_status_reports_counts_across_all_sources(service, tmp_path):
     assert status.topic_count == 1
     assert status.import_count == 1
     assert status.daily_count == 1
+
+
+# ---------------------------------------------------------------------------
+# flush_head (Stage One Phase 2, slice B)
+# ---------------------------------------------------------------------------
+
+def test_flush_head_empty_list_returns_empty_status(service):
+    outcome = service.flush_head([])
+    assert outcome.status == "empty"
+
+
+def test_flush_head_writes_to_daily_note(service, tmp_path):
+    outcome = service.flush_head([{"role": "user", "content": "important context"}])
+
+    assert outcome.status == "flushed"
+    today = date.today().isoformat()
+    content = (tmp_path / "memory" / f"{today}.md").read_text(encoding="utf-8")
+    assert "important context" in content
+    assert "[Pre-compaction checkpoint]" in content
+
+
+def test_flush_head_blank_content_returns_empty_status(service):
+    """A message with no renderable content (e.g. blank) counts as nothing to flush."""
+    outcome = service.flush_head([{"role": "user", "content": ""}])
+    assert outcome.status == "empty"
+
+
+def test_flush_head_never_raises_on_write_failure(service, monkeypatch):
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service._files, "append_daily", _boom)
+
+    outcome = service.flush_head([{"role": "user", "content": "hi"}])
+
+    assert outcome.status == "failed"
+    assert "disk full" in outcome.detail
+
+
+def test_flush_head_multiple_messages_all_included(service, tmp_path):
+    service.flush_head([
+        {"role": "user", "content": "first message"},
+        {"role": "assistant", "content": "second message"},
+    ])
+
+    today = date.today().isoformat()
+    content = (tmp_path / "memory" / f"{today}.md").read_text(encoding="utf-8")
+    assert "first message" in content
+    assert "second message" in content

@@ -496,3 +496,41 @@ def test_compact_no_failure_callback_when_succeeds():
     failures: list[str] = []
     compactor.compact(msgs, _MockProvider(), on_compaction_failed=failures.append)
     assert failures == []
+
+
+# ---------------------------------------------------------------------------
+# peek_compaction_head (Stage One Phase 2, slice B)
+# ---------------------------------------------------------------------------
+
+def test_peek_compaction_head_none_when_not_needed():
+    compactor = Compactor(context_window=100_000, preserve_tokens=4_000)
+    msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
+    assert compactor.peek_compaction_head(msgs) is None
+
+
+def test_peek_compaction_head_matches_select_head():
+    """peek_compaction_head() must return exactly what _select() would use as head."""
+    compactor = _make_compactor_with_usable(50)
+    content = "x" * 100
+    msgs = [_msg("user", content), _msg("assistant", content), _msg("user", content)]
+    expected_head, _expected_tail = compactor._select(msgs)
+
+    assert compactor.peek_compaction_head(msgs) == expected_head
+
+
+def test_peek_compaction_head_does_not_mutate_messages():
+    compactor = _make_compactor_with_usable(50)
+    content = "x" * 100
+    msgs = [_msg("user", content), _msg("assistant", content), _msg("user", content)]
+    original = [dict(m) for m in msgs]
+
+    compactor.peek_compaction_head(msgs)
+
+    assert msgs == original
+
+
+def test_peek_compaction_head_none_when_history_too_short():
+    """A single message can't be split into head+tail — _select returns ([], msgs)."""
+    compactor = _make_compactor_with_usable(1)
+    msgs = [_msg("user", "a" * 100)]
+    assert compactor.peek_compaction_head(msgs) is None
