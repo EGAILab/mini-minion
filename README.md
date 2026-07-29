@@ -50,7 +50,7 @@ uv sync
 
 # Optional extras
 uv sync --extra tiktoken   # more accurate token estimation
-uv sync --extra postgres   # PostgreSQL session store + memory index (psycopg3, watchdog)
+uv sync --extra postgres   # PostgreSQL session store + memory index (psycopg3, watchdog, pgvector)
 
 # Set up config (config lives in your home directory, not in the repo)
 cp config.example.json ~/.minion-assist/config.json
@@ -106,6 +106,7 @@ minion-assist/
 │   │   ├── anthropic.py         # Anthropic Claude adapter
 │   │   ├── lmstudio.py          # LM Studio alias
 │   │   ├── codex.py             # Codex app-server adapter (JSON-RPC 2.0 over stdio)
+│   │   ├── embeddings.py        # EmbeddingProvider — text-to-vector for the memory index (optional)
 │   │   └── __init__.py          # create_provider() factory
 │   ├── agents/                  # Agent definitions and execution
 │   │   ├── definitions.py       # AgentConfig, AGENTS dict (name, soul, max_tool_rounds)
@@ -1095,7 +1096,8 @@ minion-assist can mirror every conversation message into a PostgreSQL database, 
 # Start PostgreSQL + pgvector via Docker Compose (port 5433 to avoid conflicts with a local postgres)
 docker compose up -d
 
-# Install the psycopg3 driver + watchdog (for the memory index's live filesystem watcher)
+# Install the psycopg3 driver + watchdog (live filesystem watcher) + pgvector
+# (Python client for the vector column type, needed once embeddings are configured)
 uv sync --extra postgres
 ```
 
@@ -1197,6 +1199,32 @@ minion-assist memory status --deep                                  # + index ch
 minion-assist memory reindex                                        # cheap hash-diff reconciliation, on demand
 minion-assist memory reindex --force                                # crash-safe full rebuild-and-swap
 ```
+
+### Embeddings and the vector lane (Stage One Phase 4, slice A)
+
+An optional `"embeddings"` section in `config.json` enables a semantic-search lane on top of the lexical index:
+
+```json
+{
+  "embeddings": {
+    "provider": "lmstudio",
+    "model": "nomic-embed-text-v1.5",
+    "dimensions": 768
+  }
+}
+```
+
+`provider` must name an existing entry under `models.providers` — its `base_url`/`api_key` are reused for an `/embeddings` request against the same endpoint a chat provider already talks to, so no separate credentials are needed. `model` is the embedding model's id, which does **not** need to appear in that provider's chat `models` list (embedding models are typically served separately — e.g. a second model loaded in LM Studio alongside a chat model). `dimensions` must match that model's actual output vector size: PostgreSQL's `vector(N)` column type fixes its width at table-creation time and can't infer it from the data.
+
+**This section is absent from `config.example.json` by default, and nothing changes until you add it.** With no `"embeddings"` section, `providers/embeddings.py`'s `EmbeddingProvider` is never constructed and `memory_chunk_embeddings` is never created — search stays lexical-only, exactly as it behaved before Phase 4.
+
+| Table | Description |
+|---|---|
+| `memory_chunk_embeddings` | Embedding cache, `PRIMARY KEY (chunk_id)`. Columns: `model_identity` (e.g. `"lmstudio/nomic-embed-text-v1.5"` — lets a model change be detected rather than silently mixing vectors from different embedding spaces), `content_hash` (lets a cached vector be told apart from one that's stale because its chunk changed), `embedding` (`vector(N)`, `N` from `embeddings.dimensions`). Only created when pgvector is available **and** an embedding backend is configured — both conditions, unlike `message_embeddings` above which only needs pgvector. |
+
+`PostgresMemoryIndex.has_vector_lane` reports whether both conditions hold. `cache_embedding()`/`get_cached_embedding()` are the storage primitives — a cache miss (no vector lane, never cached, or a stale `model_identity`/`content_hash`) always returns `None` rather than raising, so a caller can treat "compute a fresh embedding" as the uniform fallback.
+
+**This slice only adds the adapter, config surface, and cache storage — nothing computes or uses embeddings yet.** Populating the cache during indexing, the actual vector search lane, reciprocal-rank fusion across lanes, temporal decay, and MMR are Stage One Phase 4 slice C.
 
 ### `session_search` Tool Modes
 
@@ -2304,7 +2332,7 @@ uv run pytest -v
 ```bash
 uv sync                          # install core dependencies
 uv sync --extra tiktoken         # + tiktoken for accurate token estimation
-uv sync --extra postgres         # + psycopg3 + watchdog for PostgreSQL session store & memory index
+uv sync --extra postgres         # + psycopg3 + watchdog + pgvector for session store & memory index
 uv sync --extra browser          # + playwright for browser tool
 uv sync --extra voice            # + silero-vad, sounddevice, torch, transformers for voice chat
 uv sync --extra tiktoken --extra postgres  # combine any extras

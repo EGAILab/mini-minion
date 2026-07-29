@@ -206,13 +206,15 @@ def _build_index() -> PostgresMemoryIndex | None:
     project (see ``docs/adr/0004-degraded-operation.md``).
     """
     from ..config import database as database_cfg  # noqa: PLC0415
+    from ..config import embeddings as embeddings_cfg  # noqa: PLC0415
 
     if not database_cfg.url:
         return None
     try:
         from .postgres_index import PostgresMemoryIndex  # noqa: PLC0415
 
-        return PostgresMemoryIndex(database_cfg.url)
+        dims = embeddings_cfg.dimensions if embeddings_cfg else None
+        return PostgresMemoryIndex(database_cfg.url, embedding_dimensions=dims)
     except Exception as exc:
         print(f"Warning: memory index unavailable ({exc}). Continuing without it.")
         return None

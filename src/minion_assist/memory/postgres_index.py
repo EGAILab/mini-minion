@@ -75,13 +75,23 @@ class PostgresMemoryIndex:
             cost of one extra idle connection per thread — a deliberate,
             simple trade given how rarely indexing operations happen
             relative to message traffic.
+        embedding_dimensions: The configured embedding model's vector
+            length (``config.embeddings.dimensions``), or ``None`` if no
+            embedding backend is configured. Needed up front because a
+            pgvector column's width is fixed at ``CREATE TABLE`` time — it
+            can't be discovered later from the data itself. When ``None``
+            (the default — matches every call site before Stage One
+            Phase 4), :attr:`memory_chunk_embeddings` is never created and
+            the vector lane simply doesn't exist for this instance.
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, embedding_dimensions: int | None = None) -> None:
         import psycopg  # noqa: PLC0415
 
         self._url = url
         self._psycopg = psycopg
+        self._embedding_dimensions = embedding_dimensions
+        self._has_vector = False
         self._ensure_schema()
 
     # ------------------------------------------------------------------
@@ -89,15 +99,41 @@ class PostgresMemoryIndex:
     # ------------------------------------------------------------------
 
     def _conn(self):
-        """Return a thread-local autocommit connection, creating it if needed."""
+        """Return a thread-local autocommit connection, creating it if needed.
+
+        When ``self._has_vector`` is set, registers pgvector's psycopg
+        adapter on every new connection — without it, a ``vector`` column
+        round-trips as a raw ``"[0.1,0.2,0.3]"`` string on read instead of a
+        usable :class:`pgvector.vector.Vector`, and (less critically) an
+        outgoing Python list wouldn't reliably be recognized as a vector
+        value on write either.
+        """
         conn = getattr(_local, "conn", None)
         if conn is None or conn.closed:
             conn = self._psycopg.connect(self._url, autocommit=True)
+            if self._has_vector:
+                from pgvector.psycopg import register_vector  # noqa: PLC0415
+
+                register_vector(conn)
             _local.conn = conn
         return conn
 
     def _ensure_schema(self) -> None:
         conn = self._conn()
+        # pgvector extension (optional — silently skipped if not available,
+        # same pattern as session/db.py's SessionDB._has_vector). Registered
+        # on *this* connection immediately since _conn() only registers it
+        # for connections created *after* self._has_vector becomes True —
+        # this first connection was already open before that happened.
+        try:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            self._has_vector = True
+            from pgvector.psycopg import register_vector  # noqa: PLC0415
+
+            register_vector(conn)
+        except Exception:
+            pass
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS memory_chunks (
                 id            BIGSERIAL PRIMARY KEY,
@@ -180,6 +216,28 @@ class PostgresMemoryIndex:
             "CREATE INDEX IF NOT EXISTS memory_files_shadow_agent_idx "
             "ON memory_files_shadow (agent_id)"
         )
+
+        # Embedding cache — only created when pgvector is available AND an
+        # embedding backend is actually configured (Stage One Phase 4,
+        # slice A). The vector width is fixed at creation time from the
+        # configured model's dimensions; f-string interpolation is required
+        # here because PostgreSQL's vector(N) type modifier can't be a bind
+        # parameter, but embedding_dimensions is a validated int from
+        # config.py, never external input, so this is safe.
+        if self._has_vector and self._embedding_dimensions:
+            dims = int(self._embedding_dimensions)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS memory_chunk_embeddings (
+                    chunk_id       BIGINT PRIMARY KEY,
+                    model_identity TEXT NOT NULL,
+                    content_hash   TEXT NOT NULL,
+                    embedding      vector({dims}) NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS memory_chunk_embeddings_hnsw "
+                "ON memory_chunk_embeddings USING hnsw (embedding vector_cosine_ops)"
+            )
 
     # ------------------------------------------------------------------
     # Indexing
@@ -528,6 +586,84 @@ class PostgresMemoryIndex:
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Embedding cache — Stage One Phase 4, slice A
+    # ------------------------------------------------------------------
+    #
+    # Just the storage primitives here — computing embeddings and populating
+    # this cache during indexing (Task 3: "cache embeddings by model
+    # identity and content hash") is Phase 4 slice C's job, once an
+    # EmbeddingProvider is actually wired into the write path. Guarded by
+    # `has_vector_lane` rather than relying on callers to check first, so a
+    # caller that forgets simply gets a no-op/None instead of a SQL error
+    # from a table that was never created.
+
+    @property
+    def has_vector_lane(self) -> bool:
+        """Whether the embedding cache table exists (pgvector available and a model configured)."""
+        return self._has_vector and bool(self._embedding_dimensions)
+
+    def cache_embedding(
+        self, chunk_id: int, model_identity: str, content_hash: str, embedding: list[float]
+    ) -> None:
+        """Store (or replace) one chunk's embedding, keyed by chunk id.
+
+        Args:
+            chunk_id: The ``memory_chunks.id`` this embedding is for.
+            model_identity: Identifies which model/config produced this
+                vector (e.g. ``"lmstudio/nomic-embed-text-v1.5"``) — lets a
+                model change be detected later rather than silently mixing
+                vectors from two different embedding spaces.
+            content_hash: The chunk content's hash at embedding time —
+                lets a caller tell "still current" apart from "stale, the
+                chunk changed since this was computed" without recomputing.
+            embedding: The vector itself. A no-op if no vector lane is
+                configured (see :attr:`has_vector_lane`).
+        """
+        if not self.has_vector_lane:
+            return
+        self._conn().execute(
+            """
+            INSERT INTO memory_chunk_embeddings (chunk_id, model_identity, content_hash, embedding)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (chunk_id)
+            DO UPDATE SET model_identity = EXCLUDED.model_identity,
+                          content_hash = EXCLUDED.content_hash,
+                          embedding = EXCLUDED.embedding
+            """,
+            (chunk_id, model_identity, content_hash, embedding),
+        )
+
+    def get_cached_embedding(
+        self, chunk_id: int, model_identity: str, content_hash: str
+    ) -> list[float] | None:
+        """Look up a chunk's cached embedding, if one is current.
+
+        Returns ``None`` (a cache miss, not an error) both when there is no
+        vector lane configured and when a cached vector exists but is
+        stale — its ``model_identity``/``content_hash`` no longer matches
+        what's asked for (the embedding model changed, or the chunk's
+        content changed since it was last embedded).
+
+        Args:
+            chunk_id: The ``memory_chunks.id`` to look up.
+            model_identity: Must match the cached row's value exactly.
+            content_hash: Must match the cached row's value exactly.
+
+        Returns:
+            list[float] | None: The cached vector, or ``None`` on any miss.
+        """
+        if not self.has_vector_lane:
+            return None
+        row = self._conn().execute(
+            "SELECT embedding FROM memory_chunk_embeddings "
+            "WHERE chunk_id = %s AND model_identity = %s AND content_hash = %s",
+            (chunk_id, model_identity, content_hash),
+        ).fetchone()
+        # register_vector() (see _conn()) makes row[0] a pgvector.vector.Vector,
+        # not a plain list — .to_list() is that class's conversion method.
+        return row[0].to_list() if row else None
 
     # ------------------------------------------------------------------
     # Inspection (used by tests and later slices' status reporting)

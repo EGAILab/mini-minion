@@ -309,6 +309,30 @@ def _validate(raw: dict) -> list[ConfigIssue]:
         elif isinstance(db_url, str) and not db_url.strip():
             issues.append(ConfigIssue("database.url", "Must be a non-empty connection string."))
 
+    # --- embeddings (optional — Stage One Phase 4, slice A) ---
+    embeddings_raw = raw.get("embeddings")
+    if embeddings_raw is not None:
+        if not isinstance(embeddings_raw, dict):
+            issues.append(ConfigIssue("embeddings", "Expected an object."))
+        else:
+            provider_name = embeddings_raw.get("provider")
+            if not isinstance(provider_name, str) or not provider_name:
+                issues.append(ConfigIssue("embeddings.provider", "Required non-empty string."))
+            elif provider_name not in providers_raw:
+                close = difflib.get_close_matches(provider_name, providers_raw.keys(), n=1)
+                hint = f" Did you mean {close[0]!r}?" if close else ""
+                issues.append(ConfigIssue(
+                    "embeddings.provider", f"Unknown provider {provider_name!r}.{hint}"
+                ))
+            model = embeddings_raw.get("model")
+            if not isinstance(model, str) or not model:
+                issues.append(ConfigIssue("embeddings.model", "Required non-empty string."))
+            dims = embeddings_raw.get("dimensions")
+            if not isinstance(dims, int) or dims <= 0:
+                issues.append(ConfigIssue(
+                    "embeddings.dimensions", f"Expected positive integer, got {dims!r}."
+                ))
+
     # --- memory ---
     memory_raw = raw.get("memory", {})
     if memory_raw and not isinstance(memory_raw, dict):
@@ -1495,6 +1519,78 @@ def _resolve_database() -> DatabaseConfig:
 # Configure in config.json: "database": {"url": "postgresql://user:pw@host/db"}
 # Omit the section (or leave url absent) to disable — file-based fallback remains active.
 database: DatabaseConfig = _resolve_database()
+
+
+@dataclass(frozen=True)
+class EmbeddingConfig:
+    """Optional embedding backend for the memory system's semantic search lane.
+
+    Configured via the ``"embeddings"`` section in config.json::
+
+        "embeddings": {
+            "provider": "lmstudio",
+            "model": "nomic-embed-text-v1.5",
+            "dimensions": 768
+        }
+
+    ``provider`` must name an existing entry under ``models.providers`` — its
+    ``base_url``/``api_key`` are reused (an ``/embeddings`` request against
+    the same endpoint a chat provider already talks to), so embeddings need
+    no separate credentials of their own. ``model`` is the embedding model's
+    id, which does *not* need to appear in that provider's chat ``models``
+    list — embedding models are typically served separately from chat
+    models (e.g. a second model loaded in LM Studio). ``dimensions`` must
+    match that model's actual output vector size: it's fixed into the
+    pgvector column width at table-creation time
+    (``memory/postgres_index.py``) and can't be inferred automatically.
+
+    When this section is absent, :data:`embeddings` is ``None`` and Stage
+    One Phase 4's vector lane stays inactive — lexical-only search,
+    identical to how memory search behaved before Phase 4 (see
+    ``docs/adr/0004-degraded-operation.md``).
+
+    Attributes:
+        provider (ProviderConfig): The chat provider whose credentials/
+            endpoint this reuses.
+        model (str): The embedding model id sent in ``/embeddings`` requests.
+        dimensions (int): The embedding vector's length.
+    """
+    provider: ProviderConfig
+    model: str
+    dimensions: int
+
+
+def _resolve_embeddings() -> EmbeddingConfig | None:
+    """Read the ``"embeddings"`` section from config.json and build an EmbeddingConfig.
+
+    Returns:
+        EmbeddingConfig | None: ``None`` when the section is absent/empty —
+            validation has already confirmed a present section is
+            well-formed, so lookups here cannot fail.
+    """
+    raw = _raw.get("embeddings")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    provider_name = raw["provider"]
+    provider_raw = _raw["models"]["providers"][provider_name]
+    api_key = os.environ.get(f"{provider_name.upper()}_API_KEY", "")
+    return EmbeddingConfig(
+        provider=ProviderConfig(
+            name=provider_name,
+            base_url=provider_raw.get("baseUrl", ""),
+            api_key=api_key,
+            api=provider_raw["api"],
+        ),
+        model=raw["model"],
+        dimensions=int(raw["dimensions"]),
+    )
+
+
+# embeddings: optional semantic-search backend for the memory system (Stage
+# One Phase 4). Configure in config.json: "embeddings": {"provider": "...",
+# "model": "...", "dimensions": N}. Omit the section to leave the vector
+# lane inactive — lexical-only search remains fully active regardless.
+embeddings: EmbeddingConfig | None = _resolve_embeddings()
 
 
 def _resolve_voice() -> VoiceConfig:

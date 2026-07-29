@@ -2022,6 +2022,7 @@ dependencies = [
 all = [
     { name = "anthropic" },
     { name = "numpy" },
+    { name = "pgvector" },
     { name = "playwright" },
     { name = "psycopg", extra = ["binary"] },
     { name = "silero-vad" },
@@ -2043,6 +2044,7 @@ matrix = [
     { name = "matrix-nio", extra = ["e2e"] },
 ]
 postgres = [
+    { name = "pgvector" },
     { name = "psycopg", extra = ["binary"] },
     { name = "watchdog" },
 ]
@@ -2084,6 +2086,8 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'all'", specifier = ">=1.26" },
     { name = "openai", specifier = ">=1.0.0" },
+    { name = "pgvector", marker = "extra == 'all'", specifier = ">=0.5.0" },
+    { name = "pgvector", marker = "extra == 'postgres'", specifier = ">=0.5.0" },
     { name = "playwright", marker = "extra == 'all'", specifier = ">=1.40.0" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.40.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.0" },
@@ -2872,6 +2876,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/88/b0/79462b42e89764998756e0557f2b58a15610a5b4512fbbcccae58fba7237/peewee-3.19.0.tar.gz", hash = "sha256:f88292a6f0d7b906cb26bca9c8599b8f4d8920ebd36124400d0cbaaaf915511f", size = 974035, upload-time = "2026-01-07T17:24:59.597Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1a/41/19c65578ef9a54b3083253c68a607f099642747168fe00f3a2bceb7c3a34/peewee-3.19.0-py3-none-any.whl", hash = "sha256:de220b94766e6008c466e00ce4ba5299b9a832117d9eb36d45d0062f3cfd7417", size = 411885, upload-time = "2026-01-07T17:24:58.33Z" },
+]
+
+[[package]]
+name = "pgvector"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/ec/6eb80aebc728200f95229219882994c1b0585b956ca47da5edb9d062627a/pgvector-0.5.0.tar.gz", hash = "sha256:07a9dcf735696879406983afc6eba9a787cef7c0cf6c367ca1a5779f036dee74", size = 35170, upload-time = "2026-07-06T18:27:27.767Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5c/e4/a5573f2c579ca9ad133293bfb624148ba0893674ca4a6eeec85ced9a6a09/pgvector-0.5.0-py3-none-any.whl", hash = "sha256:fedc9800894e6da2be51358d7b7c574bf34f247ca741a5a09513622135f5964f", size = 30958, upload-time = "2026-07-06T18:27:26.797Z" },
 ]
 
 [[package]]

@@ -90,6 +90,7 @@ from .config import dreaming as dreaming_cfg
 from .config import heartbeat as heartbeat_cfg
 from .config import codex_cfg, logging_cfg
 from .config import database as database_cfg
+from .config import embeddings as embeddings_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
 from .config import multi_agent as multi_agent_cfg
@@ -382,7 +383,15 @@ def main() -> None:
     if _db is not None:
         try:
             from .memory.postgres_index import PostgresMemoryIndex  # noqa: PLC0415
-            _memory_index = PostgresMemoryIndex(database_cfg.url)
+            # Stage One Phase 4, slice A: pgvector's column width is fixed at
+            # table-creation time, so the configured model's dimensions (if
+            # any) must be known up front. embeddings_cfg is None when the
+            # "embeddings" config.json section is absent — the vector lane
+            # then simply never gets created.
+            _embedding_dims = embeddings_cfg.dimensions if embeddings_cfg else None
+            _memory_index = PostgresMemoryIndex(
+                database_cfg.url, embedding_dimensions=_embedding_dims
+            )
         except Exception as _idx_exc:
             print(
                 f"[minion-assist] Warning: memory index unavailable ({_idx_exc}). "

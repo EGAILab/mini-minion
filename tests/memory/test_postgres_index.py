@@ -35,6 +35,12 @@ def index():
 
 
 @pytest.fixture
+def vector_index():
+    """A PostgresMemoryIndex with an embedding dimension configured (Stage One Phase 4, slice A)."""
+    return PostgresMemoryIndex(_DB_URL, embedding_dimensions=3)
+
+
+@pytest.fixture
 def agent_id():
     """A fresh, unique agent_id per test so tests never collide."""
     return f"test-{uuid.uuid4()}"
@@ -394,3 +400,81 @@ def test_index_summary_reports_counts_and_last_indexed_at(index, agent_id):
     assert summary["total_chunks"] == 2
     assert summary["by_corpus"] == {"durable": 1, "import": 1}
     assert summary["last_indexed_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Embedding cache (Stage One Phase 4, slice A)
+# ---------------------------------------------------------------------------
+
+def test_has_vector_lane_is_false_without_configured_dimensions(index):
+    assert index.has_vector_lane is False
+
+
+def test_has_vector_lane_is_true_with_configured_dimensions(vector_index):
+    assert vector_index.has_vector_lane is True
+
+
+def test_cache_embedding_is_a_no_op_without_a_vector_lane(index):
+    index.cache_embedding(999001, "test/model", "hash-a", [0.1, 0.2, 0.3])  # must not raise
+    assert index.get_cached_embedding(999001, "test/model", "hash-a") is None
+
+
+def test_get_cached_embedding_returns_none_for_a_never_cached_chunk(vector_index):
+    assert vector_index.get_cached_embedding(999002, "test/model", "hash-a") is None
+
+
+def test_cache_embedding_round_trips(vector_index):
+    chunk_id = 999003
+    try:
+        vector_index.cache_embedding(chunk_id, "test/model", "hash-a", [0.1, 0.2, 0.3])
+
+        result = vector_index.get_cached_embedding(chunk_id, "test/model", "hash-a")
+
+        assert result is not None
+        assert len(result) == 3
+        assert result[0] == pytest.approx(0.1, abs=1e-4)
+        assert result[1] == pytest.approx(0.2, abs=1e-4)
+        assert result[2] == pytest.approx(0.3, abs=1e-4)
+    finally:
+        vector_index._conn().execute(
+            "DELETE FROM memory_chunk_embeddings WHERE chunk_id = %s", (chunk_id,)
+        )
+
+
+def test_get_cached_embedding_misses_on_wrong_model_identity(vector_index):
+    chunk_id = 999004
+    try:
+        vector_index.cache_embedding(chunk_id, "test/model-a", "hash-a", [0.1, 0.2, 0.3])
+
+        assert vector_index.get_cached_embedding(chunk_id, "test/model-b", "hash-a") is None
+    finally:
+        vector_index._conn().execute(
+            "DELETE FROM memory_chunk_embeddings WHERE chunk_id = %s", (chunk_id,)
+        )
+
+
+def test_get_cached_embedding_misses_on_wrong_content_hash(vector_index):
+    chunk_id = 999005
+    try:
+        vector_index.cache_embedding(chunk_id, "test/model", "hash-a", [0.1, 0.2, 0.3])
+
+        assert vector_index.get_cached_embedding(chunk_id, "test/model", "hash-stale") is None
+    finally:
+        vector_index._conn().execute(
+            "DELETE FROM memory_chunk_embeddings WHERE chunk_id = %s", (chunk_id,)
+        )
+
+
+def test_cache_embedding_replaces_a_previous_value_for_the_same_chunk(vector_index):
+    chunk_id = 999006
+    try:
+        vector_index.cache_embedding(chunk_id, "test/model", "hash-a", [0.1, 0.2, 0.3])
+        vector_index.cache_embedding(chunk_id, "test/model", "hash-b", [0.4, 0.5, 0.6])
+
+        assert vector_index.get_cached_embedding(chunk_id, "test/model", "hash-a") is None
+        result = vector_index.get_cached_embedding(chunk_id, "test/model", "hash-b")
+        assert result[0] == pytest.approx(0.4, abs=1e-4)
+    finally:
+        vector_index._conn().execute(
+            "DELETE FROM memory_chunk_embeddings WHERE chunk_id = %s", (chunk_id,)
+        )
