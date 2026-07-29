@@ -54,6 +54,7 @@ def _cleanup_after(index, agent_id):
     conn.execute("DELETE FROM memory_files WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_chunks_shadow WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_files_shadow WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM memory_pins WHERE agent_id = %s", (agent_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +123,15 @@ def test_remove_file_deletes_chunks_and_ledger_row(index, agent_id):
 
 def test_remove_file_is_a_no_op_for_a_file_never_indexed(index, agent_id):
     index.remove_file(agent_id, "never-existed.md")  # must not raise
+
+
+def test_remove_file_also_clears_a_pin(index, agent_id):
+    index.reindex_file(agent_id, "memory/topics/goal.md", "durable", "content")
+    index.pin_file(agent_id, "memory/topics/goal.md")
+
+    index.remove_file(agent_id, "memory/topics/goal.md")
+
+    assert index.is_pinned(agent_id, "memory/topics/goal.md") is False
     assert index.chunk_count(agent_id) == 0
 
 
@@ -478,3 +488,56 @@ def test_cache_embedding_replaces_a_previous_value_for_the_same_chunk(vector_ind
         vector_index._conn().execute(
             "DELETE FROM memory_chunk_embeddings WHERE chunk_id = %s", (chunk_id,)
         )
+
+
+# ---------------------------------------------------------------------------
+# Pinning (Stage One Phase 4, slice B)
+# ---------------------------------------------------------------------------
+
+def test_is_pinned_is_false_for_a_never_pinned_file(index, agent_id):
+    assert index.is_pinned(agent_id, "memory/topics/goal.md") is False
+
+
+def test_pin_file_makes_is_pinned_true(index, agent_id):
+    index.pin_file(agent_id, "memory/topics/goal.md")
+    assert index.is_pinned(agent_id, "memory/topics/goal.md") is True
+
+
+def test_unpin_file_makes_is_pinned_false(index, agent_id):
+    index.pin_file(agent_id, "memory/topics/goal.md")
+    index.unpin_file(agent_id, "memory/topics/goal.md")
+    assert index.is_pinned(agent_id, "memory/topics/goal.md") is False
+
+
+def test_unpin_file_is_a_no_op_for_a_never_pinned_file(index, agent_id):
+    index.unpin_file(agent_id, "memory/topics/goal.md")  # must not raise
+    assert index.is_pinned(agent_id, "memory/topics/goal.md") is False
+
+
+def test_pin_file_is_idempotent(index, agent_id):
+    index.pin_file(agent_id, "memory/topics/goal.md")
+    index.pin_file(agent_id, "memory/topics/goal.md")  # must not raise or duplicate
+
+    assert index.pinned_files(agent_id) == ["memory/topics/goal.md"]
+
+
+def test_pinned_files_lists_every_pin_most_recently_first(index, agent_id):
+    index.pin_file(agent_id, "memory/topics/a.md")
+    index.pin_file(agent_id, "memory/topics/b.md")
+
+    assert index.pinned_files(agent_id) == ["memory/topics/b.md", "memory/topics/a.md"]
+
+
+def test_pinned_files_is_empty_for_an_agent_with_no_pins(index, agent_id):
+    assert index.pinned_files(agent_id) == []
+
+
+def test_pins_do_not_leak_across_agents(index, agent_id):
+    other_agent = f"test-{uuid.uuid4()}"
+    index.pin_file(other_agent, "memory/topics/goal.md")
+
+    try:
+        assert index.is_pinned(agent_id, "memory/topics/goal.md") is False
+        assert index.pinned_files(agent_id) == []
+    finally:
+        index.unpin_file(other_agent, "memory/topics/goal.md")

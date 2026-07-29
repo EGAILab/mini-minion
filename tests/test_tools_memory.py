@@ -97,6 +97,28 @@ def test_default_registry_without_memory_has_no_memory_tools():
     assert "write_daily_memory" not in names
 
 
+def test_default_registry_with_memory_but_no_db_has_no_pin_tool(tmp_path):
+    # pin_memory needs a lexical index, which needs a database — not offered
+    # to the LLM at all without one (Stage One Phase 4, slice B).
+    from minion_assist.tools import default_registry
+
+    mem = _service(tmp_path)
+    reg = default_registry(memory=mem)
+    names = {d["function"]["name"] for d in reg.definitions}
+    assert "pin_memory" not in names
+
+
+def test_default_registry_with_memory_and_db_has_pin_tool(tmp_path):
+    from unittest.mock import Mock
+
+    from minion_assist.tools import default_registry
+
+    mem = _service(tmp_path)
+    reg = default_registry(memory=mem, db=Mock())
+    names = {d["function"]["name"] for d in reg.definitions}
+    assert "pin_memory" in names
+
+
 def test_search_memory_cap_note_shown_when_limit_hit(tmp_path):
     """SearchMemoryTool output must include a cap hint when _SEARCH_MAX_RESULTS notes match."""
     from minion_assist.memory.service import _SEARCH_MAX_RESULTS

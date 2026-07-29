@@ -17,6 +17,9 @@ Currently supported:
 - ``minion-assist memory search QUERY [--agent ID] [--corpus C]`` — keyword search.
 - ``minion-assist memory doctor [--agent ID]``          — status + un-migrated-data check.
 - ``minion-assist memory reindex [--agent ID] [--force]`` — rebuild the lexical index.
+- ``minion-assist memory pin KEY --agent ID``            — pin a topic note.
+- ``minion-assist memory unpin KEY --agent ID``          — unpin a topic note.
+- ``minion-assist memory pins [--agent ID]``             — list pinned notes.
 
 Talks to
 --------
@@ -125,6 +128,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "reindexes files that actually changed."
         ),
     )
+
+    pin = sub.add_parser(
+        "pin",
+        help="Pin a topic note so it's always surfaced by the pinned fusion lane.",
+    )
+    pin.add_argument("key", help="The note's identifier, as given to save_memory.")
+    pin.add_argument("--agent", required=True, help="Which agent's note to pin.")
+
+    unpin = sub.add_parser("unpin", help="Unpin a topic note.")
+    unpin.add_argument("key", help="The note's identifier.")
+    unpin.add_argument("--agent", required=True, help="Which agent's note to unpin.")
+
+    pins = sub.add_parser("pins", help="List every pinned note for one or every agent.")
+    pins.add_argument("--agent", help="Limit to one agent ID. Default: every configured agent.")
 
     return parser
 
@@ -425,6 +442,62 @@ def _run_reindex(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_pin(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory pin KEY --agent ID``."""
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to pin.")
+        return 1
+
+    service = _build_service(workspace, args.agent, bootstrap_cfg, index=index)
+    try:
+        service.pin(args.key)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
+        return 1
+    print(f"{args.agent}: pinned {args.key!r}.")
+    return 0
+
+
+def _run_unpin(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory unpin KEY --agent ID``."""
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to unpin.")
+        return 1
+
+    service = _build_service(workspace, args.agent, bootstrap_cfg, index=index)
+    service.unpin(args.key)
+    print(f"{args.agent}: unpinned {args.key!r}.")
+    return 0
+
+
+def _run_pins(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory pins [--agent ID]``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to list.")
+        return 1
+
+    for agent_id in _selected_agents(sorted(agents_cfg), args.agent):
+        service = _build_service(workspace, agent_id, bootstrap_cfg, index=index)
+        keys = service.list_pinned()
+        print(f"{agent_id}: {len(keys)} pinned note(s)")
+        for key in keys:
+            print(f"  - {key}")
+    return 0
+
+
 _HANDLERS = {
     "migrate": _run_migrate,
     "status": _run_status,
@@ -433,6 +506,9 @@ _HANDLERS = {
     "search": _run_search,
     "doctor": _run_doctor,
     "reindex": _run_reindex,
+    "pin": _run_pin,
+    "unpin": _run_unpin,
+    "pins": _run_pins,
 }
 
 

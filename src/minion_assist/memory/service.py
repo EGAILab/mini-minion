@@ -417,6 +417,66 @@ class MemoryService:
         return self._index.reconcile_agent(self._agent_id, self._files.list_indexable_files())
 
     # -----------------------------------------------------------------
+    # Pinning (Stage One Phase 4, slice B)
+    # -----------------------------------------------------------------
+    #
+    # Scoped to explicit topic notes only (memory/topics/{key}.md) — not
+    # MEMORY.md (already unconditionally injected into every turn via
+    # bootstrap.py, a separate mechanism entirely), not daily notes
+    # (ephemeral by nature), and not imports (unreviewed/quarantined —
+    # pinning one would contradict that status). "Pin whatever you
+    # explicitly saved" mirrors how remember()/delete() already address
+    # notes by key, not by raw path.
+
+    def _pin_rel_path(self, key: str) -> str:
+        """The lexical index's rel_path for a topic note key."""
+        return self._files.topic_path(key).relative_to(self._files.root).as_posix()
+
+    def pin(self, key: str) -> None:
+        """Pin a topic note so the pinned fusion lane always surfaces it, regardless of query match.
+
+        Args:
+            key: The note identifier, same as :meth:`remember`/:meth:`delete`.
+
+        Raises:
+            RuntimeError: No lexical index is configured for this agent.
+            FileNotFoundError: No note exists under this key — pinning
+                something that doesn't exist would just create an orphaned
+                pin, so this is rejected rather than silently accepted.
+        """
+        if self._index is None or self._agent_id is None:
+            raise RuntimeError("No lexical index configured for this agent — nothing to pin.")
+        if self._files.load(key) is None:
+            raise FileNotFoundError(f"No note found for key {key!r} — nothing to pin.")
+        self._index.pin_file(self._agent_id, self._pin_rel_path(key))
+
+    def unpin(self, key: str) -> None:
+        """Unpin a topic note. A no-op if it wasn't pinned (or doesn't exist).
+
+        Deliberately does not require the note to still exist, unlike
+        :meth:`pin` — this must always be able to clear a pin, including a
+        stale one left behind by a note deleted outside :meth:`delete`.
+
+        Raises:
+            RuntimeError: No lexical index is configured for this agent.
+        """
+        if self._index is None or self._agent_id is None:
+            raise RuntimeError("No lexical index configured for this agent — nothing to unpin.")
+        self._index.unpin_file(self._agent_id, self._pin_rel_path(key))
+
+    def is_pinned(self, key: str) -> bool:
+        """Whether a topic note is pinned. ``False`` (not an error) with no index configured."""
+        if self._index is None or self._agent_id is None:
+            return False
+        return self._index.is_pinned(self._agent_id, self._pin_rel_path(key))
+
+    def list_pinned(self) -> list[str]:
+        """Every pinned note's key, most recently pinned first. Empty with no index configured."""
+        if self._index is None or self._agent_id is None:
+            return []
+        return [Path(p).stem for p in self._index.pinned_files(self._agent_id)]
+
+    # -----------------------------------------------------------------
     # Pre-compaction flush (Stage One Phase 2, slice B)
     # -----------------------------------------------------------------
 

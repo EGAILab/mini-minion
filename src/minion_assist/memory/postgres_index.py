@@ -180,6 +180,19 @@ class PostgresMemoryIndex:
             )
         """)
 
+        # Pinned files — Stage One Phase 4, slice B. Backs the "pinned" fusion
+        # lane (slice C): a pinned file's chunks are always surfaced,
+        # regardless of query match. Scoped to topic notes only (see
+        # memory/service.py's pin()/unpin() docstrings for why).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_pins (
+                agent_id   TEXT NOT NULL,
+                rel_path   TEXT NOT NULL,
+                pinned_at  DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (agent_id, rel_path)
+            )
+        """)
+
         # Shadow copies of both tables above, same shape — scratch space for
         # force_rebuild_agent()'s crash-safe rebuild-and-swap (Stage One
         # Phase 3, slice C). See that method's docstring for the swap
@@ -305,9 +318,12 @@ class PostgresMemoryIndex:
         return len(chunks)
 
     def remove_file(self, agent_id: str, rel_path: str) -> None:
-        """Remove one file's chunks and ledger row (e.g. after on-disk deletion).
+        """Remove one file's chunks, ledger row, and pin (e.g. after on-disk deletion).
 
-        A no-op if this file was never indexed — safe to call unconditionally.
+        A no-op if this file was never indexed/pinned — safe to call
+        unconditionally. Also clears any pin (Stage One Phase 4, slice B)
+        so a deleted note can never linger as an orphaned pin pointing at
+        content that no longer exists.
         """
         conn = self._conn()
         conn.execute(
@@ -316,6 +332,10 @@ class PostgresMemoryIndex:
         )
         conn.execute(
             "DELETE FROM memory_files WHERE agent_id = %s AND rel_path = %s",
+            (agent_id, rel_path),
+        )
+        conn.execute(
+            "DELETE FROM memory_pins WHERE agent_id = %s AND rel_path = %s",
             (agent_id, rel_path),
         )
 
@@ -586,6 +606,52 @@ class PostgresMemoryIndex:
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Pinning — Stage One Phase 4, slice B
+    # ------------------------------------------------------------------
+    #
+    # Just the storage primitives here — the "pinned" fusion lane that
+    # actually surfaces these in search results is Phase 4 slice C's job,
+    # once fusion across lanes exists at all.
+
+    def pin_file(self, agent_id: str, rel_path: str) -> None:
+        """Pin a file so it's always surfaced by the pinned fusion lane, regardless of query match.
+
+        Idempotent — pinning an already-pinned file just refreshes
+        ``pinned_at`` rather than erroring or creating a duplicate row.
+        """
+        self._conn().execute(
+            """
+            INSERT INTO memory_pins (agent_id, rel_path, pinned_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (agent_id, rel_path) DO UPDATE SET pinned_at = EXCLUDED.pinned_at
+            """,
+            (agent_id, rel_path, time.time()),
+        )
+
+    def unpin_file(self, agent_id: str, rel_path: str) -> None:
+        """Unpin a file. A no-op (not an error) if it wasn't pinned."""
+        self._conn().execute(
+            "DELETE FROM memory_pins WHERE agent_id = %s AND rel_path = %s",
+            (agent_id, rel_path),
+        )
+
+    def is_pinned(self, agent_id: str, rel_path: str) -> bool:
+        """Whether a specific file is currently pinned."""
+        row = self._conn().execute(
+            "SELECT 1 FROM memory_pins WHERE agent_id = %s AND rel_path = %s",
+            (agent_id, rel_path),
+        ).fetchone()
+        return row is not None
+
+    def pinned_files(self, agent_id: str) -> list[str]:
+        """Every ``rel_path`` currently pinned for one agent, most recently pinned first."""
+        rows = self._conn().execute(
+            "SELECT rel_path FROM memory_pins WHERE agent_id = %s ORDER BY pinned_at DESC",
+            (agent_id,),
+        ).fetchall()
+        return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
     # Embedding cache — Stage One Phase 4, slice A

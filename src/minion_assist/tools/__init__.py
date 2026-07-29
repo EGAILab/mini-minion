@@ -48,7 +48,7 @@ from .find_definition import FindDefinitionTool
 from .git import GitCommitTool, GitDiffTool, GitStatusTool
 from .glob import GlobTool
 from .grep import GrepTool
-from .memory import MemoryGetTool, SaveMemoryTool, SearchMemoryTool
+from .memory import MemoryGetTool, PinMemoryTool, SaveMemoryTool, SearchMemoryTool
 from .patch import PatchPreviewTool
 from .session_search import SessionSearchTool
 from .policy import PermissionPolicy
@@ -181,6 +181,13 @@ def default_registry(
         # Lets the agent append notes to memory/YYYY-MM-DD.md without needing
         # to read -> edit -> write the whole file.
         registry.register(WriteDailyMemoryTool(memory, policy=_policy))
+        # Pinning needs a lexical index (Stage One Phase 4, slice B/C),
+        # which only exists when a database is configured — same gate as
+        # SessionSearchTool above. Not offered to the LLM at all in the
+        # common no-database case, rather than being present but always
+        # erroring.
+        if db is not None:
+            registry.register(PinMemoryTool(memory, policy=_policy))
 
     # Skill tool — only when at least one skill was discovered.
     if skills:
@@ -247,6 +254,7 @@ __all__ = [
     "GrepTool",
     "MemoryGetTool",
     "PatchPreviewTool",
+    "PinMemoryTool",
     "SaveMemoryTool",
     "SearchMemoryTool",
     "SessionSearchTool",

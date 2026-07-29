@@ -35,13 +35,15 @@ intentionally a different tree from the tool sandbox boundary (``root`` /
 boundary here would incorrectly reject every memory write. Only the
 ``read_only_mode`` flag applies.
 
-Three-class design
-------------------
-:class:`SaveMemoryTool`, :class:`SearchMemoryTool`, and :class:`MemoryGetTool`
-are separate because the LLM needs to distinguish between "write/replace a
-named note", "search my memory" (relevance-ranked), and "read this exact
-file/line-range I already know about" (no ranking) — they have completely
-different schemas and behaviors. All three receive the same
+Separate tool classes, one per distinct operation
+-----------------------------------------------------
+:class:`SaveMemoryTool`, :class:`SearchMemoryTool`, :class:`MemoryGetTool`,
+and :class:`PinMemoryTool` are separate because the LLM needs to
+distinguish between "write/replace a named note", "search my memory"
+(relevance-ranked), "read this exact file/line-range I already know about"
+(no ranking), and "always surface this note regardless of query match"
+(Stage One Phase 4, slice B) — they have completely different schemas and
+behaviors. All four receive the same
 :class:`~minion_assist.memory.service.MemoryService` instance at construction
 time (dependency injection).
 
@@ -320,3 +322,93 @@ class MemoryGetTool(Tool):
             f"of {excerpt.total_lines}]"
         )
         return f"{header}\n{excerpt.text}"
+
+
+class PinMemoryTool(Tool):
+    """Tool for pinning/unpinning a saved note — Stage One Phase 4, slice B.
+
+    A pinned note is always surfaced by the memory index's pinned fusion
+    lane (Phase 4, slice C), regardless of whether it matches a search
+    query. Use this for a note that should never be missed — e.g. a
+    standing constraint or preference — as opposed to ``save_memory``
+    alone, which only surfaces a note when it happens to match a query or
+    ranks in the top-5 proactive injection.
+
+    Only works on explicit topic notes (the ones ``save_memory`` creates),
+    not ``MEMORY.md`` (already unconditionally injected every turn via a
+    separate mechanism — see ``bootstrap.py``), daily notes, or imports.
+    Requires a configured database — without one there is no lexical index
+    for a pinned lane to belong to.
+
+    Args:
+        memory (MemoryService): The memory backend to pin/unpin against.
+        policy (PermissionPolicy | None): Optional permission policy — same
+            ``read_only_mode`` guard as :class:`SaveMemoryTool`, since
+            pinning changes state.
+    """
+
+    def __init__(
+        self,
+        memory: MemoryService,
+        policy: PermissionPolicy | None = None,
+    ) -> None:
+        self._memory = memory
+        self._policy = policy
+
+    @property
+    def schema(self) -> ToolSchema:
+        """Describe this tool to the LLM."""
+        return ToolSchema(
+            name="pin_memory",
+            description=(
+                "Pin or unpin a saved note (one created with save_memory) so it's always "
+                "surfaced, not just when it matches a search. Use for standing constraints "
+                "or preferences that must never be missed."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The note's identifier, as given to save_memory.",
+                    },
+                    "pinned": {
+                        "type": "boolean",
+                        "description": "true to pin, false to unpin.",
+                    },
+                },
+                "required": ["key", "pinned"],
+            },
+        )
+
+    def execute(self, **kwargs: object) -> str:
+        """Pin or unpin a topic note.
+
+        Args:
+            key (str): The note identifier.
+            pinned (bool): ``True`` to pin, ``False`` to unpin.
+
+        Returns:
+            str: Confirmation, or an error message if there's no lexical
+                index configured or (when pinning) no note exists under
+                that key.
+        """
+        key = str(kwargs["key"])
+        pinned = bool(kwargs["pinned"])
+
+        if self._policy is not None and self._policy.read_only_mode:
+            return (
+                "Error: read-only mode is active — memory writes are not permitted. "
+                "Use /auto to disable."
+            )
+
+        try:
+            if pinned:
+                self._memory.pin(key)
+                return f"Pinned memory: {key}"
+            self._memory.unpin(key)
+            return f"Unpinned memory: {key}"
+        except RuntimeError as exc:
+            return f"Error: {exc}"
+        except FileNotFoundError as exc:
+            return f"Error: {exc}"

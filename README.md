@@ -1226,6 +1226,28 @@ An optional `"embeddings"` section in `config.json` enables a semantic-search la
 
 **This slice only adds the adapter, config surface, and cache storage — nothing computes or uses embeddings yet.** Populating the cache during indexing, the actual vector search lane, reciprocal-rank fusion across lanes, temporal decay, and MMR are Stage One Phase 4 slice C.
 
+### Pinning (Stage One Phase 4, slice B)
+
+A pinned note is always surfaced by the memory index's pinned fusion lane (slice C), regardless of whether it matches a search query — for a standing constraint or preference that must never be missed, as opposed to `save_memory` alone (only surfaces when it happens to match a query or rank in the top-5 proactive injection).
+
+Pinning is scoped to explicit topic notes only (the ones `save_memory` creates) — not `MEMORY.md` (already unconditionally injected every turn via `bootstrap.py`, a separate mechanism entirely), not daily notes (ephemeral by nature), and not imports (unreviewed/quarantined — pinning one would contradict that status). It requires a configured database, since there's no lexical index for a "pinned lane" to belong to otherwise.
+
+| Table | Description |
+|---|---|
+| `memory_pins` | `PRIMARY KEY (agent_id, rel_path)`. Columns: `pinned_at`. `PostgresMemoryIndex.remove_file()` also clears a file's pin, so a deleted note can never linger as an orphaned pin. |
+
+`MemoryService.pin(key)`/`unpin(key)`/`is_pinned(key)`/`list_pinned()` are the service-level API — `pin()` requires the note to already exist (raises `FileNotFoundError` otherwise, so pinning a typo'd key fails loudly rather than creating a dangling pin); `unpin()` doesn't, so a stale pin can always be cleared.
+
+The `pin_memory` tool (`key`, `pinned: bool`) exposes this to the LLM — registered alongside the other memory tools only when a database is configured (not offered at all, rather than present-but-always-erroring, when it isn't). Respects `read_only_mode` the same way `save_memory` does.
+
+New CLI commands:
+
+```bash
+minion-assist memory pin project-goals --agent main     # pin a topic note
+minion-assist memory unpin project-goals --agent main   # unpin it
+minion-assist memory pins --agent main                  # list pinned notes
+```
+
 ### `session_search` Tool Modes
 
 | Mode | Description |
@@ -1623,6 +1645,7 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `WriteDailyMemoryTool` | `write_daily_memory` | Append a quick timestamped bullet to today's daily log (`memory/YYYY-MM-DD.md`). No key needed — great for ephemeral observations. Blocked by `read_only_mode`. |
 | `SearchMemoryTool` | `search_memory` | Keyword search across memory. Results ranked by term frequency and recency. Capped at 20. `is_read_only=True`. |
 | `MemoryGetTool` | `memory_get` | Read an exact, bounded slice of a memory file by path (optional `from_line`/`lines`) — a targeted follow-up read, not a search. `is_read_only=True`. |
+| `PinMemoryTool` | `pin_memory` | Pin/unpin a saved note (`key`, `pinned: bool`) so it's always surfaced by the pinned fusion lane, regardless of query match. Registered only when a database is configured. Blocked by `read_only_mode`. |
 | `SkillTool` | `skill` | Load a skill's instructions into context by name. Only registered when skills are discovered at startup. |
 | `ReadTaskTool` | `read_task` | Read the current task progress file — goal, steps, status, notes, and context. |
 | `UpdateTaskTool` | `update_task` | Create a new task (goal + steps) or update an existing one (step status, notes, context, or clear). |
@@ -1704,7 +1727,7 @@ reg = default_registry(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `memory` | `MemoryService \| None` | `None` | If provided, registers `save_memory`, `search_memory`, `memory_get`, and `write_daily_memory` |
+| `memory` | `MemoryService \| None` | `None` | If provided, registers `save_memory`, `search_memory`, `memory_get`, and `write_daily_memory`. Also registers `pin_memory`, but only when `db` is also provided. |
 | `root` | `Path \| None` | `None` | Workspace root — `read`/`write`/`glob`/`edit`/`grep` reject paths outside this boundary |
 | `bash_confirm` | `Callable[[str], bool] \| None` | `None` | Simple bool callback called before every bash command; `None` = no confirmation |
 | `bash_approval` | `Callable[[str], ApprovalDecision] \| None` | `None` | Rich 4-option approval callback (ALLOW_ONCE, ALLOW_SESSION, DENY, ALWAYS_DENY). Takes priority over `bash_confirm` when both are set. The CLI wires this to a menu that also records decisions to the policy's audit log. |

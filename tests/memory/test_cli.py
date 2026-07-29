@@ -371,6 +371,119 @@ def test_reindex_filters_by_agent(monkeypatch, tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# pin / unpin / pins
+# ---------------------------------------------------------------------------
+
+def test_pin_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    root = _agent_root(tmp_path, "main")
+    MemoryFileRepository(root).remember("goal", "content")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["pin", "goal", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_pin_an_existing_note_succeeds(monkeypatch, tmp_path, capsys):
+    root = _agent_root(tmp_path, "main")
+    MemoryFileRepository(root).remember("goal", "content")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["pin", "goal", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_index.pin_file.assert_called_once_with("main", "memory/topics/goal.md")
+    assert "pinned 'goal'" in out
+
+
+def test_pin_a_missing_note_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["pin", "never-saved", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "No note found" in out
+    mock_index.pin_file.assert_not_called()
+
+
+def test_unpin_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["unpin", "goal", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_unpin_succeeds_even_for_a_missing_note(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["unpin", "goal", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_index.unpin_file.assert_called_once_with("main", "memory/topics/goal.md")
+    assert "unpinned 'goal'" in out
+
+
+def test_pins_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["pins"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_pins_lists_every_pinned_note(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.pinned_files.return_value = ["memory/topics/a.md", "memory/topics/b.md"]
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["pins"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "2 pinned note(s)" in out
+    assert "- a" in out
+    assert "- b" in out
+
+
+def test_pins_filters_by_agent(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _agent_root(tmp_path, "researcher")
+    _patch_config(monkeypatch, tmp_path, agent_ids=("main", "researcher"))
+    mock_index = Mock()
+    mock_index.pinned_files.return_value = []
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["pins", "--agent", "researcher"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "researcher:" in out
+    assert "main:" not in out
+
+
+# ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
 

@@ -274,6 +274,70 @@ def test_force_reindex_delegates_to_the_index_with_the_current_file_listing(inde
 
 
 # ---------------------------------------------------------------------------
+# pin / unpin / is_pinned / list_pinned (Stage One Phase 4, slice B)
+# ---------------------------------------------------------------------------
+
+def test_pin_raises_without_an_index(service):
+    service.remember("project-goals", "content")
+    with pytest.raises(RuntimeError, match="No lexical index configured"):
+        service.pin("project-goals")
+
+
+def test_pin_raises_for_a_key_with_no_note(indexed_service):
+    svc, _mock_index = indexed_service
+    with pytest.raises(FileNotFoundError, match="No note found"):
+        svc.pin("never-saved")
+
+
+def test_pin_delegates_to_the_index_with_the_topic_rel_path(indexed_service):
+    svc, mock_index = indexed_service
+    svc.remember("project-goals", "content")
+    mock_index.reset_mock()
+
+    svc.pin("project-goals")
+
+    mock_index.pin_file.assert_called_once_with("main", "memory/topics/project-goals.md")
+
+
+def test_unpin_raises_without_an_index(service):
+    with pytest.raises(RuntimeError, match="No lexical index configured"):
+        service.unpin("project-goals")
+
+
+def test_unpin_delegates_to_the_index_even_for_a_nonexistent_note(indexed_service):
+    svc, mock_index = indexed_service
+
+    svc.unpin("never-saved")  # must not raise — clears a possibly-stale pin
+
+    mock_index.unpin_file.assert_called_once_with("main", "memory/topics/never-saved.md")
+
+
+def test_is_pinned_returns_false_without_an_index(service):
+    assert service.is_pinned("project-goals") is False
+
+
+def test_is_pinned_delegates_to_the_index(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.is_pinned.return_value = True
+
+    assert svc.is_pinned("project-goals") is True
+    mock_index.is_pinned.assert_called_once_with("main", "memory/topics/project-goals.md")
+
+
+def test_list_pinned_returns_empty_list_without_an_index(service):
+    assert service.list_pinned() == []
+
+
+def test_list_pinned_maps_rel_paths_back_to_keys(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.pinned_files.return_value = [
+        "memory/topics/b.md", "memory/topics/a.md", "MEMORY.md",
+    ]
+
+    assert svc.list_pinned() == ["b", "a", "MEMORY"]
+
+
+# ---------------------------------------------------------------------------
 # flush_head (Stage One Phase 2, slice B)
 # ---------------------------------------------------------------------------
 
