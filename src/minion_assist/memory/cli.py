@@ -11,24 +11,30 @@ Currently supported:
 - ``minion-assist memory migrate``            — dry-run report (default).
 - ``minion-assist memory migrate --apply``    — perform the Phase 0 merge.
 - ``minion-assist memory migrate --rollback MANIFEST`` — undo a previous apply.
-- ``minion-assist memory status [--agent ID]``          — note counts per agent.
+- ``minion-assist memory status [--agent ID] [--deep]``          — note counts (+ index health).
 - ``minion-assist memory list [--agent ID]``            — list topic note keys.
 - ``minion-assist memory get PATH --agent ID``          — bounded exact read.
-- ``minion-assist memory search QUERY [--agent ID]``    — keyword search.
+- ``minion-assist memory search QUERY [--agent ID] [--corpus C]`` — keyword search.
 - ``minion-assist memory doctor [--agent ID]``          — status + un-migrated-data check.
+- ``minion-assist memory reindex [--agent ID] [--force]`` — rebuild the lexical index.
 
 Talks to
 --------
 - ``memory/migration.py`` — the actual planning/apply/rollback logic; this
   module only parses arguments and prints results.
 - ``memory/files.py``, ``memory/service.py`` — ``status``/``list``/``get``/
-  ``search`` build a :class:`~minion_assist.memory.service.MemoryService` per
-  selected agent and call straight through to it.
+  ``search``/``reindex`` build a :class:`~minion_assist.memory.service.MemoryService`
+  per selected agent and call straight through to it.
+- ``memory/postgres_index.py`` — :func:`_build_index` constructs the
+  optional :class:`~minion_assist.memory.postgres_index.PostgresMemoryIndex`
+  that ``search --corpus``, ``status --deep``, and ``reindex`` use, when a
+  database is configured (Stage One Phase 3, slice C).
 - ``minion.py`` — ``main()`` dispatches ``sys.argv[1] == "memory"`` here
   before falling through to the interactive REPL.
-- ``config.py`` — reads ``workspace``, ``agents``, and ``bootstrap`` to know
-  which agents/directories to inventory and how to resolve each agent's
-  memory root (same fallback ``minion.py`` uses for the live agent loop).
+- ``config.py`` — reads ``workspace``, ``agents``, ``bootstrap``, and
+  ``database`` to know which agents/directories to inventory, how to
+  resolve each agent's memory root (same fallback ``minion.py`` uses for
+  the live agent loop), and whether a lexical index is available.
 - ``workspace.py`` — :func:`agent_workspace_root` resolves each agent's
   per-agent or shared workspace directory.
 """
@@ -37,10 +43,14 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import migration
 from .files import MemoryFileRepository
 from .service import MemoryService
+
+if TYPE_CHECKING:
+    from .postgres_index import PostgresMemoryIndex
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -67,6 +77,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="Show note counts per agent.")
     status.add_argument("--agent", help="Limit to one agent ID. Default: every configured agent.")
+    status.add_argument(
+        "--deep",
+        action="store_true",
+        help=(
+            "Also report lexical-index health (chunk counts, corpus breakdown, "
+            "last-indexed time). Requires a configured database."
+        ),
+    )
 
     list_cmd = sub.add_parser("list", help="List explicit note keys (memory/topics/) per agent.")
     list_cmd.add_argument("--agent", help="Limit to one agent ID. Default: every configured agent.")
@@ -80,12 +98,33 @@ def _build_parser() -> argparse.ArgumentParser:
     search = sub.add_parser("search", help="Keyword search across one or every agent's memory.")
     search.add_argument("query", help="One or more keywords, space-separated.")
     search.add_argument("--agent", help="Limit to one agent ID. Default: every configured agent.")
+    search.add_argument(
+        "--corpus",
+        choices=["durable", "daily", "import"],
+        default=None,
+        help="Restrict to one corpus. Default: search everything.",
+    )
 
     doctor = sub.add_parser(
         "doctor",
         help="Report note counts and flag any un-migrated legacy data per agent.",
     )
     doctor.add_argument("--agent", help="Limit to one agent ID. Default: every configured agent.")
+
+    reindex = sub.add_parser(
+        "reindex",
+        help="Rebuild one or every agent's lexical index. Requires a configured database.",
+    )
+    reindex.add_argument("--agent", help="Limit to one agent ID. Default: every configured agent.")
+    reindex.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Crash-safe full rebuild via shadow-table swap (Stage One Phase 3, slice C). "
+            "Without this flag, performs a cheaper hash-diff reconciliation instead — only "
+            "reindexes files that actually changed."
+        ),
+    )
 
     return parser
 
@@ -138,10 +177,45 @@ def _selected_agents(agent_ids: list[str], selected: str | None) -> list[str]:
     return [selected]
 
 
-def _build_service(workspace: Path, agent_id: str, bootstrap_cfg: object) -> MemoryService:
-    """Build the :class:`MemoryService` for one agent, resolving its root first."""
+def _build_service(
+    workspace: Path,
+    agent_id: str,
+    bootstrap_cfg: object,
+    index: PostgresMemoryIndex | None = None,
+) -> MemoryService:
+    """Build the :class:`MemoryService` for one agent, resolving its root first.
+
+    Args:
+        index: The shared lexical index (from :func:`_build_index`), or
+            ``None`` — passed straight through to ``MemoryService`` so
+            ``search``/``deep_status``/``force_reindex`` all use it.
+    """
     root = _resolve_agent_root(workspace, agent_id, bootstrap_cfg)
-    return MemoryService(MemoryFileRepository(root))
+    return MemoryService(MemoryFileRepository(root), index=index, agent_id=agent_id)
+
+
+def _build_index() -> PostgresMemoryIndex | None:
+    """Construct the shared lexical index, or ``None`` if no database is configured/reachable.
+
+    One instance is built per CLI invocation and shared across every agent
+    that invocation processes (mirrors how ``minion.py`` builds one
+    :class:`PostgresMemoryIndex` for the whole running app, not one per
+    agent). Never raises — a construction failure (e.g. the database is
+    unreachable) is reported and treated the same as "no database
+    configured," matching every other database-optional code path in this
+    project (see ``docs/adr/0004-degraded-operation.md``).
+    """
+    from ..config import database as database_cfg  # noqa: PLC0415
+
+    if not database_cfg.url:
+        return None
+    try:
+        from .postgres_index import PostgresMemoryIndex  # noqa: PLC0415
+
+        return PostgresMemoryIndex(database_cfg.url)
+    except Exception as exc:
+        print(f"Warning: memory index unavailable ({exc}). Continuing without it.")
+        return None
 
 
 def _run_migrate(args: argparse.Namespace) -> int:
@@ -177,18 +251,35 @@ def _run_migrate(args: argparse.Namespace) -> int:
 
 
 def _run_status(args: argparse.Namespace) -> int:
-    """Handle ``minion-assist memory status [--agent ID]``."""
+    """Handle ``minion-assist memory status [--agent ID] [--deep]``."""
     from ..config import agents as agents_cfg  # noqa: PLC0415
     from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
     from ..config import workspace  # noqa: PLC0415
 
+    index = _build_index() if args.deep else None
+
     for agent_id in _selected_agents(sorted(agents_cfg), args.agent):
-        service = _build_service(workspace, agent_id, bootstrap_cfg)
+        service = _build_service(workspace, agent_id, bootstrap_cfg, index=index)
         status = service.status()
         print(
             f"{agent_id}: {status.topic_count} topic, {status.import_count} import, "
             f"{status.daily_count} daily note(s) — root: {status.root}"
         )
+        if args.deep:
+            deep = service.deep_status()
+            if deep is None:
+                print("  index: no database configured — lexical index unavailable")
+            else:
+                corpus_str = ", ".join(
+                    f"{kind}={count}" for kind, count in sorted(deep["by_corpus"].items())
+                ) or "none"
+                last = (
+                    f"{deep['last_indexed_at']:.0f}" if deep["last_indexed_at"] else "never"
+                )
+                print(
+                    f"  index: {deep['total_chunks']} chunk(s) across {deep['file_count']} "
+                    f"file(s) ({corpus_str}) — last indexed at {last}"
+                )
     return 0
 
 
@@ -234,18 +325,21 @@ def _run_get(args: argparse.Namespace) -> int:
 
 
 def _run_search(args: argparse.Namespace) -> int:
-    """Handle ``minion-assist memory search QUERY [--agent ID]``."""
+    """Handle ``minion-assist memory search QUERY [--agent ID] [--corpus C]``."""
     from ..config import agents as agents_cfg  # noqa: PLC0415
     from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
     from ..config import workspace  # noqa: PLC0415
 
+    index = _build_index()
+
     for agent_id in _selected_agents(sorted(agents_cfg), args.agent):
-        service = _build_service(workspace, agent_id, bootstrap_cfg)
-        hits = service.search(args.query)
+        service = _build_service(workspace, agent_id, bootstrap_cfg, index=index)
+        hits = service.search(args.query, corpus=args.corpus)
         print(f"{agent_id}: {len(hits)} match(es)")
         for hit in hits:
             snippet = hit.content.strip().splitlines()[0][:80] if hit.content.strip() else ""
-            print(f"  [{hit.source}] {hit.key}: {snippet}")
+            locator = f" ({hit.rel_path}:{hit.start_line}-{hit.end_line})" if hit.rel_path else ""
+            print(f"  [{hit.source}] {hit.key}{locator}: {snippet}")
     return 0
 
 
@@ -291,6 +385,44 @@ def _run_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_reindex(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory reindex [--agent ID] [--force]``.
+
+    Without ``--force``: a cheap hash-diff reconciliation
+    (``MemoryService.reconcile_index``) — the same operation ``minion.py``
+    runs automatically at startup, exposed here so it can be triggered
+    on demand (e.g. right after manually editing a memory file, without
+    waiting for the live filesystem watcher's debounce window or a
+    restart).
+
+    With ``--force``: a crash-safe full rebuild-and-swap
+    (``MemoryService.force_reindex``) — see
+    ``PostgresMemoryIndex.force_rebuild_agent``'s docstring for why this is
+    safe to interrupt.
+    """
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to reindex.")
+        return 1
+
+    for agent_id in _selected_agents(sorted(agents_cfg), args.agent):
+        service = _build_service(workspace, agent_id, bootstrap_cfg, index=index)
+        if args.force:
+            count = service.force_reindex()
+            print(f"{agent_id}: force-reindexed — {count} chunk(s) now indexed.")
+        else:
+            touched = service.reconcile_index()
+            if touched:
+                print(f"{agent_id}: reindexed {touched} file(s).")
+            else:
+                print(f"{agent_id}: already up to date.")
+    return 0
+
+
 _HANDLERS = {
     "migrate": _run_migrate,
     "status": _run_status,
@@ -298,6 +430,7 @@ _HANDLERS = {
     "get": _run_get,
     "search": _run_search,
     "doctor": _run_doctor,
+    "reindex": _run_reindex,
 }
 
 

@@ -144,6 +144,43 @@ class PostgresMemoryIndex:
             )
         """)
 
+        # Shadow copies of both tables above, same shape — scratch space for
+        # force_rebuild_agent()'s crash-safe rebuild-and-swap (Stage One
+        # Phase 3, slice C). See that method's docstring for the swap
+        # mechanics. Never queried by search()/chunk_count()/etc. — only
+        # force_rebuild_agent() ever touches these.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_chunks_shadow (
+                id            BIGSERIAL PRIMARY KEY,
+                agent_id      TEXT NOT NULL,
+                source_kind   TEXT NOT NULL,
+                rel_path      TEXT NOT NULL,
+                chunk_index   INTEGER NOT NULL,
+                heading_path  TEXT NOT NULL DEFAULT '',
+                content       TEXT NOT NULL,
+                start_line    INTEGER NOT NULL,
+                end_line      INTEGER NOT NULL,
+                chunk_hash    TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_chunks_shadow_agent_idx "
+            "ON memory_chunks_shadow (agent_id)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_files_shadow (
+                agent_id     TEXT NOT NULL,
+                rel_path     TEXT NOT NULL,
+                source_kind  TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                indexed_at   DOUBLE PRECISION NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_files_shadow_agent_idx "
+            "ON memory_files_shadow (agent_id)"
+        )
+
     # ------------------------------------------------------------------
     # Indexing
     # ------------------------------------------------------------------
@@ -259,9 +296,10 @@ class PostgresMemoryIndex:
         """Bring one agent's index up to date by content hash, touching only what changed.
 
         Unlike :meth:`rebuild_agent` (which unconditionally reindexes every
-        file — the primitive Phase 3 slice C's crash-safe force-reindex
-        builds on), this only reindexes a file whose content hash differs
-        from what's already in the ``memory_files`` ledger, and only
+        file in place) or :meth:`force_rebuild_agent` (which does the same
+        but crash-safely, via a shadow-table swap), this only reindexes a
+        file whose content hash differs from what's already in the
+        ``memory_files`` ledger, and only
         removes ledger/chunk rows for files no longer present. A file
         that's unchanged since the last reconciliation costs one hash
         comparison, not a full rechunk-and-reinsert.
@@ -305,6 +343,192 @@ class PostgresMemoryIndex:
 
         return touched
 
+    def force_rebuild_agent(
+        self, agent_id: str, indexable_files: list[tuple[str, str, str]]
+    ) -> int:
+        """Crash-safely rebuild one agent's entire index, atomically swapping it into service.
+
+        Unlike :meth:`rebuild_agent` (which deletes and reinserts each
+        file's chunks one at a time, so a crash partway through can leave
+        an agent with a genuinely incomplete index — some files reindexed,
+        some not), this builds the *entire* new index into a scratch area
+        first and only replaces the live tables in a single atomic
+        transaction:
+
+        1. Clear this agent's rows from ``memory_chunks_shadow`` /
+           ``memory_files_shadow`` (leftover scratch from a previous
+           *interrupted* force-rebuild, if any — safe to discard, it was
+           never live).
+        2. Chunk and write every file in ``indexable_files`` into the
+           shadow tables. If this raises partway through (or the process
+           crashes), the live ``memory_chunks``/``memory_files`` tables
+           are never touched at all — search results are completely
+           unaffected by an interrupted rebuild.
+        3. Validate that every file was actually processed (a simple
+           count check — see the "processed" counter below) before
+           proceeding to the swap.
+        4. Swap: in one PostgreSQL transaction, delete this agent's live
+           rows and copy the shadow rows into their place, then clear the
+           shadow rows. PostgreSQL's own transactional guarantees mean
+           this is atomic even if the process crashes mid-swap — either
+           the whole transaction commits (search immediately sees the new
+           index) or none of it does (search keeps seeing the old index,
+           unchanged) - there is never a moment where search sees a
+           half-old-half-new or empty result set.
+
+        Args:
+            agent_id: The agent to rebuild.
+            indexable_files: ``(source_kind, rel_path, content)`` triples —
+                typically :meth:`MemoryFileRepository.list_indexable_files`'s
+                current return value.
+
+        Returns:
+            int: Total chunk count written across all files (post-swap).
+
+        Note:
+            Single-writer assumption: running two ``force_rebuild_agent``
+            calls for the *same* agent concurrently is not safe (both would
+            share the same shadow scratch rows). This is a rare, manual
+            maintenance operation (``minion-assist memory reindex --force``),
+            not something the running app ever triggers concurrently with
+            itself, so this is an accepted, documented limitation rather
+            than something guarded against with extra locking — the same
+            kind of concurrency assumption ``session/db.py``'s
+            ``mirror_message`` documents for its own check-then-insert.
+        """
+        conn = self._conn()
+        conn.execute("DELETE FROM memory_chunks_shadow WHERE agent_id = %s", (agent_id,))
+        conn.execute("DELETE FROM memory_files_shadow WHERE agent_id = %s", (agent_id,))
+
+        processed = 0
+        for source_kind, rel_path, content in indexable_files:
+            chunks = chunk_markdown(content)
+            for i, chunk in enumerate(chunks):
+                conn.execute(
+                    """
+                    INSERT INTO memory_chunks_shadow
+                        (agent_id, source_kind, rel_path, chunk_index, heading_path,
+                         content, start_line, end_line, chunk_hash)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        agent_id, source_kind, rel_path, i, " > ".join(chunk.heading_path),
+                        chunk.content, chunk.start_line, chunk.end_line,
+                        _hash_text(chunk.content),
+                    ),
+                )
+            conn.execute(
+                """
+                INSERT INTO memory_files_shadow
+                    (agent_id, rel_path, source_kind, content_hash, indexed_at)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (agent_id, rel_path, source_kind, _hash_text(content), time.time()),
+            )
+            processed += 1
+
+        if processed != len(indexable_files):
+            raise RuntimeError(
+                f"force_rebuild_agent: processed {processed} of {len(indexable_files)} "
+                f"files for agent {agent_id!r} — aborting swap, live index left unchanged."
+            )
+
+        with conn.transaction():
+            conn.execute("DELETE FROM memory_chunks WHERE agent_id = %s", (agent_id,))
+            conn.execute(
+                """
+                INSERT INTO memory_chunks
+                    (agent_id, source_kind, rel_path, chunk_index, heading_path,
+                     content, start_line, end_line, chunk_hash)
+                SELECT agent_id, source_kind, rel_path, chunk_index, heading_path,
+                       content, start_line, end_line, chunk_hash
+                FROM memory_chunks_shadow WHERE agent_id = %s
+                """,
+                (agent_id,),
+            )
+            conn.execute("DELETE FROM memory_files WHERE agent_id = %s", (agent_id,))
+            conn.execute(
+                """
+                INSERT INTO memory_files (agent_id, rel_path, source_kind, content_hash, indexed_at)
+                SELECT agent_id, rel_path, source_kind, content_hash, indexed_at
+                FROM memory_files_shadow WHERE agent_id = %s
+                """,
+                (agent_id,),
+            )
+
+        conn.execute("DELETE FROM memory_chunks_shadow WHERE agent_id = %s", (agent_id,))
+        conn.execute("DELETE FROM memory_files_shadow WHERE agent_id = %s", (agent_id,))
+
+        return self.chunk_count(agent_id)
+
+    # ------------------------------------------------------------------
+    # Search — Stage One Phase 3, slice C
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        agent_id: str,
+        query: str,
+        *,
+        corpus: str | None = None,
+        max_results: int = 20,
+    ) -> list[dict]:
+        """Full-text search across one agent's indexed chunks, ranked by relevance.
+
+        Args:
+            agent_id: Which agent's chunks to search.
+            query: Free-text query, passed through PostgreSQL's
+                ``websearch_to_tsquery`` — quoted phrases, ``AND``/``OR``,
+                and ``-exclude`` all work, the same query language
+                ``session/db.py``'s ``search_messages`` already uses for
+                message search.
+            corpus: Restrict results to one ``source_kind`` (``"durable"``,
+                ``"daily"``, or ``"import"``), or ``None`` to search every
+                corpus. The plan's fourth corpus, "sessions", is
+                deliberately not offered here — that's already the
+                separate ``session_search`` tool's job; duplicating it into
+                this index would mean two divergent ways to search the same
+                message data.
+            max_results: Maximum chunks to return.
+
+        Returns:
+            list[dict]: Best matches first. Each has ``rel_path``,
+                ``source_kind``, ``chunk_index``, ``heading_path``,
+                ``content``, ``start_line``, ``end_line``, and ``score``
+                (the ``ts_rank`` value) — everything
+                :class:`~minion_assist.memory.models.MemoryHit`'s optional
+                citation fields need.
+        """
+        conn = self._conn()
+        corpus_sql = " AND source_kind = %s" if corpus else ""
+        params: list = [query, agent_id, query]
+        if corpus:
+            params.append(corpus)
+        params.append(max_results)
+
+        rows = conn.execute(
+            f"""
+            SELECT rel_path, source_kind, chunk_index, heading_path, content,
+                   start_line, end_line,
+                   ts_rank(search_vector, websearch_to_tsquery('english', %s)) AS score
+            FROM memory_chunks
+            WHERE agent_id = %s
+              AND search_vector @@ websearch_to_tsquery('english', %s)
+              {corpus_sql}
+            ORDER BY score DESC
+            LIMIT %s
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "rel_path": r[0], "source_kind": r[1], "chunk_index": r[2],
+                "heading_path": r[3], "content": r[4], "start_line": r[5],
+                "end_line": r[6], "score": float(r[7]),
+            }
+            for r in rows
+        ]
+
     # ------------------------------------------------------------------
     # Inspection (used by tests and later slices' status reporting)
     # ------------------------------------------------------------------
@@ -322,3 +546,40 @@ class PostgresMemoryIndex:
             "SELECT rel_path FROM memory_files WHERE agent_id = %s ORDER BY rel_path", (agent_id,)
         ).fetchall()
         return [r[0] for r in rows]
+
+    def index_summary(self, agent_id: str) -> dict:
+        """A snapshot of one agent's index health — the primitive behind ``memory status --deep``.
+
+        Everything here is derived from tables a one-shot CLI process can
+        actually read; it deliberately does *not* claim to know whether a
+        live ``CaptureWorker``/``MemoryIndexWatcher`` thread is currently
+        running in some other process — that's not observable from here.
+
+        Returns:
+            dict: ``total_chunks``, ``file_count``, ``by_corpus`` (chunk
+                count per ``source_kind``), and ``last_indexed_at`` (the
+                most recent ``memory_files.indexed_at`` — ``None`` if this
+                agent has no indexed files at all).
+        """
+        conn = self._conn()
+        total_chunks = self.chunk_count(agent_id)
+        file_count = len(self.indexed_files(agent_id))
+
+        by_corpus_rows = conn.execute(
+            "SELECT source_kind, count(*) FROM memory_chunks "
+            "WHERE agent_id = %s GROUP BY source_kind",
+            (agent_id,),
+        ).fetchall()
+        by_corpus = {kind: count for kind, count in by_corpus_rows}
+
+        last_indexed_row = conn.execute(
+            "SELECT max(indexed_at) FROM memory_files WHERE agent_id = %s", (agent_id,)
+        ).fetchone()
+        last_indexed_at = last_indexed_row[0] if last_indexed_row else None
+
+        return {
+            "total_chunks": total_chunks,
+            "file_count": file_count,
+            "by_corpus": by_corpus,
+            "last_indexed_at": last_indexed_at,
+        }

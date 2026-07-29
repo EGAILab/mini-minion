@@ -9,6 +9,7 @@ workspace without touching the real ~/.minion-assist config.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import minion_assist.config as config
 from minion_assist.memory import cli
@@ -23,6 +24,12 @@ def _patch_config(monkeypatch, tmp_path, agent_ids=("main",)):
     # — pin that fallback inside tmp_path so a test can never touch the real
     # working directory's filesystem.
     monkeypatch.setattr(config, "bootstrap", SimpleNamespace(path=str(tmp_path)))
+    # No database by default: _build_index() (Stage One Phase 3, slice C)
+    # must not silently pick up this machine's real configured/reachable
+    # dev database and start querying a live, unrelated index for these
+    # file-based tests. Tests that specifically want an index configured
+    # pass their own database SimpleNamespace instead (see test_reindex_*).
+    monkeypatch.setattr(config, "database", SimpleNamespace(url=None))
 
 
 def _agent_root(tmp_path, agent_id: str):
@@ -31,6 +38,11 @@ def _agent_root(tmp_path, agent_id: str):
     root = tmp_path / "workspaces" / agent_id
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _patch_index(monkeypatch, mock_index):
+    """Make `_build_index()` return a mock instead of touching a real database."""
+    monkeypatch.setattr(cli, "_build_index", lambda: mock_index)
 
 
 def test_migrate_dry_run_is_default(monkeypatch, tmp_path, capsys):
@@ -119,6 +131,48 @@ def test_status_rejects_unknown_agent(monkeypatch, tmp_path):
     except SystemExit:
         raised = True
     assert raised
+
+
+def test_status_deep_without_a_database_reports_unavailable(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["status", "--deep"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "no database configured" in out
+
+
+def test_status_deep_with_an_index_reports_chunk_counts(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.index_summary.return_value = {
+        "total_chunks": 4, "file_count": 2,
+        "by_corpus": {"durable": 3, "daily": 1}, "last_indexed_at": 1234.0,
+    }
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["status", "--deep"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "4 chunk(s) across 2 file(s)" in out
+    assert "durable=3" in out
+
+
+def test_status_without_deep_never_builds_an_index(monkeypatch, tmp_path, capsys):
+    def _fail_if_called():
+        raise AssertionError("status without --deep must not call _build_index()")
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_build_index", _fail_if_called)
+
+    exit_code = cli.main(["status"])
+
+    assert exit_code == 0
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +270,104 @@ def test_search_no_matches_reports_zero(monkeypatch, tmp_path, capsys):
 
     assert exit_code == 0
     assert "0 match(es)" in out
+
+
+def test_search_with_an_index_passes_corpus_through_and_shows_citation(
+    monkeypatch, tmp_path, capsys
+):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.search.return_value = [{
+        "rel_path": "MEMORY.md", "source_kind": "durable", "chunk_index": 0,
+        "heading_path": "", "content": "REST API best practices", "start_line": 1,
+        "end_line": 1, "score": 0.5,
+    }]
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["search", "REST", "--corpus", "durable"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_index.search.assert_called_once_with("main", "REST", corpus="durable", max_results=20)
+    assert "MEMORY.md:1-1" in out
+
+
+# ---------------------------------------------------------------------------
+# reindex
+# ---------------------------------------------------------------------------
+
+def test_reindex_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["reindex"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_reindex_without_force_calls_reconcile(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.reconcile_agent.return_value = 2
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["reindex"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_index.reconcile_agent.assert_called_once()
+    mock_index.force_rebuild_agent.assert_not_called()
+    assert "reindexed 2 file(s)" in out
+
+
+def test_reindex_reports_already_up_to_date_when_nothing_changed(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.reconcile_agent.return_value = 0
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["reindex"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "already up to date" in out
+
+
+def test_reindex_with_force_calls_force_rebuild(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.force_rebuild_agent.return_value = 7
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["reindex", "--force"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_index.force_rebuild_agent.assert_called_once()
+    mock_index.reconcile_agent.assert_not_called()
+    assert "force-reindexed — 7 chunk(s)" in out
+
+
+def test_reindex_filters_by_agent(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _agent_root(tmp_path, "researcher")
+    _patch_config(monkeypatch, tmp_path, agent_ids=("main", "researcher"))
+    mock_index = Mock()
+    mock_index.reconcile_agent.return_value = 0
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["reindex", "--agent", "researcher"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "researcher:" in out
+    assert "main:" not in out
 
 
 # ---------------------------------------------------------------------------

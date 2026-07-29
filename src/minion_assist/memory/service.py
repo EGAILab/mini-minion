@@ -80,6 +80,13 @@ _log = logging.getLogger("minion_assist.memory_service")
 # Mirrors MemoryFileRepository's / LongTermMemory's default search cap.
 _SEARCH_MAX_RESULTS = 20
 
+# Maps a lexical-index corpus name to the linear scan's equivalent `source`
+# tag, so search()'s corpus filter still narrows results in degraded mode
+# (no index configured, or the index search just failed). "durable" is the
+# only one that actually differs — the linear scan calls topic notes
+# "topic", never "durable" (and never returns MEMORY.md at all).
+_CORPUS_TO_LEGACY_SOURCE = {"durable": "topic", "daily": "daily", "import": "import"}
+
 
 class MemoryService:
     """Thin orchestration facade over :class:`MemoryFileRepository`.
@@ -190,26 +197,77 @@ class MemoryService:
     # Search and recall
     # -----------------------------------------------------------------
 
-    def search(self, query: str, max_results: int = _SEARCH_MAX_RESULTS) -> list[MemoryHit]:
-        """Search topic, import, and daily notes for ``query``.
+    def search(
+        self,
+        query: str,
+        max_results: int = _SEARCH_MAX_RESULTS,
+        *,
+        corpus: str | None = None,
+    ) -> list[MemoryHit]:
+        """Search memory for ``query``, using the lexical index when one is configured.
+
+        With a configured index (Stage One Phase 3), this searches
+        PostgreSQL full-text chunks across ``MEMORY.md``, topic notes,
+        daily notes, and imports — a strictly larger corpus than the Phase 1
+        linear scan, which never covers root ``MEMORY.md`` at all (see
+        ``memory/files.py``'s ``list_indexable_files``). Without a
+        configured index, or if an index search fails (e.g. a transient
+        connection drop), this falls back to the Phase 1 linear scan — a
+        turn's memory injection must never break over a database hiccup.
+        The fallback is not silent: a failed index search is logged at
+        WARNING, and ``deep_status()`` (Phase 3 slice C) surfaces ongoing
+        index health so a persistently broken index isn't invisible.
 
         Returns raw, structured hits — formatting them into a prompt block
         or tool-result string is the caller's job (``session.py`` for
         per-turn injection, ``SearchMemoryTool`` for the explicit
-        ``search_memory`` tool call), matching how ``LongTermMemory.search()``
-        results are used today. See the module docstring's "Scope,
+        ``search_memory`` tool call). See the module docstring's "Scope,
         deliberately not enforced here" note — this is also where a future
         recall-telemetry hook (Stage One Phase 5) would attach, once one
         exists.
 
         Args:
             query: One or more keywords, space-separated.
-            max_results: Maximum notes to return.
+            max_results: Maximum notes/chunks to return.
+            corpus: Restrict to one corpus (``"durable"``, ``"daily"``, or
+                ``"import"``), or ``None`` to search everything. Only
+                affects the indexed path in practice — the deliberate
+                degraded-mode scope reduction. See :data:`_CORPUS_TO_LEGACY_SOURCE`.
 
         Returns:
-            list[MemoryHit]: Best matches first, tagged by source.
+            list[MemoryHit]: Best matches first, tagged by source. Hits from
+                the lexical index also carry ``rel_path``/``start_line``/
+                ``end_line``/``score``; linear-scan hits leave those unset.
         """
-        return self._files.search(query, max_results=max_results)
+        if self._index is not None and self._agent_id is not None:
+            try:
+                rows = self._index.search(
+                    self._agent_id, query, corpus=corpus, max_results=max_results
+                )
+                return [
+                    MemoryHit(
+                        key=Path(r["rel_path"]).stem,
+                        content=r["content"],
+                        source=r["source_kind"],
+                        rel_path=r["rel_path"],
+                        start_line=r["start_line"],
+                        end_line=r["end_line"],
+                        score=r["score"],
+                    )
+                    for r in rows
+                ]
+            except Exception as exc:
+                _log.warning(
+                    "Lexical index search failed for agent %s, falling back to linear scan: "
+                    "%s: %s",
+                    self._agent_id, type(exc).__name__, exc,
+                )
+
+        hits = self._files.search(query, max_results=max_results)
+        if corpus is not None:
+            legacy_source = _CORPUS_TO_LEGACY_SOURCE.get(corpus, corpus)
+            hits = [h for h in hits if h.source == legacy_source]
+        return hits
 
     # -----------------------------------------------------------------
     # Daily notes
@@ -293,6 +351,70 @@ class MemoryService:
             import_count=counts["import"],
             daily_count=counts["daily"],
         )
+
+    def deep_status(self) -> dict | None:
+        """Lexical-index health for this agent — the primitive behind ``memory status --deep``.
+
+        Deliberately returns ``None`` (not a zeroed-out dict) when no index
+        is configured, so a caller can tell "index configured but empty"
+        apart from "no index at all" — see
+        ``docs/adr/0004-degraded-operation.md``. Everything reported comes
+        from tables a one-shot CLI process can actually read; it does not
+        (and cannot) claim to know whether a live ``CaptureWorker``/
+        ``MemoryIndexWatcher`` thread is currently running in some other
+        process.
+
+        Returns:
+            dict | None: ``PostgresMemoryIndex.index_summary()``'s result
+                (``total_chunks``, ``file_count``, ``by_corpus``,
+                ``last_indexed_at``), or ``None`` if no index is configured.
+        """
+        if self._index is None or self._agent_id is None:
+            return None
+        return self._index.index_summary(self._agent_id)
+
+    def force_reindex(self) -> int:
+        """Crash-safely rebuild this agent's entire lexical index from scratch.
+
+        Delegates to :meth:`PostgresMemoryIndex.force_rebuild_agent` — see
+        its docstring for the shadow-table swap that makes this safe to
+        interrupt. This is a deliberate, manual maintenance operation (the
+        ``memory reindex --force`` CLI command); nothing in the running app
+        calls this automatically.
+
+        Returns:
+            int: Total chunk count in the rebuilt index.
+
+        Raises:
+            RuntimeError: No index is configured for this agent. A caller
+                asking to force-reindex with no database configured is
+                almost certainly a mistake worth surfacing, not a silent
+                no-op.
+        """
+        if self._index is None or self._agent_id is None:
+            raise RuntimeError("No lexical index configured for this agent — nothing to reindex.")
+        return self._index.force_rebuild_agent(self._agent_id, self._files.list_indexable_files())
+
+    def reconcile_index(self) -> int:
+        """Hash-diff reconcile this agent's lexical index against its current on-disk files.
+
+        Delegates to :meth:`PostgresMemoryIndex.reconcile_agent` — the
+        cheaper counterpart to :meth:`force_reindex`: only touches files
+        whose content actually changed since the last reconciliation,
+        rather than rebuilding everything. This is what ``minion.py`` calls
+        at startup and what ``minion-assist memory reindex`` (without
+        ``--force``) calls on demand.
+
+        Returns:
+            int: How many files were reindexed or removed (0 means the
+                index was already fully up to date).
+
+        Raises:
+            RuntimeError: No index is configured for this agent.
+        """
+        if self._index is None or self._agent_id is None:
+            raise RuntimeError("No lexical index configured for this agent — nothing to reconcile.")
+        return self._index.reconcile_agent(self._agent_id, self._files.list_indexable_files())
 
     # -----------------------------------------------------------------
     # Pre-compaction flush (Stage One Phase 2, slice B)

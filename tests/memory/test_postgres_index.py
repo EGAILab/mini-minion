@@ -46,6 +46,8 @@ def _cleanup_after(index, agent_id):
     conn = index._conn()
     conn.execute("DELETE FROM memory_chunks WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_files WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM memory_chunks_shadow WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM memory_files_shadow WHERE agent_id = %s", (agent_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -230,3 +232,165 @@ def test_reconcile_agent_does_not_reindex_files_it_only_removes_or_only_adds(ind
     # One removed (2026-07-20.md), one added (new.md), MEMORY.md untouched.
     assert touched == 2
     assert sorted(index.indexed_files(agent_id)) == ["MEMORY.md", "memory/imports/new.md"]
+
+
+# ---------------------------------------------------------------------------
+# force_rebuild_agent
+# ---------------------------------------------------------------------------
+
+def test_force_rebuild_agent_indexes_every_file(index, agent_id):
+    files = [
+        ("durable", "MEMORY.md", "Durable memory content."),
+        ("import", "memory/imports/_auto_extracted.md", "User prefers dark mode."),
+    ]
+
+    total = index.force_rebuild_agent(agent_id, files)
+
+    assert total == 2
+    assert sorted(index.indexed_files(agent_id)) == sorted(rel for _k, rel, _c in files)
+
+
+def test_force_rebuild_agent_replaces_previous_content(index, agent_id):
+    index.force_rebuild_agent(agent_id, [("durable", "MEMORY.md", "original content")])
+    index.force_rebuild_agent(agent_id, [("durable", "MEMORY.md", "replaced content")])
+
+    [chunk] = index._conn().execute(
+        "SELECT content FROM memory_chunks WHERE agent_id = %s AND rel_path = %s",
+        (agent_id, "MEMORY.md"),
+    ).fetchall()
+    assert chunk[0] == "replaced content"
+    assert index.chunk_count(agent_id) == 1  # old chunk didn't linger alongside the new one
+
+
+def test_force_rebuild_agent_removes_files_no_longer_present(index, agent_id):
+    index.force_rebuild_agent(agent_id, [
+        ("durable", "MEMORY.md", "content"),
+        ("daily", "memory/2026-07-20.md", "daily content"),
+    ])
+
+    index.force_rebuild_agent(agent_id, [("durable", "MEMORY.md", "content")])
+
+    assert index.indexed_files(agent_id) == ["MEMORY.md"]
+
+
+def test_force_rebuild_agent_clears_shadow_tables_after_a_successful_swap(index, agent_id):
+    index.force_rebuild_agent(agent_id, [("durable", "MEMORY.md", "content")])
+
+    conn = index._conn()
+    shadow_chunks = conn.execute(
+        "SELECT count(*) FROM memory_chunks_shadow WHERE agent_id = %s", (agent_id,)
+    ).fetchone()
+    shadow_files = conn.execute(
+        "SELECT count(*) FROM memory_files_shadow WHERE agent_id = %s", (agent_id,)
+    ).fetchone()
+    assert shadow_chunks[0] == 0
+    assert shadow_files[0] == 0
+
+
+def test_force_rebuild_agent_raises_and_leaves_the_live_index_unchanged_on_failure(
+    index, agent_id, monkeypatch
+):
+    # Establish a known-good live index first.
+    index.force_rebuild_agent(agent_id, [("durable", "MEMORY.md", "original content")])
+
+    def _boom(text, **kwargs):
+        raise RuntimeError("chunker exploded")
+
+    monkeypatch.setattr("minion_assist.memory.postgres_index.chunk_markdown", _boom)
+
+    with pytest.raises(RuntimeError, match="chunker exploded"):
+        index.force_rebuild_agent(agent_id, [("durable", "MEMORY.md", "new content")])
+
+    # The live index is untouched -- still serving the original content.
+    [chunk] = index._conn().execute(
+        "SELECT content FROM memory_chunks WHERE agent_id = %s AND rel_path = %s",
+        (agent_id, "MEMORY.md"),
+    ).fetchall()
+    assert chunk[0] == "original content"
+
+
+def test_force_rebuild_agent_does_not_touch_another_agents_files(index, agent_id):
+    other_agent = f"test-{uuid.uuid4()}"
+    index.force_rebuild_agent(other_agent, [("durable", "MEMORY.md", "other agent's content")])
+
+    index.force_rebuild_agent(agent_id, [("durable", "MEMORY.md", "this agent's content")])
+
+    try:
+        assert index.indexed_files(other_agent) == ["MEMORY.md"]
+    finally:
+        index.remove_file(other_agent, "MEMORY.md")
+
+
+# ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+
+def test_search_finds_a_matching_chunk(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User prefers dark mode in the editor.")
+
+    results = index.search(agent_id, "dark mode")
+
+    assert len(results) == 1
+    assert results[0]["rel_path"] == "MEMORY.md"
+    assert "dark mode" in results[0]["content"]
+    assert results[0]["score"] > 0
+
+
+def test_search_returns_empty_list_for_no_match(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User prefers dark mode.")
+
+    assert index.search(agent_id, "coffee preferences") == []
+
+
+def test_search_restricts_to_one_corpus(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "shared keyword content")
+    index.reindex_file(agent_id, "memory/imports/x.md", "import", "shared keyword content")
+
+    durable_only = index.search(agent_id, "shared keyword", corpus="durable")
+
+    assert len(durable_only) == 1
+    assert durable_only[0]["source_kind"] == "durable"
+
+
+def test_search_respects_max_results(index, agent_id):
+    for i in range(5):
+        index.reindex_file(agent_id, f"memory/topics/note-{i}.md", "durable", "shared keyword")
+
+    results = index.search(agent_id, "shared keyword", max_results=2)
+
+    assert len(results) == 2
+
+
+def test_search_only_searches_the_given_agent(index, agent_id):
+    other_agent = f"test-{uuid.uuid4()}"
+    index.reindex_file(other_agent, "MEMORY.md", "durable", "shared keyword content")
+
+    try:
+        assert index.search(agent_id, "shared keyword") == []
+    finally:
+        index.remove_file(other_agent, "MEMORY.md")
+
+
+# ---------------------------------------------------------------------------
+# index_summary
+# ---------------------------------------------------------------------------
+
+def test_index_summary_for_agent_with_no_files(index, agent_id):
+    summary = index.index_summary(agent_id)
+
+    assert summary["total_chunks"] == 0
+    assert summary["file_count"] == 0
+    assert summary["by_corpus"] == {}
+    assert summary["last_indexed_at"] is None
+
+
+def test_index_summary_reports_counts_and_last_indexed_at(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "durable content")
+    index.reindex_file(agent_id, "memory/imports/x.md", "import", "import content")
+
+    summary = index.index_summary(agent_id)
+
+    assert summary["file_count"] == 2
+    assert summary["total_chunks"] == 2
+    assert summary["by_corpus"] == {"durable": 1, "import": 1}
+    assert summary["last_indexed_at"] is not None

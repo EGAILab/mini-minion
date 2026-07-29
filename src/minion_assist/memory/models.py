@@ -28,22 +28,41 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class MemoryHit:
-    """One search result: a note found by :meth:`MemoryFileRepository.search`.
+    """One search result — a whole note (Phase 1 scan) or one chunk (Phase 3 index).
 
     Attributes:
         key: The note's identifier (filename stem), e.g. ``"api-research"``.
-        content: The note's full Markdown content.
-        source: Which part of the memory root the note came from —
-            ``"topic"`` (an explicit ``save_memory`` note under
-            ``memory/topics/``), ``"import"`` (quarantined, unreviewed
-            extractor/daily-log output under ``memory/imports/`` — see
-            ``docs/adr/0003-per-agent-memory-scope.md``), or ``"daily"`` (a
-            dated ``memory/YYYY-MM-DD.md`` log file).
+        content: The matched content — a whole note's text (linear scan) or
+            one chunk's text (lexical index; see ``memory/chunking.py``).
+        source: Which part of the memory root the content came from. The
+            linear scan tags ``"topic"``/``"import"``/``"daily"``; the
+            lexical index (Stage One Phase 3, slice C) tags
+            ``"durable"``/``"daily"``/``"import"`` — ``"durable"`` covers
+            both topic notes *and* root ``MEMORY.md``, which the linear
+            scan never returns at all (see ``memory/files.py``'s
+            ``list_indexable_files``). This naming difference is a
+            deliberate, documented consequence of using a richer corpus,
+            not an inconsistency to paper over.
+        rel_path: Path relative to the agent's workspace root, e.g.
+            ``"memory/topics/project-goals.md"``. ``None`` for a linear-scan
+            hit (Phase 1 never tracked this).
+        start_line: 1-indexed first line of this chunk in its source file.
+            ``None`` for a linear-scan hit (whole-file, no chunk range).
+        end_line: 1-indexed last line of this chunk (inclusive). ``None``
+            for a linear-scan hit.
+        score: The lexical index's ``ts_rank`` relevance score. ``None`` for
+            a linear-scan hit (that scoring isn't rank-comparable to
+            ``ts_rank``, so it's left unset rather than forced into this
+            field).
     """
 
     key: str
     content: str
     source: str
+    rel_path: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    score: float | None = None
 
 
 @dataclass(frozen=True)

@@ -1163,6 +1163,7 @@ Without a configured database, `CaptureWorker` is never constructed and `AgentSe
 |---|---|
 | `memory_chunks` | One row per indexed chunk. Columns: `id` (BIGSERIAL), `agent_id`, `source_kind` (`durable`/`daily`/`import`), `rel_path`, `chunk_index`, `heading_path`, `content`, `start_line`, `end_line`, `chunk_hash`, `search_vector` (weighted: heading text at FTS weight `A`, body at `B`). |
 | `memory_files` | Per-file reconciliation ledger, `PRIMARY KEY (agent_id, rel_path)`. Same role as `message_mirrors` above: lets a later slice diff "what's on disk" against "what's indexed" by content hash rather than reindexing everything unconditionally. |
+| `memory_chunks_shadow`, `memory_files_shadow` | Scratch space for `force_rebuild_agent()`'s crash-safe rebuild-and-swap (Stage One Phase 3, slice C) — same shape as the tables above, minus the generated `search_vector` (never searched directly). Empty except during/just after a `minion-assist memory reindex --force` run. |
 
 `memory/chunking.py`'s `chunk_markdown()` splits a file into heading-aware, token-bounded (~400 tokens), overlapping (~80 tokens) chunks before indexing — see its module docstring for why both heading-awareness and overlap matter. Token counting reuses `context.py`'s tiktoken-or-char/4-heuristic fallback pattern.
 
@@ -1173,12 +1174,29 @@ Without a configured database, `CaptureWorker` is never constructed and `AgentSe
 Three layers keep `memory_chunks`/`memory_files` current, from cheapest/fastest to broadest-coverage:
 
 1. **Write-path sync.** `MemoryService`'s write methods (`remember`, `remember_import`, `append_daily`, `delete`) call `PostgresMemoryIndex.reindex_file()`/`remove_file()` directly, right after the disk write succeeds — the single file just touched, nothing more. Covers everything the app itself writes, with no lag. Never raises: a failed sync here is logged (`minion_assist.memory_service`, debug level) and swallowed, not surfaced to the caller.
-2. **Startup reconciliation.** On every startup (when a database is configured), `minion.py` calls `PostgresMemoryIndex.reconcile_agent(agent_id, ...)` for every configured agent — hash-diffs the agent's current files against the `memory_files` ledger, reindexing only what's new or changed and removing what's gone. Prints `Reindexed N memory file(s) for agent '{agent_id}'.` when anything actually changed. Catches any edit made while the process wasn't running.
+2. **Startup reconciliation.** On every startup (when a database is configured), `minion.py` calls `MemoryService.reconcile_index()` for every configured agent — hash-diffs the agent's current files against the `memory_files` ledger, reindexing only what's new or changed and removing what's gone. Prints `Reindexed N memory file(s) for agent '{agent_id}'.` when anything actually changed. Catches any edit made while the process wasn't running.
 3. **Live filesystem watcher.** `memory/watcher.py`'s `MemoryIndexWatcher` — one background thread (started at process startup, alongside `CaptureWorker`) watching every configured agent's workspace root via the optional `watchdog` package (installed with the `postgres` extra). Catches an edit made *while the process is running* but outside the app itself (e.g. hand-editing `MEMORY.md` in a text editor) — the one gap write-path sync can't close. Filesystem events are debounced per agent (~1 second of quiet) before triggering `reconcile_agent()`, so one save that fires several OS-level events (e.g. a temp-file-then-rename) triggers one reconcile, not several.
 
 `reconcile_agent()` (used by both layer 2 and layer 3) is the "targeted" counterpart to `rebuild_agent()`: it only touches files whose content hash actually changed, the same "diff by hash, heal exactly what's missing or stale" shape as `session/db.py`'s `reconcile_session`/`reconcile_all_sessions` for message mirrors.
 
-**`MemoryService.search()` is still unchanged** (the Phase 1 linear scan) — wiring the index into live search, corpus filters, citations, and crash-safe rebuild-and-swap are Phase 3 slice C. Without a configured database, none of the above run: `_memory_index`/`_memory_watcher` are simply `None`, and `MemoryService` behaves exactly as it did before Phase 3.
+Without a configured database, none of the above run: `_memory_index`/`_memory_watcher` are simply `None`, and `MemoryService` behaves exactly as it did before Phase 3.
+
+### Search, citations, and crash-safe reindex (Stage One Phase 3, slice C)
+
+`MemoryService.search()` now uses the lexical index when one is configured — a strictly larger corpus than the Phase 1 linear scan, since the index also covers root `MEMORY.md` (the linear scan never returns it at all). Each hit is a `MemoryHit` as before, now optionally carrying `rel_path`/`start_line`/`end_line`/`score` when it came from the index (`None` for a linear-scan hit). Pass `corpus="durable"|"daily"|"import"` to restrict results to one part of the memory root; the plan's fourth corpus, "sessions", is deliberately not offered here since it's already the separate `session_search` tool's job.
+
+**Fallback behavior:** without a configured database, or if an index search call raises (e.g. a transient connection drop), `search()` falls back to the Phase 1 linear scan rather than failing the caller — a turn's `<relevant_memories>` injection must never break over a database hiccup. This fallback is not silent: a failed index search is logged at `WARNING`, and `deep_status()`/`memory status --deep` surface ongoing index health so a persistently broken index isn't invisible.
+
+**Crash-safe rebuild.** `PostgresMemoryIndex.force_rebuild_agent()` (`MemoryService.force_reindex()`) rebuilds an agent's entire index into `memory_chunks_shadow`/`memory_files_shadow` first, then swaps it into the live tables inside a single PostgreSQL transaction. If the process crashes or raises while building the shadow copy, the live index is never touched — search keeps serving the last complete index, unchanged. If it crashes during the swap itself, PostgreSQL's own transactional guarantees mean either the whole swap commits or none of it does; there is no moment where search sees a half-old-half-new result set. This is a deliberate, manual maintenance operation (`minion-assist memory reindex --force`) — nothing in the running app triggers it automatically.
+
+New CLI commands:
+
+```bash
+minion-assist memory search "coffee preferences" --corpus durable   # restrict to MEMORY.md + topic notes
+minion-assist memory status --deep                                  # + index chunk counts, corpus breakdown, last-indexed time
+minion-assist memory reindex                                        # cheap hash-diff reconciliation, on demand
+minion-assist memory reindex --force                                # crash-safe full rebuild-and-swap
+```
 
 ### `session_search` Tool Modes
 
@@ -1957,13 +1975,22 @@ minion-assist memory list [--agent main]
 # Exact, bounded read — same as the memory_get tool, from the shell.
 minion-assist memory get memory/topics/project-goals.md --agent main [--from-line N] [--lines N]
 
-# Keyword search across one or every agent's memory.
-minion-assist memory search "REST API" [--agent main]
+# Keyword search across one or every agent's memory. Uses the lexical index
+# when a database is configured (Stage One Phase 3, slice C); --corpus
+# restricts to "durable", "daily", or "import".
+minion-assist memory search "REST API" [--agent main] [--corpus durable]
 
-# Note counts plus a check for un-migrated legacy data (the closest thing
-# Phase 1 has to a health check — no database/job/index exists yet to
-# report on further; see docs/adr/0004-degraded-operation.md).
+# Note counts plus a check for un-migrated legacy data.
 minion-assist memory doctor [--agent main]
+
+# Lexical-index health: chunk counts, corpus breakdown, last-indexed time.
+# Requires a configured database (Stage One Phase 3, slice C).
+minion-assist memory status --deep [--agent main]
+
+# Rebuild the lexical index. Without --force: cheap hash-diff reconciliation
+# (only reindexes files that actually changed). With --force: crash-safe
+# full rebuild via shadow-table swap. Requires a configured database.
+minion-assist memory reindex [--agent main] [--force]
 ```
 
 `memory/baseline.py` measures the legacy `LongTermMemory.search()` — recall and latency — against the checked-in fixture corpus at `tests/fixtures/memory_corpus/`, so later phases (PostgreSQL lexical index, embeddings) have a real number to compare against rather than an assumption. See `tests/fixtures/memory_corpus/README.md` for the recorded baseline and a known current gap (punctuation-sensitive matching).

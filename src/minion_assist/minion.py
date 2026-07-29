@@ -573,16 +573,14 @@ def main() -> None:
         # dedicated or shared workspace directory configured.
         _agent_files_repo = MemoryFileRepository(_agent_bootstrap_root)
         _agent_files_repos[agent_id] = _agent_files_repo
+        memory_service = MemoryService(_agent_files_repo, index=_memory_index, agent_id=agent_id)
         if _memory_index is not None:
             # Startup catch-up: reconcile by content hash rather than
             # unconditionally reindexing, so an unchanged file since the
             # last run costs one hash comparison, not a full rechunk.
-            _reindexed = _memory_index.reconcile_agent(
-                agent_id, _agent_files_repo.list_indexable_files()
-            )
+            _reindexed = memory_service.reconcile_index()
             if _reindexed:
                 print(f"  Reindexed {_reindexed} memory file(s) for agent '{agent_id}'.")
-        memory_service = MemoryService(_agent_files_repo, index=_memory_index, agent_id=agent_id)
 
         tools = default_registry(
             memory=memory_service,

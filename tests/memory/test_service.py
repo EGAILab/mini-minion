@@ -107,6 +107,66 @@ def test_search_returns_empty_list_when_nothing_matches(service):
     assert service.search("xyzzy") == []
 
 
+def test_search_with_corpus_filters_linear_scan_results_by_legacy_source(service):
+    service.remember("topic-note", "shared keyword")
+    service.remember_import("import-note", "shared keyword")
+
+    durable_only = service.search("shared keyword", corpus="durable")
+
+    assert len(durable_only) == 1
+    assert durable_only[0].key == "topic-note"
+
+
+# ---------------------------------------------------------------------------
+# search — with a configured lexical index (Stage One Phase 3, slice C)
+# ---------------------------------------------------------------------------
+
+def _index_row(**overrides):
+    row = {
+        "rel_path": "MEMORY.md", "source_kind": "durable", "chunk_index": 0,
+        "heading_path": "", "content": "matched content", "start_line": 1,
+        "end_line": 3, "score": 0.5,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_search_uses_the_index_when_configured(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.search.return_value = [_index_row()]
+
+    [hit] = svc.search("query")
+
+    mock_index.search.assert_called_once_with("main", "query", corpus=None, max_results=20)
+    assert hit.key == "MEMORY"
+    assert hit.content == "matched content"
+    assert hit.source == "durable"
+    assert hit.rel_path == "MEMORY.md"
+    assert hit.start_line == 1
+    assert hit.end_line == 3
+    assert hit.score == 0.5
+
+
+def test_search_passes_corpus_through_to_the_index(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.search.return_value = []
+
+    svc.search("query", corpus="daily")
+
+    mock_index.search.assert_called_once_with("main", "query", corpus="daily", max_results=20)
+
+
+def test_search_falls_back_to_linear_scan_when_index_search_raises(indexed_service, tmp_path):
+    svc, mock_index = indexed_service
+    mock_index.search.side_effect = RuntimeError("connection lost")
+    svc.remember("project-goals", "fallback content")
+
+    [hit] = svc.search("fallback")
+
+    assert hit.key == "project-goals"
+    assert hit.rel_path is None  # a plain linear-scan MemoryHit, not an index one
+
+
 # ---------------------------------------------------------------------------
 # append_daily
 # ---------------------------------------------------------------------------
@@ -172,6 +232,45 @@ def test_status_reports_counts_across_all_sources(service, tmp_path):
     assert status.topic_count == 1
     assert status.import_count == 1
     assert status.daily_count == 1
+
+
+# ---------------------------------------------------------------------------
+# deep_status / force_reindex (Stage One Phase 3, slice C)
+# ---------------------------------------------------------------------------
+
+def test_deep_status_returns_none_without_an_index(service):
+    assert service.deep_status() is None
+
+
+def test_deep_status_delegates_to_the_index(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.index_summary.return_value = {
+        "total_chunks": 3, "file_count": 2, "by_corpus": {"durable": 3}, "last_indexed_at": 1.0
+    }
+
+    result = svc.deep_status()
+
+    mock_index.index_summary.assert_called_once_with("main")
+    assert result["total_chunks"] == 3
+
+
+def test_force_reindex_raises_without_an_index(service):
+    with pytest.raises(RuntimeError, match="No lexical index configured"):
+        service.force_reindex()
+
+
+def test_force_reindex_delegates_to_the_index_with_the_current_file_listing(indexed_service):
+    svc, mock_index = indexed_service
+    svc.remember("project-goals", "content")  # so list_indexable_files() has something
+    mock_index.force_rebuild_agent.return_value = 5
+
+    result = svc.force_reindex()
+
+    assert result == 5
+    mock_index.force_rebuild_agent.assert_called_once()
+    call_args = mock_index.force_rebuild_agent.call_args.args
+    assert call_args[0] == "main"
+    assert ("durable", "memory/topics/project-goals.md", "content") in call_args[1]
 
 
 # ---------------------------------------------------------------------------
