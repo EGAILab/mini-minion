@@ -231,7 +231,18 @@ def _build_index() -> PostgresMemoryIndex | None:
         from .postgres_index import PostgresMemoryIndex  # noqa: PLC0415
 
         dims = embeddings_cfg.dimensions if embeddings_cfg else None
-        return PostgresMemoryIndex(database_cfg.url, embedding_dimensions=dims)
+        embedding_provider = None
+        if embeddings_cfg is not None:
+            from ..providers.embeddings import EmbeddingProvider  # noqa: PLC0415
+            embedding_provider = EmbeddingProvider(
+                base_url=embeddings_cfg.provider.base_url,
+                api_key=embeddings_cfg.provider.api_key,
+                model=embeddings_cfg.model,
+                dimensions=embeddings_cfg.dimensions,
+            )
+        return PostgresMemoryIndex(
+            database_cfg.url, embedding_dimensions=dims, embedding_provider=embedding_provider
+        )
     except Exception as exc:
         print(f"Warning: memory index unavailable ({exc}). Continuing without it.")
         return None

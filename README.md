@@ -1220,11 +1220,9 @@ An optional `"embeddings"` section in `config.json` enables a semantic-search la
 
 | Table | Description |
 |---|---|
-| `memory_chunk_embeddings` | Embedding cache, `PRIMARY KEY (chunk_id)`. Columns: `model_identity` (e.g. `"lmstudio/nomic-embed-text-v1.5"` — lets a model change be detected rather than silently mixing vectors from different embedding spaces), `content_hash` (lets a cached vector be told apart from one that's stale because its chunk changed), `embedding` (`vector(N)`, `N` from `embeddings.dimensions`). Only created when pgvector is available **and** an embedding backend is configured — both conditions, unlike `message_embeddings` above which only needs pgvector. |
+| `memory_chunk_embeddings` | Embedding cache, `PRIMARY KEY (content_hash, model_identity)` — content-addressed, *not* tied to a `memory_chunks` row id (see below for why). Columns: `model_identity` (e.g. `"http://host/v1::nomic-embed-text-v1.5"` — lets a model/endpoint change be detected rather than silently mixing vectors from different embedding spaces), `embedding` (`vector(N)`, `N` from `embeddings.dimensions`). Only created when pgvector is available **and** an embedding backend is configured — both conditions, unlike `message_embeddings` above which only needs pgvector. |
 
-`PostgresMemoryIndex.has_vector_lane` reports whether both conditions hold. `cache_embedding()`/`get_cached_embedding()` are the storage primitives — a cache miss (no vector lane, never cached, or a stale `model_identity`/`content_hash`) always returns `None` rather than raising, so a caller can treat "compute a fresh embedding" as the uniform fallback.
-
-**This slice only adds the adapter, config surface, and cache storage — nothing computes or uses embeddings yet.** Populating the cache during indexing, the actual vector search lane, reciprocal-rank fusion across lanes, temporal decay, and MMR are Stage One Phase 4 slice C.
+`PostgresMemoryIndex.has_vector_lane` reports whether both conditions hold. `cache_embedding()`/`get_cached_embedding()` are the storage primitives, keyed by `(content_hash, model_identity)` rather than a `memory_chunks` row id — `reindex_file()` deletes and reinserts every chunk of a file on every call (even when only one paragraph changed), so a row-id-keyed cache could never actually hit. `memory_chunks.chunk_hash` already stores the same hash per row, so the vector lane joins through that column instead of needing its own row reference — and since identical chunk text embeds identically regardless of which agent's note it came from, a cache hit is shared across agents for free. (An earlier, row-id-keyed version of this table shipped briefly before this design — `_ensure_schema()` detects and self-heals it on first connect if found, so nothing manual is needed on a machine that already ran that code.) A cache miss (no vector lane, or this exact `(content_hash, model_identity)` pair never embedded) always returns `None` rather than raising, so a caller can treat "compute a fresh embedding" as the uniform fallback.
 
 ### Pinning (Stage One Phase 4, slice B)
 
@@ -1247,6 +1245,28 @@ minion-assist memory pin project-goals --agent main     # pin a topic note
 minion-assist memory unpin project-goals --agent main   # unpin it
 minion-assist memory pins --agent main                  # list pinned notes
 ```
+
+### Hybrid retrieval (Stage One Phase 4, slice C)
+
+`MemoryService.search()` now calls `PostgresMemoryIndex.hybrid_search()` when an index is configured — fusing five independent lanes rather than ranking on lexical match alone:
+
+| Lane | Signal | Notes |
+|---|---|---|
+| **path** | Exact/substring match against a chunk's `rel_path` | Catches a query naming a file directly (e.g. `"project-goals"`) even if that text never appears in the file's *body*. |
+| **lexical** | `ts_rank` (same as `search()`) | |
+| **vector** | Cosine similarity against cached embeddings | Empty (not an error) without a configured embedding provider, or if embedding the query itself fails. |
+| **pinned** | Every chunk of every currently pinned file | See "Pinning" above. |
+| **recent** | Most recently indexed files' chunks | Regardless of content match — a deliberate fallback so a query with no other signal still surfaces something, rather than returning empty. |
+
+**Fusion.** Each lane ranks candidates by an incompatible signal (a `ts_rank` isn't comparable to a cosine similarity), so scores aren't averaged — reciprocal-rank fusion sums each candidate's `1/(60+rank)` contribution across every lane it appears in. A chunk only one lane finds still scores well; a chunk multiple lanes agree on scores higher still. This is the mem0 "reject semantic-seeded fusion" decision the plan cites: every lane must be able to surface a candidate the others missed, not just refine a shared candidate set.
+
+**Temporal decay.** A `"daily"` chunk's fused score is multiplied by `0.5 ** (days_old / 30)` — halving every 30 days since the date in its filename. `"durable"` content (`MEMORY.md`, topic notes) never decays, per the plan's "evergreen content does not decay merely because its file mtime is old."
+
+**MMR.** When an embedding provider is configured, a greedy maximal-marginal-relevance pass re-orders the fused results to push down near-duplicate snippets (measured by cached-embedding cosine similarity) in favor of more novel ones. Skipped entirely without embeddings — MMR's purpose is catching *semantic* near-duplicates, which requires vectors to measure; there's no lexical-only equivalent implemented here.
+
+**Pinned guarantee.** Every currently pinned chunk (matching the `corpus` filter) is prepended to the final result list ahead of the fused ranking, so pinning something really does mean "always surfaced," not just "boosted" — it can never be pushed out by `max_results` truncation as long as there's room.
+
+**Embedding generation during indexing.** `reindex_file()`/`force_rebuild_agent()` embed new/changed chunks best-effort right after writing them (never blocks indexing — a failed embedding call is logged and the chunk is simply left out of the vector lane until the next successful pass). Batches all of a call's chunks into one `embed()` request and skips any chunk whose content is already cached under the current model, so re-saving a file with one changed paragraph doesn't re-embed the unchanged parts.
 
 ### `session_search` Tool Modes
 

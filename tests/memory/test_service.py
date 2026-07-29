@@ -133,11 +133,11 @@ def _index_row(**overrides):
 
 def test_search_uses_the_index_when_configured(indexed_service):
     svc, mock_index = indexed_service
-    mock_index.search.return_value = [_index_row()]
+    mock_index.hybrid_search.return_value = [_index_row()]
 
     [hit] = svc.search("query")
 
-    mock_index.search.assert_called_once_with("main", "query", corpus=None, max_results=20)
+    mock_index.hybrid_search.assert_called_once_with("main", "query", corpus=None, max_results=20)
     assert hit.key == "MEMORY"
     assert hit.content == "matched content"
     assert hit.source == "durable"
@@ -149,16 +149,18 @@ def test_search_uses_the_index_when_configured(indexed_service):
 
 def test_search_passes_corpus_through_to_the_index(indexed_service):
     svc, mock_index = indexed_service
-    mock_index.search.return_value = []
+    mock_index.hybrid_search.return_value = []
 
     svc.search("query", corpus="daily")
 
-    mock_index.search.assert_called_once_with("main", "query", corpus="daily", max_results=20)
+    mock_index.hybrid_search.assert_called_once_with(
+        "main", "query", corpus="daily", max_results=20
+    )
 
 
 def test_search_falls_back_to_linear_scan_when_index_search_raises(indexed_service, tmp_path):
     svc, mock_index = indexed_service
-    mock_index.search.side_effect = RuntimeError("connection lost")
+    mock_index.hybrid_search.side_effect = RuntimeError("connection lost")
     svc.remember("project-goals", "fallback content")
 
     [hit] = svc.search("fallback")

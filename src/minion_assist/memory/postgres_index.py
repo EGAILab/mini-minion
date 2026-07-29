@@ -43,15 +43,118 @@ Talks to
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 import threading
 import time
+from datetime import date as _date
+from typing import TYPE_CHECKING
 
-from .chunking import chunk_markdown
+from .chunking import Chunk, chunk_markdown
+
+if TYPE_CHECKING:
+    from ..providers.embeddings import EmbeddingProvider
+
+_log = logging.getLogger("minion_assist.memory_index")
 
 # Thread-local connection cache, kept separate from session/db.py's own
 # thread-local so a psycopg connection meant for one module is never
 # accidentally reused by the other.
 _local = threading.local()
+
+# ---------------------------------------------------------------------------
+# Fusion helpers — Stage One Phase 4, slice C
+# ---------------------------------------------------------------------------
+# Free functions (not methods) since none of them touch the database — they
+# operate purely on the lane results hybrid_search() already fetched.
+
+# Standard reciprocal-rank-fusion constant. 60 is the value from the
+# original RRF paper (Cormack et al.) and is not sensitive to tuning for
+# typical result-list lengths — it just controls how quickly a lower rank's
+# contribution falls off, not the fusion's correctness.
+_RRF_K = 60
+
+# Half-life for daily-note score decay: a daily note's fused score is
+# multiplied by 0.5 for every _DECAY_HALF_LIFE_DAYS days since the date in
+# its filename. Only source_kind "daily" decays — "durable" content
+# (MEMORY.md, topic notes) does not, per Task 6's "evergreen MEMORY.md and
+# topic pages do not decay merely because their file mtime is old."
+_DECAY_HALF_LIFE_DAYS = 30
+
+_DAILY_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\.md$")
+
+
+def _reciprocal_rank_fusion(lanes: list[list[dict]]) -> tuple[dict[int, float], dict[int, dict]]:
+    """Combine several independently-ranked lanes into one score per chunk id.
+
+    Each lane is a list of chunk dicts already ranked best-first (by
+    whatever criterion that lane uses — ts_rank, cosine similarity, recency,
+    exact-path match). A chunk's fused score is the sum, across every lane
+    it appears in, of ``1 / (_RRF_K + rank)`` — so a chunk ranked highly by
+    even one lane scores well, and a chunk multiple lanes agree on scores
+    higher still. This is why every lane must be able to surface a
+    candidate the others missed (the mem0 "reject semantic-seeded fusion"
+    decision the plan cites): a chunk absent from a lane simply doesn't
+    collect that lane's contribution, rather than being penalized for it.
+
+    Args:
+        lanes: One ranked list per lane. A lane may be empty (e.g. the
+            vector lane with no embedding provider configured).
+
+    Returns:
+        tuple[dict[int, float], dict[int, dict]]: ``(scores, rows)`` —
+            ``scores`` maps chunk id to its fused score, ``rows`` maps
+            chunk id to the first lane's dict that mentioned it (all lanes
+            describe the same underlying chunk, so any one's fields work).
+    """
+    scores: dict[int, float] = {}
+    rows: dict[int, dict] = {}
+    for lane in lanes:
+        for rank, row in enumerate(lane, start=1):
+            chunk_id = row["id"]
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (_RRF_K + rank)
+            rows.setdefault(chunk_id, row)
+    return scores, rows
+
+
+def _decay_factor(rel_path: str, source_kind: str) -> float:
+    """Score multiplier for temporal decay — 1.0 (no decay) for anything but daily notes.
+
+    Args:
+        rel_path: The chunk's file path, e.g. ``"memory/2026-07-20.md"``.
+        source_kind: ``"durable"``, ``"daily"``, or ``"import"``.
+
+    Returns:
+        float: 1.0 for non-daily content, or ``0.5 ** (days_old /
+            _DECAY_HALF_LIFE_DAYS)`` for a daily note — halving every
+            ``_DECAY_HALF_LIFE_DAYS`` days since the date in its filename.
+            Also 1.0 (no decay applied) if the filename doesn't parse as a
+            date or the note is dated today/in the future — decay should
+            never fail loudly over an unexpected filename shape.
+    """
+    if source_kind != "daily":
+        return 1.0
+    match = _DAILY_DATE_RE.search(rel_path)
+    if not match:
+        return 1.0
+    try:
+        note_date = _date.fromisoformat(match.group(1))
+    except ValueError:
+        return 1.0
+    days_old = (_date.today() - note_date).days
+    if days_old <= 0:
+        return 1.0
+    return 0.5 ** (days_old / _DECAY_HALF_LIFE_DAYS)
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two equal-length vectors, in [-1, 1] (0.0 if either is zero)."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 def _hash_text(text: str) -> str:
@@ -83,14 +186,26 @@ class PostgresMemoryIndex:
             (the default — matches every call site before Stage One
             Phase 4), :attr:`memory_chunk_embeddings` is never created and
             the vector lane simply doesn't exist for this instance.
+        embedding_provider: The :class:`EmbeddingProvider` to call when
+            indexing a chunk with no cached embedding yet (Stage One
+            Phase 4, slice C). ``None`` (the default) means chunks are
+            never embedded — the vector lane stays empty even if
+            ``embedding_dimensions`` created the table, exactly as if no
+            embedding backend were configured at all.
     """
 
-    def __init__(self, url: str, embedding_dimensions: int | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        embedding_dimensions: int | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+    ) -> None:
         import psycopg  # noqa: PLC0415
 
         self._url = url
         self._psycopg = psycopg
         self._embedding_dimensions = embedding_dimensions
+        self._embedding_provider = embedding_provider
         self._has_vector = False
         self._ensure_schema()
 
@@ -237,14 +352,43 @@ class PostgresMemoryIndex:
         # here because PostgreSQL's vector(N) type modifier can't be a bind
         # parameter, but embedding_dimensions is a validated int from
         # config.py, never external input, so this is safe.
+        #
+        # Keyed by (content_hash, model_identity), NOT chunk_id or agent_id.
+        # reindex_file() deletes and reinserts every chunk on every call
+        # (even when only one changed), so a chunk_id-keyed cache could
+        # never hit — Task 3's "cache embeddings by model identity and
+        # content hash" literally means content, not row identity.
+        # memory_chunks.chunk_hash already stores this same hash per row,
+        # so the vector lane joins through that column rather than needing
+        # its own chunk_id reference. No agent_id either: identical chunk
+        # text embeds identically regardless of which agent's note it came
+        # from, so a cache hit is shared across agents for free.
         if self._has_vector and self._embedding_dimensions:
+            # Self-healing one-time migration: an earlier build of this
+            # table (before this content-hash-keyed shape existed) used
+            # chunk_id as its primary key. Nothing ever wrote real
+            # embeddings under that shape — it was never wired into any
+            # write path until now — so it's safe to detect and drop it
+            # here rather than requiring a manual fix on any machine that
+            # already ran the earlier code.
+            old_pk_cols = conn.execute("""
+                SELECT kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                    ON tc.constraint_name = kcu.constraint_name
+                WHERE tc.table_name = 'memory_chunk_embeddings'
+                  AND tc.constraint_type = 'PRIMARY KEY'
+            """).fetchall()
+            if old_pk_cols and {r[0] for r in old_pk_cols} == {"chunk_id"}:
+                conn.execute("DROP TABLE memory_chunk_embeddings")
+
             dims = int(self._embedding_dimensions)
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS memory_chunk_embeddings (
-                    chunk_id       BIGINT PRIMARY KEY,
-                    model_identity TEXT NOT NULL,
                     content_hash   TEXT NOT NULL,
-                    embedding      vector({dims}) NOT NULL
+                    model_identity TEXT NOT NULL,
+                    embedding      vector({dims}) NOT NULL,
+                    PRIMARY KEY (content_hash, model_identity)
                 )
             """)
             conn.execute(
@@ -315,6 +459,7 @@ class PostgresMemoryIndex:
             """,
             (agent_id, rel_path, source_kind, _hash_text(content), time.time()),
         )
+        self._maybe_embed_chunks(chunks)
         return len(chunks)
 
     def remove_file(self, agent_id: str, rel_path: str) -> None:
@@ -479,8 +624,10 @@ class PostgresMemoryIndex:
         conn.execute("DELETE FROM memory_files_shadow WHERE agent_id = %s", (agent_id,))
 
         processed = 0
+        all_chunks = []
         for source_kind, rel_path, content in indexable_files:
             chunks = chunk_markdown(content)
+            all_chunks.extend(chunks)
             for i, chunk in enumerate(chunks):
                 conn.execute(
                     """
@@ -537,6 +684,7 @@ class PostgresMemoryIndex:
         conn.execute("DELETE FROM memory_chunks_shadow WHERE agent_id = %s", (agent_id,))
         conn.execute("DELETE FROM memory_files_shadow WHERE agent_id = %s", (agent_id,))
 
+        self._maybe_embed_chunks(all_chunks)
         return self.chunk_count(agent_id)
 
     # ------------------------------------------------------------------
@@ -570,12 +718,13 @@ class PostgresMemoryIndex:
             max_results: Maximum chunks to return.
 
         Returns:
-            list[dict]: Best matches first. Each has ``rel_path``,
-                ``source_kind``, ``chunk_index``, ``heading_path``,
-                ``content``, ``start_line``, ``end_line``, and ``score``
-                (the ``ts_rank`` value) — everything
-                :class:`~minion_assist.memory.models.MemoryHit`'s optional
-                citation fields need.
+            list[dict]: Best matches first. Each has ``id`` (the
+                ``memory_chunks`` row id — used internally by
+                :meth:`hybrid_search`'s fusion, not part of
+                :class:`~minion_assist.memory.models.MemoryHit`),
+                ``rel_path``, ``source_kind``, ``chunk_index``,
+                ``heading_path``, ``content``, ``start_line``, ``end_line``,
+                and ``score`` (the ``ts_rank`` value).
         """
         conn = self._conn()
         corpus_sql = " AND source_kind = %s" if corpus else ""
@@ -586,7 +735,7 @@ class PostgresMemoryIndex:
 
         rows = conn.execute(
             f"""
-            SELECT rel_path, source_kind, chunk_index, heading_path, content,
+            SELECT id, rel_path, source_kind, chunk_index, heading_path, content,
                    start_line, end_line,
                    ts_rank(search_vector, websearch_to_tsquery('english', %s)) AS score
             FROM memory_chunks
@@ -600,12 +749,298 @@ class PostgresMemoryIndex:
         ).fetchall()
         return [
             {
-                "rel_path": r[0], "source_kind": r[1], "chunk_index": r[2],
-                "heading_path": r[3], "content": r[4], "start_line": r[5],
-                "end_line": r[6], "score": float(r[7]),
+                "id": r[0], "rel_path": r[1], "source_kind": r[2], "chunk_index": r[3],
+                "heading_path": r[4], "content": r[5], "start_line": r[6],
+                "end_line": r[7], "score": float(r[8]),
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Hybrid retrieval — Stage One Phase 4, slice C
+    # ------------------------------------------------------------------
+
+    def hybrid_search(
+        self,
+        agent_id: str,
+        query: str,
+        *,
+        corpus: str | None = None,
+        max_results: int = 20,
+    ) -> list[dict]:
+        """Fuse path, lexical, vector, pinned, and recent lanes into one ranked result list.
+
+        Each lane ranks candidates by a completely different signal (exact
+        path match, ``ts_rank``, cosine similarity, pin status, recency), so
+        no single lane's score is comparable to another's. Reciprocal-rank
+        fusion (:func:`_reciprocal_rank_fusion`) sidesteps that by summing
+        each candidate's ``1/(k+rank)`` contribution across every lane it
+        appears in, rather than trying to average incompatible scores.
+
+        Order of operations:
+
+        1. Run each lane (each already ranked, best first).
+        2. Fuse via RRF.
+        3. Apply temporal decay to daily-note chunks (:func:`_decay_factor`).
+        4. Re-rank by the decayed fused score.
+        5. If an embedding provider is configured, run MMR
+           (:meth:`_mmr`) to reduce near-duplicate snippets. Skipped
+           without embeddings — MMR's whole purpose is catching *semantic*
+           near-duplicates, which requires vectors to measure; there is no
+           equivalent lexical-only substitute implemented here.
+        6. Guarantee every currently pinned chunk (matching ``corpus``) is
+           included, prepended ahead of the ranked results — "pinned"
+           means always surfaced, not just boosted.
+        7. Truncate to ``max_results``.
+
+        Args:
+            agent_id: Which agent's chunks to search.
+            query: Free-text query.
+            corpus: Restrict to one ``source_kind``, or ``None`` for every
+                corpus. Applies to every lane, including pinned (in
+                practice only "durable" pins exist, since pinning is
+                scoped to topic notes — see ``memory/service.py``'s
+                ``pin()``).
+            max_results: Maximum chunks to return.
+
+        Returns:
+            list[dict]: Same shape as :meth:`search`'s results (``id``,
+                ``rel_path``, ``source_kind``, ``chunk_index``,
+                ``heading_path``, ``content``, ``start_line``, ``end_line``,
+                ``score``) — ``score`` here is the fused, decayed RRF score
+                (0.0 for a chunk included only because it's pinned and
+                wasn't otherwise ranked by any lane).
+        """
+        lane_limit = max(max_results * 2, 20)  # overfetch each lane so fusion has real signal
+
+        lexical_hits = self.search(agent_id, query, corpus=corpus, max_results=lane_limit)
+        path_hits = self._path_lane(agent_id, query, corpus, lane_limit)
+        vector_hits = self._vector_lane(agent_id, query, corpus, lane_limit)
+        recent_hits = self._recent_lane(agent_id, corpus, lane_limit)
+
+        scores, rows = _reciprocal_rank_fusion([path_hits, lexical_hits, vector_hits, recent_hits])
+        for chunk_id, row in rows.items():
+            scores[chunk_id] *= _decay_factor(row["rel_path"], row["source_kind"])
+
+        ranked = sorted(rows.values(), key=lambda r: -scores[r["id"]])
+
+        if self._embedding_provider is not None and self.has_vector_lane:
+            final = self._mmr(ranked, scores, max_results)
+        else:
+            final = ranked[:max_results]
+
+        pinned_hits = self._pinned_lane(agent_id, corpus)
+        pinned_ids = {r["id"] for r in pinned_hits}
+        non_pinned = [r for r in final if r["id"] not in pinned_ids]
+        combined = pinned_hits + non_pinned
+
+        results = []
+        for row in combined[:max_results]:
+            results.append({**row, "score": scores.get(row["id"], 0.0)})
+        return results
+
+    def _path_lane(self, agent_id: str, query: str, corpus: str | None, limit: int) -> list[dict]:
+        """Exact/substring identifier match — catches a query naming a file directly.
+
+        Complements the lexical lane's content-based ranking: a query like
+        "project-goals" should surface a file at that path even if the
+        word "project-goals" never appears in the file's *body* text.
+        """
+        terms = [t.lower() for t in query.split() if len(t) >= 3]
+        if not terms:
+            return []
+        conn = self._conn()
+        term_conditions = " OR ".join(["rel_path ILIKE %s"] * len(terms))
+        params: list = [agent_id] + [f"%{t}%" for t in terms]
+        corpus_sql = ""
+        if corpus:
+            corpus_sql = " AND source_kind = %s"
+            params.append(corpus)
+        params.append(limit)
+
+        rows = conn.execute(
+            f"""
+            SELECT id, rel_path, source_kind, chunk_index, heading_path, content,
+                   start_line, end_line
+            FROM memory_chunks
+            WHERE agent_id = %s AND ({term_conditions}) {corpus_sql}
+            ORDER BY chunk_index
+            LIMIT %s
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "rel_path": r[1], "source_kind": r[2], "chunk_index": r[3],
+                "heading_path": r[4], "content": r[5], "start_line": r[6], "end_line": r[7],
+            }
+            for r in rows
+        ]
+
+    def _vector_lane(self, agent_id: str, query: str, corpus: str | None, limit: int) -> list[dict]:
+        """Cosine-similarity ranking against cached chunk embeddings.
+
+        Returns an empty lane (never raises) if no embedding provider is
+        configured, or if embedding the query itself fails — the vector
+        lane is optional by design; its absence just means the other lanes
+        carry the fusion.
+        """
+        if self._embedding_provider is None or not self.has_vector_lane:
+            return []
+        try:
+            [query_vector] = self._embedding_provider.embed([query])
+        except Exception as exc:
+            _log.debug("Embedding the query failed, skipping vector lane: %s: %s",
+                       type(exc).__name__, exc)
+            return []
+
+        conn = self._conn()
+        corpus_sql = " AND mc.source_kind = %s" if corpus else ""
+        # Parameter order must match the SQL's %s occurrences top-to-bottom:
+        # similarity's query_vector, the JOIN's model_identity, agent_id,
+        # (corpus), ORDER BY's query_vector again, then LIMIT.
+        params: list = [query_vector, self._embedding_provider.model_identity, agent_id]
+        if corpus:
+            params.append(corpus)
+        params += [query_vector, limit]
+
+        # %s::vector explicit casts: without them, psycopg sends a bare
+        # Python list parameter as a plain float8[] array (even with
+        # pgvector's adapter registered), and pgvector's <=> operator has
+        # no overload for vector <=> float8[] — confirmed by a direct
+        # smoke test against the dev database while building this lane.
+        rows = conn.execute(
+            f"""
+            SELECT mc.id, mc.rel_path, mc.source_kind, mc.chunk_index, mc.heading_path,
+                   mc.content, mc.start_line, mc.end_line,
+                   1 - (mce.embedding <=> %s::vector) AS similarity
+            FROM memory_chunks mc
+            JOIN memory_chunk_embeddings mce
+                ON mc.chunk_hash = mce.content_hash AND mce.model_identity = %s
+            WHERE mc.agent_id = %s {corpus_sql}
+            ORDER BY mce.embedding <=> %s::vector
+            LIMIT %s
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "rel_path": r[1], "source_kind": r[2], "chunk_index": r[3],
+                "heading_path": r[4], "content": r[5], "start_line": r[6], "end_line": r[7],
+                "score": float(r[8]),
+            }
+            for r in rows
+        ]
+
+    def _pinned_lane(self, agent_id: str, corpus: str | None) -> list[dict]:
+        """Every chunk of every currently pinned file, most recently pinned first."""
+        pinned_paths = self.pinned_files(agent_id)
+        if not pinned_paths:
+            return []
+        conn = self._conn()
+        corpus_sql = " AND source_kind = %s" if corpus else ""
+        params: list = [agent_id, pinned_paths]
+        if corpus:
+            params.append(corpus)
+
+        rows = conn.execute(
+            f"""
+            SELECT id, rel_path, source_kind, chunk_index, heading_path, content,
+                   start_line, end_line
+            FROM memory_chunks
+            WHERE agent_id = %s AND rel_path = ANY(%s) {corpus_sql}
+            ORDER BY array_position(%s, rel_path), chunk_index
+            """,
+            [*params, pinned_paths],
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "rel_path": r[1], "source_kind": r[2], "chunk_index": r[3],
+                "heading_path": r[4], "content": r[5], "start_line": r[6], "end_line": r[7],
+            }
+            for r in rows
+        ]
+
+    def _recent_lane(self, agent_id: str, corpus: str | None, limit: int) -> list[dict]:
+        """Most recently indexed files' chunks, regardless of content match."""
+        conn = self._conn()
+        corpus_sql = " AND mf.source_kind = %s" if corpus else ""
+        params: list = [agent_id]
+        if corpus:
+            params.append(corpus)
+        params.append(limit)
+
+        rows = conn.execute(
+            f"""
+            SELECT mc.id, mc.rel_path, mc.source_kind, mc.chunk_index, mc.heading_path,
+                   mc.content, mc.start_line, mc.end_line
+            FROM memory_chunks mc
+            JOIN memory_files mf ON mc.agent_id = mf.agent_id AND mc.rel_path = mf.rel_path
+            WHERE mc.agent_id = %s {corpus_sql}
+            ORDER BY mf.indexed_at DESC, mc.chunk_index
+            LIMIT %s
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "rel_path": r[1], "source_kind": r[2], "chunk_index": r[3],
+                "heading_path": r[4], "content": r[5], "start_line": r[6], "end_line": r[7],
+            }
+            for r in rows
+        ]
+
+    def _mmr(self, ranked: list[dict], scores: dict[int, float], max_results: int) -> list[dict]:
+        """Greedy maximal-marginal-relevance re-ranking to reduce near-duplicate snippets.
+
+        Standard greedy MMR: repeatedly pick whichever remaining candidate
+        maximizes ``score - max_similarity_to_already_selected``, so a
+        highly-ranked chunk that's nearly identical to one already picked
+        gets pushed down in favor of a lower-ranked but more novel one.
+        Only ever called when an embedding provider is configured (see
+        :meth:`hybrid_search`) — similarity here is cosine similarity
+        between cached embeddings, falling back to no penalty (0.0
+        similarity) for a candidate whose embedding isn't cached yet
+        (e.g. it was written since the last successful embedding pass).
+
+        Args:
+            ranked: Candidates already sorted best-first by fused score.
+            scores: chunk id -> fused score, from :meth:`hybrid_search`.
+            max_results: How many to select.
+
+        Returns:
+            list[dict]: Up to ``max_results`` candidates, MMR-reordered.
+        """
+        model_identity = self._embedding_provider.model_identity
+        vectors: dict[int, list[float] | None] = {}
+        for row in ranked:
+            content_hash = _hash_text(row["content"])
+            vectors[row["id"]] = self.get_cached_embedding(content_hash, model_identity)
+
+        selected: list[dict] = []
+        selected_vectors: list[list[float]] = []
+        remaining = list(ranked)
+
+        while remaining and len(selected) < max_results:
+            best_index = 0
+            best_mmr_score = None
+            for i, row in enumerate(remaining):
+                vec = vectors.get(row["id"])
+                if vec is not None and selected_vectors:
+                    max_sim = max(_cosine_similarity(vec, sv) for sv in selected_vectors)
+                else:
+                    max_sim = 0.0
+                mmr_score = 0.5 * scores[row["id"]] - 0.5 * max_sim
+                if best_mmr_score is None or mmr_score > best_mmr_score:
+                    best_mmr_score = mmr_score
+                    best_index = i
+            picked = remaining.pop(best_index)
+            selected.append(picked)
+            picked_vector = vectors.get(picked["id"])
+            if picked_vector is not None:
+                selected_vectors.append(picked_vector)
+
+        return selected
 
     # ------------------------------------------------------------------
     # Pinning — Stage One Phase 4, slice B
@@ -653,17 +1088,64 @@ class PostgresMemoryIndex:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def _maybe_embed_chunks(self, chunks: list[Chunk]) -> None:
+        """Best-effort: embed and cache ``chunks`` not already cached under the current model.
+
+        Called from :meth:`reindex_file` and :meth:`force_rebuild_agent`
+        right after their writes succeed — indexing itself never depends
+        on this step. A no-op with no embedding provider configured. Skips
+        any chunk whose content is already cached under the current
+        model's identity (the common case on repeated indexing of mostly
+        unchanged content), and batches everything else into one
+        ``embed()`` call rather than one request per chunk.
+
+        Never raises: a failed embedding call (provider unreachable, bad
+        model name, etc.) is logged and swallowed, exactly like
+        ``memory/service.py``'s ``_sync_index`` never lets an index-sync
+        failure block the write that triggered it. The vector lane simply
+        stays incomplete for these chunks until the next successful
+        reindex retries them.
+        """
+        if self._embedding_provider is None or not self.has_vector_lane:
+            return
+
+        model_identity = self._embedding_provider.model_identity
+        to_embed_hashes: list[str] = []
+        to_embed_texts: list[str] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            content_hash = _hash_text(chunk.content)
+            if content_hash in seen:
+                continue  # duplicate content already queued this batch (e.g. two identical chunks)
+            seen.add(content_hash)
+            if self.get_cached_embedding(content_hash, model_identity) is not None:
+                continue
+            to_embed_hashes.append(content_hash)
+            to_embed_texts.append(chunk.content)
+
+        if not to_embed_texts:
+            return
+
+        try:
+            vectors = self._embedding_provider.embed(to_embed_texts)
+            for content_hash, vector in zip(to_embed_hashes, vectors):
+                self.cache_embedding(content_hash, model_identity, vector)
+        except Exception as exc:
+            _log.debug(
+                "Embedding %d chunk(s) failed (model %s): %s: %s",
+                len(to_embed_texts), model_identity, type(exc).__name__, exc,
+            )
+
     # ------------------------------------------------------------------
-    # Embedding cache — Stage One Phase 4, slice A
+    # Embedding cache — Stage One Phase 4, slices A & C
     # ------------------------------------------------------------------
     #
-    # Just the storage primitives here — computing embeddings and populating
-    # this cache during indexing (Task 3: "cache embeddings by model
-    # identity and content hash") is Phase 4 slice C's job, once an
-    # EmbeddingProvider is actually wired into the write path. Guarded by
-    # `has_vector_lane` rather than relying on callers to check first, so a
-    # caller that forgets simply gets a no-op/None instead of a SQL error
-    # from a table that was never created.
+    # Keyed by (content_hash, model_identity) — see the schema comment in
+    # _ensure_schema() for why this is content-addressed rather than tied
+    # to a specific memory_chunks row. Guarded by `has_vector_lane` rather
+    # than relying on callers to check first, so a caller that forgets
+    # simply gets a no-op/None instead of a SQL error from a table that
+    # was never created.
 
     @property
     def has_vector_lane(self) -> bool:
@@ -671,19 +1153,18 @@ class PostgresMemoryIndex:
         return self._has_vector and bool(self._embedding_dimensions)
 
     def cache_embedding(
-        self, chunk_id: int, model_identity: str, content_hash: str, embedding: list[float]
+        self, content_hash: str, model_identity: str, embedding: list[float]
     ) -> None:
-        """Store (or replace) one chunk's embedding, keyed by chunk id.
+        """Store (or replace) the embedding for one exact chunk content, under one model.
 
         Args:
-            chunk_id: The ``memory_chunks.id`` this embedding is for.
-            model_identity: Identifies which model/config produced this
-                vector (e.g. ``"lmstudio/nomic-embed-text-v1.5"``) — lets a
-                model change be detected later rather than silently mixing
+            content_hash: SHA256 of the chunk's content (matches
+                ``memory_chunks.chunk_hash`` for the chunk(s) this text
+                came from — see :func:`_hash_text`).
+            model_identity: Identifies which model/endpoint produced this
+                vector (:attr:`EmbeddingProvider.model_identity`) — lets a
+                model change be detected rather than silently mixing
                 vectors from two different embedding spaces.
-            content_hash: The chunk content's hash at embedding time —
-                lets a caller tell "still current" apart from "stale, the
-                chunk changed since this was computed" without recomputing.
             embedding: The vector itself. A no-op if no vector lane is
                 configured (see :attr:`has_vector_lane`).
         """
@@ -691,41 +1172,33 @@ class PostgresMemoryIndex:
             return
         self._conn().execute(
             """
-            INSERT INTO memory_chunk_embeddings (chunk_id, model_identity, content_hash, embedding)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (chunk_id)
-            DO UPDATE SET model_identity = EXCLUDED.model_identity,
-                          content_hash = EXCLUDED.content_hash,
-                          embedding = EXCLUDED.embedding
+            INSERT INTO memory_chunk_embeddings (content_hash, model_identity, embedding)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (content_hash, model_identity) DO UPDATE SET embedding = EXCLUDED.embedding
             """,
-            (chunk_id, model_identity, content_hash, embedding),
+            (content_hash, model_identity, embedding),
         )
 
-    def get_cached_embedding(
-        self, chunk_id: int, model_identity: str, content_hash: str
-    ) -> list[float] | None:
-        """Look up a chunk's cached embedding, if one is current.
+    def get_cached_embedding(self, content_hash: str, model_identity: str) -> list[float] | None:
+        """Look up the cached embedding for this exact chunk content, under this model.
 
         Returns ``None`` (a cache miss, not an error) both when there is no
-        vector lane configured and when a cached vector exists but is
-        stale — its ``model_identity``/``content_hash`` no longer matches
-        what's asked for (the embedding model changed, or the chunk's
-        content changed since it was last embedded).
+        vector lane configured and when this exact ``(content_hash,
+        model_identity)`` pair has simply never been embedded.
 
         Args:
-            chunk_id: The ``memory_chunks.id`` to look up.
-            model_identity: Must match the cached row's value exactly.
             content_hash: Must match the cached row's value exactly.
+            model_identity: Must match the cached row's value exactly.
 
         Returns:
-            list[float] | None: The cached vector, or ``None`` on any miss.
+            list[float] | None: The cached vector, or ``None`` on a miss.
         """
         if not self.has_vector_lane:
             return None
         row = self._conn().execute(
             "SELECT embedding FROM memory_chunk_embeddings "
-            "WHERE chunk_id = %s AND model_identity = %s AND content_hash = %s",
-            (chunk_id, model_identity, content_hash),
+            "WHERE content_hash = %s AND model_identity = %s",
+            (content_hash, model_identity),
         ).fetchone()
         # register_vector() (see _conn()) makes row[0] a pgvector.vector.Vector,
         # not a plain list — .to_list() is that class's conversion method.

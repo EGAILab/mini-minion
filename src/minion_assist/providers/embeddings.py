@@ -72,8 +72,22 @@ class EmbeddingProvider:
         # (memory/postgres_index.py wraps embedding calls in a
         # never-block-the-write try/except) decide whether to retry.
         self._client = OpenAI(base_url=base_url, api_key=api_key, timeout=30.0, max_retries=0)
+        self.base_url = base_url
         self.model = model
         self.dimensions = dimensions
+
+    @property
+    def model_identity(self) -> str:
+        """A stable string identifying this exact model/endpoint pair — the embedding cache's key.
+
+        Combines ``base_url`` and ``model`` (not just ``model``) because
+        the same model *name* served by two different endpoints isn't
+        guaranteed to produce the same vectors — this is the "record
+        provider, model... as index identity" Task 2 asks for, expressed
+        as one string ``memory/postgres_index.py``'s embedding cache can
+        use directly as a key.
+        """
+        return f"{self.base_url}::{self.model}"
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of texts, one vector per input, in the same order.

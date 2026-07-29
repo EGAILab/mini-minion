@@ -278,7 +278,7 @@ def test_search_with_an_index_passes_corpus_through_and_shows_citation(
     _agent_root(tmp_path, "main")
     _patch_config(monkeypatch, tmp_path)
     mock_index = Mock()
-    mock_index.search.return_value = [{
+    mock_index.hybrid_search.return_value = [{
         "rel_path": "MEMORY.md", "source_kind": "durable", "chunk_index": 0,
         "heading_path": "", "content": "REST API best practices", "start_line": 1,
         "end_line": 1, "score": 0.5,
@@ -289,7 +289,9 @@ def test_search_with_an_index_passes_corpus_through_and_shows_citation(
     out = capsys.readouterr().out
 
     assert exit_code == 0
-    mock_index.search.assert_called_once_with("main", "REST", corpus="durable", max_results=20)
+    mock_index.hybrid_search.assert_called_once_with(
+        "main", "REST", corpus="durable", max_results=20
+    )
     assert "MEMORY.md:1-1" in out
 
 
@@ -521,3 +523,53 @@ def test_doctor_warns_about_missing_workspace(monkeypatch, tmp_path, capsys):
 
     assert exit_code == 0
     assert "no workspace directory yet" in out
+
+
+# ---------------------------------------------------------------------------
+# _build_index (Stage One Phase 4, slice C: embedding provider construction)
+# ---------------------------------------------------------------------------
+
+def test_build_index_passes_no_embedding_provider_without_embeddings_config(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    import minion_assist.config as config
+
+    monkeypatch.setattr(config, "database", SimpleNamespace(url="postgresql://fake/db"))
+    monkeypatch.setattr(config, "embeddings", None)
+    mock_index_cls = Mock()
+
+    with patch("minion_assist.memory.postgres_index.PostgresMemoryIndex", mock_index_cls):
+        cli._build_index()
+
+    mock_index_cls.assert_called_once_with(
+        "postgresql://fake/db", embedding_dimensions=None, embedding_provider=None
+    )
+
+
+def test_build_index_constructs_an_embedding_provider_when_configured(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    import minion_assist.config as config
+
+    monkeypatch.setattr(config, "database", SimpleNamespace(url="postgresql://fake/db"))
+    monkeypatch.setattr(config, "embeddings", SimpleNamespace(
+        provider=SimpleNamespace(base_url="http://localhost:1234/v1", api_key="k"),
+        model="nomic-embed-text",
+        dimensions=768,
+    ))
+    mock_index_cls = Mock()
+    mock_provider_cls = Mock()
+
+    with patch("minion_assist.memory.postgres_index.PostgresMemoryIndex", mock_index_cls), \
+         patch("minion_assist.providers.embeddings.EmbeddingProvider", mock_provider_cls):
+        cli._build_index()
+
+    mock_provider_cls.assert_called_once_with(
+        base_url="http://localhost:1234/v1", api_key="k",
+        model="nomic-embed-text", dimensions=768,
+    )
+    call_kwargs = mock_index_cls.call_args.kwargs
+    assert call_kwargs["embedding_dimensions"] == 768
+    assert call_kwargs["embedding_provider"] is mock_provider_cls.return_value

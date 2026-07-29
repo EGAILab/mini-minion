@@ -389,8 +389,23 @@ def main() -> None:
             # "embeddings" config.json section is absent — the vector lane
             # then simply never gets created.
             _embedding_dims = embeddings_cfg.dimensions if embeddings_cfg else None
+            # Stage One Phase 4, slice C: constructed once here (not inside
+            # PostgresMemoryIndex) so the index stays free of a direct
+            # config.py dependency — same reasoning CaptureWorker's injected
+            # provider_for_agent callable follows.
+            _embedding_provider = None
+            if embeddings_cfg is not None:
+                from .providers.embeddings import EmbeddingProvider  # noqa: PLC0415
+                _embedding_provider = EmbeddingProvider(
+                    base_url=embeddings_cfg.provider.base_url,
+                    api_key=embeddings_cfg.provider.api_key,
+                    model=embeddings_cfg.model,
+                    dimensions=embeddings_cfg.dimensions,
+                )
             _memory_index = PostgresMemoryIndex(
-                database_cfg.url, embedding_dimensions=_embedding_dims
+                database_cfg.url,
+                embedding_dimensions=_embedding_dims,
+                embedding_provider=_embedding_provider,
             )
         except Exception as _idx_exc:
             print(

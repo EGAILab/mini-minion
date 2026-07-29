@@ -204,19 +204,21 @@ class MemoryService:
         *,
         corpus: str | None = None,
     ) -> list[MemoryHit]:
-        """Search memory for ``query``, using the lexical index when one is configured.
+        """Search memory for ``query``, using hybrid retrieval when an index is configured.
 
-        With a configured index (Stage One Phase 3), this searches
-        PostgreSQL full-text chunks across ``MEMORY.md``, topic notes,
-        daily notes, and imports — a strictly larger corpus than the Phase 1
-        linear scan, which never covers root ``MEMORY.md`` at all (see
-        ``memory/files.py``'s ``list_indexable_files``). Without a
-        configured index, or if an index search fails (e.g. a transient
-        connection drop), this falls back to the Phase 1 linear scan — a
-        turn's memory injection must never break over a database hiccup.
-        The fallback is not silent: a failed index search is logged at
-        WARNING, and ``deep_status()`` (Phase 3 slice C) surfaces ongoing
-        index health so a persistently broken index isn't invisible.
+        With a configured index (Stage One Phase 3/4), this fuses path,
+        lexical, vector, pinned, and recent lanes
+        (``PostgresMemoryIndex.hybrid_search`` — see its docstring for how)
+        across ``MEMORY.md``, topic notes, daily notes, and imports — a
+        strictly larger corpus than the Phase 1 linear scan, which never
+        covers root ``MEMORY.md`` at all (see ``memory/files.py``'s
+        ``list_indexable_files``). Without a configured index, or if an
+        index search fails (e.g. a transient connection drop), this falls
+        back to the Phase 1 linear scan — a turn's memory injection must
+        never break over a database hiccup. The fallback is not silent: a
+        failed index search is logged at WARNING, and ``deep_status()``
+        surfaces ongoing index health so a persistently broken index isn't
+        invisible.
 
         Returns raw, structured hits — formatting them into a prompt block
         or tool-result string is the caller's job (``session.py`` for
@@ -241,7 +243,7 @@ class MemoryService:
         """
         if self._index is not None and self._agent_id is not None:
             try:
-                rows = self._index.search(
+                rows = self._index.hybrid_search(
                     self._agent_id, query, corpus=corpus, max_results=max_results
                 )
                 return [
@@ -258,7 +260,7 @@ class MemoryService:
                 ]
             except Exception as exc:
                 _log.warning(
-                    "Lexical index search failed for agent %s, falling back to linear scan: "
+                    "Hybrid index search failed for agent %s, falling back to linear scan: "
                     "%s: %s",
                     self._agent_id, type(exc).__name__, exc,
                 )

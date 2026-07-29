@@ -77,3 +77,18 @@ def test_stores_model_and_dimensions():
     provider = _provider()
     assert provider.model == "nomic-embed-text"
     assert provider.dimensions == 768
+
+
+def test_model_identity_combines_base_url_and_model():
+    provider = _provider()
+    assert provider.model_identity == "http://localhost:1234/v1::nomic-embed-text"
+
+
+def test_model_identity_differs_across_endpoints_for_the_same_model_name():
+    a = EmbeddingProvider(
+        base_url="http://host-a:1234/v1", api_key="k", model="nomic-embed-text", dimensions=768
+    )
+    b = EmbeddingProvider(
+        base_url="http://host-b:1234/v1", api_key="k", model="nomic-embed-text", dimensions=768
+    )
+    assert a.model_identity != b.model_identity

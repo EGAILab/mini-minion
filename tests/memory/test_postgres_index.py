@@ -10,6 +10,7 @@ other or leave rows behind in the shared dev database.
 from __future__ import annotations
 
 import uuid
+from datetime import date as _date
 
 import pytest
 
@@ -26,7 +27,12 @@ except Exception:
 
 pytestmark = pytest.mark.skipif(not _DB_AVAILABLE, reason="requires a live PostgreSQL instance")
 
-from minion_assist.memory.postgres_index import PostgresMemoryIndex  # noqa: E402
+from minion_assist.memory.postgres_index import (  # noqa: E402
+    PostgresMemoryIndex,
+    _cosine_similarity,
+    _decay_factor,
+    _reciprocal_rank_fusion,
+)
 
 
 @pytest.fixture
@@ -38,6 +44,31 @@ def index():
 def vector_index():
     """A PostgresMemoryIndex with an embedding dimension configured (Stage One Phase 4, slice A)."""
     return PostgresMemoryIndex(_DB_URL, embedding_dimensions=3)
+
+
+@pytest.fixture
+def mock_embedding_provider():
+    """A fake EmbeddingProvider returning one fixed 3-dim vector per input text."""
+    from unittest.mock import Mock
+
+    provider = Mock()
+    provider.model_identity = "test-endpoint::test-model"
+    provider.embed = Mock(side_effect=lambda texts: [[0.1, 0.2, 0.3] for _ in texts])
+    return provider
+
+
+@pytest.fixture
+def embedding_index(mock_embedding_provider):
+    """A PostgresMemoryIndex fully wired for embeddings — dimensions + a mock provider."""
+    idx = PostgresMemoryIndex(
+        _DB_URL, embedding_dimensions=3, embedding_provider=mock_embedding_provider
+    )
+    yield idx
+    # The mock's model_identity is a fixed test-only value never used by a
+    # real embedding backend, so this can never touch real cached data.
+    idx._conn().execute(
+        "DELETE FROM memory_chunk_embeddings WHERE model_identity = 'test-endpoint::test-model'"
+    )
 
 
 @pytest.fixture
@@ -107,6 +138,66 @@ def test_reindex_file_stores_source_kind_and_heading_path(index, agent_id):
     assert row[1] == "A Heading"
     assert row[2] == 1
     assert row[3] == 2
+
+
+def test_reindex_file_without_a_provider_never_embeds(index, agent_id):
+    index.reindex_file(agent_id, "topic.md", "durable", "some content")
+    # No provider configured -- nothing to assert against a real cache
+    # table, but this documents/locks the no-op behavior explicitly.
+    assert index._embedding_provider is None
+
+
+def test_reindex_file_embeds_new_chunks_when_a_provider_is_configured(
+    embedding_index, mock_embedding_provider, agent_id
+):
+    embedding_index.reindex_file(agent_id, "topic.md", "durable", "some content to embed")
+
+    mock_embedding_provider.embed.assert_called_once()
+    [chunk_row] = embedding_index._conn().execute(
+        "SELECT chunk_hash FROM memory_chunks WHERE agent_id = %s AND rel_path = %s",
+        (agent_id, "topic.md"),
+    ).fetchall()
+    cached = embedding_index.get_cached_embedding(chunk_row[0], "test-endpoint::test-model")
+    assert cached == pytest.approx([0.1, 0.2, 0.3])
+
+
+def test_reindex_file_skips_embedding_already_cached_content(
+    embedding_index, mock_embedding_provider, agent_id
+):
+    embedding_index.reindex_file(agent_id, "a.md", "durable", "shared content")
+    mock_embedding_provider.embed.reset_mock()
+
+    # A second file with IDENTICAL content -- its chunk's hash is already
+    # cached from the first call, so embed() must not be called again.
+    embedding_index.reindex_file(agent_id, "b.md", "durable", "shared content")
+
+    mock_embedding_provider.embed.assert_not_called()
+
+
+def test_reindex_file_embedding_failure_does_not_block_indexing(
+    embedding_index, mock_embedding_provider, agent_id
+):
+    mock_embedding_provider.embed.side_effect = RuntimeError("provider unavailable")
+
+    count = embedding_index.reindex_file(agent_id, "topic.md", "durable", "some content")
+
+    assert count == 1  # the chunk itself was still indexed
+    assert embedding_index.chunk_count(agent_id) == 1
+
+
+def test_force_rebuild_agent_embeds_chunks_across_all_files(
+    embedding_index, mock_embedding_provider, agent_id
+):
+    files = [
+        ("durable", "MEMORY.md", "durable content"),
+        ("import", "memory/imports/x.md", "import content"),
+    ]
+
+    embedding_index.force_rebuild_agent(agent_id, files)
+
+    mock_embedding_provider.embed.assert_called_once()
+    call_args = mock_embedding_provider.embed.call_args.args[0]
+    assert sorted(call_args) == sorted(["durable content", "import content"])
 
 
 # ---------------------------------------------------------------------------
@@ -424,21 +515,54 @@ def test_has_vector_lane_is_true_with_configured_dimensions(vector_index):
     assert vector_index.has_vector_lane is True
 
 
+def test_old_chunk_id_keyed_table_self_heals_into_the_new_schema():
+    # Simulates a machine that already ran the earlier chunk_id-keyed
+    # build of memory_chunk_embeddings (Stage One Phase 4, slice A) before
+    # this content-hash-keyed shape existed.
+    conn = _psycopg.connect(_DB_URL, autocommit=True)
+    conn.execute("DROP TABLE IF EXISTS memory_chunk_embeddings")
+    conn.execute("""
+        CREATE TABLE memory_chunk_embeddings (
+            chunk_id BIGINT PRIMARY KEY,
+            model_identity TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            embedding vector(3) NOT NULL
+        )
+    """)
+    conn.close()
+
+    try:
+        migrated = PostgresMemoryIndex(_DB_URL, embedding_dimensions=3)
+        assert migrated.has_vector_lane is True
+
+        migrated.cache_embedding("hash-migration-test", "test/model", [0.1, 0.2, 0.3])
+        result = migrated.get_cached_embedding("hash-migration-test", "test/model")
+
+        assert result is not None
+        assert result[0] == pytest.approx(0.1, abs=1e-4)
+    finally:
+        conn = _psycopg.connect(_DB_URL, autocommit=True)
+        conn.execute(
+            "DELETE FROM memory_chunk_embeddings WHERE content_hash = 'hash-migration-test'"
+        )
+        conn.close()
+
+
 def test_cache_embedding_is_a_no_op_without_a_vector_lane(index):
-    index.cache_embedding(999001, "test/model", "hash-a", [0.1, 0.2, 0.3])  # must not raise
-    assert index.get_cached_embedding(999001, "test/model", "hash-a") is None
+    index.cache_embedding("hash-a", "test/model", [0.1, 0.2, 0.3])  # must not raise
+    assert index.get_cached_embedding("hash-a", "test/model") is None
 
 
-def test_get_cached_embedding_returns_none_for_a_never_cached_chunk(vector_index):
-    assert vector_index.get_cached_embedding(999002, "test/model", "hash-a") is None
+def test_get_cached_embedding_returns_none_for_a_never_cached_hash(vector_index):
+    assert vector_index.get_cached_embedding("hash-never-cached", "test/model") is None
 
 
 def test_cache_embedding_round_trips(vector_index):
-    chunk_id = 999003
+    content_hash = "hash-round-trip"
     try:
-        vector_index.cache_embedding(chunk_id, "test/model", "hash-a", [0.1, 0.2, 0.3])
+        vector_index.cache_embedding(content_hash, "test/model", [0.1, 0.2, 0.3])
 
-        result = vector_index.get_cached_embedding(chunk_id, "test/model", "hash-a")
+        result = vector_index.get_cached_embedding(content_hash, "test/model")
 
         assert result is not None
         assert len(result) == 3
@@ -447,46 +571,48 @@ def test_cache_embedding_round_trips(vector_index):
         assert result[2] == pytest.approx(0.3, abs=1e-4)
     finally:
         vector_index._conn().execute(
-            "DELETE FROM memory_chunk_embeddings WHERE chunk_id = %s", (chunk_id,)
+            "DELETE FROM memory_chunk_embeddings WHERE content_hash = %s", (content_hash,)
         )
 
 
 def test_get_cached_embedding_misses_on_wrong_model_identity(vector_index):
-    chunk_id = 999004
+    content_hash = "hash-model-mismatch"
     try:
-        vector_index.cache_embedding(chunk_id, "test/model-a", "hash-a", [0.1, 0.2, 0.3])
+        vector_index.cache_embedding(content_hash, "test/model-a", [0.1, 0.2, 0.3])
 
-        assert vector_index.get_cached_embedding(chunk_id, "test/model-b", "hash-a") is None
+        assert vector_index.get_cached_embedding(content_hash, "test/model-b") is None
     finally:
         vector_index._conn().execute(
-            "DELETE FROM memory_chunk_embeddings WHERE chunk_id = %s", (chunk_id,)
+            "DELETE FROM memory_chunk_embeddings WHERE content_hash = %s", (content_hash,)
         )
 
 
-def test_get_cached_embedding_misses_on_wrong_content_hash(vector_index):
-    chunk_id = 999005
+def test_cache_embedding_replaces_a_previous_value_for_the_same_hash_and_model(vector_index):
+    content_hash = "hash-replace"
     try:
-        vector_index.cache_embedding(chunk_id, "test/model", "hash-a", [0.1, 0.2, 0.3])
+        vector_index.cache_embedding(content_hash, "test/model", [0.1, 0.2, 0.3])
+        vector_index.cache_embedding(content_hash, "test/model", [0.4, 0.5, 0.6])
 
-        assert vector_index.get_cached_embedding(chunk_id, "test/model", "hash-stale") is None
-    finally:
-        vector_index._conn().execute(
-            "DELETE FROM memory_chunk_embeddings WHERE chunk_id = %s", (chunk_id,)
-        )
-
-
-def test_cache_embedding_replaces_a_previous_value_for_the_same_chunk(vector_index):
-    chunk_id = 999006
-    try:
-        vector_index.cache_embedding(chunk_id, "test/model", "hash-a", [0.1, 0.2, 0.3])
-        vector_index.cache_embedding(chunk_id, "test/model", "hash-b", [0.4, 0.5, 0.6])
-
-        assert vector_index.get_cached_embedding(chunk_id, "test/model", "hash-a") is None
-        result = vector_index.get_cached_embedding(chunk_id, "test/model", "hash-b")
+        result = vector_index.get_cached_embedding(content_hash, "test/model")
         assert result[0] == pytest.approx(0.4, abs=1e-4)
     finally:
         vector_index._conn().execute(
-            "DELETE FROM memory_chunk_embeddings WHERE chunk_id = %s", (chunk_id,)
+            "DELETE FROM memory_chunk_embeddings WHERE content_hash = %s", (content_hash,)
+        )
+
+
+def test_cache_embedding_is_shared_across_agents_for_identical_content(vector_index):
+    # No agent_id in the cache key by design -- identical text embeds
+    # identically regardless of which agent's note it came from.
+    content_hash = "hash-shared"
+    try:
+        vector_index.cache_embedding(content_hash, "test/model", [0.7, 0.8, 0.9])
+
+        result = vector_index.get_cached_embedding(content_hash, "test/model")
+        assert result[0] == pytest.approx(0.7, abs=1e-4)
+    finally:
+        vector_index._conn().execute(
+            "DELETE FROM memory_chunk_embeddings WHERE content_hash = %s", (content_hash,)
         )
 
 
@@ -541,3 +667,198 @@ def test_pins_do_not_leak_across_agents(index, agent_id):
         assert index.pinned_files(agent_id) == []
     finally:
         index.unpin_file(other_agent, "memory/topics/goal.md")
+
+
+# ---------------------------------------------------------------------------
+# Fusion helpers (Stage One Phase 4, slice C) — pure functions, no DB needed
+# ---------------------------------------------------------------------------
+
+def test_reciprocal_rank_fusion_sums_contributions_across_lanes():
+    row_a = {"id": 1, "rel_path": "a.md"}
+    row_b = {"id": 2, "rel_path": "b.md"}
+    lane1 = [row_a, row_b]  # a ranked 1st, b ranked 2nd
+    lane2 = [row_b, row_a]  # b ranked 1st, a ranked 2nd
+
+    scores, rows = _reciprocal_rank_fusion([lane1, lane2])
+
+    # Symmetric ranks across two lanes -> equal fused scores.
+    assert scores[1] == pytest.approx(scores[2])
+    assert rows[1] == row_a
+    assert rows[2] == row_b
+
+
+def test_reciprocal_rank_fusion_favors_a_chunk_ranked_highly_in_multiple_lanes():
+    row_a = {"id": 1}
+    row_b = {"id": 2}
+    lane1 = [row_a, row_b]
+    lane2 = [row_a, row_b]  # a is top in both lanes
+
+    scores, _rows = _reciprocal_rank_fusion([lane1, lane2])
+
+    assert scores[1] > scores[2]
+
+
+def test_reciprocal_rank_fusion_handles_empty_lanes():
+    scores, rows = _reciprocal_rank_fusion([[], []])
+    assert scores == {}
+    assert rows == {}
+
+
+def test_reciprocal_rank_fusion_a_chunk_missing_from_a_lane_is_not_penalized():
+    # A chunk absent from a lane contributes 0 from that lane, not a
+    # negative adjustment -- it just doesn't collect that lane's score.
+    row_a = {"id": 1}
+    scores, _rows = _reciprocal_rank_fusion([[row_a], []])
+    assert scores[1] > 0
+
+
+def test_decay_factor_is_1_for_durable_content_regardless_of_path():
+    assert _decay_factor("memory/2020-01-01.md", "durable") == 1.0
+
+
+def test_decay_factor_is_1_for_import_content():
+    assert _decay_factor("memory/2020-01-01.md", "import") == 1.0
+
+
+def test_decay_factor_is_1_for_a_daily_note_dated_today():
+    today_path = f"memory/{_date.today().isoformat()}.md"
+    assert _decay_factor(today_path, "daily") == 1.0
+
+
+def test_decay_factor_is_less_than_1_for_an_old_daily_note():
+    old_path = "memory/2000-01-01.md"
+    assert _decay_factor(old_path, "daily") < 1.0
+
+
+def test_decay_factor_decreases_monotonically_with_age():
+    recent = _decay_factor("memory/2026-07-01.md", "daily")
+    older = _decay_factor("memory/2026-01-01.md", "daily")
+    assert older < recent
+
+
+def test_decay_factor_is_1_for_an_unparseable_daily_path():
+    assert _decay_factor("memory/not-a-date.md", "daily") == 1.0
+
+
+def test_cosine_similarity_of_identical_vectors_is_1():
+    assert _cosine_similarity([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]) == pytest.approx(1.0)
+
+
+def test_cosine_similarity_of_orthogonal_vectors_is_0():
+    assert _cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+
+
+def test_cosine_similarity_of_opposite_vectors_is_negative_1():
+    assert _cosine_similarity([1.0, 0.0], [-1.0, 0.0]) == pytest.approx(-1.0)
+
+
+def test_cosine_similarity_with_a_zero_vector_is_0():
+    assert _cosine_similarity([0.0, 0.0], [1.0, 2.0]) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# hybrid_search (Stage One Phase 4, slice C)
+# ---------------------------------------------------------------------------
+
+def test_hybrid_search_finds_a_lexical_match_without_an_embedding_provider(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User prefers dark mode in the editor.")
+
+    results = index.hybrid_search(agent_id, "dark mode")
+
+    assert any(r["rel_path"] == "MEMORY.md" for r in results)
+
+
+def test_hybrid_search_path_lane_surfaces_exact_filename_match(index, agent_id):
+    # The query term appears in the file's path/key but nowhere in its body.
+    index.reindex_file(
+        agent_id, "memory/topics/project-goals.md", "durable", "Ship it this quarter."
+    )
+
+    results = index.hybrid_search(agent_id, "project-goals")
+
+    assert any(r["rel_path"] == "memory/topics/project-goals.md" for r in results)
+
+
+def test_hybrid_search_always_includes_pinned_content_even_without_a_query_match(
+    index, agent_id
+):
+    index.reindex_file(agent_id, "memory/topics/standing-rule.md", "durable", "Always be polite.")
+    index.pin_file(agent_id, "memory/topics/standing-rule.md")
+
+    results = index.hybrid_search(agent_id, "completely unrelated query xyz")
+
+    assert any(r["rel_path"] == "memory/topics/standing-rule.md" for r in results)
+
+
+def test_hybrid_search_respects_corpus_filter(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "shared keyword content")
+    index.reindex_file(agent_id, "memory/imports/x.md", "import", "shared keyword content")
+
+    durable_only = index.hybrid_search(agent_id, "shared keyword", corpus="durable")
+
+    assert all(r["source_kind"] == "durable" for r in durable_only)
+
+
+def test_hybrid_search_respects_max_results(index, agent_id):
+    for i in range(10):
+        index.reindex_file(agent_id, f"memory/topics/note-{i}.md", "durable", "shared keyword")
+
+    results = index.hybrid_search(agent_id, "shared keyword", max_results=3)
+
+    assert len(results) <= 3
+
+
+def test_hybrid_search_returns_empty_for_an_agent_with_nothing_indexed(index, agent_id):
+    # No recent-lane fallback content exists at all for this agent, so
+    # there's nothing any lane could surface.
+    results = index.hybrid_search(agent_id, "anything")
+    assert results == []
+
+
+def test_hybrid_search_recent_lane_still_surfaces_content_for_an_unrelated_query(index, agent_id):
+    # The recent lane is explicitly "regardless of content match" (it's a
+    # fallback so a fresh conversation still gets some injected context) --
+    # an unrelated query is not expected to return nothing as long as the
+    # agent has indexed content at all.
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "unrelated content")
+
+    results = index.hybrid_search(agent_id, "xyzzy-nonexistent-term")
+
+    assert any(r["rel_path"] == "MEMORY.md" for r in results)
+
+
+def test_hybrid_search_only_searches_the_given_agent(index, agent_id):
+    other_agent = f"test-{uuid.uuid4()}"
+    index.reindex_file(other_agent, "MEMORY.md", "durable", "shared keyword content")
+
+    try:
+        results = index.hybrid_search(agent_id, "shared keyword")
+        assert results == []
+    finally:
+        index.remove_file(other_agent, "MEMORY.md")
+
+
+def test_hybrid_search_uses_the_vector_lane_when_a_provider_is_configured(
+    embedding_index, mock_embedding_provider, agent_id
+):
+    embedding_index.reindex_file(agent_id, "MEMORY.md", "durable", "some indexed content")
+
+    embedding_index.hybrid_search(agent_id, "a semantically related query")
+
+    # The vector lane embeds the query itself (one call), on top of whatever
+    # reindex_file's own indexing-time embedding call already made.
+    assert mock_embedding_provider.embed.call_count >= 2
+
+
+def test_hybrid_search_applies_temporal_decay_to_old_daily_notes(index, agent_id):
+    # MEMORY.md indexed FIRST (older by indexed_at, disadvantaged in the
+    # recent lane) and the daily note indexed LAST (favored by recency) --
+    # if durable still outranks it despite that recency disadvantage,
+    # decay is doing real work, not just recency coincidentally agreeing.
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "shared keyword content")
+    index.reindex_file(agent_id, "memory/2000-01-01.md", "daily", "shared keyword content")
+
+    results = index.hybrid_search(agent_id, "shared keyword")
+
+    by_path = {r["rel_path"]: r["score"] for r in results}
+    assert by_path["memory/2000-01-01.md"] < by_path["MEMORY.md"]
