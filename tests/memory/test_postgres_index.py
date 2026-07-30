@@ -32,6 +32,7 @@ from minion_assist.memory.postgres_index import (  # noqa: E402
     _cosine_similarity,
     _decay_factor,
     _reciprocal_rank_fusion,
+    hash_query,
 )
 
 
@@ -86,6 +87,7 @@ def _cleanup_after(index, agent_id):
     conn.execute("DELETE FROM memory_chunks_shadow WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_files_shadow WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_pins WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM memory_recall_events WHERE agent_id = %s", (agent_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -862,3 +864,128 @@ def test_hybrid_search_applies_temporal_decay_to_old_daily_notes(index, agent_id
 
     by_path = {r["rel_path"]: r["score"] for r in results}
     assert by_path["memory/2000-01-01.md"] < by_path["MEMORY.md"]
+
+
+# ---------------------------------------------------------------------------
+# hash_query (Stage One Phase 5, slice A) — pure function, no DB needed
+# ---------------------------------------------------------------------------
+
+def test_hash_query_is_deterministic():
+    assert hash_query("Python facts") == hash_query("Python facts")
+
+
+def test_hash_query_ignores_case():
+    assert hash_query("Python Facts") == hash_query("python facts")
+
+
+def test_hash_query_collapses_whitespace():
+    assert hash_query("python   facts") == hash_query("python facts")
+    assert hash_query("  python facts  ") == hash_query("python facts")
+
+
+def test_hash_query_differs_for_different_queries():
+    assert hash_query("python facts") != hash_query("coffee preferences")
+
+
+# ---------------------------------------------------------------------------
+# Recall telemetry (Stage One Phase 5, slice A)
+# ---------------------------------------------------------------------------
+
+def test_recall_stats_for_a_never_recalled_file(index, agent_id):
+    stats = index.recall_stats(agent_id, "MEMORY.md")
+    assert stats == {
+        "recall_count": 0, "unique_queries": 0, "injected_count": 0, "last_recalled_at": None,
+    }
+
+
+def test_record_recall_increments_recall_count(index, agent_id):
+    index.record_recall(agent_id, "MEMORY.md", hash_query("first query"))
+    index.record_recall(agent_id, "MEMORY.md", hash_query("second query"))
+
+    stats = index.recall_stats(agent_id, "MEMORY.md")
+
+    assert stats["recall_count"] == 2
+    assert stats["injected_count"] == 0
+    assert stats["last_recalled_at"] is not None
+
+
+def test_record_recall_tracks_unique_queries(index, agent_id):
+    index.record_recall(agent_id, "MEMORY.md", hash_query("same query"))
+    index.record_recall(agent_id, "MEMORY.md", hash_query("same query"))
+    index.record_recall(agent_id, "MEMORY.md", hash_query("different query"))
+
+    stats = index.recall_stats(agent_id, "MEMORY.md")
+
+    assert stats["recall_count"] == 3
+    assert stats["unique_queries"] == 2
+
+
+def test_mark_injected_flags_the_most_recent_matching_event(index, agent_id):
+    query_hash = hash_query("some query")
+    index.record_recall(agent_id, "MEMORY.md", query_hash)
+
+    index.mark_injected(agent_id, ["MEMORY.md"], query_hash)
+
+    stats = index.recall_stats(agent_id, "MEMORY.md")
+    assert stats["injected_count"] == 1
+
+
+def test_mark_injected_does_not_affect_a_different_query_hash(index, agent_id):
+    index.record_recall(agent_id, "MEMORY.md", hash_query("query one"))
+
+    index.mark_injected(agent_id, ["MEMORY.md"], hash_query("query two"))
+
+    stats = index.recall_stats(agent_id, "MEMORY.md")
+    assert stats["injected_count"] == 0
+
+
+def test_mark_injected_is_a_no_op_for_a_file_never_recalled(index, agent_id):
+    index.mark_injected(agent_id, ["never-recalled.md"], hash_query("q"))  # must not raise
+    assert index.recall_stats(agent_id, "never-recalled.md")["recall_count"] == 0
+
+
+def test_recall_events_do_not_leak_across_agents(index, agent_id):
+    other_agent = f"test-{uuid.uuid4()}"
+    index.record_recall(other_agent, "MEMORY.md", hash_query("q"))
+
+    try:
+        stats = index.recall_stats(agent_id, "MEMORY.md")
+        assert stats["recall_count"] == 0
+    finally:
+        index._conn().execute(
+            "DELETE FROM memory_recall_events WHERE agent_id = %s", (other_agent,)
+        )
+
+
+def test_plain_search_does_not_record_recall_telemetry(index, agent_id):
+    # search() is now purely an internal lane candidate-generator for
+    # hybrid_search() (nothing else calls it directly) -- recording
+    # telemetry here too would double-count/over-count lane candidates
+    # that fusion filters out, which were never actually "surfaced" to
+    # anyone. Only hybrid_search()'s final, actually-returned results
+    # should ever be recorded (Task 1: "results actually surfaced").
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User prefers dark mode.")
+
+    index.search(agent_id, "dark mode")
+
+    stats = index.recall_stats(agent_id, "MEMORY.md")
+    assert stats["recall_count"] == 0
+
+
+def test_hybrid_search_records_recall_telemetry(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User prefers dark mode.")
+
+    index.hybrid_search(agent_id, "dark mode")
+
+    stats = index.recall_stats(agent_id, "MEMORY.md")
+    assert stats["recall_count"] >= 1
+
+
+def test_hybrid_search_uses_the_same_query_hash_as_a_manual_mark_injected_call(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User prefers dark mode.")
+
+    index.hybrid_search(agent_id, "dark mode")
+    index.mark_injected(agent_id, ["MEMORY.md"], hash_query("dark mode"))
+
+    stats = index.recall_stats(agent_id, "MEMORY.md")
+    assert stats["injected_count"] == 1

@@ -170,6 +170,38 @@ def test_search_falls_back_to_linear_scan_when_index_search_raises(indexed_servi
 
 
 # ---------------------------------------------------------------------------
+# mark_injected (Stage One Phase 5, slice A)
+# ---------------------------------------------------------------------------
+
+def test_mark_injected_is_a_no_op_without_an_index(service):
+    service.mark_injected(["MEMORY.md"], "some query")  # must not raise
+
+
+def test_mark_injected_is_a_no_op_for_an_empty_list(indexed_service):
+    svc, mock_index = indexed_service
+    svc.mark_injected([], "some query")
+    mock_index.mark_injected.assert_not_called()
+
+
+def test_mark_injected_delegates_to_the_index_with_a_hashed_query(indexed_service):
+    from minion_assist.memory.postgres_index import hash_query
+
+    svc, mock_index = indexed_service
+    svc.mark_injected(["MEMORY.md", "memory/topics/goal.md"], "some query")
+
+    mock_index.mark_injected.assert_called_once_with(
+        "main", ["MEMORY.md", "memory/topics/goal.md"], hash_query("some query")
+    )
+
+
+def test_mark_injected_never_raises_when_the_index_call_fails(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.mark_injected.side_effect = RuntimeError("db unavailable")
+
+    svc.mark_injected(["MEMORY.md"], "some query")  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # append_daily
 # ---------------------------------------------------------------------------
 

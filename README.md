@@ -1268,6 +1268,18 @@ minion-assist memory pins --agent main                  # list pinned notes
 
 **Embedding generation during indexing.** `reindex_file()`/`force_rebuild_agent()` embed new/changed chunks best-effort right after writing them (never blocks indexing — a failed embedding call is logged and the chunk is simply left out of the vector lane until the next successful pass). Batches all of a call's chunks into one `embed()` request and skips any chunk whose content is already cached under the current model, so re-saving a file with one changed paragraph doesn't re-embed the unchanged parts.
 
+### Recall telemetry (Stage One Phase 5, slice A)
+
+`hybrid_search()` records one row per result it actually returns — regardless of caller, so an explicit `search_memory` tool call surfaces results just as much as proactive per-turn injection does. `AgentSession.send()` separately marks which of those surfaced results were actually selected for injection (`build_prompt_section()`'s token budget may only fit a few), via `MemoryService.mark_injected()`.
+
+| Table | Description |
+|---|---|
+| `memory_recall_events` | Columns: `agent_id`, `rel_path`, `query_hash`, `surfaced_at`, `was_injected`. Keyed by `rel_path`, not a `memory_chunks` row id — chunk ids aren't stable across a reindex (the same lesson learned fixing the embedding cache in Phase 4), and promotion decisions (Phase 5 slice C) operate at the file/note level anyway. |
+
+`hash_query()` normalizes (lowercase, collapsed whitespace) and hashes the query before storing it — Task 2: "hash normalized queries rather than storing unnecessary raw query text." Both `hybrid_search()`'s recording and `mark_injected()`'s later correlating call use this same function, so they agree on what counts as "the same query." `recall_stats(agent_id, rel_path)` aggregates `recall_count`, `unique_queries` (distinct query hashes — Task 3's "query diversity"), `injected_count`, and `last_recalled_at` — the primitive Phase 5 slice C's promotion ranking will consume.
+
+All of this is best-effort and never blocks a search or a turn: a failed telemetry write is logged and swallowed, matching every other observability hook in this codebase (`_sync_index`, `MemoryInjected`).
+
 ### `session_search` Tool Modes
 
 | Mode | Description |

@@ -271,6 +271,34 @@ class MemoryService:
             hits = [h for h in hits if h.source == legacy_source]
         return hits
 
+    def mark_injected(self, rel_paths: list[str], query: str) -> None:
+        """Record that these files (from a prior :meth:`search` call) were actually injected.
+
+        Stage One Phase 5, slice A. Called by ``agents/session.py``'s
+        ``send()`` right after ``build_prompt_section()`` decides which of
+        this turn's search results fit its token budget — the "was
+        actually surfaced" vs. "was actually injected" distinction Task 1
+        asks for. Correlates with the index's own recall recording (done
+        inside ``hybrid_search()`` for every result it returns) via
+        ``hash_query(query)``, so both calls must be given the exact same
+        query text.
+
+        A no-op with no index configured, an empty ``rel_paths`` list, or
+        (like every telemetry write in this module) if the update itself
+        fails — a turn must never break over a telemetry hiccup.
+        """
+        if self._index is None or self._agent_id is None or not rel_paths:
+            return
+        try:
+            from .postgres_index import hash_query  # noqa: PLC0415
+
+            self._index.mark_injected(self._agent_id, rel_paths, hash_query(query))
+        except Exception as exc:
+            _log.debug(
+                "Recording injection telemetry failed for agent %s: %s: %s",
+                self._agent_id, type(exc).__name__, exc,
+            )
+
     # -----------------------------------------------------------------
     # Daily notes
     # -----------------------------------------------------------------

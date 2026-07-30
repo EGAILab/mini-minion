@@ -505,19 +505,19 @@ def test_no_relevant_memories_block_when_nothing_matches(tmp_path):
 
 def test_build_prompt_section_returns_empty_for_no_results(tmp_path):
     memory = MemoryService(MemoryFileRepository(tmp_path))
-    text, keys, tokens = build_prompt_section(memory, "anything", max_tokens=1000)
+    text, injected_hits, tokens = build_prompt_section(memory, "anything", max_tokens=1000)
     assert text == ""
-    assert keys == ()
+    assert injected_hits == ()
     assert tokens == 0
 
 
-def test_build_prompt_section_returns_injected_keys_in_order(tmp_path):
+def test_build_prompt_section_returns_injected_hits_in_order(tmp_path):
     memory = MemoryService(MemoryFileRepository(tmp_path))
     memory.remember("python-facts", "User is a Python expert.")
 
-    text, keys, tokens = build_prompt_section(memory, "Python", max_tokens=1000)
+    text, injected_hits, tokens = build_prompt_section(memory, "Python", max_tokens=1000)
 
-    assert "python-facts" in keys
+    assert "python-facts" in [h.key for h in injected_hits]
     assert "<relevant_memories>" in text
     assert tokens > 0
 
@@ -526,7 +526,7 @@ def test_build_prompt_section_includes_source_label(tmp_path):
     memory = MemoryService(MemoryFileRepository(tmp_path))
     memory.remember("python-facts", "User is a Python expert.")
 
-    text, _keys, _tokens = build_prompt_section(memory, "Python", max_tokens=1000)
+    text, _injected_hits, _tokens = build_prompt_section(memory, "Python", max_tokens=1000)
 
     assert "[topic]" in text  # linear-scan source tag, no index configured
 
@@ -536,7 +536,7 @@ def test_build_prompt_section_omits_citation_without_an_index(tmp_path):
     memory = MemoryService(MemoryFileRepository(tmp_path))
     memory.remember("python-facts", "User is a Python expert.")
 
-    text, _keys, _tokens = build_prompt_section(memory, "Python", max_tokens=1000)
+    text, _injected_hits, _tokens = build_prompt_section(memory, "Python", max_tokens=1000)
 
     assert "python-facts.md" not in text
 
@@ -547,10 +547,10 @@ def test_build_prompt_section_respects_a_tiny_token_budget(tmp_path):
 
     # A budget too small to fit even the header must return nothing rather
     # than a truncated/broken block.
-    text, keys, tokens = build_prompt_section(memory, "Python", max_tokens=1)
+    text, injected_hits, tokens = build_prompt_section(memory, "Python", max_tokens=1)
 
     assert text == ""
-    assert keys == ()
+    assert injected_hits == ()
     assert tokens == 0
 
 
@@ -560,9 +560,9 @@ def test_build_prompt_section_stops_once_the_budget_is_exhausted(tmp_path):
         memory.remember(f"note-{i}", "shared keyword " * 30)
 
     # A budget big enough for the header and roughly one entry, but not five.
-    text, keys, tokens = build_prompt_section(memory, "shared keyword", max_tokens=40)
+    text, injected_hits, tokens = build_prompt_section(memory, "shared keyword", max_tokens=40)
 
-    assert len(keys) < 5
+    assert len(injected_hits) < 5
     assert tokens <= 40
 
 
@@ -592,6 +592,27 @@ def test_memory_injected_event_not_fired_when_nothing_matches(tmp_path):
     session.send("hello", on_event=events.append)
 
     assert not [e for e in events if isinstance(e, MemoryInjected)]
+
+
+def test_send_marks_injected_recall_telemetry_on_the_index(tmp_path):
+    """Stage One Phase 5, slice A: send() must tell the index which surfaced result was injected."""
+    mock_index = Mock()
+    mock_index.hybrid_search.return_value = [{
+        "id": 1, "rel_path": "memory/topics/python-facts.md", "source_kind": "durable",
+        "chunk_index": 0, "heading_path": "", "content": "User is a Python expert.",
+        "start_line": 1, "end_line": 1, "score": 0.9,
+    }]
+    memory = MemoryService(
+        MemoryFileRepository(tmp_path), index=mock_index, agent_id="main"
+    )
+    session = _make_session_with_memory(tmp_path, memory)
+
+    session.send("Tell me about Python")
+
+    mock_index.mark_injected.assert_called_once()
+    call_args = mock_index.mark_injected.call_args.args
+    assert call_args[0] == "main"
+    assert call_args[1] == ["memory/topics/python-facts.md"]
 
 
 def test_context_generation_starts_at_zero(tmp_path):

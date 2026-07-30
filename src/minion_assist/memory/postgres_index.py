@@ -167,6 +167,28 @@ def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def hash_query(query: str) -> str:
+    """Normalize and hash a search query — the recall-telemetry correlation key.
+
+    Stage One Phase 5, slice A, Task 2: "hash normalized queries rather
+    than storing unnecessary raw query text in promotion telemetry."
+    Normalizing (lowercase, collapsed whitespace) before hashing means two
+    queries that differ only in case or spacing count as the "same"
+    query for recall-diversity purposes — what Task 3's later ranking
+    calls "query diversity" cares about distinct *intents*, not
+    incidental text formatting.
+
+    Public (not a leading-underscore helper) because both
+    :meth:`PostgresMemoryIndex.hybrid_search` (recording a surfaced
+    result) and :meth:`~minion_assist.memory.service.MemoryService.mark_injected`
+    (recording which of those were actually injected, later in the same
+    turn) must compute the exact same hash for a given query to correlate
+    with each other.
+    """
+    normalized = " ".join(query.lower().split())
+    return _hash_text(normalized)
+
+
 class PostgresMemoryIndex:
     """Rebuildable PostgreSQL lexical index over one or more agents' memory files.
 
@@ -307,6 +329,28 @@ class PostgresMemoryIndex:
                 PRIMARY KEY (agent_id, rel_path)
             )
         """)
+
+        # Recall telemetry — Stage One Phase 5, slice A. Keyed by rel_path,
+        # not a memory_chunks row id: chunk ids aren't stable across a
+        # reindex (the same lesson learned fixing the embedding cache in
+        # Phase 4), and promotion decisions (Phase 5 slice C) operate at
+        # the file/note level anyway. query_hash is a normalized-and-hashed
+        # query (Task 2: "hash normalized queries rather than storing
+        # unnecessary raw query text") — see hash_query().
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_recall_events (
+                id           BIGSERIAL PRIMARY KEY,
+                agent_id     TEXT NOT NULL,
+                rel_path     TEXT NOT NULL,
+                query_hash   TEXT NOT NULL,
+                surfaced_at  DOUBLE PRECISION NOT NULL,
+                was_injected BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_recall_events_file_idx "
+            "ON memory_recall_events (agent_id, rel_path)"
+        )
 
         # Shadow copies of both tables above, same shape — scratch space for
         # force_rebuild_agent()'s crash-safe rebuild-and-swap (Stage One
@@ -837,6 +881,23 @@ class PostgresMemoryIndex:
         results = []
         for row in combined[:max_results]:
             results.append({**row, "score": scores.get(row["id"], 0.0)})
+
+        # Recall telemetry (Stage One Phase 5, slice A) — record every
+        # result actually returned, regardless of caller (an explicit
+        # search_memory tool call surfaces results just as much as
+        # proactive per-turn injection does; mark_injected() is what later
+        # distinguishes the subset that was actually injected). Never
+        # allowed to turn a working search into a failed one.
+        try:
+            query_hash = hash_query(query)
+            for row in results:
+                self.record_recall(agent_id, row["rel_path"], query_hash)
+        except Exception as exc:
+            _log.debug(
+                "Recording recall telemetry failed for agent %s: %s: %s",
+                agent_id, type(exc).__name__, exc,
+            )
+
         return results
 
     def _path_lane(self, agent_id: str, query: str, corpus: str | None, limit: int) -> list[dict]:
@@ -1135,6 +1196,93 @@ class PostgresMemoryIndex:
                 "Embedding %d chunk(s) failed (model %s): %s: %s",
                 len(to_embed_texts), model_identity, type(exc).__name__, exc,
             )
+
+    # ------------------------------------------------------------------
+    # Recall telemetry — Stage One Phase 5, slice A
+    # ------------------------------------------------------------------
+    #
+    # hybrid_search() calls record_recall() for every result it actually
+    # returns (Task 1: "record recall telemetry only for results actually
+    # surfaced"). mark_injected() is called separately, later in the same
+    # turn, once the caller knows which of those surfaced results were
+    # actually selected for prompt injection (build_prompt_section() may
+    # only fit a few of them within its token budget) — see
+    # memory/service.py's mark_injected() and agents/session.py's send().
+
+    def record_recall(self, agent_id: str, rel_path: str, query_hash: str) -> None:
+        """Record that ``rel_path`` was surfaced by a search, keyed by its (already-hashed) query.
+
+        Never raises out of :meth:`hybrid_search` — a telemetry-write
+        failure must not turn a working search into a failed one. Callers
+        needing that guarantee wrap this themselves (see
+        :meth:`hybrid_search`'s own try/except around its recording loop).
+        """
+        self._conn().execute(
+            """
+            INSERT INTO memory_recall_events (agent_id, rel_path, query_hash, surfaced_at)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (agent_id, rel_path, query_hash, time.time()),
+        )
+
+    def mark_injected(self, agent_id: str, rel_paths: list[str], query_hash: str) -> None:
+        """Mark the most recent recall event for each ``rel_path`` under this query as injected.
+
+        Correlates by ``(agent_id, rel_path, query_hash)`` rather than a
+        row id passed back through the whole call chain — safe because a
+        turn's own ``record_recall`` calls and its later ``mark_injected``
+        call for the *same query* happen microseconds apart, serialized by
+        ``AgentSession._lock``, so "most recent matching row" is
+        unambiguous in practice.
+
+        Args:
+            agent_id: The agent whose recall events to update.
+            rel_paths: Which surfaced files were actually injected.
+            query_hash: Must match the ``query_hash`` :meth:`hybrid_search`
+                recorded for this same search (see :func:`hash_query`).
+        """
+        conn = self._conn()
+        for rel_path in rel_paths:
+            conn.execute(
+                """
+                UPDATE memory_recall_events SET was_injected = TRUE
+                WHERE id = (
+                    SELECT id FROM memory_recall_events
+                    WHERE agent_id = %s AND rel_path = %s AND query_hash = %s
+                    ORDER BY surfaced_at DESC
+                    LIMIT 1
+                )
+                """,
+                (agent_id, rel_path, query_hash),
+            )
+
+    def recall_stats(self, agent_id: str, rel_path: str) -> dict:
+        """Aggregate recall telemetry for one file — a primitive Phase 5 slice C's ranking uses.
+
+        Returns:
+            dict: ``recall_count`` (total times surfaced), ``unique_queries``
+                (distinct ``query_hash`` values — Task 3's "query
+                diversity"), ``injected_count`` (times actually injected),
+                and ``last_recalled_at`` (``None`` if never recalled).
+        """
+        rows = self._conn().execute(
+            "SELECT query_hash, was_injected, surfaced_at FROM memory_recall_events "
+            "WHERE agent_id = %s AND rel_path = %s",
+            (agent_id, rel_path),
+        ).fetchall()
+        if not rows:
+            return {
+                "recall_count": 0,
+                "unique_queries": 0,
+                "injected_count": 0,
+                "last_recalled_at": None,
+            }
+        return {
+            "recall_count": len(rows),
+            "unique_queries": len({r[0] for r in rows}),
+            "injected_count": sum(1 for r in rows if r[1]),
+            "last_recalled_at": max(r[2] for r in rows),
+        }
 
     # ------------------------------------------------------------------
     # Embedding cache — Stage One Phase 4, slices A & C
