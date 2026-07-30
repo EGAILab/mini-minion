@@ -8,9 +8,10 @@ from minion_assist.agents.events import (
     CompactionFailed,
     CompactionStarted,
     FinalAnswer,
+    MemoryInjected,
     ToolCalled,
 )
-from minion_assist.agents.session import AgentSession
+from minion_assist.agents.session import AgentSession, build_prompt_section
 from minion_assist.context import Compactor
 from minion_assist.memory.files import MemoryFileRepository
 from minion_assist.memory.service import MemoryService
@@ -496,6 +497,158 @@ def test_no_relevant_memories_block_when_nothing_matches(tmp_path):
     session.send("hello")
 
     assert "<relevant_memories>" not in captured_system[0]
+
+
+# ---------------------------------------------------------------------------
+# build_prompt_section (Stage One Phase 4, slice D)
+# ---------------------------------------------------------------------------
+
+def test_build_prompt_section_returns_empty_for_no_results(tmp_path):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    text, keys, tokens = build_prompt_section(memory, "anything", max_tokens=1000)
+    assert text == ""
+    assert keys == ()
+    assert tokens == 0
+
+
+def test_build_prompt_section_returns_injected_keys_in_order(tmp_path):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert.")
+
+    text, keys, tokens = build_prompt_section(memory, "Python", max_tokens=1000)
+
+    assert "python-facts" in keys
+    assert "<relevant_memories>" in text
+    assert tokens > 0
+
+
+def test_build_prompt_section_includes_source_label(tmp_path):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert.")
+
+    text, _keys, _tokens = build_prompt_section(memory, "Python", max_tokens=1000)
+
+    assert "[topic]" in text  # linear-scan source tag, no index configured
+
+
+def test_build_prompt_section_omits_citation_without_an_index(tmp_path):
+    # A Phase 1 linear-scan hit never carries rel_path/start_line/end_line.
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert.")
+
+    text, _keys, _tokens = build_prompt_section(memory, "Python", max_tokens=1000)
+
+    assert "python-facts.md" not in text
+
+
+def test_build_prompt_section_respects_a_tiny_token_budget(tmp_path):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert. " * 50)
+
+    # A budget too small to fit even the header must return nothing rather
+    # than a truncated/broken block.
+    text, keys, tokens = build_prompt_section(memory, "Python", max_tokens=1)
+
+    assert text == ""
+    assert keys == ()
+    assert tokens == 0
+
+
+def test_build_prompt_section_stops_once_the_budget_is_exhausted(tmp_path):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    for i in range(5):
+        memory.remember(f"note-{i}", "shared keyword " * 30)
+
+    # A budget big enough for the header and roughly one entry, but not five.
+    text, keys, tokens = build_prompt_section(memory, "shared keyword", max_tokens=40)
+
+    assert len(keys) < 5
+    assert tokens <= 40
+
+
+# ---------------------------------------------------------------------------
+# MemoryInjected event and context-generation tracking (Stage One Phase 4, slice D)
+# ---------------------------------------------------------------------------
+
+def test_memory_injected_event_fired_when_memory_is_injected(tmp_path):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert.")
+    session = _make_session_with_memory(tmp_path, memory)
+
+    events: list[object] = []
+    session.send("Tell me about Python", on_event=events.append)
+
+    [injected] = [e for e in events if isinstance(e, MemoryInjected)]
+    assert "python-facts" in injected.keys
+    assert injected.context_generation == 0
+    assert injected.token_count > 0
+
+
+def test_memory_injected_event_not_fired_when_nothing_matches(tmp_path):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    session = _make_session_with_memory(tmp_path, memory)
+
+    events: list[object] = []
+    session.send("hello", on_event=events.append)
+
+    assert not [e for e in events if isinstance(e, MemoryInjected)]
+
+
+def test_context_generation_starts_at_zero(tmp_path):
+    session = _make_session(tmp_path)
+    assert session._context_generation == 0
+
+
+def test_context_generation_increments_on_reset(tmp_path):
+    session = _make_session(tmp_path)
+    session.reset()
+    assert session._context_generation == 1
+    session.reset()
+    assert session._context_generation == 2
+
+
+def test_context_generation_increments_on_manual_compact(tmp_path):
+    session = _make_session(tmp_path)
+    session._history = [
+        {"role": "user", "content": "old message"},
+        {"role": "assistant", "content": "old reply"},
+    ]
+    with patch.object(session._compactor, "_summarise", return_value="Summary."):
+        changed = session.compact_now()
+
+    assert changed is True
+    assert session._context_generation == 1
+
+
+def test_context_generation_unchanged_when_manual_compact_does_nothing(tmp_path):
+    session = _make_session(tmp_path)
+    # No history at all -- Compactor needs at least 2 messages to compact.
+    changed = session.compact_now()
+
+    assert changed is False
+    assert session._context_generation == 0
+
+
+def test_context_generation_increments_on_automatic_compaction(tmp_path):
+    provider = _mock_provider()
+    session = _make_session(tmp_path, provider=provider)
+    session._history = [
+        {"role": "user", "content": "old message"},
+        {"role": "assistant", "content": "old reply"},
+    ]
+
+    with patch.object(session._compactor, "needs_compaction", return_value=True):
+        with patch.object(session._compactor, "_summarise", return_value="Summary."):
+            session.send("trigger compaction")
+
+    assert session._context_generation == 1
+
+
+def test_fork_does_not_change_the_forking_sessions_context_generation(tmp_path):
+    session = _make_session(tmp_path)
+    session.reset()  # generation is now 1
+    session.fork("forked-agent")
+    assert session._context_generation == 1
 
 
 # ---------------------------------------------------------------------------

@@ -331,7 +331,7 @@ AgentSession.send(message, on_event=callback, stream=True/False)
     │     soul + bootstrap Project Context (AGENTS.md, SOUL.md, TOOLS.md,
     │            USER.md, MEMORY.md, …) — read live every turn, no restart needed
     │          + <bootstrap_pending> guidance (if BOOTSTRAP.md present)
-    │          + <relevant_memories> (proactive search — top-5 snippets)
+    │          + <relevant_memories> (proactive search — top-5 snippets; fires MemoryInjected)
     │          + <active_task> (current task progress, if a task is active)
     │          + <context_budget> warning (if history > 50% of context window)
     │          + <available_skills> suffix
@@ -1533,7 +1533,6 @@ session = AgentSession(
     session_store=session_store,
     soul_suffix="",              # optional skills block appended each turn
     memory=memory_service,       # enables memory injection and background extraction
-    memory_injection_tokens=600, # token budget for proactive memory injection (default 600)
     enable_memory_extraction=True,  # False to suppress the background extraction API call
 )
 
@@ -1558,7 +1557,7 @@ md = session.export(format="md")   # "md" (default) or "html"
 ```
 
 When `memory` is provided, `AgentSession`:
-- Searches memory before each turn and injects the top-5 matching snippets as a `<relevant_memories>` block (capped at `memory_injection_tokens * 4` characters).
+- Searches memory before each turn (via `build_prompt_section()` — see "Prompt injection" under the `memory` module reference below) and injects the top-5 matching snippets as a `<relevant_memories>` block, bounded by a real per-agent token budget computed from the model's context window (~0.77%, floor 100 / ceiling 8 000 tokens) — not a char-count heuristic.
 - Fires background fact extraction after each successful turn — enqueues a durable `memory_capture_jobs` row for `CaptureWorker` if a database is configured, otherwise falls back to a fire-and-forget daemon thread (never blocks the REPL either way). Can be disabled via `enable_memory_extraction=False` (or `config.json` `"memory": {"enable_extraction": false}`).
 
 (Stable user-profile injection — formerly a separate `<user_context>` block loaded once at init from a `user_context` note — is handled by `bootstrap.py`'s live `USER.md` mechanism instead; see the `memory` module reference below.)
@@ -1990,6 +1989,18 @@ service.flush_head(head)   # FlushOutcome(status="flushed"|"empty"|"failed", det
 One `MemoryService` per agent, each wrapping a repository rooted at that agent's own workspace directory, is the entire scope-enforcement story for now — Stage One's target design names several memory scopes (agent-private, user-shared, workspace, session-lineage, channel, import-quarantine), but only `agent-private` has a real caller today, so that's the only one enforced.
 
 **Retired: the `user_context` reserved key.** `AgentSession` used to load a separate `user_context.md` note once at construction and inject it as a static `<user_context>` block. That duplicated `bootstrap.py`'s live `USER.md` injection once Phase 0 migrated `user_context.md` → `USER.md`, so it was removed in Phase 1 — write to `USER.md` directly (or via the `write`/`edit` tools) to give the agent persistent background about yourself; it's re-read live every turn, no restart needed.
+
+#### Prompt injection (`agents/session.py`'s `build_prompt_section()`) — Stage One Phase 4, slice D
+
+Replaces the old `_inject_relevant_memories()`: a real per-agent token budget (computed once at construction — see above — checked with the same estimator `context.py` uses for compaction, not a 4-chars-per-token guess), a citation (`path:start-end`) on any hit that came from the lexical/hybrid index, and a source label per snippet:
+
+```
+[durable] project-goals (memory/topics/project-goals.md:1-5): Ship it this quarter.
+```
+
+`AgentSession.send()` fires a `MemoryInjected` event (`keys`, `context_generation`, `token_count`) whenever the block is non-empty. This is purely observational, not a mechanism that changes what gets injected — verified by reading OpenClaw's own `plugins/memory-state.ts` (the design this phase is modeled on): it rebuilds its memory prompt section fresh on every call too, with no cross-turn dedup or suppression. The injected block here is never written into `AgentSession._history`, so a past turn's injection is never visible to the model on a later turn regardless of whether this turn re-injects the same content — skipping a still-relevant re-injection would only make the model lose context it needs *now*, not save it something it already has.
+
+`AgentSession._context_generation` (starts at 0) increments on `reset()` and after any successful compaction (both the automatic path in `send()` and the manual `/compact` command) — each `MemoryInjected` event carries the generation it fired in, so a consumer can tell "these were injected in the same stretch of history" from "context has since been reset/compacted." A forked session starts its own count at 0 rather than inheriting the parent's — `fork()` only writes history/session-store state to disk, and the child's `AgentSession` object (constructed later, when something switches to it) begins an independently tracked branch; the parent/child relationship is already preserved via `SessionInfo.parent_id`, so threading the counter through a disk round-trip would just duplicate that lineage tracking for no behavioral benefit.
 
 #### Background extractor (`extractor.py`) and durable capture (`capture_worker.py`)
 

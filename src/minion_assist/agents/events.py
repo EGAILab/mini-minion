@@ -223,6 +223,43 @@ class MemoryFlushed:
     detail: str = ""
 
 
+@dataclass
+class MemoryInjected:
+    """Emitted when ``build_prompt_section()`` injects memory (Stage One Phase 4, slice D).
+
+    Purely observational — a record of what was actually placed in this
+    turn's system prompt, not a mechanism that changes what gets injected.
+    OpenClaw's own memory prompt builder (verified by reading
+    ``plugins/memory-state.ts``) has no cross-turn dedup/suppression
+    either: it rebuilds the section fresh on every call. The injected block
+    here is never stored in ``AgentSession._history``, so a past turn's
+    injection is not visible to the model on a later turn regardless —
+    skipping a still-relevant re-injection would only make the model lose
+    context it needs *now*, not save it something it already has. This
+    event exists so *what* was injected, and in which context generation,
+    is inspectable (e.g. in tests or structured logs) without changing
+    that behavior.
+
+    Attributes:
+        keys: The injected notes' keys, in injection order.
+        context_generation: :attr:`AgentSession._context_generation` at
+            injection time — increments on :meth:`AgentSession.reset` and
+            after a successful compaction, so this event's consumer can
+            tell "these were injected in the same stretch of history" from
+            "context has since been reset/compacted." A forked session
+            starts its own count at 0 rather than inheriting the parent's —
+            forking begins an independently tracked branch (the parent/child
+            relationship remains visible via ``SessionInfo.parent_id``, not
+            via this counter).
+        token_count: Approximate token cost of the injected block (the
+            real token budget check that replaced the old 4-chars-per-token
+            heuristic).
+    """
+    keys: tuple[str, ...]
+    context_generation: int
+    token_count: int
+
+
 # ---------------------------------------------------------------------------
 # Hook event objects — used by ToolRegistry's plugin-facing hook system.
 # ---------------------------------------------------------------------------
