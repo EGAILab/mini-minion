@@ -88,6 +88,7 @@ def _cleanup_after(index, agent_id):
     conn.execute("DELETE FROM memory_files_shadow WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_pins WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_recall_events WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM memory_consolidation_previews WHERE agent_id = %s", (agent_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -1080,3 +1081,74 @@ def test_hybrid_search_uses_the_same_query_hash_as_a_manual_mark_injected_call(i
 
     stats = index.recall_stats(agent_id, "MEMORY.md")
     assert stats["injected_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Consolidation previews (Stage One Phase 5, slice C)
+# ---------------------------------------------------------------------------
+
+def test_record_consolidation_preview_returns_a_new_id_each_time(index, agent_id):
+    first_id = index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Drafted content.", "New preference."
+    )
+    second_id = index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Different draft.", "Redrafted."
+    )
+
+    assert first_id != second_id
+
+
+def test_list_consolidation_previews_returns_everything_for_the_agent(index, agent_id):
+    index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Draft one.", "Reason one."
+    )
+    index.record_consolidation_preview(
+        agent_id, 2, "revise_topic", "project-goals", "abc123", "Draft two.", "Reason two."
+    )
+
+    previews = index.list_consolidation_previews(agent_id)
+
+    assert {p["proposal_id"] for p in previews} == {1, 2}
+
+
+def test_list_consolidation_previews_restricts_to_one_proposal(index, agent_id):
+    index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Draft one.", "Reason one."
+    )
+    index.record_consolidation_preview(
+        agent_id, 2, "revise_topic", "project-goals", "abc123", "Draft two.", "Reason two."
+    )
+
+    previews = index.list_consolidation_previews(agent_id, proposal_id=1)
+
+    assert [p["proposal_id"] for p in previews] == [1]
+
+
+def test_list_consolidation_previews_returns_newest_first(index, agent_id):
+    first_id = index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "First draft.", "First."
+    )
+    second_id = index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Second draft.", "Second."
+    )
+
+    previews = index.list_consolidation_previews(agent_id, proposal_id=1)
+
+    assert [p["id"] for p in previews] == [second_id, first_id]
+
+
+def test_list_consolidation_previews_is_empty_for_an_agent_with_none(index, agent_id):
+    assert index.list_consolidation_previews(agent_id) == []
+
+
+def test_consolidation_previews_do_not_leak_across_agents(index, agent_id):
+    other_agent = f"other-{agent_id}"
+    index.record_consolidation_preview(
+        other_agent, 1, "new_topic", "dark-mode", "", "Draft.", "Reason."
+    )
+    try:
+        assert index.list_consolidation_previews(agent_id) == []
+    finally:
+        index._conn().execute(
+            "DELETE FROM memory_consolidation_previews WHERE agent_id = %s", (other_agent,)
+        )

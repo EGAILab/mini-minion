@@ -1294,6 +1294,25 @@ Every proposal `CaptureWorker` records (`memory_proposals`, Phase 2 slice C) is 
 
 `minion-assist memory search --corpus proposal` and `search_memory`/`MemoryService.search(corpus="proposal")` are how a caller deliberately looks at unreviewed proposals.
 
+### Consolidation ranking and preview drafting (Stage One Phase 5, slice C)
+
+`memory/consolidation.py` turns pending proposals into a human-reviewable queue, without ever writing to disk or changing a proposal's status:
+
+`rank_proposals(db, index, agent_id)` scores every `status = 'pending'` proposal as `5 * injected_count + 2 * recall_count + unique_queries` (all from Phase 5 slice A's recall telemetry, looked up under the proposal's `proposals/{id}` rel_path from slice B) and sorts highest first — a proposal never recalled still appears, at the bottom (score `0`), rather than being hidden. This score only orders a review queue; nothing is gated on it.
+
+The plan's ranking task also lists confidence, source authority, contradiction status, and user pinning as signals — none of these exist yet in minion-assist (`extract_facts()` returns bare claim strings with no confidence; every proposal comes from the same capture pipeline; proposals aren't pinnable; and contradiction detection would need a new semantic-comparison step). These are documented, deliberate gaps in `consolidation.py`'s module docstring, not oversights — consistent with the plan's own "begin in preview-only mode; collect data before choosing thresholds."
+
+`MemoryConsolidator(db, index, files, provider).preview(agent_id, proposal_id)` drafts what a topic-note update *would* look like for one proposal:
+
+1. Searches existing topic notes only (`hybrid_search(..., corpus="durable")`, filtered to `memory/topics/` hits — never `MEMORY.md`, daily notes, or imports) for a merge target. No score threshold is applied — the first topic-note hit becomes the target, or there is none and the draft proposes a new topic. A wrong guess here only produces a preview a human can discard; nothing is ever applied automatically.
+2. Calls the provider with a fixed drafting prompt containing only the proposal's claim text and the target's current content (or nothing, for a new topic) — asking for a `KEY:`/`RATIONALE:`/`---`/content-formatted response with the full revised note text.
+3. The prompt explicitly instructs the model to keep contradicting statements marked as contested rather than silently resolve them — the plan's "contradictory preferences ... never merged into a false synthesis" acceptance criterion, satisfied at the drafting-prompt level in this slice.
+4. Stores the result via `PostgresMemoryIndex.record_consolidation_preview()` — a new `memory_consolidation_previews` row, hashing the target's content **at draft time** (`based_on_content_hash`) so a later apply step can detect a human edit made since. Nothing is written to any actual note file.
+
+**Evidence provenance (Task 8).** `consolidation.py` never reads `DREAMS.md` or any `DreamingScheduler` state — a draft's only inputs are a proposal's claim text (traceable through its `job_id` to real captured messages) and the merge target's existing content (the thing being revised, not "evidence" for the new claim). `tests/memory/test_consolidation.py` pins this down with an explicit regression test asserting the drafting prompt only ever contains those two inputs.
+
+`format_preview_report(preview)` renders a preview as plain text (candidate, rationale, target, drafted content) with `Decision: pending review` — nothing decides anything in this slice. CLI commands (`memory consolidate preview/list/explain/approve/reject/rollback`) and the actual apply/rollback logic are a later slice, built on top of these stored preview rows.
+
 ### `session_search` Tool Modes
 
 | Mode | Description |

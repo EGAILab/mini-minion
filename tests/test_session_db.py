@@ -353,6 +353,47 @@ def test_complete_capture_job_with_no_proposals_returns_empty_list(db, session_i
     assert new_proposals == []
 
 
+def test_list_pending_proposals_returns_only_pending_ones(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+    new_proposals = db.complete_capture_job(
+        job_id, ["User prefers dark mode.", "User's dog is named Biscuit."]
+    )
+    db._conn().execute(
+        "UPDATE memory_proposals SET status = 'promoted' WHERE id = %s", (new_proposals[0]["id"],)
+    )
+
+    pending = db.list_pending_proposals("main")
+
+    pending_ids = {p["id"] for p in pending}
+    assert new_proposals[0]["id"] not in pending_ids
+    assert new_proposals[1]["id"] in pending_ids
+
+
+def test_list_pending_proposals_scopes_to_the_given_agent(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+    db.complete_capture_job(job_id, ["A fact about main."])
+
+    assert db.list_pending_proposals(f"other-{session_id}") == []
+
+
+def test_get_proposal_returns_the_matching_row(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+    new_proposals = db.complete_capture_job(job_id, ["User prefers dark mode."])
+
+    proposal = db.get_proposal(new_proposals[0]["id"])
+
+    assert proposal["claim_text"] == "User prefers dark mode."
+    assert proposal["status"] == "pending"
+    assert proposal["job_id"] == job_id
+
+
+def test_get_proposal_returns_none_for_an_unknown_id(db):
+    assert db.get_proposal(-1) is None
+
+
 def test_new_proposal_defaults_to_pending_status(db, session_id):
     # Stage One Phase 5, slice B: the status column (used by Phase 5 slice
     # D's consolidation review) defaults to "pending" for every existing

@@ -767,3 +767,61 @@ class SessionDB:
             """,
             (state, attempts, now + backoff_seconds, error, now, job_id),
         )
+
+    def list_pending_proposals(self, agent_id: str) -> list[dict]:
+        """List every not-yet-reviewed proposal for one agent, oldest first.
+
+        Stage One Phase 5, slice C: the source list
+        ``memory/consolidation.py``'s ``rank_proposals`` scores and orders
+        into a review queue. Only ``status = 'pending'`` rows are returned —
+        a proposal already ``promoted``/``rejected``/``superseded`` (a later
+        slice's review flow assigns these) has already been decided and
+        shouldn't be re-offered for review.
+
+        Args:
+            agent_id: Which agent's proposals to list.
+
+        Returns:
+            list[dict]: ``{"id", "job_id", "agent_id", "claim_text",
+                "created_at"}`` dicts, ordered by ``id`` (oldest first).
+        """
+        rows = self._conn().execute(
+            """
+            SELECT id, job_id, agent_id, claim_text, created_at
+            FROM memory_proposals
+            WHERE agent_id = %s AND status = 'pending'
+            ORDER BY id
+            """,
+            (agent_id,),
+        ).fetchall()
+        return [
+            {"id": r[0], "job_id": r[1], "agent_id": r[2], "claim_text": r[3], "created_at": r[4]}
+            for r in rows
+        ]
+
+    def get_proposal(self, proposal_id: int) -> dict | None:
+        """Look up one proposal by id.
+
+        Stage One Phase 5, slice C: ``MemoryConsolidator.preview()`` needs a
+        single proposal's claim text and status without listing every
+        pending proposal first.
+
+        Returns:
+            dict | None: ``{"id", "job_id", "agent_id", "claim_text",
+                "created_at", "status"}``, or ``None`` if no proposal with
+                this id exists.
+        """
+        row = self._conn().execute(
+            """
+            SELECT id, job_id, agent_id, claim_text, created_at, status
+            FROM memory_proposals
+            WHERE id = %s
+            """,
+            (proposal_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "job_id": row[1], "agent_id": row[2], "claim_text": row[3],
+            "created_at": row[4], "status": row[5],
+        }

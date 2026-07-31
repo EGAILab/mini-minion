@@ -352,6 +352,37 @@ class PostgresMemoryIndex:
             "ON memory_recall_events (agent_id, rel_path)"
         )
 
+        # Consolidation previews — Stage One Phase 5, slice C. A row is a
+        # draft, never an applied change: MemoryConsolidator.preview() never
+        # writes to disk, it only records what it *would* write, for a human
+        # to review (a later slice adds apply/reject/rollback on top of
+        # these rows). No FOREIGN KEY to memory_proposals — this codebase
+        # never declares cross-table FKs (see memory_proposals.job_id for
+        # the same plain-BIGINT precedent), partly because memory_proposals
+        # is owned by session/db.py's SessionDB, a separate connection/class
+        # entirely. based_on_content_hash captures the target file's content
+        # hash *at preview time* — Task 6's "detect human edits before
+        # applying a stale proposal" needs to compare this against the
+        # file's hash again at apply time, which only works if it was
+        # captured when the preview was drafted, not reconstructed later.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_consolidation_previews (
+                id                    BIGSERIAL PRIMARY KEY,
+                agent_id              TEXT NOT NULL,
+                proposal_id           BIGINT NOT NULL,
+                target_kind           TEXT NOT NULL,
+                target_key            TEXT NOT NULL,
+                based_on_content_hash TEXT NOT NULL,
+                drafted_content       TEXT NOT NULL,
+                rationale             TEXT NOT NULL,
+                created_at            DOUBLE PRECISION NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_consolidation_previews_proposal_idx "
+            "ON memory_consolidation_previews (agent_id, proposal_id)"
+        )
+
         # Shadow copies of both tables above, same shape — scratch space for
         # force_rebuild_agent()'s crash-safe rebuild-and-swap (Stage One
         # Phase 3, slice C). See that method's docstring for the swap
@@ -1391,6 +1422,95 @@ class PostgresMemoryIndex:
             "injected_count": sum(1 for r in rows if r[1]),
             "last_recalled_at": max(r[2] for r in rows),
         }
+
+    # ------------------------------------------------------------------
+    # Consolidation previews — Stage One Phase 5, slice C
+    # ------------------------------------------------------------------
+
+    def record_consolidation_preview(
+        self,
+        agent_id: str,
+        proposal_id: int,
+        target_kind: str,
+        target_key: str,
+        based_on_content_hash: str,
+        drafted_content: str,
+        rationale: str,
+    ) -> int:
+        """Store one drafted consolidation preview — never applied, only recorded.
+
+        Called by :class:`~minion_assist.memory.consolidation.MemoryConsolidator`'s
+        ``preview()``. Every call inserts a new row rather than upserting —
+        a proposal can be re-previewed after its target note changes, and
+        keeping every draft lets a later slice's ``rollback``/``explain``
+        commands see the full history rather than only the latest attempt.
+
+        Args:
+            agent_id: The agent this preview belongs to.
+            proposal_id: Which ``memory_proposals`` row this drafts from.
+            target_kind: ``"new_topic"`` or ``"revise_topic"``.
+            target_key: The topic note key this would create/revise.
+            based_on_content_hash: SHA256 of the target's content at the
+                moment this preview was drafted (``""`` for a new topic) —
+                lets a later apply step detect a human edit made since.
+            drafted_content: The full proposed note content.
+            rationale: One or two sentences explaining the draft.
+
+        Returns:
+            int: The new preview row's id.
+        """
+        row = self._conn().execute(
+            """
+            INSERT INTO memory_consolidation_previews
+                (agent_id, proposal_id, target_kind, target_key,
+                 based_on_content_hash, drafted_content, rationale, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                agent_id, proposal_id, target_kind, target_key,
+                based_on_content_hash, drafted_content, rationale, time.time(),
+            ),
+        ).fetchone()
+        return row[0]
+
+    def list_consolidation_previews(
+        self, agent_id: str, proposal_id: int | None = None
+    ) -> list[dict]:
+        """List consolidation previews for one agent, most recent first.
+
+        Args:
+            agent_id: Which agent's previews to list.
+            proposal_id: Restrict to one proposal's previews, or ``None``
+                for every preview belonging to the agent.
+
+        Returns:
+            list[dict]: ``{"id", "agent_id", "proposal_id", "target_kind",
+                "target_key", "based_on_content_hash", "drafted_content",
+                "rationale", "created_at"}`` dicts, newest first.
+        """
+        proposal_sql = " AND proposal_id = %s" if proposal_id is not None else ""
+        params: list = [agent_id]
+        if proposal_id is not None:
+            params.append(proposal_id)
+        rows = self._conn().execute(
+            f"""
+            SELECT id, agent_id, proposal_id, target_kind, target_key,
+                   based_on_content_hash, drafted_content, rationale, created_at
+            FROM memory_consolidation_previews
+            WHERE agent_id = %s {proposal_sql}
+            ORDER BY created_at DESC
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "agent_id": r[1], "proposal_id": r[2], "target_kind": r[3],
+                "target_key": r[4], "based_on_content_hash": r[5], "drafted_content": r[6],
+                "rationale": r[7], "created_at": r[8],
+            }
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Embedding cache — Stage One Phase 4, slices A & C
