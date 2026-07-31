@@ -146,6 +146,92 @@ def test_process_one_backoff_grows_with_attempts():
 
 
 # ---------------------------------------------------------------------------
+# index_proposal wiring (Stage One Phase 5, slice B)
+# ---------------------------------------------------------------------------
+
+def test_process_one_indexes_each_new_proposal():
+    db = Mock()
+    db.claim_next_capture_job = Mock(return_value=_job())
+    db.get_messages_in_range = Mock(return_value=[
+        {"id": 10, "role": "user", "content": "I like tea", "tool_name": None, "timestamp": 1.0},
+    ])
+    db.complete_capture_job = Mock(return_value=[
+        {"id": 501, "agent_id": "main", "claim_text": "User prefers tea over coffee."},
+    ])
+    indexed = []
+    worker = CaptureWorker(
+        db,
+        provider_for_agent=lambda agent_id: _provider_returning("User prefers tea over coffee."),
+        index_proposal=lambda agent_id, proposal_id, claim_text: indexed.append(
+            (agent_id, proposal_id, claim_text)
+        ),
+    )
+
+    worker._process_one()
+
+    assert indexed == [("main", 501, "User prefers tea over coffee.")]
+
+
+def test_process_one_indexes_no_proposals_when_none_were_extracted():
+    db = Mock()
+    db.claim_next_capture_job = Mock(return_value=_job())
+    db.get_messages_in_range = Mock(return_value=[])
+    db.complete_capture_job = Mock(return_value=[])
+    indexed = []
+    worker = CaptureWorker(
+        db,
+        provider_for_agent=lambda agent_id: _provider_returning("NOTHING"),
+        index_proposal=lambda agent_id, proposal_id, claim_text: indexed.append(proposal_id),
+    )
+
+    worker._process_one()
+
+    assert indexed == []
+
+
+def test_process_one_does_not_index_when_index_proposal_is_not_configured():
+    # Default (index_proposal=None) — no lexical index configured. Must not
+    # raise even though complete_capture_job returns real proposal rows.
+    db = Mock()
+    db.claim_next_capture_job = Mock(return_value=_job())
+    db.get_messages_in_range = Mock(return_value=[])
+    db.complete_capture_job = Mock(return_value=[
+        {"id": 501, "agent_id": "main", "claim_text": "User prefers tea over coffee."},
+    ])
+    worker = CaptureWorker(db, provider_for_agent=lambda agent_id: _provider_returning("NOTHING"))
+
+    processed = worker._process_one()
+
+    assert processed is True  # must not raise
+
+
+def test_process_one_treats_the_job_as_successful_even_if_indexing_fails():
+    # Best-effort: an indexing failure must not turn an already-successful
+    # capture job into a failed one — the proposal is already safely
+    # recorded by complete_capture_job before indexing is attempted.
+    db = Mock()
+    db.claim_next_capture_job = Mock(return_value=_job())
+    db.get_messages_in_range = Mock(return_value=[])
+    db.complete_capture_job = Mock(return_value=[
+        {"id": 501, "agent_id": "main", "claim_text": "User prefers tea over coffee."},
+    ])
+
+    def _broken_index(agent_id, proposal_id, claim_text):
+        raise RuntimeError("index unavailable")
+
+    worker = CaptureWorker(
+        db,
+        provider_for_agent=lambda agent_id: _provider_returning("NOTHING"),
+        index_proposal=_broken_index,
+    )
+
+    processed = worker._process_one()
+
+    assert processed is True
+    db.fail_capture_job.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # start / stop lifecycle
 # ---------------------------------------------------------------------------
 

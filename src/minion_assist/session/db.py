@@ -15,8 +15,11 @@ Schema (created automatically on first connect):
            source_to_message_id, idempotency_key, state, attempts, run_after,
            last_error, created_at, updated_at) — durable extraction queue
            (Stage One Phase 2, slice C)
-  memory_proposals(id, job_id, agent_id, claim_text, created_at) — structured,
-           unreviewed extraction output (Stage One Phase 2, slice C)
+  memory_proposals(id, job_id, agent_id, claim_text, created_at, status) —
+           structured, unreviewed extraction output (Stage One Phase 2,
+           slice C); status (Stage One Phase 5, slice B) defaults to
+           "pending" until a later slice's review flow assigns
+           "promoted"/"rejected"/"superseded"
 
 Durable capture jobs (Stage One Phase 2, slice C)
 ----------------------------------------------------
@@ -222,9 +225,19 @@ class SessionDB:
                 job_id     BIGINT NOT NULL,
                 agent_id   TEXT NOT NULL,
                 claim_text TEXT NOT NULL,
-                created_at DOUBLE PRECISION NOT NULL
+                created_at DOUBLE PRECISION NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'pending'
             )
         """)
+        # status added in Stage One Phase 5, slice B — ADD COLUMN IF NOT
+        # EXISTS so a database that already has this table from Phase 2
+        # picks it up without a manual migration. Values: "pending" (not
+        # yet reviewed), "promoted"/"rejected"/"superseded" (Phase 5 slice
+        # D's consolidation review will assign these; nothing does yet).
+        conn.execute(
+            "ALTER TABLE memory_proposals ADD COLUMN IF NOT EXISTS "
+            "status TEXT NOT NULL DEFAULT 'pending'"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS proposals_agent_idx ON memory_proposals (agent_id)"
         )
@@ -686,7 +699,7 @@ class SessionDB:
             "attempts": row[5],
         }
 
-    def complete_capture_job(self, job_id: int, proposals: list[str]) -> None:
+    def complete_capture_job(self, job_id: int, proposals: list[str]) -> list[dict]:
         """Mark a capture job done and record its extracted proposals.
 
         Args:
@@ -694,6 +707,13 @@ class SessionDB:
             proposals: 0 or more extracted claim strings. An empty list is a
                 normal, successful outcome ("nothing worth remembering this
                 time"), not a failure.
+
+        Returns:
+            list[dict]: One ``{"id", "agent_id", "claim_text"}`` per newly
+                inserted proposal row, in the same order as ``proposals``.
+                Stage One Phase 5, slice B: :class:`~minion_assist.memory.capture_worker.CaptureWorker`
+                uses these ids to index each new proposal as searchable
+                right after this call returns, without a second query.
         """
         now = time.time()
         conn = self._conn()
@@ -701,18 +721,22 @@ class SessionDB:
             "SELECT agent_id FROM memory_capture_jobs WHERE id = %s", (job_id,)
         ).fetchone()
         agent_id = job_row[0] if job_row else ""
+        new_proposals = []
         for claim in proposals:
-            conn.execute(
+            row = conn.execute(
                 """
                 INSERT INTO memory_proposals (job_id, agent_id, claim_text, created_at)
                 VALUES (%s, %s, %s, %s)
+                RETURNING id
                 """,
                 (job_id, agent_id, claim, now),
-            )
+            ).fetchone()
+            new_proposals.append({"id": row[0], "agent_id": agent_id, "claim_text": claim})
         conn.execute(
             "UPDATE memory_capture_jobs SET state = 'done', updated_at = %s WHERE id = %s",
             (now, job_id),
         )
+        return new_proposals
 
     def fail_capture_job(
         self, job_id: int, error: str, backoff_seconds: float, max_attempts: int = 5

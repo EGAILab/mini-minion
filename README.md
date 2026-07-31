@@ -1153,7 +1153,7 @@ job = db.claim_next_capture_job()   # SELECT ... FOR UPDATE SKIP LOCKED
 
 `extract_facts(provider, exchange)` (`memory/extractor.py`) is the shared prompt/parsing primitive both the degraded-mode daemon thread and `CaptureWorker` call — but the two wrap it differently on purpose. The daemon thread swallows provider exceptions (fire-and-forget best-effort). `CaptureWorker` lets them propagate, since its own retry/backoff loop needs to see the failure to reschedule the job.
 
-**Known, accepted gap:** `memory_proposals` rows are not yet surfaced anywhere — not in `search_memory`, not in `<relevant_memories>` injection. They sit inert until Stage One Phase 5 (consolidation) exists to review and promote them into curated notes. This is a deliberate scope boundary for slice C, not an oversight — see `minion-assist-docs/improve/memory-implementation-plan.md`.
+**Known, accepted gap (updated Phase 5, slice B):** `memory_proposals` rows are now indexed as searchable (see "Proposals become searchable" below), but stay out of `search_memory` and `<relevant_memories>` injection by default — reachable only via an explicit `corpus="proposal"` query. They sit unreviewed until Stage One Phase 5's later slices add a review/promotion flow.
 
 Without a configured database, `CaptureWorker` is never constructed and `AgentSession` falls back to the original per-turn daemon-thread path described above (`extract_and_save_async`).
 
@@ -1163,7 +1163,7 @@ Without a configured database, `CaptureWorker` is never constructed and `AgentSe
 
 | Table | Description |
 |---|---|
-| `memory_chunks` | One row per indexed chunk. Columns: `id` (BIGSERIAL), `agent_id`, `source_kind` (`durable`/`daily`/`import`), `rel_path`, `chunk_index`, `heading_path`, `content`, `start_line`, `end_line`, `chunk_hash`, `search_vector` (weighted: heading text at FTS weight `A`, body at `B`). |
+| `memory_chunks` | One row per indexed chunk. Columns: `id` (BIGSERIAL), `agent_id`, `source_kind` (`durable`/`daily`/`import`, plus `proposal` since Phase 5 slice B), `rel_path`, `chunk_index`, `heading_path`, `content`, `start_line`, `end_line`, `chunk_hash`, `search_vector` (weighted: heading text at FTS weight `A`, body at `B`). |
 | `memory_files` | Per-file reconciliation ledger, `PRIMARY KEY (agent_id, rel_path)`. Same role as `message_mirrors` above: lets a later slice diff "what's on disk" against "what's indexed" by content hash rather than reindexing everything unconditionally. |
 | `memory_chunks_shadow`, `memory_files_shadow` | Scratch space for `force_rebuild_agent()`'s crash-safe rebuild-and-swap (Stage One Phase 3, slice C) — same shape as the tables above, minus the generated `search_vector` (never searched directly). Empty except during/just after a `minion-assist memory reindex --force` run. |
 
@@ -1185,7 +1185,7 @@ Without a configured database, none of the above run: `_memory_index`/`_memory_w
 
 ### Search, citations, and crash-safe reindex (Stage One Phase 3, slice C)
 
-`MemoryService.search()` now uses the lexical index when one is configured — a strictly larger corpus than the Phase 1 linear scan, since the index also covers root `MEMORY.md` (the linear scan never returns it at all). Each hit is a `MemoryHit` as before, now optionally carrying `rel_path`/`start_line`/`end_line`/`score` when it came from the index (`None` for a linear-scan hit). Pass `corpus="durable"|"daily"|"import"` to restrict results to one part of the memory root; the plan's fourth corpus, "sessions", is deliberately not offered here since it's already the separate `session_search` tool's job.
+`MemoryService.search()` now uses the lexical index when one is configured — a strictly larger corpus than the Phase 1 linear scan, since the index also covers root `MEMORY.md` (the linear scan never returns it at all). Each hit is a `MemoryHit` as before, now optionally carrying `rel_path`/`start_line`/`end_line`/`score` when it came from the index (`None` for a linear-scan hit). Pass `corpus="durable"|"daily"|"import"` to restrict results to one part of the memory root (`"proposal"` also works since Phase 5 slice B, but is excluded from the default `corpus=None` search — see "Proposals become searchable" below); the plan's fourth corpus, "sessions", is deliberately not offered here since it's already the separate `session_search` tool's job.
 
 **Fallback behavior:** without a configured database, or if an index search call raises (e.g. a transient connection drop), `search()` falls back to the Phase 1 linear scan rather than failing the caller — a turn's `<relevant_memories>` injection must never break over a database hiccup. This fallback is not silent: a failed index search is logged at `WARNING`, and `deep_status()`/`memory status --deep` surface ongoing index health so a persistently broken index isn't invisible.
 
@@ -1279,6 +1279,20 @@ minion-assist memory pins --agent main                  # list pinned notes
 `hash_query()` normalizes (lowercase, collapsed whitespace) and hashes the query before storing it — Task 2: "hash normalized queries rather than storing unnecessary raw query text." Both `hybrid_search()`'s recording and `mark_injected()`'s later correlating call use this same function, so they agree on what counts as "the same query." `recall_stats(agent_id, rel_path)` aggregates `recall_count`, `unique_queries` (distinct query hashes — Task 3's "query diversity"), `injected_count`, and `last_recalled_at` — the primitive Phase 5 slice C's promotion ranking will consume.
 
 All of this is best-effort and never blocks a search or a turn: a failed telemetry write is logged and swallowed, matching every other observability hook in this codebase (`_sync_index`, `MemoryInjected`).
+
+### Proposals become searchable (Stage One Phase 5, slice B)
+
+Every proposal `CaptureWorker` records (`memory_proposals`, Phase 2 slice C) is now also indexed into `PostgresMemoryIndex` right after it's created, under a new `source_kind = "proposal"` and a synthetic `rel_path` of `proposals/{proposal_id}` (a proposal has no real file on disk). This is what lets Phase 5's later consolidation-ranking slice reuse the same recall-telemetry machinery (`hash_query`/`recall_stats`) on proposals that already exists for real notes.
+
+**Gated, not just indexed.** Making proposals searchable does **not** mean they show up in normal conversation. `hybrid_search()`'s corpus-agnostic default (`corpus=None`) explicitly excludes `source_kind = "proposal"` chunks — every lane (lexical, path, vector) adds `AND source_kind != 'proposal'` unless the caller passes `corpus="proposal"` explicitly. Per-turn `<relevant_memories>` injection and a normal `search_memory` call never pass that, so an unreviewed proposal can never masquerade as a reviewed note in the model's context. (The pinned and recent lanes need no such guard: pins can only ever point at topic notes, and the recent lane only surfaces files with a `memory_files` ledger row — which proposals deliberately never get, see below.)
+
+**No reconciliation ledger row.** Unlike a real file, a proposal never gets a `memory_files` row: that ledger exists to hash-diff indexed content against on-disk content (`reconcile_agent()`), which doesn't apply to a proposal — it's written once and never edited in place. Because it has no ledger row, `rebuild_agent()`/`reconcile_agent()` (which only ever look at `memory_files`) never touch it; `force_rebuild_agent()`'s crash-safe live-swap explicitly excludes `source_kind = 'proposal'` from the ledger-driven DELETE it does for files, so a force-rebuild (a files-only operation) can never wipe out proposal chunks that happen to share the same `memory_chunks` table.
+
+`PostgresMemoryIndex.reindex_proposal(agent_id, proposal_id, claim_text)` / `remove_proposal(agent_id, proposal_id)` are the indexing primitives. `CaptureWorker` takes an optional `index_proposal` callable (`minion.py` wires it to `PostgresMemoryIndex.reindex_proposal` when a lexical index is configured, `None` otherwise — proposals are still recorded either way, just not searchable without an index) and calls it, best-effort, for every proposal `complete_capture_job()` just created; an indexing failure is logged and swallowed, never turning an already-successful capture job into a failed one.
+
+`memory_proposals` also gained a `status` column (`TEXT NOT NULL DEFAULT 'pending'`, added via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so an existing database picks it up automatically) — `pending`/`promoted`/`rejected`/`superseded`. Nothing assigns anything but `pending` yet; a later Phase 5 slice's review flow will.
+
+`minion-assist memory search --corpus proposal` and `search_memory`/`MemoryService.search(corpus="proposal")` are how a caller deliberately looks at unreviewed proposals.
 
 ### `session_search` Tool Modes
 

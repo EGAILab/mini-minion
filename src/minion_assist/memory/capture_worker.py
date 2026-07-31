@@ -5,13 +5,23 @@ a database is configured. One long-running background thread — started
 once at process startup, not per turn — polls ``memory_capture_jobs`` for
 due work, extracts facts via the provider, and records them as
 ``memory_proposals``: structured, unreviewed claims, deliberately *not*
-written into any note file directly. Stage One Phase 5 (consolidation) will
-decide how/whether proposals get promoted into curated memory; until then
-they are inert — searchable only by querying the table directly, not through
-``search_memory`` or ``<relevant_memories>`` injection. This is a known,
-accepted gap for this slice (see
-``minion-assist-docs/improve/memory-implementation-plan.md``), not an
-oversight.
+written into any note file directly. Stage One Phase 5 (consolidation)
+decides how/whether proposals get promoted into curated memory; until a
+human approves one, it stays a proposal.
+
+Searchable, but gated (Stage One Phase 5, slice B)
+-----------------------------------------------------
+Each new proposal is also indexed into :class:`~minion_assist.memory.postgres_index.PostgresMemoryIndex`
+right after :meth:`~minion_assist.session.db.SessionDB.complete_capture_job`
+returns (via the optional ``index_proposal`` callable below), so Phase 5
+slice C's consolidation ranking can use recall telemetry
+(``hash_query``/``recall_stats``) on proposals the same way it does on
+notes. This does *not* mean proposals show up in normal conversation:
+``PostgresMemoryIndex.hybrid_search``'s corpus-agnostic default explicitly
+excludes ``source_kind = "proposal"`` chunks — they're reachable only via
+an explicit ``corpus="proposal"`` query (what Phase 5 slice C/D's
+consolidation review does), never through per-turn ``<relevant_memories>``
+injection or a normal ``search_memory`` call.
 
 Why one worker, not one thread per job?
 ------------------------------------------
@@ -32,7 +42,11 @@ Talks to
   primitive (this worker relies on it *raising* on provider failure, so its
   own retry/backoff loop can catch and reschedule the job).
 - ``minion.py`` — constructs one :class:`CaptureWorker` at startup (only
-  when a database is configured) and calls :meth:`start`/:meth:`stop`.
+  when a database is configured) and calls :meth:`start`/:meth:`stop`;
+  passes ``index_proposal=_memory_index.reindex_proposal`` when a lexical
+  index is also configured.
+- ``memory/postgres_index.py`` — :meth:`PostgresMemoryIndex.reindex_proposal`,
+  the typical ``index_proposal`` callable (Stage One Phase 5, slice B).
 - ``agents/session.py`` — enqueues jobs via
   :meth:`SessionDB.enqueue_capture_job` after each turn; does not touch this
   worker directly.
@@ -76,15 +90,26 @@ class CaptureWorker:
         provider_for_agent: Callable that returns the configured
             :class:`LLMProvider` for a given agent ID — the worker isn't
             tied to one agent, so it looks up the right provider per job.
+        index_proposal: Optional ``(agent_id, proposal_id, claim_text) ->
+            None`` callable — typically
+            :meth:`~minion_assist.memory.postgres_index.PostgresMemoryIndex.reindex_proposal`
+            (Stage One Phase 5, slice B). ``None`` (the default) when no
+            lexical index is configured: proposals are still recorded in
+            ``memory_proposals``, just not searchable until an index
+            exists. Passed in rather than imported directly, matching
+            ``provider_for_agent``'s own reasoning — this module stays
+            free of a direct dependency on ``postgres_index.py``.
     """
 
     def __init__(
         self,
         db: SessionDB,
         provider_for_agent: Callable[[str], LLMProvider],
+        index_proposal: Callable[[str, int, str], None] | None = None,
     ) -> None:
         self._db = db
         self._provider_for_agent = provider_for_agent
+        self._index_proposal = index_proposal
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -138,7 +163,21 @@ class CaptureWorker:
             ]
             provider = self._provider_for_agent(job["agent_id"])
             facts = extract_facts(provider, exchange)
-            self._db.complete_capture_job(job["id"], facts)
+            new_proposals = self._db.complete_capture_job(job["id"], facts)
+            if self._index_proposal is not None:
+                for proposal in new_proposals:
+                    try:
+                        self._index_proposal(
+                            proposal["agent_id"], proposal["id"], proposal["claim_text"]
+                        )
+                    except Exception as exc:
+                        # Best-effort: an indexing failure must never turn an
+                        # already-successful capture job into a failed one —
+                        # the proposal itself is already safely recorded.
+                        _log.debug(
+                            "Indexing proposal %s failed: %s: %s",
+                            proposal["id"], type(exc).__name__, exc,
+                        )
         except Exception as exc:
             _log.debug("Capture job %s failed: %s: %s", job["id"], type(exc).__name__, exc)
             backoff = _BACKOFF_BASE_SECONDS * (2 ** job["attempts"])

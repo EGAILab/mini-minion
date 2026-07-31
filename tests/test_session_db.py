@@ -321,6 +321,52 @@ def test_complete_capture_job_with_no_proposals_still_marks_done(db, session_id)
     assert state_row[0] == "done"
 
 
+def test_complete_capture_job_returns_new_proposal_ids_and_text(db, session_id):
+    # Stage One Phase 5, slice B: CaptureWorker needs each new proposal's id
+    # and claim text (without a second query) to index it as searchable
+    # right after this call returns.
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+
+    new_proposals = db.complete_capture_job(
+        job_id, ["User prefers dark mode.", "User's dog is named Biscuit."]
+    )
+
+    assert [p["claim_text"] for p in new_proposals] == [
+        "User prefers dark mode.", "User's dog is named Biscuit.",
+    ]
+    assert all(p["agent_id"] == "main" for p in new_proposals)
+    assert all(isinstance(p["id"], int) for p in new_proposals)
+    # ids must match what was actually inserted, not just be present
+    proposal_rows = db._conn().execute(
+        "SELECT id, claim_text FROM memory_proposals WHERE job_id = %s ORDER BY id", (job_id,)
+    ).fetchall()
+    assert [p["id"] for p in new_proposals] == [r[0] for r in proposal_rows]
+
+
+def test_complete_capture_job_with_no_proposals_returns_empty_list(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+
+    new_proposals = db.complete_capture_job(job_id, [])
+
+    assert new_proposals == []
+
+
+def test_new_proposal_defaults_to_pending_status(db, session_id):
+    # Stage One Phase 5, slice B: the status column (used by Phase 5 slice
+    # D's consolidation review) defaults to "pending" for every existing
+    # and newly-created proposal.
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+    db.complete_capture_job(job_id, ["User prefers dark mode."])
+
+    status_row = db._conn().execute(
+        "SELECT status FROM memory_proposals WHERE job_id = %s", (job_id,)
+    ).fetchone()
+    assert status_row[0] == "pending"
+
+
 def test_fail_capture_job_reschedules_with_backoff(db, session_id):
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()

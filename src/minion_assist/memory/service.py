@@ -231,10 +231,13 @@ class MemoryService:
         Args:
             query: One or more keywords, space-separated.
             max_results: Maximum notes/chunks to return.
-            corpus: Restrict to one corpus (``"durable"``, ``"daily"``, or
-                ``"import"``), or ``None`` to search everything. Only
-                affects the indexed path in practice — the deliberate
-                degraded-mode scope reduction. See :data:`_CORPUS_TO_LEGACY_SOURCE`.
+            corpus: Restrict to one corpus (``"durable"``, ``"daily"``,
+                ``"import"``, or ``"proposal"`` — Stage One Phase 5, slice
+                B; unreviewed capture-job proposals, only ever present
+                with a configured index), or ``None`` to search
+                everything. Only affects the indexed path in practice —
+                the deliberate degraded-mode scope reduction. See
+                :data:`_CORPUS_TO_LEGACY_SOURCE`.
 
         Returns:
             list[MemoryHit]: Best matches first, tagged by source. Hits from

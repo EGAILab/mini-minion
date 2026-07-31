@@ -528,6 +528,85 @@ class PostgresMemoryIndex:
             (agent_id, rel_path),
         )
 
+    # ------------------------------------------------------------------
+    # Proposal indexing — Stage One Phase 5, slice B
+    # ------------------------------------------------------------------
+
+    def reindex_proposal(self, agent_id: str, proposal_id: int, claim_text: str) -> int:
+        """Index one unreviewed capture-job proposal as a searchable chunk.
+
+        Makes ``memory_proposals`` rows (``session/db.py``'s ``SessionDB``)
+        reachable through the same lexical/hybrid search as real memory
+        files, so Phase 5 slice C's consolidation ranking can use recall
+        telemetry (:func:`hash_query`, :meth:`recall_stats`) on proposals
+        the same way it does on notes.
+
+        A proposal has no file on disk, so it gets a synthetic
+        ``rel_path`` (``"proposals/{proposal_id}"``) instead of a real
+        one, and deliberately gets no ``memory_files`` ledger row: that
+        ledger exists to reconcile indexed chunks against on-disk content
+        (see :meth:`reconcile_agent`), which doesn't apply here — a
+        proposal is written once, by
+        :class:`~minion_assist.memory.capture_worker.CaptureWorker`, and
+        never edited in place. Because it has no ledger row,
+        :meth:`rebuild_agent`/:meth:`reconcile_agent` (which only ever
+        look at ``memory_files`` rows) never touch it; :meth:`force_rebuild_agent`'s
+        live-swap DELETE explicitly excludes ``source_kind = 'proposal'``
+        rows for the same reason.
+
+        Args:
+            agent_id: The agent the proposal belongs to.
+            proposal_id: ``memory_proposals.id`` (returned by
+                :meth:`~minion_assist.session.db.SessionDB.complete_capture_job`).
+            claim_text: The proposal's claim text.
+
+        Returns:
+            int: How many chunks were written (a proposal's claim text is
+                short — almost always 1 — but :func:`chunk_markdown` is
+                reused unconditionally rather than special-cased).
+        """
+        conn = self._conn()
+        rel_path = f"proposals/{proposal_id}"
+        conn.execute(
+            "DELETE FROM memory_chunks WHERE agent_id = %s AND rel_path = %s",
+            (agent_id, rel_path),
+        )
+        chunks = chunk_markdown(claim_text)
+        for i, chunk in enumerate(chunks):
+            conn.execute(
+                """
+                INSERT INTO memory_chunks
+                    (agent_id, source_kind, rel_path, chunk_index, heading_path,
+                     content, start_line, end_line, chunk_hash)
+                VALUES (%s, 'proposal', %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    agent_id,
+                    rel_path,
+                    i,
+                    " > ".join(chunk.heading_path),
+                    chunk.content,
+                    chunk.start_line,
+                    chunk.end_line,
+                    _hash_text(chunk.content),
+                ),
+            )
+        self._maybe_embed_chunks(chunks)
+        return len(chunks)
+
+    def remove_proposal(self, agent_id: str, proposal_id: int) -> None:
+        """Remove one proposal's indexed chunks (e.g. once reviewed, no longer 'pending').
+
+        A no-op if this proposal was never indexed — safe to call
+        unconditionally. Phase 5 slice D (review/apply/reject) is the
+        expected caller once a proposal's status leaves ``"pending"``.
+        """
+        conn = self._conn()
+        conn.execute(
+            "DELETE FROM memory_chunks WHERE agent_id = %s AND rel_path = %s",
+            (agent_id, f"proposals/{proposal_id}"),
+        )
+
     def rebuild_agent(self, agent_id: str, indexable_files: list[tuple[str, str, str]]) -> int:
         """Rebuild one agent's entire index from a fresh file listing.
 
@@ -703,7 +782,14 @@ class PostgresMemoryIndex:
             )
 
         with conn.transaction():
-            conn.execute("DELETE FROM memory_chunks WHERE agent_id = %s", (agent_id,))
+            # Proposal chunks (Stage One Phase 5, slice B) live in this same
+            # table but have no memory_files ledger row and aren't part of
+            # indexable_files — excluded here so a force-rebuild (a
+            # files-only operation) can't wipe them out.
+            conn.execute(
+                "DELETE FROM memory_chunks WHERE agent_id = %s AND source_kind != 'proposal'",
+                (agent_id,),
+            )
             conn.execute(
                 """
                 INSERT INTO memory_chunks
@@ -753,8 +839,9 @@ class PostgresMemoryIndex:
                 ``session/db.py``'s ``search_messages`` already uses for
                 message search.
             corpus: Restrict results to one ``source_kind`` (``"durable"``,
-                ``"daily"``, or ``"import"``), or ``None`` to search every
-                corpus. The plan's fourth corpus, "sessions", is
+                ``"daily"``, ``"import"``, or ``"proposal"`` — Stage One
+                Phase 5, slice B), or ``None`` to search every corpus. The
+                plan's fourth corpus, "sessions", is
                 deliberately not offered here — that's already the
                 separate ``session_search`` tool's job; duplicating it into
                 this index would mean two divergent ways to search the same
@@ -771,7 +858,15 @@ class PostgresMemoryIndex:
                 and ``score`` (the ``ts_rank`` value).
         """
         conn = self._conn()
-        corpus_sql = " AND source_kind = %s" if corpus else ""
+        # Proposals (Stage One Phase 5, slice B) are unreviewed capture-job
+        # output — never surfaced by a corpus-agnostic search (which is what
+        # per-turn injection and search_memory both do) unless a caller
+        # explicitly asks for corpus="proposal" (Phase 5 slice C/D's
+        # consolidation review). Every lane below follows this same rule.
+        if corpus:
+            corpus_sql = " AND source_kind = %s"
+        else:
+            corpus_sql = " AND source_kind != 'proposal'"
         params: list = [query, agent_id, query]
         if corpus:
             params.append(corpus)
@@ -841,10 +936,15 @@ class PostgresMemoryIndex:
             agent_id: Which agent's chunks to search.
             query: Free-text query.
             corpus: Restrict to one ``source_kind``, or ``None`` for every
-                corpus. Applies to every lane, including pinned (in
-                practice only "durable" pins exist, since pinning is
+                *reviewed* corpus. Applies to every lane, including pinned
+                (in practice only "durable" pins exist, since pinning is
                 scoped to topic notes — see ``memory/service.py``'s
-                ``pin()``).
+                ``pin()``). ``None`` does *not* mean literally every
+                chunk: ``"proposal"`` chunks (Stage One Phase 5, slice B —
+                unreviewed capture-job output) are excluded unless
+                ``corpus="proposal"`` is given explicitly, so a normal
+                per-turn search or ``search_memory`` call never surfaces
+                an unreviewed claim as if it were a reviewed note.
             max_results: Maximum chunks to return.
 
         Returns:
@@ -913,10 +1013,13 @@ class PostgresMemoryIndex:
         conn = self._conn()
         term_conditions = " OR ".join(["rel_path ILIKE %s"] * len(terms))
         params: list = [agent_id] + [f"%{t}%" for t in terms]
-        corpus_sql = ""
+        # See search()'s comment: proposals are excluded from a
+        # corpus-agnostic query unless explicitly requested.
         if corpus:
             corpus_sql = " AND source_kind = %s"
             params.append(corpus)
+        else:
+            corpus_sql = " AND source_kind != 'proposal'"
         params.append(limit)
 
         rows = conn.execute(
@@ -956,7 +1059,12 @@ class PostgresMemoryIndex:
             return []
 
         conn = self._conn()
-        corpus_sql = " AND mc.source_kind = %s" if corpus else ""
+        # See search()'s comment: proposals are excluded from a
+        # corpus-agnostic query unless explicitly requested.
+        if corpus:
+            corpus_sql = " AND mc.source_kind = %s"
+        else:
+            corpus_sql = " AND mc.source_kind != 'proposal'"
         # Parameter order must match the SQL's %s occurrences top-to-bottom:
         # similarity's query_vector, the JOIN's model_identity, agent_id,
         # (corpus), ORDER BY's query_vector again, then LIMIT.

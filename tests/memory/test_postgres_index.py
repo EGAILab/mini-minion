@@ -229,6 +229,97 @@ def test_remove_file_also_clears_a_pin(index, agent_id):
 
 
 # ---------------------------------------------------------------------------
+# reindex_proposal / remove_proposal (Stage One Phase 5, slice B)
+# ---------------------------------------------------------------------------
+
+def test_reindex_proposal_writes_a_searchable_chunk(index, agent_id):
+    count = index.reindex_proposal(agent_id, 42, "User prefers dark mode.")
+
+    assert count == 1
+    assert index.chunk_count(agent_id) == 1
+    results = index.search(agent_id, "dark mode", corpus="proposal")
+    assert len(results) == 1
+    assert results[0]["rel_path"] == "proposals/42"
+    assert results[0]["source_kind"] == "proposal"
+
+
+def test_reindex_proposal_does_not_create_a_memory_files_ledger_row(index, agent_id):
+    # Proposals have no on-disk file to reconcile against — see the
+    # method's docstring for why this matters to rebuild_agent/
+    # reconcile_agent/force_rebuild_agent.
+    index.reindex_proposal(agent_id, 42, "User prefers dark mode.")
+
+    assert index.indexed_files(agent_id) == []
+
+
+def test_reindex_proposal_replaces_previous_chunks_for_the_same_proposal(index, agent_id):
+    index.reindex_proposal(agent_id, 42, "Original claim.")
+    index.reindex_proposal(agent_id, 42, "Updated claim.")
+
+    assert index.chunk_count(agent_id) == 1
+    results = index.search(agent_id, "Updated", corpus="proposal")
+    assert len(results) == 1
+
+
+def test_remove_proposal_deletes_its_chunks(index, agent_id):
+    index.reindex_proposal(agent_id, 42, "User prefers dark mode.")
+
+    index.remove_proposal(agent_id, 42)
+
+    assert index.chunk_count(agent_id) == 0
+
+
+def test_remove_proposal_is_a_no_op_for_a_proposal_never_indexed(index, agent_id):
+    index.remove_proposal(agent_id, 999)  # must not raise
+
+
+def test_search_excludes_proposals_by_default(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User likes dark mode.")
+    index.reindex_proposal(agent_id, 42, "User prefers dark mode.")
+
+    results = index.search(agent_id, "dark mode")
+
+    assert [r["rel_path"] for r in results] == ["MEMORY.md"]
+
+
+def test_search_finds_proposals_when_explicitly_requested(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User likes dark mode.")
+    index.reindex_proposal(agent_id, 42, "User prefers dark mode.")
+
+    results = index.search(agent_id, "dark mode", corpus="proposal")
+
+    assert [r["rel_path"] for r in results] == ["proposals/42"]
+
+
+def test_hybrid_search_excludes_proposals_by_default(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User likes dark mode.")
+    index.reindex_proposal(agent_id, 42, "User prefers dark mode.")
+
+    results = index.hybrid_search(agent_id, "dark mode")
+
+    assert all(r["rel_path"] != "proposals/42" for r in results)
+
+
+def test_hybrid_search_finds_proposals_when_explicitly_requested(index, agent_id):
+    index.reindex_proposal(agent_id, 42, "User prefers dark mode.")
+
+    results = index.hybrid_search(agent_id, "dark mode", corpus="proposal")
+
+    assert [r["rel_path"] for r in results] == ["proposals/42"]
+
+
+def test_force_rebuild_agent_does_not_delete_proposal_chunks(index, agent_id):
+    # force_rebuild_agent is a files-only operation (see its docstring) —
+    # proposal chunks share memory_chunks but must survive it untouched.
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "Some content.")
+    index.reindex_proposal(agent_id, 42, "User prefers dark mode.")
+
+    index.force_rebuild_agent(agent_id, [("durable", "MEMORY.md", "Some content.")])
+
+    assert index.search(agent_id, "dark mode", corpus="proposal") != []
+
+
+# ---------------------------------------------------------------------------
 # rebuild_agent
 # ---------------------------------------------------------------------------
 

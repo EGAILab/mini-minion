@@ -103,9 +103,13 @@ def _build_parser() -> argparse.ArgumentParser:
     search.add_argument("--agent", help="Limit to one agent ID. Default: every configured agent.")
     search.add_argument(
         "--corpus",
-        choices=["durable", "daily", "import"],
+        choices=["durable", "daily", "import", "proposal"],
         default=None,
-        help="Restrict to one corpus. Default: search everything.",
+        help=(
+            "Restrict to one corpus. Default: search every *reviewed* "
+            "corpus (--corpus proposal is required to see unreviewed "
+            "capture-job proposals, per Stage One Phase 5, slice B)."
+        ),
     )
 
     doctor = sub.add_parser(

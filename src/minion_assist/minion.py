@@ -771,7 +771,15 @@ def main() -> None:
     _capture_worker = None
     if _db is not None:
         from .memory.capture_worker import CaptureWorker  # noqa: PLC0415
-        _capture_worker = CaptureWorker(_db, lambda aid: _providers_by_agent[aid])
+        # Stage One Phase 5, slice B: when a lexical index is configured,
+        # every newly-extracted proposal gets indexed as searchable
+        # (under corpus="proposal") right after it's recorded — see
+        # capture_worker.py's module docstring for why this stays gated
+        # out of normal per-turn search/injection.
+        _index_proposal = _memory_index.reindex_proposal if _memory_index is not None else None
+        _capture_worker = CaptureWorker(
+            _db, lambda aid: _providers_by_agent[aid], index_proposal=_index_proposal
+        )
         _capture_worker.start()
 
     # --- Memory index watcher (optional — only when a database is configured) ---
