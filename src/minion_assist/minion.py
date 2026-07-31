@@ -93,6 +93,7 @@ from .config import database as database_cfg
 from .config import embeddings as embeddings_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
+from .config import memory_consolidation as memory_consolidation_cfg
 from .config import multi_agent as multi_agent_cfg
 from .plugins import load_plugins
 from .config import streaming, voice as voice_cfg, workspace
@@ -858,6 +859,50 @@ def main() -> None:
                 f"[dreaming] Scheduler started "
                 f"(nightly at {dreaming_cfg.hour:02d}:{dreaming_cfg.minute:02d} "
                 f"{dreaming_cfg.timezone})."
+            )
+
+    # --- Memory consolidation scheduler (optional) ---
+    # Stage One Phase 5, slice D, Task 9: deliberately a separate schedule
+    # from `dreaming` above, even though both use the same daily wall-clock
+    # shape — this drafts consolidation previews (never applies/promotes
+    # anything), keeping `memory consolidate list` populated with fresh
+    # drafts. Requires a database, a lexical index, and the configured
+    # agent to actually be running (its provider/files repo must already
+    # exist from the per-agent loop above).
+    _memory_consolidation: object = None
+    if memory_consolidation_cfg.enabled:
+        if _db is None or _memory_index is None:
+            print(
+                "[memory-consolidation] Warning: no database/index configured — "
+                "consolidation scheduler disabled.",
+                file=sys.stderr,
+            )
+        elif memory_consolidation_cfg.agent_id not in _providers_by_agent:
+            print(
+                f"[memory-consolidation] Warning: agent "
+                f"'{memory_consolidation_cfg.agent_id}' not found in config — "
+                "consolidation scheduler disabled.",
+                file=sys.stderr,
+            )
+        else:
+            from .memory.consolidation import MemoryConsolidator  # noqa: PLC0415
+            from .memory.consolidation_scheduler import MemoryConsolidationScheduler  # noqa: PLC0415
+
+            _consolidator = MemoryConsolidator(
+                _db,
+                _memory_index,
+                _agent_files_repos[memory_consolidation_cfg.agent_id],
+                _providers_by_agent[memory_consolidation_cfg.agent_id],
+                agent_id=memory_consolidation_cfg.agent_id,
+            )
+            _memory_consolidation = MemoryConsolidationScheduler(
+                memory_consolidation_cfg, _db, _memory_index, _consolidator
+            )
+            _memory_consolidation.start()  # type: ignore[attr-defined]
+            print(
+                f"[memory-consolidation] Scheduler started "
+                f"(daily at {memory_consolidation_cfg.hour:02d}:{memory_consolidation_cfg.minute:02d} "
+                f"{memory_consolidation_cfg.timezone})."
             )
 
     use_streaming = streaming.chat_mode

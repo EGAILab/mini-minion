@@ -767,6 +767,59 @@ class DreamingConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConsolidationConfig:
+    """Controls the automated consolidation-preview scheduler.
+
+    Stage One Phase 5, slice D, Task 9: "keep the poetic DreamingScheduler
+    independently configurable; rename the consolidation schedule in
+    code/UI to avoid ambiguity." This section is deliberately separate
+    from ``"dreaming"`` above, even though both use the same daily
+    wall-clock scheduling shape — this fires
+    ``MemoryConsolidator.preview()`` (structured drafting, never
+    disk-writing) for an agent's top-ranked pending proposals, keeping
+    ``minion-assist memory consolidate list`` populated with fresh drafts
+    rather than requiring a manual ``preview`` call per proposal. It never
+    applies/promotes anything on its own — the 100% human-gated design
+    Phase 5 settled on throughout applies here too.
+
+    Configured in ``config.json`` under the ``"memory_consolidation"`` key::
+
+        "memory_consolidation": {
+            "enabled": true,
+            "hour": 4,
+            "minute": 0,
+            "timezone": "Australia/Sydney",
+            "agent_id": "main",
+            "top_n": 5
+        }
+
+    Attributes:
+        enabled (bool): When ``True`` (default ``False``), the scheduler
+            starts at process startup. Requires a configured database and
+            lexical index — silently does not start without one (see
+            ``minion.py``).
+        hour (int): Wall-clock hour of day to fire (0-23). Default 4.
+        minute (int): Wall-clock minute to fire (0-59). Default 0.
+        timezone (str): IANA timezone name for scheduling. Default
+            ``"Australia/Sydney"``.
+        agent_id (str): Which agent's pending proposals to draft previews
+            for. Default ``"main"``.
+        top_n (int): Draft at most this many *new* previews per run —
+            proposals that already have at least one preview are skipped
+            (not redrafted every single day they sit pending), so this
+            caps how many fresh drafting LLM calls one pass can make, not
+            how many ranked candidates are considered. Default 5.
+    """
+
+    enabled: bool = False
+    hour: int = 4
+    minute: int = 0
+    timezone: str = "Australia/Sydney"
+    agent_id: str = "main"
+    top_n: int = 5
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     """Controls verbose LLM request/response logging.
 
@@ -1298,6 +1351,37 @@ def _resolve_dreaming() -> DreamingConfig:
 # dreaming: controls the nightly dream diary scheduler.
 # Disabled by default; enabled via "dreaming": {"enabled": true} in config.json.
 dreaming: DreamingConfig = _resolve_dreaming()
+
+
+def _resolve_memory_consolidation() -> MemoryConsolidationConfig:
+    """Read the ``"memory_consolidation"`` section from config.json and build a MemoryConsolidationConfig.
+
+    All fields have sensible defaults so the section can be omitted entirely.
+
+    Returns:
+        MemoryConsolidationConfig: Immutable settings; defaults apply when absent.
+    """
+    raw = _raw.get("memory_consolidation", {})
+    if not isinstance(raw, dict):
+        return MemoryConsolidationConfig()
+    hour = int(raw.get("hour", 4))
+    minute = int(raw.get("minute", 0))
+    return MemoryConsolidationConfig(
+        enabled=bool(raw.get("enabled", False)),
+        hour=max(0, min(23, hour)),
+        minute=max(0, min(59, minute)),
+        timezone=str(raw.get("timezone", "Australia/Sydney")),
+        agent_id=str(raw.get("agent_id", "main")),
+        top_n=max(1, int(raw.get("top_n", 5))),
+    )
+
+
+# memory_consolidation: controls the automated consolidation-preview scheduler
+# (Stage One Phase 5, slice D). Disabled by default; enabled via
+# "memory_consolidation": {"enabled": true} in config.json. Deliberately
+# separate from `dreaming` above (Task 9) even though both use the same
+# daily wall-clock scheduling shape.
+memory_consolidation: MemoryConsolidationConfig = _resolve_memory_consolidation()
 
 
 def _resolve_logging() -> LoggingConfig:

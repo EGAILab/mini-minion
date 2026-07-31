@@ -383,6 +383,30 @@ class PostgresMemoryIndex:
             "ON memory_consolidation_previews (agent_id, proposal_id)"
         )
 
+        # Topic revision history — Stage One Phase 5, slice D. A row is a
+        # snapshot of a topic note's content taken right BEFORE
+        # MemoryConsolidator.approve() overwrites it, so rollback() can
+        # restore exactly what was there (an empty string means the topic
+        # didn't exist before this apply — rollback() deletes the file
+        # rather than writing "" back). Acts as a one-entry-per-apply undo
+        # stack: rollback() consumes (deletes) the row it restores from,
+        # so repeated rollbacks step back through history one apply at a
+        # time, the same shape as a normal undo stack.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_topic_revisions (
+                id            BIGSERIAL PRIMARY KEY,
+                agent_id      TEXT NOT NULL,
+                target_key    TEXT NOT NULL,
+                proposal_id   BIGINT NOT NULL,
+                prior_content TEXT NOT NULL,
+                created_at    DOUBLE PRECISION NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_topic_revisions_key_idx "
+            "ON memory_topic_revisions (agent_id, target_key)"
+        )
+
         # Shadow copies of both tables above, same shape — scratch space for
         # force_rebuild_agent()'s crash-safe rebuild-and-swap (Stage One
         # Phase 3, slice C). See that method's docstring for the swap
@@ -1511,6 +1535,103 @@ class PostgresMemoryIndex:
             }
             for r in rows
         ]
+
+    def get_consolidation_preview(self, preview_id: int) -> dict | None:
+        """Look up one preview by id.
+
+        Stage One Phase 5, slice D: ``MemoryConsolidator.approve()``/CLI's
+        ``explain``/``approve`` commands need a single preview, not a list.
+
+        Returns:
+            dict | None: Same shape as :meth:`list_consolidation_previews`'
+                rows, or ``None`` if no preview with this id exists.
+        """
+        row = self._conn().execute(
+            """
+            SELECT id, agent_id, proposal_id, target_kind, target_key,
+                   based_on_content_hash, drafted_content, rationale, created_at
+            FROM memory_consolidation_previews
+            WHERE id = %s
+            """,
+            (preview_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "agent_id": row[1], "proposal_id": row[2], "target_kind": row[3],
+            "target_key": row[4], "based_on_content_hash": row[5], "drafted_content": row[6],
+            "rationale": row[7], "created_at": row[8],
+        }
+
+    # ------------------------------------------------------------------
+    # Topic revision history — Stage One Phase 5, slice D
+    # ------------------------------------------------------------------
+
+    def record_topic_revision(
+        self, agent_id: str, target_key: str, proposal_id: int, prior_content: str
+    ) -> int:
+        """Snapshot a topic note's content right before an apply overwrites it.
+
+        Args:
+            agent_id: The agent the topic note belongs to.
+            target_key: The topic note's key.
+            proposal_id: Which proposal's approval triggered this apply —
+                lets :meth:`~minion_assist.memory.consolidation.MemoryConsolidator.rollback`
+                restore the proposal to ``"pending"`` too.
+            prior_content: The note's full content immediately before the
+                apply (``""`` if the topic didn't exist yet — a brand new
+                topic, not a revision).
+
+        Returns:
+            int: The new revision row's id.
+        """
+        row = self._conn().execute(
+            """
+            INSERT INTO memory_topic_revisions
+                (agent_id, target_key, proposal_id, prior_content, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (agent_id, target_key, proposal_id, prior_content, time.time()),
+        ).fetchone()
+        return row[0]
+
+    def latest_topic_revision(self, agent_id: str, target_key: str) -> dict | None:
+        """The most recent not-yet-rolled-back-from revision for one topic note.
+
+        Returns:
+            dict | None: ``{"id", "agent_id", "target_key", "proposal_id",
+                "prior_content", "created_at"}``, or ``None`` if this topic
+                has no revision history (never applied, or already fully
+                rolled back).
+        """
+        row = self._conn().execute(
+            """
+            SELECT id, agent_id, target_key, proposal_id, prior_content, created_at
+            FROM memory_topic_revisions
+            WHERE agent_id = %s AND target_key = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (agent_id, target_key),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "agent_id": row[1], "target_key": row[2], "proposal_id": row[3],
+            "prior_content": row[4], "created_at": row[5],
+        }
+
+    def delete_topic_revision(self, revision_id: int) -> None:
+        """Consume (delete) one revision row — called once ``rollback()`` restores from it.
+
+        Makes the revision table behave as a proper undo stack: rolling
+        back twice in a row steps back through two prior applies, rather
+        than restoring the same snapshot repeatedly.
+        """
+        self._conn().execute(
+            "DELETE FROM memory_topic_revisions WHERE id = %s", (revision_id,)
+        )
 
     # ------------------------------------------------------------------
     # Embedding cache — Stage One Phase 4, slices A & C

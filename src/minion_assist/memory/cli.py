@@ -20,6 +20,13 @@ Currently supported:
 - ``minion-assist memory pin KEY --agent ID``            — pin a topic note.
 - ``minion-assist memory unpin KEY --agent ID``          — unpin a topic note.
 - ``minion-assist memory pins [--agent ID]``             — list pinned notes.
+- ``minion-assist memory consolidate list --agent ID [--top N]``       — ranked pending proposals.
+- ``minion-assist memory consolidate preview PROPOSAL_ID --agent ID``  — draft a preview.
+- ``minion-assist memory consolidate explain PREVIEW_ID --agent ID``   — show a stored preview + staleness.
+- ``minion-assist memory consolidate approve PREVIEW_ID --agent ID``   — apply a preview to disk.
+- ``minion-assist memory consolidate reject PROPOSAL_ID --agent ID [--reason TEXT]`` — reject.
+- ``minion-assist memory consolidate rollback TARGET_KEY --agent ID``  — undo the last approve.
+- ``minion-assist memory consolidate backfill --agent ID``             — gap-fill historical capture jobs.
 
 Talks to
 --------
@@ -32,6 +39,13 @@ Talks to
   optional :class:`~minion_assist.memory.postgres_index.PostgresMemoryIndex`
   that ``search --corpus``, ``status --deep``, and ``reindex`` use, when a
   database is configured (Stage One Phase 3, slice C).
+- ``memory/consolidation.py`` — :func:`rank_proposals`,
+  :func:`format_preview_report`, :func:`is_preview_stale`,
+  :func:`backfill_agent`, and :class:`MemoryConsolidator`, wired up by
+  every ``consolidate`` subcommand (Stage One Phase 5, slice D).
+- ``session/db.py`` — :func:`_build_db` constructs the
+  :class:`~minion_assist.session.db.SessionDB` every ``consolidate``
+  subcommand needs (proposals live there, not in the lexical index).
 - ``minion.py`` — ``main()`` dispatches ``sys.argv[1] == "memory"`` here
   before falling through to the interactive REPL.
 - ``config.py`` — reads ``workspace``, ``agents``, ``bootstrap``, and
@@ -147,6 +161,61 @@ def _build_parser() -> argparse.ArgumentParser:
     pins = sub.add_parser("pins", help="List every pinned note for one or every agent.")
     pins.add_argument("--agent", help="Limit to one agent ID. Default: every configured agent.")
 
+    consolidate = sub.add_parser(
+        "consolidate",
+        help=(
+            "Review, approve, reject, or roll back consolidation proposals "
+            "(Stage One Phase 5, slice D). Requires a configured database."
+        ),
+    )
+    consolidate_sub = consolidate.add_subparsers(dest="consolidate_subcommand", required=True)
+
+    c_list = consolidate_sub.add_parser(
+        "list", help="Rank and list one agent's pending (unreviewed) proposals."
+    )
+    c_list.add_argument("--agent", required=True, help="Which agent's proposals to list.")
+    c_list.add_argument("--top", type=int, default=10, help="Show at most this many (default 10).")
+
+    c_preview = consolidate_sub.add_parser(
+        "preview", help="Draft a preview for one pending proposal — never writes to disk."
+    )
+    c_preview.add_argument("proposal_id", type=int)
+    c_preview.add_argument("--agent", required=True)
+
+    c_explain = consolidate_sub.add_parser(
+        "explain", help="Show one stored preview's full review report, plus staleness."
+    )
+    c_explain.add_argument("preview_id", type=int)
+    c_explain.add_argument("--agent", required=True)
+
+    c_approve = consolidate_sub.add_parser(
+        "approve", help="Apply a preview: write its drafted content to disk and reindex it."
+    )
+    c_approve.add_argument("preview_id", type=int)
+    c_approve.add_argument("--agent", required=True)
+
+    c_reject = consolidate_sub.add_parser(
+        "reject", help="Reject a pending proposal — never promoted, no file touched."
+    )
+    c_reject.add_argument("proposal_id", type=int)
+    c_reject.add_argument("--agent", required=True)
+    c_reject.add_argument("--reason", default="", help="Optional reason, stored for audit.")
+
+    c_rollback = consolidate_sub.add_parser(
+        "rollback", help="Undo the most recent approve() for one topic note."
+    )
+    c_rollback.add_argument("target_key", help="The topic note's key.")
+    c_rollback.add_argument("--agent", required=True)
+
+    c_backfill = consolidate_sub.add_parser(
+        "backfill",
+        help=(
+            "Enqueue capture jobs for historical message ranges no capture job has "
+            "ever covered (gap-filled across every session)."
+        ),
+    )
+    c_backfill.add_argument("--agent", required=True)
+
     return parser
 
 
@@ -215,6 +284,37 @@ def _build_service(
     return MemoryService(MemoryFileRepository(root), index=index, agent_id=agent_id)
 
 
+def _build_provider(agent_id: str):
+    """Construct the LLM provider configured for one agent.
+
+    Stage One Phase 5, slice D: only ``consolidate preview`` needs an
+    actual drafting call — every other ``consolidate`` subcommand
+    (``list``/``explain``/``approve``/``reject``/``rollback``/``backfill``)
+    never touches a provider, so callers should only invoke this when they
+    actually need one (constructing a provider implies a live API key,
+    which shouldn't be a requirement for e.g. rejecting a proposal).
+
+    Args:
+        agent_id: Which configured agent's provider/model to build.
+
+    Raises:
+        KeyError: If ``agent_id`` isn't a configured agent — same failure
+            mode :func:`_selected_agents` already guards against for every
+            other subcommand, so callers should validate ``agent_id``
+            first the same way.
+    """
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..providers import create_provider  # noqa: PLC0415
+
+    cfg = agents_cfg[agent_id]
+    return create_provider(
+        api=cfg.provider.api,
+        base_url=cfg.provider.base_url,
+        api_key=cfg.provider.api_key,
+        model=cfg.model.id,
+    )
+
+
 def _build_index() -> PostgresMemoryIndex | None:
     """Construct the shared lexical index, or ``None`` if no database is configured/reachable.
 
@@ -249,6 +349,26 @@ def _build_index() -> PostgresMemoryIndex | None:
         )
     except Exception as exc:
         print(f"Warning: memory index unavailable ({exc}). Continuing without it.")
+        return None
+
+
+def _build_db():
+    """Construct a :class:`~minion_assist.session.db.SessionDB`, or ``None`` if unconfigured/unreachable.
+
+    Stage One Phase 5, slice D: every ``consolidate`` subcommand needs
+    ``SessionDB`` — proposals live there, not in the lexical index. Same
+    "never raises, report and degrade" contract as :func:`_build_index`.
+    """
+    from ..config import database as database_cfg  # noqa: PLC0415
+
+    if not database_cfg.url:
+        return None
+    try:
+        from ..session.db import SessionDB  # noqa: PLC0415
+
+        return SessionDB(database_cfg.url)
+    except Exception as exc:
+        print(f"Warning: database unavailable ({exc}).")
         return None
 
 
@@ -513,6 +633,204 @@ def _run_pins(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_consolidate_list(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory consolidate list --agent ID [--top N]``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from .consolidation import rank_proposals  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    index = _build_index()
+    if db is None or index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to list.")
+        return 1
+
+    ranked = rank_proposals(db, index, agent_id)[: args.top]
+    if not ranked:
+        print(f"{agent_id}: no pending proposals.")
+        return 0
+    for p in ranked:
+        snippet = p["claim_text"][:80]
+        print(f"#{p['id']}  score={p['score']}  {snippet}")
+    return 0
+
+
+def _run_consolidate_preview(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory consolidate preview PROPOSAL_ID --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .consolidation import MemoryConsolidator, format_preview_report  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    index = _build_index()
+    if db is None or index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to preview.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    provider = _build_provider(agent_id)
+    consolidator = MemoryConsolidator(db, index, files, provider, agent_id=agent_id)
+    try:
+        preview = consolidator.preview(args.proposal_id)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print(format_preview_report(preview))
+    print(
+        f"\nPreview id: {preview['id']} — approve with "
+        f"`memory consolidate approve {preview['id']} --agent {agent_id}`."
+    )
+    return 0
+
+
+def _run_consolidate_explain(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory consolidate explain PREVIEW_ID --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .consolidation import format_preview_report, is_preview_stale  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to explain.")
+        return 1
+
+    preview = index.get_consolidation_preview(args.preview_id)
+    if preview is None:
+        print(f"Error: no consolidation preview with id {args.preview_id!r}.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    print(format_preview_report(preview))
+
+    db = _build_db()
+    if db is not None:
+        proposal = db.get_proposal(preview["proposal_id"])
+        if proposal is not None and proposal["status"] != "pending":
+            print(f"\nActual current status: {proposal['status']}")
+            if proposal["rejected_reason"]:
+                print(f"Rejection reason: {proposal['rejected_reason']}")
+
+    if is_preview_stale(files, preview):
+        print(
+            "\nWARNING: stale — the target has changed since this preview was drafted. "
+            "Re-run `preview` before approving."
+        )
+    return 0
+
+
+def _run_consolidate_approve(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory consolidate approve PREVIEW_ID --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .consolidation import MemoryConsolidator, StaleProposalError  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    index = _build_index()
+    if db is None or index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to approve.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    consolidator = MemoryConsolidator(db, index, files, None, agent_id=agent_id)
+    try:
+        result = consolidator.approve(args.preview_id)
+    except (ValueError, StaleProposalError) as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print(f"{agent_id}: applied to {result['rel_path']} — proposal #{result['proposal_id']} promoted.")
+    return 0
+
+
+def _run_consolidate_reject(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory consolidate reject PROPOSAL_ID --agent ID [--reason TEXT]``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .consolidation import MemoryConsolidator  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    if db is None:
+        print("Error: no database configured (or it's unreachable) — nothing to reject.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    # reject() never touches the index — pass None rather than paying for
+    # _build_index()'s connection just to satisfy an unused parameter.
+    consolidator = MemoryConsolidator(db, None, files, None, agent_id=agent_id)
+    consolidator.reject(args.proposal_id, reason=args.reason)
+    print(f"{agent_id}: rejected proposal #{args.proposal_id}.")
+    return 0
+
+
+def _run_consolidate_rollback(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory consolidate rollback TARGET_KEY --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .consolidation import MemoryConsolidator  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    index = _build_index()
+    if db is None or index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to roll back.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    consolidator = MemoryConsolidator(db, index, files, None, agent_id=agent_id)
+    try:
+        result = consolidator.rollback(args.target_key)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print(f"{agent_id}: rolled back {args.target_key!r} — proposal #{result['proposal_id']} back to pending.")
+    return 0
+
+
+def _run_consolidate_backfill(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory consolidate backfill --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from .consolidation import backfill_agent  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    if db is None:
+        print("Error: no database configured (or it's unreachable) — nothing to backfill.")
+        return 1
+
+    model_id = agents_cfg[agent_id].model.id
+    enqueued = backfill_agent(db, agent_id, model_id)
+    print(f"{agent_id}: enqueued {enqueued} new capture job(s) from historical gaps.")
+    return 0
+
+
+_CONSOLIDATE_HANDLERS = {
+    "list": _run_consolidate_list,
+    "preview": _run_consolidate_preview,
+    "explain": _run_consolidate_explain,
+    "approve": _run_consolidate_approve,
+    "reject": _run_consolidate_reject,
+    "rollback": _run_consolidate_rollback,
+    "backfill": _run_consolidate_backfill,
+}
+
+
+def _run_consolidate(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory consolidate <list|preview|explain|approve|reject|rollback|backfill>``."""
+    handler = _CONSOLIDATE_HANDLERS[args.consolidate_subcommand]
+    return handler(args)
+
+
 _HANDLERS = {
     "migrate": _run_migrate,
     "status": _run_status,
@@ -524,6 +842,7 @@ _HANDLERS = {
     "pin": _run_pin,
     "unpin": _run_unpin,
     "pins": _run_pins,
+    "consolidate": _run_consolidate,
 }
 
 

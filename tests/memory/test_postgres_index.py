@@ -89,6 +89,7 @@ def _cleanup_after(index, agent_id):
     conn.execute("DELETE FROM memory_pins WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_recall_events WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_consolidation_previews WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM memory_topic_revisions WHERE agent_id = %s", (agent_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -1151,4 +1152,67 @@ def test_consolidation_previews_do_not_leak_across_agents(index, agent_id):
     finally:
         index._conn().execute(
             "DELETE FROM memory_consolidation_previews WHERE agent_id = %s", (other_agent,)
+        )
+
+
+def test_get_consolidation_preview_returns_the_matching_row(index, agent_id):
+    preview_id = index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Draft.", "New preference."
+    )
+
+    preview = index.get_consolidation_preview(preview_id)
+
+    assert preview["proposal_id"] == 1
+    assert preview["target_key"] == "dark-mode"
+    assert preview["rationale"] == "New preference."
+
+
+def test_get_consolidation_preview_returns_none_for_an_unknown_id(index):
+    assert index.get_consolidation_preview(-1) is None
+
+
+# ---------------------------------------------------------------------------
+# Topic revisions (Stage One Phase 5, slice D)
+# ---------------------------------------------------------------------------
+
+def test_latest_topic_revision_is_none_when_never_applied(index, agent_id):
+    assert index.latest_topic_revision(agent_id, "project-goals") is None
+
+
+def test_record_and_fetch_a_topic_revision(index, agent_id):
+    index.record_topic_revision(agent_id, "project-goals", 1, "Existing goal: ship v1.")
+
+    revision = index.latest_topic_revision(agent_id, "project-goals")
+
+    assert revision["proposal_id"] == 1
+    assert revision["prior_content"] == "Existing goal: ship v1."
+
+
+def test_latest_topic_revision_returns_the_most_recent_one(index, agent_id):
+    index.record_topic_revision(agent_id, "project-goals", 1, "First prior content.")
+    index.record_topic_revision(agent_id, "project-goals", 2, "Second prior content.")
+
+    revision = index.latest_topic_revision(agent_id, "project-goals")
+
+    assert revision["prior_content"] == "Second prior content."
+
+
+def test_delete_topic_revision_removes_it_from_the_undo_stack(index, agent_id):
+    index.record_topic_revision(agent_id, "project-goals", 1, "First prior content.")
+    second_id = index.record_topic_revision(agent_id, "project-goals", 2, "Second prior content.")
+
+    index.delete_topic_revision(second_id)
+
+    revision = index.latest_topic_revision(agent_id, "project-goals")
+    assert revision["prior_content"] == "First prior content."
+
+
+def test_topic_revisions_do_not_leak_across_agents(index, agent_id):
+    other_agent = f"other-{agent_id}"
+    index.record_topic_revision(other_agent, "project-goals", 1, "Content.")
+    try:
+        assert index.latest_topic_revision(agent_id, "project-goals") is None
+    finally:
+        index._conn().execute(
+            "DELETE FROM memory_topic_revisions WHERE agent_id = %s", (other_agent,)
         )

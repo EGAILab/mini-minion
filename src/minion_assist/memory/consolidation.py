@@ -1,12 +1,24 @@
-"""Proposal ranking and preview drafting — Stage One Phase 5, slice C.
+"""Proposal ranking, preview drafting, and apply/reject/rollback — Stage One Phase 5, slices C-D.
 
-Nothing in this module ever writes to disk or changes a proposal's status.
-It only ranks unreviewed ``memory_proposals`` (Phase 2, slice C) into a
-review queue and, for a chosen proposal, drafts what a topic-note update
-*would* look like — storing the draft as a
-``memory_consolidation_previews`` row (``postgres_index.py``) for a human
-to look at. A later slice adds apply/reject/rollback on top of these rows;
-until then a preview is inert, exactly like a proposal.
+:func:`rank_proposals` ranks unreviewed ``memory_proposals`` (Phase 2,
+slice C) into a review queue. :class:`MemoryConsolidator`'s ``preview()``
+drafts what a topic-note update *would* look like, storing the draft as a
+``memory_consolidation_previews`` row (``postgres_index.py``) — nothing is
+written to disk yet at that point. ``approve()``/``reject()``/
+``rollback()`` (slice D) are what actually change something: ``approve()``
+writes a preview's drafted content to disk and reindexes it, ``reject()``
+only updates the proposal's status, and ``rollback()`` restores a topic
+note's pre-apply content. Every one of these three is still a deliberate,
+human-triggered action — nothing in this module decides *when* to apply
+anything on its own (a later slice's ``MemoryConsolidationScheduler`` only
+ever calls ``preview()`` on a timer, never ``approve()``).
+
+One :class:`MemoryConsolidator` instance is scoped to a single agent (its
+``agent_id`` is fixed at construction, matching ``MemoryService``'s own
+per-agent design) — unlike ``rank_proposals()``, which stays a free
+function taking ``agent_id`` per call, since it never touches an agent's
+on-disk files (only ``db``/``index``, both already agent-partitioned
+internally).
 
 Ranking signals: what's used, and what's deliberately skipped
 ------------------------------------------------------------------
@@ -62,17 +74,54 @@ are never merged into a false synthesis" requires of *this* slice (the
 resolution itself is a human's job, in whatever review flow a later slice
 adds).
 
+Staleness and rollback (Task 6, slice D)
+------------------------------------------
+A preview records ``based_on_content_hash`` — the merge target's content
+hash *at draft time*. ``approve()`` re-hashes the target's *current*
+content and refuses to apply (raising :class:`StaleProposalError`) if it
+no longer matches — a human's manual edit made between preview and
+approval always wins over stale consolidator output, never gets silently
+clobbered. ``rollback()`` restores a topic note's exact pre-apply content
+from ``memory_topic_revisions`` (a snapshot ``approve()`` records right
+before writing), consuming that revision row so repeated rollbacks step
+back through history one apply at a time, and puts the proposal itself
+back to ``"pending"`` — undoing an approval undoes the review decision
+too, not just the file content.
+
+Historical backfill (Task 10)
+--------------------------------
+:func:`backfill_agent` finds message ranges in an agent's session history
+that no ``memory_capture_jobs`` row has ever covered (comparing every
+session's actual message ids against every capture job's recorded
+range — true gap-filling, not just "skip sessions with any coverage"),
+chunks each gap into bounded windows (:data:`_BACKFILL_WINDOW_MESSAGES`),
+and enqueues one capture job per window via the existing
+``SessionDB.enqueue_capture_job``. It does not run extraction itself —
+the already-running ``CaptureWorker`` picks these jobs up and processes
+them exactly like a live turn's job, so no second extraction path exists.
+
 Talks to
 --------
 - ``session/db.py`` — :meth:`SessionDB.list_pending_proposals`,
-  :meth:`SessionDB.get_proposal`.
+  :meth:`SessionDB.get_proposal`, :meth:`SessionDB.set_proposal_status`,
+  :meth:`SessionDB.list_session_ids_for_agent`,
+  :meth:`SessionDB.list_message_ids`,
+  :meth:`SessionDB.list_capture_job_ranges`,
+  :meth:`SessionDB.enqueue_capture_job`.
 - ``memory/postgres_index.py`` — :meth:`PostgresMemoryIndex.recall_stats`
   (ranking), :meth:`PostgresMemoryIndex.hybrid_search` (finding a merge
-  target, restricted to ``corpus="durable"``), and
-  :meth:`PostgresMemoryIndex.record_consolidation_preview`.
+  target, restricted to ``corpus="durable"``),
+  :meth:`PostgresMemoryIndex.record_consolidation_preview`/
+  :meth:`~PostgresMemoryIndex.get_consolidation_preview`, and
+  :meth:`~PostgresMemoryIndex.record_topic_revision`/
+  :meth:`~PostgresMemoryIndex.latest_topic_revision`/
+  :meth:`~PostgresMemoryIndex.delete_topic_revision`.
 - ``memory/files.py`` — :meth:`MemoryFileRepository.load` reads a merge
-  target's current content; nothing here ever calls ``remember()`` — no
-  write happens in this slice.
+  target's current content; ``approve()``/``rollback()`` are the only
+  methods in this module that call ``remember()``/``delete()``.
+- ``memory/extractor.py`` — :data:`_EXTRACTION_PROMPT_VERSION`, reused by
+  :func:`backfill_agent` so a backfilled job's idempotency key has the
+  exact same shape a live per-turn job's key would.
 - ``providers/base.py`` — :class:`LLMProvider`, for the drafting call.
 """
 
@@ -219,8 +268,12 @@ def _parse_draft_response(text: str) -> tuple[str, str, str]:
 def format_preview_report(preview: dict) -> str:
     """Human-readable review report for one preview (Task 7).
 
-    "Decision" always reads "pending review" — nothing decides anything in
-    this slice; a later slice's approve/reject flow is what fills that in.
+    "Decision" always reads "pending review" — this renders the *draft*
+    itself, not the proposal's current review status (which may since
+    have become ``"promoted"``/``"rejected"`` via
+    :meth:`MemoryConsolidator.approve`/``reject``). A caller that wants
+    the current status should check it separately, e.g. via
+    ``SessionDB.get_proposal()``.
 
     Args:
         preview: A preview dict, as returned by
@@ -244,17 +297,167 @@ def format_preview_report(preview: dict) -> str:
     return "\n".join(lines)
 
 
+def is_preview_stale(files: MemoryFileRepository, preview: dict) -> bool:
+    """Whether a preview's merge target has changed since it was drafted.
+
+    Used by the CLI's ``explain``/``approve`` commands to warn a human
+    before a stale apply is attempted — the read-only check behind
+    :meth:`MemoryConsolidator.approve`'s own (enforced) staleness guard.
+
+    Args:
+        files: The agent's ``MemoryFileRepository`` (must be the same
+            agent the preview belongs to).
+        preview: A preview dict — needs ``target_key`` and
+            ``based_on_content_hash``.
+
+    Returns:
+        bool: ``True`` if the target's current content hash no longer
+            matches ``based_on_content_hash``.
+    """
+    current_content = files.load(preview["target_key"]) or ""
+    return _hash_text(current_content) != preview["based_on_content_hash"]
+
+
+# Fixed message-count window for one backfilled capture job (Stage One
+# Phase 5, slice D). Bounds how much history a single extract_facts() call
+# ever receives — a live per-turn job only ever covers one exchange (2
+# messages), so an unbounded backfill window could dwarf that by orders of
+# magnitude and risk exceeding the extraction model's context. Not
+# configurable (yet) — same "no knob without evaluation data" reasoning as
+# capture_worker.py's own hardcoded constants.
+_BACKFILL_WINDOW_MESSAGES = 20
+
+
+def _chunk_run(run: list[int]) -> list[tuple[int, int]]:
+    """Split one contiguous run of uncovered message ids into bounded (from, to) windows."""
+    return [
+        (chunk[0], chunk[-1])
+        for chunk in (
+            run[i : i + _BACKFILL_WINDOW_MESSAGES]
+            for i in range(0, len(run), _BACKFILL_WINDOW_MESSAGES)
+        )
+    ]
+
+
+def _compute_backfill_windows(
+    message_ids: list[int], covered_ranges: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Find bounded (from_id, to_id) windows covering every uncaptured message in a session.
+
+    "Contiguous" here means adjacent *by position in message_ids* (this
+    session's own message order), not adjacent integers — ``messages`` is
+    one shared table with a single id sequence across every session, so
+    two of one session's own messages are almost never numerically
+    consecutive (other sessions' messages get ids in between). Walking
+    ``message_ids`` in order and tracking runs of "not covered" sidesteps
+    that entirely.
+
+    Args:
+        message_ids: Every message id in one session, ascending (as
+            :meth:`~minion_assist.session.db.SessionDB.list_message_ids`
+            returns).
+        covered_ranges: Every ``(from_id, to_id)`` pair any capture job
+            (of any state) has ever been enqueued for, in this session
+            (as :meth:`~minion_assist.session.db.SessionDB.list_capture_job_ranges`
+            returns).
+
+    Returns:
+        list[tuple[int, int]]: Windows to enqueue, each at most
+            :data:`_BACKFILL_WINDOW_MESSAGES` messages wide, covering
+            exactly the gaps — messages already covered by an existing
+            job are never included in any window.
+    """
+    covered: set[int] = set()
+    for from_id, to_id in covered_ranges:
+        covered.update(range(from_id, to_id + 1))
+
+    windows: list[tuple[int, int]] = []
+    current_run: list[int] = []
+    for mid in message_ids:
+        if mid in covered:
+            if current_run:
+                windows.extend(_chunk_run(current_run))
+                current_run = []
+        else:
+            current_run.append(mid)
+    if current_run:
+        windows.extend(_chunk_run(current_run))
+    return windows
+
+
+def backfill_agent(db: SessionDB, agent_id: str, model_id: str) -> int:
+    """Enqueue capture jobs for every historical message range never captured (Task 10).
+
+    Does not run extraction itself — enqueues into the same
+    ``memory_capture_jobs`` queue a live turn uses, so the already-running
+    ``CaptureWorker`` processes backfilled ranges exactly like a live
+    turn's job (same retry/backoff, same proposal-indexing wiring). Safe
+    to re-run: a gap already backfilled produces the same idempotency key
+    the second time, so ``enqueue_capture_job`` no-ops it.
+
+    Args:
+        db: The ``SessionDB`` sessions/messages/capture jobs live in.
+        agent_id: Which agent's history to backfill.
+        model_id: The model id to embed in each enqueued job's
+            idempotency key — should match whatever model this agent is
+            actually configured to use, the same key shape a live turn's
+            enqueue already uses (``agents/session.py``'s ``send()``).
+
+    Returns:
+        int: How many *new* capture jobs were actually enqueued (0 means
+            every session was already fully covered).
+    """
+    from .extractor import _EXTRACTION_PROMPT_VERSION  # noqa: PLC0415
+
+    enqueued = 0
+    for session_id in db.list_session_ids_for_agent(agent_id):
+        message_ids = db.list_message_ids(session_id)
+        if not message_ids:
+            continue
+        covered = db.list_capture_job_ranges(session_id)
+        for from_id, to_id in _compute_backfill_windows(message_ids, covered):
+            idempotency_key = (
+                f"{agent_id}:{session_id}:{from_id}-{to_id}:"
+                f"{_EXTRACTION_PROMPT_VERSION}:{model_id}"
+            )
+            job_id = db.enqueue_capture_job(agent_id, session_id, from_id, to_id, idempotency_key)
+            if job_id is not None:
+                enqueued += 1
+    return enqueued
+
+
+class StaleProposalError(Exception):
+    """Raised by :meth:`MemoryConsolidator.approve` when the merge target changed since preview.
+
+    The concrete mechanism behind the plan's "user edits win over stale
+    consolidator output" acceptance criterion: ``approve()`` never
+    overwrites a topic note whose content no longer matches what the
+    preview was drafted against.
+    """
+
+
 class MemoryConsolidator:
-    """Drafts (never applies) topic-note updates from pending proposals.
+    """Drafts, applies, rejects, and rolls back topic-note updates for one agent's proposals.
+
+    Scoped to a single agent (unlike ``rank_proposals()``, a free
+    function) because ``files``/``index`` writes are inherently
+    agent-rooted — see the module docstring.
 
     Args:
         db: The ``SessionDB`` proposals live in.
-        index: The lexical index used to find a merge target and to store
-            the resulting preview.
-        files: The agent's ``MemoryFileRepository`` — read-only here
-            (``load()`` only); nothing is ever written to disk by this
-            class.
+        index: The lexical index used to find a merge target, store
+            previews/revisions, and reindex after a write.
+        files: The agent's ``MemoryFileRepository`` — ``load()`` only in
+            ``preview()``; ``approve()``/``rollback()`` are the only
+            methods here that call ``remember()``/``delete()``.
         provider: The LLM provider used to draft the revised note text.
+            Only ``preview()`` calls it — ``None`` is fine for a caller
+            that only ever needs ``approve()``/``reject()``/``rollback()``
+            (e.g. the CLI's ``reject``/``rollback`` commands, which have
+            no reason to require a live model/API key).
+        agent_id: Which agent this instance drafts/applies for. Must match
+            the agent ``files`` is rooted at and ``index``'s rows are
+            partitioned under.
     """
 
     def __init__(
@@ -262,18 +465,19 @@ class MemoryConsolidator:
         db: SessionDB,
         index: PostgresMemoryIndex,
         files: MemoryFileRepository,
-        provider: LLMProvider,
+        provider: LLMProvider | None,
+        agent_id: str,
     ) -> None:
         self._db = db
         self._index = index
         self._files = files
         self._provider = provider
+        self._agent_id = agent_id
 
-    def preview(self, agent_id: str, proposal_id: int) -> dict:
+    def preview(self, proposal_id: int) -> dict:
         """Draft a preview for one pending proposal — never writes to disk.
 
         Args:
-            agent_id: The agent the proposal belongs to.
             proposal_id: Which ``memory_proposals`` row to draft from.
 
         Returns:
@@ -293,7 +497,7 @@ class MemoryConsolidator:
             raise ValueError(f"No proposal with id {proposal_id!r}")
         claim_text = proposal["claim_text"]
 
-        target_key = self._find_merge_target(agent_id, claim_text)
+        target_key = self._find_merge_target(claim_text)
         if target_key is not None:
             target_kind = "revise_topic"
             existing_content = self._files.load(target_key) or ""
@@ -306,12 +510,12 @@ class MemoryConsolidator:
         final_key = target_key if target_kind == "revise_topic" else drafted_key
 
         preview_id = self._index.record_consolidation_preview(
-            agent_id, proposal_id, target_kind, final_key,
+            self._agent_id, proposal_id, target_kind, final_key,
             based_on_content_hash, drafted_content, rationale,
         )
         return {
             "id": preview_id,
-            "agent_id": agent_id,
+            "agent_id": self._agent_id,
             "proposal_id": proposal_id,
             "target_kind": target_kind,
             "target_key": final_key,
@@ -320,7 +524,120 @@ class MemoryConsolidator:
             "rationale": rationale,
         }
 
-    def _find_merge_target(self, agent_id: str, claim_text: str) -> str | None:
+    def approve(self, preview_id: int) -> dict:
+        """Apply a preview: write its drafted content to disk and reindex it.
+
+        Refuses to apply (see :class:`StaleProposalError`) if the target's
+        current content no longer matches ``based_on_content_hash`` —
+        someone edited it since this preview was drafted, and that edit
+        wins.
+
+        Args:
+            preview_id: Which ``memory_consolidation_previews`` row to
+                apply.
+
+        Returns:
+            dict: ``{"proposal_id", "target_key", "rel_path"}``.
+
+        Raises:
+            ValueError: If ``preview_id`` doesn't exist.
+            StaleProposalError: If the target changed since this preview
+                was drafted.
+        """
+        preview = self._index.get_consolidation_preview(preview_id)
+        if preview is None:
+            raise ValueError(f"No consolidation preview with id {preview_id!r}")
+
+        current_content = self._files.load(preview["target_key"]) or ""
+        current_hash = _hash_text(current_content)
+        if current_hash != preview["based_on_content_hash"]:
+            raise StaleProposalError(
+                f"Topic {preview['target_key']!r} changed since this preview was drafted "
+                f"(based on hash {preview['based_on_content_hash'][:8]}, "
+                f"now {current_hash[:8]}) — re-run preview before approving."
+            )
+
+        # Snapshot BEFORE writing, so rollback() can restore it.
+        self._index.record_topic_revision(
+            self._agent_id, preview["target_key"], preview["proposal_id"], current_content
+        )
+        path = self._files.remember(preview["target_key"], preview["drafted_content"])
+        rel_path = path.relative_to(self._files.root).as_posix()
+        self._index.reindex_file(self._agent_id, rel_path, "durable", preview["drafted_content"])
+        # The raw proposal claim is now redundant — its content lives in the
+        # real note. Reject keeps the chunk (still useful to audit what was
+        # rejected); promote does not.
+        self._index.remove_proposal(self._agent_id, preview["proposal_id"])
+        self._db.set_proposal_status(preview["proposal_id"], "promoted")
+
+        return {
+            "proposal_id": preview["proposal_id"],
+            "target_key": preview["target_key"],
+            "rel_path": rel_path,
+        }
+
+    def reject(self, proposal_id: int, reason: str = "") -> None:
+        """Mark a proposal reviewed and rejected — never promoted, no file touched.
+
+        Args:
+            proposal_id: Which proposal to reject.
+            reason: Optional human-readable reason, stored on the
+                proposal row (``memory_proposals.rejected_reason``) for
+                later audit/explain purposes.
+        """
+        self._db.set_proposal_status(proposal_id, "rejected", reason=reason)
+
+    def rollback(self, target_key: str) -> dict:
+        """Undo the most recent ``approve()`` for one topic note.
+
+        Restores the note's exact pre-apply content (or deletes the file
+        entirely if it didn't exist before that apply — i.e. the apply
+        created a brand new topic), reindexes accordingly, restores the
+        associated proposal to ``"pending"`` and re-indexes its raw claim
+        chunk (removed by ``approve()``), and consumes the revision row —
+        a second rollback steps back one apply further, not the same one
+        again.
+
+        Args:
+            target_key: Which topic note to roll back.
+
+        Returns:
+            dict: ``{"target_key", "proposal_id", "restored_content"}``.
+
+        Raises:
+            ValueError: If this topic has no revision history to roll
+                back (never applied, or already fully rolled back).
+        """
+        revision = self._index.latest_topic_revision(self._agent_id, target_key)
+        if revision is None:
+            raise ValueError(f"No revision history for topic {target_key!r} to roll back")
+
+        rel_path = self._files.topic_path(target_key).relative_to(self._files.root).as_posix()
+        if revision["prior_content"] == "":
+            # "" means the apply this undoes created the note from
+            # scratch — there is nothing to restore it to, so the file
+            # goes away entirely rather than becoming an empty note.
+            self._files.delete(target_key)
+            self._index.remove_file(self._agent_id, rel_path)
+        else:
+            self._files.remember(target_key, revision["prior_content"])
+            self._index.reindex_file(self._agent_id, rel_path, "durable", revision["prior_content"])
+
+        self._db.set_proposal_status(revision["proposal_id"], "pending")
+        proposal = self._db.get_proposal(revision["proposal_id"])
+        if proposal is not None:
+            self._index.reindex_proposal(
+                self._agent_id, revision["proposal_id"], proposal["claim_text"]
+            )
+        self._index.delete_topic_revision(revision["id"])
+
+        return {
+            "target_key": target_key,
+            "proposal_id": revision["proposal_id"],
+            "restored_content": revision["prior_content"],
+        }
+
+    def _find_merge_target(self, claim_text: str) -> str | None:
         """Find an existing topic note this claim likely belongs in, or ``None``.
 
         Restricted to ``corpus="durable"`` and, within that, to
@@ -336,7 +653,7 @@ class MemoryConsolidator:
         Task 4 note) — and a wrong guess here only produces a preview a
         human can reject, never an applied change.
         """
-        hits = self._index.hybrid_search(agent_id, claim_text, corpus="durable", max_results=5)
+        hits = self._index.hybrid_search(self._agent_id, claim_text, corpus="durable", max_results=5)
         for hit in hits:
             key = _topic_key_from_rel_path(hit["rel_path"])
             if key is not None:

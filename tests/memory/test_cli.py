@@ -45,6 +45,16 @@ def _patch_index(monkeypatch, mock_index):
     monkeypatch.setattr(cli, "_build_index", lambda: mock_index)
 
 
+def _patch_db(monkeypatch, mock_db):
+    """Make `_build_db()` return a mock instead of touching a real database."""
+    monkeypatch.setattr(cli, "_build_db", lambda: mock_db)
+
+
+def _patch_provider(monkeypatch, mock_provider):
+    """Make `_build_provider()` return a mock instead of constructing a real one."""
+    monkeypatch.setattr(cli, "_build_provider", lambda agent_id: mock_provider)
+
+
 def test_migrate_dry_run_is_default(monkeypatch, tmp_path, capsys):
     _patch_config(monkeypatch, tmp_path)
     exit_code = cli.main(["migrate"])
@@ -573,3 +583,316 @@ def test_build_index_constructs_an_embedding_provider_when_configured(monkeypatc
     call_kwargs = mock_index_cls.call_args.kwargs
     assert call_kwargs["embedding_dimensions"] == 768
     assert call_kwargs["embedding_provider"] is mock_provider_cls.return_value
+
+
+# ---------------------------------------------------------------------------
+# consolidate (Stage One Phase 5, slice D)
+# ---------------------------------------------------------------------------
+
+def _fake_preview(**overrides) -> dict:
+    from minion_assist.memory.consolidation import _hash_text
+
+    base = {
+        "id": 5, "agent_id": "main", "proposal_id": 1, "target_kind": "new_topic",
+        "target_key": "dark-mode", "based_on_content_hash": _hash_text(""),
+        "drafted_content": "Drafted.", "rationale": "New preference.",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_consolidate_list_shows_ranked_proposals(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    _patch_index(monkeypatch, Mock())
+    monkeypatch.setattr(consolidation, "rank_proposals", lambda db, index, agent_id: [
+        {"id": 1, "score": 8, "claim_text": "User prefers dark mode."},
+    ])
+
+    exit_code = cli.main(["consolidate", "list", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "#1" in out
+    assert "User prefers dark mode." in out
+
+
+def test_consolidate_list_respects_top(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    _patch_index(monkeypatch, Mock())
+    monkeypatch.setattr(consolidation, "rank_proposals", lambda db, index, agent_id: [
+        {"id": i, "score": 0, "claim_text": f"Claim {i}."} for i in range(1, 6)
+    ])
+
+    exit_code = cli.main(["consolidate", "list", "--agent", "main", "--top", "2"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert out.count("Claim") == 2
+
+
+def test_consolidate_list_reports_no_pending_proposals(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    _patch_index(monkeypatch, Mock())
+    monkeypatch.setattr(consolidation, "rank_proposals", lambda db, index, agent_id: [])
+
+    exit_code = cli.main(["consolidate", "list", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "no pending proposals" in out
+
+
+def test_consolidate_list_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["consolidate", "list", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_consolidate_preview_shows_the_drafted_report(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    _patch_index(monkeypatch, Mock())
+    _patch_provider(monkeypatch, Mock())
+    mock_consolidator = Mock()
+    mock_consolidator.preview.return_value = _fake_preview()
+    monkeypatch.setattr(consolidation, "MemoryConsolidator", lambda *a, **kw: mock_consolidator)
+
+    exit_code = cli.main(["consolidate", "preview", "1", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "dark-mode" in out
+    assert "Preview id: 5" in out
+    mock_consolidator.preview.assert_called_once_with(1)
+
+
+def test_consolidate_preview_reports_an_unknown_proposal(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    _patch_index(monkeypatch, Mock())
+    _patch_provider(monkeypatch, Mock())
+    mock_consolidator = Mock()
+    mock_consolidator.preview.side_effect = ValueError("No proposal with id 999")
+    monkeypatch.setattr(consolidation, "MemoryConsolidator", lambda *a, **kw: mock_consolidator)
+
+    exit_code = cli.main(["consolidate", "preview", "999", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+
+
+def test_consolidate_explain_shows_the_report(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.get_consolidation_preview.return_value = _fake_preview()
+    _patch_index(monkeypatch, mock_index)
+    mock_db = Mock()
+    mock_db.get_proposal.return_value = {"status": "pending", "rejected_reason": ""}
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["consolidate", "explain", "5", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "dark-mode" in out
+    assert "WARNING: stale" not in out  # nothing on disk yet, hash matches ""
+
+
+def test_consolidate_explain_flags_a_stale_preview(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    # based_on_content_hash won't match "" (empty/never-existed) since the
+    # note was hand-edited on disk after the preview was drafted.
+    mock_index.get_consolidation_preview.return_value = _fake_preview(
+        target_kind="revise_topic", based_on_content_hash="not-the-real-hash"
+    )
+    _patch_index(monkeypatch, mock_index)
+    _patch_db(monkeypatch, Mock(get_proposal=Mock(return_value=None)))
+    files = MemoryFileRepository(_agent_root(tmp_path, "main"))
+    files.remember("dark-mode", "Hand-edited content.")
+
+    exit_code = cli.main(["consolidate", "explain", "5", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "WARNING: stale" in out
+
+
+def test_consolidate_explain_reports_an_unknown_preview(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.get_consolidation_preview.return_value = None
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["consolidate", "explain", "999", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+
+
+def test_consolidate_approve_applies_and_reports_success(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    _patch_index(monkeypatch, Mock())
+    mock_consolidator = Mock()
+    mock_consolidator.approve.return_value = {
+        "proposal_id": 1, "target_key": "dark-mode", "rel_path": "memory/topics/dark-mode.md",
+    }
+    monkeypatch.setattr(consolidation, "MemoryConsolidator", lambda *a, **kw: mock_consolidator)
+
+    exit_code = cli.main(["consolidate", "approve", "5", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "applied" in out
+    mock_consolidator.approve.assert_called_once_with(5)
+
+
+def test_consolidate_approve_reports_a_stale_preview(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+    from minion_assist.memory.consolidation import StaleProposalError
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    _patch_index(monkeypatch, Mock())
+    mock_consolidator = Mock()
+    mock_consolidator.approve.side_effect = StaleProposalError("Topic changed since draft.")
+    monkeypatch.setattr(consolidation, "MemoryConsolidator", lambda *a, **kw: mock_consolidator)
+
+    exit_code = cli.main(["consolidate", "approve", "5", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+
+
+def test_consolidate_reject_marks_rejected(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    mock_consolidator = Mock()
+    monkeypatch.setattr(consolidation, "MemoryConsolidator", lambda *a, **kw: mock_consolidator)
+
+    exit_code = cli.main(["consolidate", "reject", "3", "--agent", "main", "--reason", "Not useful."])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "rejected" in out
+    mock_consolidator.reject.assert_called_once_with(3, reason="Not useful.")
+
+
+def test_consolidate_reject_never_builds_an_index(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    def _fail_if_called():
+        raise AssertionError("_build_index should not be called by reject")
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    monkeypatch.setattr(cli, "_build_index", _fail_if_called)
+    monkeypatch.setattr(consolidation, "MemoryConsolidator", lambda *a, **kw: Mock())
+
+    exit_code = cli.main(["consolidate", "reject", "3", "--agent", "main"])
+
+    assert exit_code == 0
+
+
+def test_consolidate_rollback_restores_and_reports(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    _patch_index(monkeypatch, Mock())
+    mock_consolidator = Mock()
+    mock_consolidator.rollback.return_value = {
+        "target_key": "dark-mode", "proposal_id": 1, "restored_content": "",
+    }
+    monkeypatch.setattr(consolidation, "MemoryConsolidator", lambda *a, **kw: mock_consolidator)
+
+    exit_code = cli.main(["consolidate", "rollback", "dark-mode", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "rolled back" in out
+    mock_consolidator.rollback.assert_called_once_with("dark-mode")
+
+
+def test_consolidate_rollback_reports_no_history(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_db(monkeypatch, Mock())
+    _patch_index(monkeypatch, Mock())
+    mock_consolidator = Mock()
+    mock_consolidator.rollback.side_effect = ValueError("No revision history for topic 'x' to roll back")
+    monkeypatch.setattr(consolidation, "MemoryConsolidator", lambda *a, **kw: mock_consolidator)
+
+    exit_code = cli.main(["consolidate", "rollback", "x", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+
+
+def test_consolidate_backfill_reports_enqueued_count(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    config.agents["main"] = SimpleNamespace(model=SimpleNamespace(id="test-model"))
+    _patch_db(monkeypatch, Mock())
+    monkeypatch.setattr(consolidation, "backfill_agent", lambda db, agent_id, model_id: 3)
+
+    exit_code = cli.main(["consolidate", "backfill", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "enqueued 3" in out
+
+
+def test_consolidate_backfill_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["consolidate", "backfill", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out

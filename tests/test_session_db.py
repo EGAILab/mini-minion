@@ -394,6 +394,31 @@ def test_get_proposal_returns_none_for_an_unknown_id(db):
     assert db.get_proposal(-1) is None
 
 
+def test_set_proposal_status_updates_status_and_reason(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+    new_proposals = db.complete_capture_job(job_id, ["User prefers dark mode."])
+
+    db.set_proposal_status(new_proposals[0]["id"], "rejected", reason="Not useful.")
+
+    proposal = db.get_proposal(new_proposals[0]["id"])
+    assert proposal["status"] == "rejected"
+    assert proposal["rejected_reason"] == "Not useful."
+
+
+def test_set_proposal_status_clears_a_stale_reason_on_a_later_transition(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+    new_proposals = db.complete_capture_job(job_id, ["User prefers dark mode."])
+    db.set_proposal_status(new_proposals[0]["id"], "rejected", reason="Not useful.")
+
+    db.set_proposal_status(new_proposals[0]["id"], "pending")  # e.g. a rollback
+
+    proposal = db.get_proposal(new_proposals[0]["id"])
+    assert proposal["status"] == "pending"
+    assert proposal["rejected_reason"] == ""
+
+
 def test_new_proposal_defaults_to_pending_status(db, session_id):
     # Stage One Phase 5, slice B: the status column (used by Phase 5 slice
     # D's consolidation review) defaults to "pending" for every existing
@@ -448,3 +473,51 @@ def test_failed_job_is_reclaimable_after_backoff_expires(db, session_id):
     assert job is not None
     assert job["id"] == job_id
     assert job["attempts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Backfill primitives (Stage One Phase 5, slice D)
+# ---------------------------------------------------------------------------
+
+def test_list_message_ids_returns_every_id_ascending(db, session_id):
+    id1 = db.add_message(session_id, "user", "hi")
+    id2 = db.add_message(session_id, "assistant", "hello")
+
+    assert db.list_message_ids(session_id) == sorted([id1, id2])
+
+
+def test_list_message_ids_is_empty_for_a_session_with_no_messages(db, session_id):
+    assert db.list_message_ids(session_id) == []
+
+
+def test_list_capture_job_ranges_returns_every_enqueued_range(db, session_id):
+    db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-a-{session_id}")
+    db.enqueue_capture_job("main", session_id, 5, 6, idempotency_key=f"key-b-{session_id}")
+
+    ranges = db.list_capture_job_ranges(session_id)
+
+    assert sorted(ranges) == [(1, 2), (5, 6)]
+
+
+def test_list_capture_job_ranges_includes_failed_jobs(db, session_id):
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+    db.fail_capture_job(job_id, "boom", backoff_seconds=999.0, max_attempts=1)  # marks 'failed'
+
+    assert db.list_capture_job_ranges(session_id) == [(1, 2)]
+
+
+def test_list_capture_job_ranges_is_empty_for_a_session_with_no_jobs(db, session_id):
+    assert db.list_capture_job_ranges(session_id) == []
+
+
+def test_list_session_ids_for_agent_finds_an_upserted_session(db, session_id):
+    db.upsert_session(session_id, "main")
+
+    assert session_id in db.list_session_ids_for_agent("main")
+
+
+def test_list_session_ids_for_agent_excludes_a_different_agents_session(db, session_id):
+    db.upsert_session(session_id, "researcher")
+
+    assert session_id not in db.list_session_ids_for_agent("main")

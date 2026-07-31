@@ -1302,7 +1302,7 @@ Every proposal `CaptureWorker` records (`memory_proposals`, Phase 2 slice C) is 
 
 The plan's ranking task also lists confidence, source authority, contradiction status, and user pinning as signals — none of these exist yet in minion-assist (`extract_facts()` returns bare claim strings with no confidence; every proposal comes from the same capture pipeline; proposals aren't pinnable; and contradiction detection would need a new semantic-comparison step). These are documented, deliberate gaps in `consolidation.py`'s module docstring, not oversights — consistent with the plan's own "begin in preview-only mode; collect data before choosing thresholds."
 
-`MemoryConsolidator(db, index, files, provider).preview(agent_id, proposal_id)` drafts what a topic-note update *would* look like for one proposal:
+`MemoryConsolidator(db, index, files, provider, agent_id).preview(proposal_id)` drafts what a topic-note update *would* look like for one proposal (one instance per agent — see "Apply, reject, and rollback" below for why):
 
 1. Searches existing topic notes only (`hybrid_search(..., corpus="durable")`, filtered to `memory/topics/` hits — never `MEMORY.md`, daily notes, or imports) for a merge target. No score threshold is applied — the first topic-note hit becomes the target, or there is none and the draft proposes a new topic. A wrong guess here only produces a preview a human can discard; nothing is ever applied automatically.
 2. Calls the provider with a fixed drafting prompt containing only the proposal's claim text and the target's current content (or nothing, for a new topic) — asking for a `KEY:`/`RATIONALE:`/`---`/content-formatted response with the full revised note text.
@@ -1311,7 +1311,54 @@ The plan's ranking task also lists confidence, source authority, contradiction s
 
 **Evidence provenance (Task 8).** `consolidation.py` never reads `DREAMS.md` or any `DreamingScheduler` state — a draft's only inputs are a proposal's claim text (traceable through its `job_id` to real captured messages) and the merge target's existing content (the thing being revised, not "evidence" for the new claim). `tests/memory/test_consolidation.py` pins this down with an explicit regression test asserting the drafting prompt only ever contains those two inputs.
 
-`format_preview_report(preview)` renders a preview as plain text (candidate, rationale, target, drafted content) with `Decision: pending review` — nothing decides anything in this slice. CLI commands (`memory consolidate preview/list/explain/approve/reject/rollback`) and the actual apply/rollback logic are a later slice, built on top of these stored preview rows.
+`format_preview_report(preview)` renders a preview as plain text (candidate, rationale, target, drafted content) with `Decision: pending review` — this always reflects the *draft* itself, not the proposal's current review status (which "Apply, reject, and rollback" below adds).
+
+### Apply, reject, rollback, and historical backfill (Stage One Phase 5, slice D)
+
+`MemoryConsolidator` is scoped to a single agent (`agent_id` is fixed at construction, matching `MemoryService`'s own per-agent design) — unlike `rank_proposals()`, which stays a free function taking `agent_id` per call, since it never touches an agent's on-disk files.
+
+**`approve(preview_id)`** applies a stored preview: writes its drafted content to disk (`MemoryFileRepository.remember()`), reindexes it (`source_kind="durable"`), removes the proposal's own raw-claim chunk (now redundant — its content lives in the real note), and marks the proposal `"promoted"`. Before any of that, it re-hashes the target's *current* content and compares it against the preview's `based_on_content_hash` — if they no longer match, it raises `StaleProposalError` and applies nothing at all. This is the concrete mechanism behind the plan's "user edits win over stale consolidator output" acceptance criterion: a human's manual edit made between preview and approval always wins, never gets silently clobbered.
+
+**`reject(proposal_id, reason="")`** only updates the proposal's status to `"rejected"` (and stores `reason` in the new `memory_proposals.rejected_reason` column, added the same `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` way `status` was) — no file, no index row touched. Rejected proposals keep their searchable `proposals/{id}` chunk (still reachable via `corpus="proposal"`, useful for audit) — approved ones don't, since their content has moved into a real note.
+
+**`rollback(target_key)`** undoes the most recent `approve()` for one topic note:
+
+| Table | Description |
+|---|---|
+| `memory_topic_revisions` | A snapshot of a topic note's content taken by `approve()` right *before* it overwrites — `PRIMARY KEY` none (plain `BIGSERIAL`), indexed on `(agent_id, target_key)`. Columns: `proposal_id` (so rollback can restore the proposal to `"pending"` too), `prior_content` (`""` means the apply being undone created the note from scratch). |
+
+Restores `prior_content` (or deletes the file entirely if `prior_content == ""`, since there's nothing to restore an empty string *to*), reindexes accordingly, puts the associated proposal back to `"pending"`, re-indexes its raw proposal chunk (the one `approve()` removed), and **consumes** the revision row — so a second `rollback()` on the same topic steps back one apply further, not the same one again, the same one-entry-per-undo-step shape a normal undo stack has.
+
+**Historical backfill (Task 10).** `backfill_agent(db, agent_id, model_id)` finds message ranges in an agent's session history that no `memory_capture_jobs` row has ever covered — true gap-filling, not just "skip sessions with any coverage": it diffs every session's actual message ids against every capture job's recorded range (any state, including `failed` — a failed job already exists in the retry/backoff pipeline, backfill's job is catching ranges *never attempted* at all), chunks each gap into bounded 20-message windows (`_BACKFILL_WINDOW_MESSAGES`), and enqueues one capture job per window via the existing `SessionDB.enqueue_capture_job` — using the exact same idempotency-key shape a live turn's job already uses, so re-running backfill is a safe no-op the second time. It does not run extraction itself: the already-running `CaptureWorker` picks up backfilled jobs and processes them exactly like a live turn's job.
+
+New CLI commands:
+
+```bash
+minion-assist memory consolidate list --agent main --top 5      # ranked pending proposals
+minion-assist memory consolidate preview 42 --agent main        # draft a preview for proposal #42
+minion-assist memory consolidate explain 7 --agent main         # show a stored preview + staleness
+minion-assist memory consolidate approve 7 --agent main         # apply preview #7 to disk
+minion-assist memory consolidate reject 42 --agent main --reason "not useful"
+minion-assist memory consolidate rollback project-goals --agent main
+minion-assist memory consolidate backfill --agent main          # gap-fill historical capture jobs
+```
+
+**`MemoryConsolidationScheduler`** (`memory/consolidation_scheduler.py`) automates preview drafting on a daily wall-clock schedule — the same scheduling shape as `DreamingScheduler` (reuses its `_seconds_until_next`), but deliberately a **separate, independently-configured schedule** (Task 9: "keep the poetic `DreamingScheduler` independently configurable; rename the consolidation schedule ... to avoid ambiguity"):
+
+```json
+{
+  "memory_consolidation": {
+    "enabled": true,
+    "hour": 4,
+    "minute": 0,
+    "timezone": "Australia/Sydney",
+    "agent_id": "main",
+    "top_n": 5
+  }
+}
+```
+
+Each pass ranks the configured agent's pending proposals and drafts a preview for up to `top_n` of them — but only ones that don't already have a preview yet, so a proposal sitting `"pending"` for many days doesn't get redrafted (and re-billed) every single day. Never applies, promotes, or rejects anything — 100% human-gated, same as every other part of Phase 5. Starts only when both a database and lexical index are configured, and the configured `agent_id` is actually running.
 
 ### `session_search` Tool Modes
 

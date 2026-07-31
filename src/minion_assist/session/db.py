@@ -221,22 +221,32 @@ class SessionDB:
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS memory_proposals (
-                id         BIGSERIAL PRIMARY KEY,
-                job_id     BIGINT NOT NULL,
-                agent_id   TEXT NOT NULL,
-                claim_text TEXT NOT NULL,
-                created_at DOUBLE PRECISION NOT NULL,
-                status     TEXT NOT NULL DEFAULT 'pending'
+                id              BIGSERIAL PRIMARY KEY,
+                job_id          BIGINT NOT NULL,
+                agent_id        TEXT NOT NULL,
+                claim_text      TEXT NOT NULL,
+                created_at      DOUBLE PRECISION NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                rejected_reason TEXT NOT NULL DEFAULT ''
             )
         """)
-        # status added in Stage One Phase 5, slice B — ADD COLUMN IF NOT
-        # EXISTS so a database that already has this table from Phase 2
-        # picks it up without a manual migration. Values: "pending" (not
-        # yet reviewed), "promoted"/"rejected"/"superseded" (Phase 5 slice
-        # D's consolidation review will assign these; nothing does yet).
+        # status added in Stage One Phase 5, slice B; rejected_reason in
+        # slice D — both ADD COLUMN IF NOT EXISTS so a database that
+        # already has this table from an earlier slice picks them up
+        # without a manual migration. status: "pending" (not yet
+        # reviewed), "promoted"/"rejected"/"superseded" (assigned by
+        # MemoryConsolidator's approve()/reject()/rollback()).
+        # rejected_reason: the human-readable reason passed to reject() —
+        # cleared back to "" on any other status transition (approve,
+        # rollback) so it can never linger as a stale explanation for a
+        # decision that's since been reversed.
         conn.execute(
             "ALTER TABLE memory_proposals ADD COLUMN IF NOT EXISTS "
             "status TEXT NOT NULL DEFAULT 'pending'"
+        )
+        conn.execute(
+            "ALTER TABLE memory_proposals ADD COLUMN IF NOT EXISTS "
+            "rejected_reason TEXT NOT NULL DEFAULT ''"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS proposals_agent_idx ON memory_proposals (agent_id)"
@@ -525,6 +535,79 @@ class SessionDB:
             for r in rows
         ]
 
+    def list_message_ids(self, session_id: str) -> list[int]:
+        """Every message id in one session, ascending.
+
+        Stage One Phase 5, slice D: ``memory/consolidation.py``'s
+        ``backfill_agent`` diffs this against
+        :meth:`list_capture_job_ranges` to find message ranges no capture
+        job has ever covered.
+        """
+        rows = self._conn().execute(
+            "SELECT id FROM messages WHERE session_id = %s ORDER BY id", (session_id,)
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def list_capture_job_ranges(self, session_id: str) -> list[tuple[int, int]]:
+        """Every ``(source_from_message_id, source_to_message_id)`` pair ever enqueued for one session.
+
+        Every job state counts as "covered" here, including ``failed`` —
+        backfill's job is to catch messages that were *never attempted*,
+        not to retry a job that already ran and failed (that's
+        ``CaptureWorker``'s own retry/backoff loop's responsibility, up to
+        ``_MAX_ATTEMPTS``).
+
+        Stage One Phase 5, slice D: the other half of
+        ``backfill_agent``'s gap computation.
+        """
+        rows = self._conn().execute(
+            """
+            SELECT source_from_message_id, source_to_message_id
+            FROM memory_capture_jobs
+            WHERE session_id = %s
+            """,
+            (session_id,),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def list_session_ids_for_agent(self, agent_id: str) -> list[str]:
+        """Every session id ever recorded for one agent — no recency limit.
+
+        Unlike :meth:`list_sessions` (most recent N, for display), this is
+        exhaustive — Stage One Phase 5, slice D's ``backfill_agent`` needs
+        every session, including ones long past any "recent" window, to
+        find historical gaps.
+        """
+        rows = self._conn().execute(
+            "SELECT id FROM sessions WHERE agent_id = %s", (agent_id,)
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def set_proposal_status(self, proposal_id: int, status: str, reason: str = "") -> None:
+        """Set one proposal's review status (and optional rejection reason).
+
+        Stage One Phase 5, slice D: used by
+        :class:`~minion_assist.memory.consolidation.MemoryConsolidator`'s
+        ``approve()`` (→ ``"promoted"``), ``reject()`` (→ ``"rejected"``,
+        with a reason), and ``rollback()`` (→ back to ``"pending"``).
+
+        Args:
+            proposal_id: Which proposal to update.
+            status: ``"pending"``, ``"promoted"``, ``"rejected"``, or
+                ``"superseded"`` — not validated against this list here
+                (this is an internal primitive; validation, if any, is the
+                caller's job) the same way ``fail_capture_job`` doesn't
+                re-validate ``state`` either.
+            reason: Stored as ``rejected_reason`` — always set (default
+                ``""``), so any transition *other than* a fresh
+                ``reject()`` call clears a stale reason from a previous
+                decision rather than leaving it to linger.
+        """
+        self._conn().execute(
+            "UPDATE memory_proposals SET status = %s, rejected_reason = %s WHERE id = %s",
+            (status, reason, proposal_id),
+        )
+
     # ------------------------------------------------------------------
     # Reconciliation (Stage One Phase 2, slice A)
     # ------------------------------------------------------------------
@@ -808,12 +891,12 @@ class SessionDB:
 
         Returns:
             dict | None: ``{"id", "job_id", "agent_id", "claim_text",
-                "created_at", "status"}``, or ``None`` if no proposal with
-                this id exists.
+                "created_at", "status", "rejected_reason"}``, or ``None``
+                if no proposal with this id exists.
         """
         row = self._conn().execute(
             """
-            SELECT id, job_id, agent_id, claim_text, created_at, status
+            SELECT id, job_id, agent_id, claim_text, created_at, status, rejected_reason
             FROM memory_proposals
             WHERE id = %s
             """,
@@ -823,5 +906,5 @@ class SessionDB:
             return None
         return {
             "id": row[0], "job_id": row[1], "agent_id": row[2], "claim_text": row[3],
-            "created_at": row[4], "status": row[5],
+            "created_at": row[4], "status": row[5], "rejected_reason": row[6],
         }
