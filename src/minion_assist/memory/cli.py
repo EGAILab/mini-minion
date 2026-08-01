@@ -27,6 +27,9 @@ Currently supported:
 - ``minion-assist memory consolidate reject PROPOSAL_ID --agent ID [--reason TEXT]`` — reject.
 - ``minion-assist memory consolidate rollback TARGET_KEY --agent ID``  — undo the last approve.
 - ``minion-assist memory consolidate backfill --agent ID``             — gap-fill historical capture jobs.
+- ``minion-assist memory commitments list --agent ID [--status S] [--channel C]`` — list commitments.
+- ``minion-assist memory commitments dismiss COMMITMENT_ID --agent ID`` — dismiss without sending.
+- ``minion-assist memory commitments delete COMMITMENT_ID --agent ID``  — permanently delete.
 
 Talks to
 --------
@@ -215,6 +218,37 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     c_backfill.add_argument("--agent", required=True)
+
+    commitments = sub.add_parser(
+        "commitments",
+        help=(
+            "List, dismiss, or delete inferred commitments "
+            "(Stage One Phase 6, slice C). Requires a configured database."
+        ),
+    )
+    commitments_sub = commitments.add_subparsers(dest="commitments_subcommand", required=True)
+
+    m_list = commitments_sub.add_parser("list", help="List one agent's commitments.")
+    m_list.add_argument("--agent", required=True, help="Which agent's commitments to list.")
+    m_list.add_argument(
+        "--status",
+        choices=["pending", "sent", "dismissed", "snoozed", "expired"],
+        default=None,
+        help="Restrict to one status. Default: every status.",
+    )
+    m_list.add_argument("--channel", default=None, help="Restrict to one channel.")
+
+    m_dismiss = commitments_sub.add_parser(
+        "dismiss", help="Dismiss one pending commitment without sending anything."
+    )
+    m_dismiss.add_argument("commitment_id", type=int)
+    m_dismiss.add_argument("--agent", required=True)
+
+    m_delete = commitments_sub.add_parser(
+        "delete", help="Permanently delete one commitment."
+    )
+    m_delete.add_argument("commitment_id", type=int)
+    m_delete.add_argument("--agent", required=True)
 
     return parser
 
@@ -831,6 +865,89 @@ def _run_consolidate(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def _format_due(epoch: float) -> str:
+    """Render an epoch-seconds timestamp for CLI display."""
+    from datetime import datetime  # noqa: PLC0415
+
+    return datetime.fromtimestamp(epoch).isoformat(timespec="minutes")
+
+
+def _run_commitments_list(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory commitments list --agent ID [--status S] [--channel C]``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    if db is None:
+        print("Error: no database configured (or it's unreachable) — nothing to list.")
+        return 1
+
+    results = db.list_commitments(agent_id, status=args.status, channel=args.channel)
+    if not results:
+        print(f"{agent_id}: no commitments.")
+        return 0
+    for c in results:
+        print(
+            f"#{c['id']} [{c['status']}] {c['kind']} ({c['channel']}) "
+            f"due {_format_due(c['due_earliest'])}: {c['reason']}"
+        )
+    return 0
+
+
+def _run_commitments_dismiss(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory commitments dismiss COMMITMENT_ID --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    if db is None:
+        print("Error: no database configured (or it's unreachable) — nothing to dismiss.")
+        return 1
+
+    commitment = db.get_commitment(args.commitment_id)
+    if commitment is None or commitment["agent_id"] != agent_id:
+        print(f"Error: no commitment with id {args.commitment_id} for agent {agent_id!r}.")
+        return 1
+    if commitment["status"] != "pending":
+        print(f"{agent_id}: commitment #{args.commitment_id} is already {commitment['status']!r}.")
+        return 0
+
+    db.mark_commitment_dismissed(args.commitment_id)
+    print(f"{agent_id}: dismissed commitment #{args.commitment_id}.")
+    return 0
+
+
+def _run_commitments_delete(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory commitments delete COMMITMENT_ID --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    if db is None:
+        print("Error: no database configured (or it's unreachable) — nothing to delete.")
+        return 1
+
+    deleted = db.delete_commitment(agent_id, args.commitment_id)
+    if not deleted:
+        print(f"Error: no commitment with id {args.commitment_id} for agent {agent_id!r}.")
+        return 1
+    print(f"{agent_id}: deleted commitment #{args.commitment_id}.")
+    return 0
+
+
+_COMMITMENTS_HANDLERS = {
+    "list": _run_commitments_list,
+    "dismiss": _run_commitments_dismiss,
+    "delete": _run_commitments_delete,
+}
+
+
+def _run_commitments(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory commitments <list|dismiss|delete>``."""
+    handler = _COMMITMENTS_HANDLERS[args.commitments_subcommand]
+    return handler(args)
+
+
 _HANDLERS = {
     "migrate": _run_migrate,
     "status": _run_status,
@@ -843,6 +960,7 @@ _HANDLERS = {
     "unpin": _run_unpin,
     "pins": _run_pins,
     "consolidate": _run_consolidate,
+    "commitments": _run_commitments,
 }
 
 

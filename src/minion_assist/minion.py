@@ -848,6 +848,7 @@ def main() -> None:
             sessions=sessions,
             matrix_outbound=_matrix_outbound,
             matrix_loop=_matrix_loop,
+            db=_db,
         )
         _heartbeat.start()  # type: ignore[attr-defined]
         print(f"[heartbeat] Scheduler started (interval: {heartbeat_cfg.interval_seconds}s).")

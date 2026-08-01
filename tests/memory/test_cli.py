@@ -897,3 +897,170 @@ def test_consolidate_backfill_without_a_database_reports_an_error(monkeypatch, t
 
     assert exit_code == 1
     assert "no database configured" in out
+
+
+# ---------------------------------------------------------------------------
+# commitments (Stage One Phase 6, slice C)
+# ---------------------------------------------------------------------------
+
+def _fake_commitment(**overrides) -> dict:
+    base = {
+        "id": 1, "agent_id": "main", "session_id": "sess-1", "channel": "!room:example.org",
+        "kind": "open_loop", "sensitivity": "routine", "source": "inferred_user_context",
+        "status": "pending", "reason": "User mentioned an interview.",
+        "suggested_text": "How did it go?", "dedupe_key": "interview:2026-08-01",
+        "confidence": 0.8, "due_earliest": 2_000_000_000.0, "due_latest": 2_000_010_000.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_commitments_list_shows_each_commitment(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_commitments.return_value = [_fake_commitment()]
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["commitments", "list", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "#1" in out
+    assert "User mentioned an interview." in out
+    mock_db.list_commitments.assert_called_once_with("main", status=None, channel=None)
+
+
+def test_commitments_list_passes_status_and_channel_filters(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_commitments.return_value = []
+    _patch_db(monkeypatch, mock_db)
+
+    cli.main(["commitments", "list", "--agent", "main", "--status", "pending", "--channel", "cli"])
+
+    mock_db.list_commitments.assert_called_once_with("main", status="pending", channel="cli")
+
+
+def test_commitments_list_reports_none_found(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_commitments.return_value = []
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["commitments", "list", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "no commitments" in out
+
+
+def test_commitments_list_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["commitments", "list", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_commitments_dismiss_marks_dismissed(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.get_commitment.return_value = _fake_commitment()
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["commitments", "dismiss", "1", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "dismissed" in out.lower()
+    mock_db.mark_commitment_dismissed.assert_called_once_with(1)
+
+
+def test_commitments_dismiss_reports_an_unknown_id(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.get_commitment.return_value = None
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["commitments", "dismiss", "999", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+    mock_db.mark_commitment_dismissed.assert_not_called()
+
+
+def test_commitments_dismiss_refuses_a_wrong_agent(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.get_commitment.return_value = _fake_commitment(agent_id="researcher")
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["commitments", "dismiss", "1", "--agent", "main"])
+
+    assert exit_code == 1
+    mock_db.mark_commitment_dismissed.assert_not_called()
+
+
+def test_commitments_dismiss_reports_an_already_handled_commitment(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.get_commitment.return_value = _fake_commitment(status="sent")
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["commitments", "dismiss", "1", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "already" in out.lower()
+    mock_db.mark_commitment_dismissed.assert_not_called()
+
+
+def test_commitments_delete_removes_the_row(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.delete_commitment.return_value = True
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["commitments", "delete", "1", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "deleted" in out.lower()
+    mock_db.delete_commitment.assert_called_once_with("main", 1)
+
+
+def test_commitments_delete_reports_an_unknown_id(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.delete_commitment.return_value = False
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["commitments", "delete", "999", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+
+
+def test_commitments_delete_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["commitments", "delete", "1", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out

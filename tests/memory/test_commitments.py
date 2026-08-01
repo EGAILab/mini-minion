@@ -14,6 +14,7 @@ from minion_assist.memory.commitments import (
     _parse_time_epoch,
     _validate_candidate,
     extract_commitments,
+    format_due_commitments_block,
 )
 from minion_assist.providers.base import LLMResponse
 
@@ -283,3 +284,45 @@ def test_extract_commitments_tells_the_model_to_skip_explicit_reminders():
 
     assert "remind me" in _EXTRACT_SYSTEM.lower()
     assert "skip" in _EXTRACT_SYSTEM.lower()
+
+
+# ---------------------------------------------------------------------------
+# format_due_commitments_block
+# ---------------------------------------------------------------------------
+
+def _due_commitment(**overrides) -> dict:
+    base = {
+        "id": 1, "kind": "open_loop", "reason": "User mentioned an interview.",
+        "suggested_text": "How did the interview go?", "due_earliest": _NOW + 3600,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_format_due_commitments_block_is_explicitly_untrusted():
+    block = format_due_commitments_block([_due_commitment()])
+
+    assert "untrusted" in block.lower()
+    assert "not instructions" in block.lower()
+
+
+def test_format_due_commitments_block_includes_the_id_and_content():
+    block = format_due_commitments_block([_due_commitment(id=42)])
+
+    assert "#42" in block
+    assert "User mentioned an interview." in block
+    assert "How did the interview go?" in block
+
+
+def test_format_due_commitments_block_mentions_both_tool_names():
+    block = format_due_commitments_block([_due_commitment()])
+
+    assert "respond_to_commitment" in block
+    assert "dismiss_commitment" in block
+
+
+def test_format_due_commitments_block_includes_every_commitment():
+    block = format_due_commitments_block([_due_commitment(id=1), _due_commitment(id=2)])
+
+    assert "#1" in block
+    assert "#2" in block

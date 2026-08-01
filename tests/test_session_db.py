@@ -791,3 +791,233 @@ def test_list_pending_commitments_for_scope_respects_limit(db, session_id):
     pending = db.list_pending_commitments_for_scope("main", "cli", limit=2)
 
     assert len(pending) == 2
+
+
+# ---------------------------------------------------------------------------
+# Commitment lifecycle (Stage One Phase 6, slice C)
+# ---------------------------------------------------------------------------
+
+def _create_commitment(db, session_id, agent_id="main", channel="cli", **overrides) -> dict:
+    """Create a real commitment row via the enqueue/claim/complete flow and return it in full."""
+    job_id = db.enqueue_commitment_job(
+        agent_id, session_id, channel, 1, 2,
+        idempotency_key=f"commit-key-{session_id}-{overrides.get('dedupe_key', 'x')}",
+    )
+    db.claim_next_commitment_job()
+    results = db.complete_commitment_job(job_id, [_candidate(**overrides)])
+    return db.get_commitment(results[0]["id"])
+
+
+def test_get_commitment_returns_the_full_row(db, session_id):
+    created = _create_commitment(db, session_id)
+
+    fetched = db.get_commitment(created["id"])
+
+    assert fetched["status"] == "pending"
+    assert fetched["kind"] == "open_loop"
+    assert fetched["channel"] == "cli"
+
+
+def test_get_commitment_returns_none_for_an_unknown_id(db):
+    assert db.get_commitment(-1) is None
+
+
+def test_mark_commitment_sent_updates_status_and_sent_at(db, session_id):
+    created = _create_commitment(db, session_id)
+
+    db.mark_commitment_sent(created["id"])
+
+    updated = db.get_commitment(created["id"])
+    assert updated["status"] == "sent"
+    sent_at = db._conn().execute(
+        "SELECT sent_at FROM commitments WHERE id = %s", (created["id"],)
+    ).fetchone()[0]
+    assert sent_at is not None
+
+
+def test_mark_commitment_dismissed_updates_status_and_dismissed_at(db, session_id):
+    created = _create_commitment(db, session_id)
+
+    db.mark_commitment_dismissed(created["id"])
+
+    updated = db.get_commitment(created["id"])
+    assert updated["status"] == "dismissed"
+    dismissed_at = db._conn().execute(
+        "SELECT dismissed_at FROM commitments WHERE id = %s", (created["id"],)
+    ).fetchone()[0]
+    assert dismissed_at is not None
+
+
+def test_expire_stale_commitments_expires_ones_past_the_grace_period(db, session_id):
+    long_ago = time.time() - 100 * 3600.0  # well past the 72h grace period
+    created = _create_commitment(
+        db, session_id, due_earliest=long_ago, due_latest=long_ago + 60
+    )
+
+    expired_count = db.expire_stale_commitments("main", time.time())
+
+    assert expired_count >= 1
+    assert db.get_commitment(created["id"])["status"] == "expired"
+
+
+def test_expire_stale_commitments_leaves_recent_pending_commitments_alone(db, session_id):
+    created = _create_commitment(
+        db, session_id, due_earliest=time.time() + 10, due_latest=time.time() + 20
+    )
+
+    db.expire_stale_commitments("main", time.time())
+
+    assert db.get_commitment(created["id"])["status"] == "pending"
+
+
+def test_expire_stale_commitments_never_touches_an_already_sent_commitment(db, session_id):
+    long_ago = time.time() - 100 * 3600.0
+    created = _create_commitment(
+        db, session_id, due_earliest=long_ago, due_latest=long_ago + 60
+    )
+    db.mark_commitment_sent(created["id"])
+
+    db.expire_stale_commitments("main", time.time())
+
+    assert db.get_commitment(created["id"])["status"] == "sent"
+
+
+def test_list_due_commitments_for_agent_returns_a_due_commitment(db, session_id):
+    now = time.time()
+    created = _create_commitment(
+        db, session_id, due_earliest=now - 10, due_latest=now + 3600
+    )
+
+    due = db.list_due_commitments_for_agent("main", now)
+
+    assert [c["id"] for c in due] == [created["id"]]
+
+
+def test_list_due_commitments_for_agent_excludes_a_not_yet_due_commitment(db, session_id):
+    now = time.time()
+    _create_commitment(db, session_id, due_earliest=now + 3600, due_latest=now + 7200)
+
+    due = db.list_due_commitments_for_agent("main", now)
+
+    assert due == []
+
+
+def test_list_due_commitments_for_agent_spans_every_channel(db, session_id):
+    now = time.time()
+    a = _create_commitment(
+        db, session_id, channel="room-a", due_earliest=now - 10, due_latest=now + 3600,
+        dedupe_key="a",
+    )
+    b = _create_commitment(
+        db, session_id, channel="room-b", due_earliest=now - 10, due_latest=now + 3600,
+        dedupe_key="b",
+    )
+
+    due = db.list_due_commitments_for_agent("main", now)
+
+    assert {c["id"] for c in due} == {a["id"], b["id"]}
+
+
+def test_list_due_commitments_for_agent_respects_max_per_heartbeat(db, session_id):
+    now = time.time()
+    for i in range(5):
+        _create_commitment(
+            db, session_id, due_earliest=now - 10, due_latest=now + 3600, dedupe_key=f"k{i}",
+        )
+
+    due = db.list_due_commitments_for_agent("main", now, max_per_heartbeat=2)
+
+    assert len(due) == 2
+
+
+def test_list_due_commitments_for_agent_respects_max_per_day(db, session_id):
+    now = time.time()
+    created = [
+        _create_commitment(
+            db, session_id, due_earliest=now - 10, due_latest=now + 3600, dedupe_key=f"k{i}",
+        )
+        for i in range(3)
+    ]
+    for c in created[:2]:
+        db.mark_commitment_sent(c["id"], now=now - 60)  # 2 already sent today
+
+    due = db.list_due_commitments_for_agent("main", now, max_per_day=2, max_per_heartbeat=10)
+
+    assert due == []  # today's quota is already used up
+
+
+def test_list_due_commitments_for_agent_orders_earliest_due_first(db, session_id):
+    now = time.time()
+    later = _create_commitment(
+        db, session_id, due_earliest=now - 5, due_latest=now + 3600, dedupe_key="later",
+    )
+    earlier = _create_commitment(
+        db, session_id, due_earliest=now - 50, due_latest=now + 3600, dedupe_key="earlier",
+    )
+
+    due = db.list_due_commitments_for_agent("main", now)
+
+    assert [c["id"] for c in due] == [earlier["id"], later["id"]]
+
+
+def test_list_due_commitments_for_agent_scoped_to_the_given_agent(db, session_id):
+    now = time.time()
+    _create_commitment(
+        db, session_id, agent_id="researcher", due_earliest=now - 10, due_latest=now + 3600,
+    )
+
+    due = db.list_due_commitments_for_agent("main", now)
+
+    assert due == []
+
+
+def test_list_commitments_returns_every_status_by_default(db, session_id):
+    created = _create_commitment(db, session_id)
+    db.mark_commitment_sent(created["id"])
+
+    results = db.list_commitments("main")
+
+    assert created["id"] in [c["id"] for c in results]
+
+
+def test_list_commitments_filters_by_status(db, session_id):
+    pending_one = _create_commitment(db, session_id, dedupe_key="p")
+    sent_one = _create_commitment(db, session_id, dedupe_key="s")
+    db.mark_commitment_sent(sent_one["id"])
+
+    results = db.list_commitments("main", status="pending")
+
+    result_ids = [c["id"] for c in results]
+    assert pending_one["id"] in result_ids
+    assert sent_one["id"] not in result_ids
+
+
+def test_list_commitments_filters_by_channel(db, session_id):
+    a = _create_commitment(db, session_id, channel="room-a", dedupe_key="a")
+    _create_commitment(db, session_id, channel="room-b", dedupe_key="b")
+
+    results = db.list_commitments("main", channel="room-a")
+
+    assert [c["id"] for c in results] == [a["id"]]
+
+
+def test_delete_commitment_removes_the_row(db, session_id):
+    created = _create_commitment(db, session_id)
+
+    deleted = db.delete_commitment("main", created["id"])
+
+    assert deleted is True
+    assert db.get_commitment(created["id"]) is None
+
+
+def test_delete_commitment_returns_false_for_an_unknown_id(db):
+    assert db.delete_commitment("main", -1) is False
+
+
+def test_delete_commitment_is_scoped_to_the_given_agent(db, session_id):
+    created = _create_commitment(db, session_id, agent_id="main")
+
+    deleted = db.delete_commitment("researcher", created["id"])
+
+    assert deleted is False
+    assert db.get_commitment(created["id"]) is not None

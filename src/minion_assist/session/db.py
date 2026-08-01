@@ -1175,6 +1175,237 @@ class SessionDB:
             (state, attempts, now + backoff_seconds, error, now, job_id),
         )
 
+    # ------------------------------------------------------------------
+    # Commitment lifecycle — Stage One Phase 6, slice C
+    # ------------------------------------------------------------------
+
+    # How long past its own due_latest a still-pending commitment survives
+    # before being auto-expired. OpenClaw's own shipped default
+    # (ref-repos/openclaw/src/commitments/config.ts's
+    # DEFAULT_COMMITMENT_EXPIRE_AFTER_HOURS), reused for the same
+    # "no evaluation data of our own yet" reason
+    # memory/commitments.py's confidence thresholds already document.
+    _COMMITMENT_EXPIRE_AFTER_SECONDS = 72 * 3600.0
+
+    def expire_stale_commitments(self, agent_id: str, now: float) -> int:
+        """Mark any ``pending`` commitment whose window closed long ago as ``"expired"``.
+
+        Called at the top of :meth:`list_due_commitments_for_agent` (lazy
+        sweep on every read, mirroring OpenClaw's own
+        ``expireStaleCommitments`` — verified against
+        ``ref-repos/openclaw/src/commitments/store.ts``) rather than
+        needing a dedicated expiry scheduler.
+
+        Args:
+            agent_id: Which agent's commitments to sweep.
+            now: Epoch seconds "now" is evaluated at.
+
+        Returns:
+            int: How many commitments were just expired.
+        """
+        cutoff = now - self._COMMITMENT_EXPIRE_AFTER_SECONDS
+        result = self._conn().execute(
+            """
+            UPDATE commitments
+            SET status = 'expired', updated_at = %s
+            WHERE agent_id = %s AND status = 'pending' AND due_latest < %s
+            """,
+            (now, agent_id, cutoff),
+        )
+        return result.rowcount
+
+    def list_due_commitments_for_agent(
+        self, agent_id: str, now: float, max_per_day: int = 3, max_per_heartbeat: int = 3
+    ) -> list[dict]:
+        """List commitments currently due for one agent, across every channel, rate-limited.
+
+        "Due" means ``status = 'pending'`` and ``due_earliest <= now``.
+        Unlike :meth:`list_pending_commitments_for_scope` (a single
+        ``(agent_id, channel)`` scope, used for extraction-time
+        deduplication), this spans every channel the agent has commitments
+        in — the delivery side of "multi-room-aware": one heartbeat pass
+        can see commitments from several different rooms at once, each
+        later resolved to its own room at send time (see
+        ``heartbeat.py``'s ``_deliver_to_channel``), rather than needing a
+        separate heartbeat run per room.
+
+        Rate-limited the same way OpenClaw's own
+        ``listDueCommitmentsForSession`` is (verified against
+        ``ref-repos/openclaw/src/commitments/store.ts``): capped at
+        ``max_per_heartbeat`` per call *and* at ``max_per_day`` total
+        ``"sent"`` commitments in the trailing 24 hours — whichever is
+        smaller wins.
+
+        Args:
+            agent_id: Which agent's commitments to list.
+            now: Epoch seconds "now" is evaluated at.
+            max_per_day: Maximum commitments *sent* per rolling 24 hours.
+            max_per_heartbeat: Maximum commitments returned by one call.
+
+        Returns:
+            list[dict]: ``{"id", "agent_id", "session_id", "channel",
+                "kind", "sensitivity", "source", "reason",
+                "suggested_text", "dedupe_key", "confidence",
+                "due_earliest", "due_latest"}`` dicts, earliest-due first
+                (ties broken by ``created_at`` then ``id`` for
+                deterministic ordering) — empty once the day's quota is
+                used up.
+        """
+        self.expire_stale_commitments(agent_id, now)
+        conn = self._conn()
+        sent_today = conn.execute(
+            """
+            SELECT count(*) FROM commitments
+            WHERE agent_id = %s AND status = 'sent' AND sent_at >= %s
+            """,
+            (agent_id, now - 86400.0),
+        ).fetchone()[0]
+        remaining_today = max_per_day - sent_today
+        if remaining_today <= 0:
+            return []
+        limit = min(max_per_heartbeat, remaining_today)
+
+        rows = conn.execute(
+            """
+            SELECT id, agent_id, session_id, channel, kind, sensitivity, source, reason,
+                   suggested_text, dedupe_key, confidence, due_earliest, due_latest
+            FROM commitments
+            WHERE agent_id = %s AND status = 'pending' AND due_earliest <= %s
+            ORDER BY due_earliest ASC, created_at ASC, id ASC
+            LIMIT %s
+            """,
+            (agent_id, now, limit),
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "agent_id": r[1], "session_id": r[2], "channel": r[3],
+                "kind": r[4], "sensitivity": r[5], "source": r[6], "reason": r[7],
+                "suggested_text": r[8], "dedupe_key": r[9], "confidence": r[10],
+                "due_earliest": r[11], "due_latest": r[12],
+            }
+            for r in rows
+        ]
+
+    def get_commitment(self, commitment_id: int) -> dict | None:
+        """Look up one commitment by id.
+
+        Returns:
+            dict | None: ``{"id", "agent_id", "session_id", "channel",
+                "kind", "sensitivity", "source", "status", "reason",
+                "suggested_text", "dedupe_key", "confidence",
+                "due_earliest", "due_latest"}``, or ``None`` if it doesn't
+                exist.
+        """
+        row = self._conn().execute(
+            """
+            SELECT id, agent_id, session_id, channel, kind, sensitivity, source, status,
+                   reason, suggested_text, dedupe_key, confidence, due_earliest, due_latest
+            FROM commitments WHERE id = %s
+            """,
+            (commitment_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "agent_id": row[1], "session_id": row[2], "channel": row[3],
+            "kind": row[4], "sensitivity": row[5], "source": row[6], "status": row[7],
+            "reason": row[8], "suggested_text": row[9], "dedupe_key": row[10],
+            "confidence": row[11], "due_earliest": row[12], "due_latest": row[13],
+        }
+
+    def mark_commitment_sent(self, commitment_id: int, now: float | None = None) -> None:
+        """Mark a commitment ``"sent"`` — a check-in was actually delivered for it.
+
+        Called by ``tools/commitment_response.py``'s
+        ``RespondToCommitmentTool`` right after delivery succeeds.
+        """
+        now = time.time() if now is None else now
+        self._conn().execute(
+            "UPDATE commitments SET status = 'sent', sent_at = %s, updated_at = %s WHERE id = %s",
+            (now, now, commitment_id),
+        )
+
+    def mark_commitment_dismissed(self, commitment_id: int, now: float | None = None) -> None:
+        """Mark a commitment ``"dismissed"`` — reviewed and deliberately not sent.
+
+        Called by ``tools/commitment_response.py``'s
+        ``DismissCommitmentTool``.
+        """
+        now = time.time() if now is None else now
+        self._conn().execute(
+            "UPDATE commitments SET status = 'dismissed', dismissed_at = %s, updated_at = %s "
+            "WHERE id = %s",
+            (now, now, commitment_id),
+        )
+
+    def list_commitments(
+        self, agent_id: str, status: str | None = None, channel: str | None = None
+    ) -> list[dict]:
+        """List commitments for one agent, most recently created first — the CLI's primitive.
+
+        Args:
+            agent_id: Which agent's commitments to list.
+            status: Restrict to one status (``"pending"``/``"sent"``/
+                ``"dismissed"``/``"snoozed"``/``"expired"``), or ``None``
+                for every status.
+            channel: Restrict to one channel, or ``None`` for every
+                channel.
+
+        Returns:
+            list[dict]: Same shape as :meth:`get_commitment`'s return
+                value, newest first.
+        """
+        clauses = ["agent_id = %s"]
+        params: list = [agent_id]
+        if status is not None:
+            clauses.append("status = %s")
+            params.append(status)
+        if channel is not None:
+            clauses.append("channel = %s")
+            params.append(channel)
+        where_sql = " AND ".join(clauses)
+        rows = self._conn().execute(
+            f"""
+            SELECT id, agent_id, session_id, channel, kind, sensitivity, source, status,
+                   reason, suggested_text, dedupe_key, confidence, due_earliest, due_latest
+            FROM commitments
+            WHERE {where_sql}
+            ORDER BY created_at DESC
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "agent_id": r[1], "session_id": r[2], "channel": r[3],
+                "kind": r[4], "sensitivity": r[5], "source": r[6], "status": r[7],
+                "reason": r[8], "suggested_text": r[9], "dedupe_key": r[10],
+                "confidence": r[11], "due_earliest": r[12], "due_latest": r[13],
+            }
+            for r in rows
+        ]
+
+    def delete_commitment(self, agent_id: str, commitment_id: int) -> bool:
+        """Permanently delete one commitment — Task 7's "complete scoped deletion."
+
+        Scoped to ``agent_id`` (not just the raw id) so an operator can't
+        accidentally delete a different agent's commitment by guessing an
+        id — the same scoping discipline ``memory/service.py``'s
+        ``pin()``/``unpin()`` already applies.
+
+        Args:
+            agent_id: The commitment's owning agent — must match, or
+                nothing is deleted.
+            commitment_id: Which commitment to delete.
+
+        Returns:
+            bool: ``True`` if a row was actually deleted.
+        """
+        result = self._conn().execute(
+            "DELETE FROM commitments WHERE id = %s AND agent_id = %s",
+            (commitment_id, agent_id),
+        )
+        return result.rowcount > 0
+
     def list_pending_proposals(self, agent_id: str) -> list[dict]:
         """List every not-yet-reviewed proposal for one agent, oldest first.
 

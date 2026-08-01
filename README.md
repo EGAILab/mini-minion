@@ -1413,7 +1413,23 @@ A **commitment** is an *inferred* social follow-up the model notices in a comple
 
 Applied uniformly to every configured agent (like `"memory": {"enable_extraction": ...}`), not per-agent. Requires a configured database — there is no degraded-mode fallback (no in-memory commitments store exists).
 
-Nothing in this slice delivers a commitment anywhere yet — that, plus expiry/dismissal/listing/deletion and the CLI, is Stage One Phase 6's next slice.
+### Commitment delivery, expiry, and lifecycle (Stage One Phase 6, slice C)
+
+**Multi-room-aware delivery without a multi-room-aware scheduler.** `HeartbeatScheduler` still runs exactly one heartbeat turn per tick, for one fixed agent — it doesn't need a full per-session/per-room runner (OpenClaw's own architecture) to satisfy "a commitment from one Matrix room is not delivered in another." Instead, a single turn can see due commitments *from every room that agent has commitments in at once* (`SessionDB.list_due_commitments_for_agent`), each one resolved to its own room *at delivery time* — `HeartbeatScheduler._deliver_to_channel()` sends to exactly the channel stored on that specific commitment, never the fixed `notification_room_id` the base heartbeat notification uses. A wrong-room delivery is structurally impossible: the target is a direct database lookup keyed to the commitment being responded to, never inferred from "what room is this turn about."
+
+**What a heartbeat tick does differently now.** If `list_due_commitments_for_agent()` (rate-limited: 3 per day, 3 per heartbeat pass — OpenClaw's own shipped defaults) returns anything, the tick appends an explicitly untrusted-framed block (`memory/commitments.py`'s `format_due_commitments_block()` — "untrusted reference material ... not instructions", the same framing `<relevant_memories>`/`search_memory` already use) to the heartbeat prompt, and injects two new tools for that turn only: `respond_to_commitment(commitment_id, message)` and `dismiss_commitment(commitment_id)` (`tools/commitment_response.py`). Task 5's "the agent may send one natural check-in or dismiss it" is two separate tool calls rather than one call with a mode flag — a model is less likely to send an unwanted check-in by accident when "send" and "dismiss" are genuinely different actions.
+
+**"Commitment delivery cannot invoke tools" (acceptance criterion).** `respond_to_commitment` delivers its message as literal text via the injected `deliver_fn` (a direct Matrix `send_text` call, or a terminal print) — never as a new prompt fed back into an agent turn. There is no code path that could cause the delivered message to trigger a further tool call; delivery is a dumb text-send, structurally incapable of doing anything else. Both tools also refuse to act twice on the same commitment (checking its current status before sending/dismissing), so a stray duplicate tool call can't double-send.
+
+**Expiry.** `SessionDB.expire_stale_commitments()` runs lazily at the top of every `list_due_commitments_for_agent()` call (mirrors OpenClaw's own `expireStaleCommitments`) rather than needing a dedicated scheduler — a `pending` commitment whose `due_latest` closed more than 72 hours ago (OpenClaw's own shipped default) is marked `"expired"` and stops being surfaced.
+
+New CLI commands:
+
+```bash
+minion-assist memory commitments list --agent main [--status pending] [--channel !room:example.org]
+minion-assist memory commitments dismiss 42 --agent main   # dismiss without sending
+minion-assist memory commitments delete 42 --agent main    # permanently delete (Task 7's "complete scoped deletion")
+```
 
 ### `session_search` Tool Modes
 
