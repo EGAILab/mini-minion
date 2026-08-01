@@ -293,6 +293,7 @@ def test_search_with_an_index_passes_corpus_through_and_shows_citation(
         "heading_path": "", "content": "REST API best practices", "start_line": 1,
         "end_line": 1, "score": 0.5,
     }]
+    mock_index.get_boundary.return_value = None  # Stage One Phase 6, slice A
     _patch_index(monkeypatch, mock_index)
 
     exit_code = cli.main(["search", "REST", "--corpus", "durable"])

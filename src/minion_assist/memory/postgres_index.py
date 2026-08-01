@@ -43,6 +43,7 @@ Talks to
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -50,6 +51,7 @@ import time
 from datetime import date as _date
 from typing import TYPE_CHECKING
 
+from .boundaries import parse_frontmatter
 from .chunking import Chunk, chunk_markdown
 
 if TYPE_CHECKING:
@@ -316,6 +318,18 @@ class PostgresMemoryIndex:
                 PRIMARY KEY (agent_id, rel_path)
             )
         """)
+        # boundary_metadata added in Stage One Phase 6, slice A — ADD COLUMN
+        # IF NOT EXISTS so a database that already has this table from an
+        # earlier phase picks it up without a manual migration. JSON-encoded
+        # dict from memory/boundaries.py's parse_frontmatter(); '' means the
+        # file has no action-boundary frontmatter. The file itself is the
+        # source of truth (a human can hand-edit the frontmatter block
+        # directly) — this column is a cache refreshed on every reindex, the
+        # same relationship content_hash already has to the file's raw text.
+        conn.execute(
+            "ALTER TABLE memory_files ADD COLUMN IF NOT EXISTS "
+            "boundary_metadata TEXT NOT NULL DEFAULT ''"
+        )
 
         # Pinned files — Stage One Phase 4, slice B. Backs the "pinned" fusion
         # lane (slice C): a pinned file's chunks are always surfaced,
@@ -443,6 +457,13 @@ class PostgresMemoryIndex:
             "CREATE INDEX IF NOT EXISTS memory_files_shadow_agent_idx "
             "ON memory_files_shadow (agent_id)"
         )
+        # Same self-healing ADD COLUMN IF NOT EXISTS as memory_files above —
+        # this scratch table's CREATE TABLE IF NOT EXISTS is a no-op on an
+        # existing database, so the column needs adding explicitly too.
+        conn.execute(
+            "ALTER TABLE memory_files_shadow ADD COLUMN IF NOT EXISTS "
+            "boundary_metadata TEXT NOT NULL DEFAULT ''"
+        )
 
         # Embedding cache — only created when pgvector is available AND an
         # embedding backend is actually configured (Stage One Phase 4,
@@ -525,7 +546,14 @@ class PostgresMemoryIndex:
             (agent_id, rel_path),
         )
 
-        chunks = chunk_markdown(content)
+        # Stage One Phase 6, slice A: strip any action-boundary frontmatter
+        # before chunking so it never becomes searchable/embeddable body
+        # text — only chunk_markdown()'s citations need adjusting, via
+        # line_offset, so they still point at the right line in the
+        # *original* file on disk (the frontmatter block still occupies
+        # real lines there).
+        boundary_metadata, body, line_offset = parse_frontmatter(content)
+        chunks = chunk_markdown(body)
         for i, chunk in enumerate(chunks):
             conn.execute(
                 """
@@ -541,25 +569,53 @@ class PostgresMemoryIndex:
                     i,
                     " > ".join(chunk.heading_path),
                     chunk.content,
-                    chunk.start_line,
-                    chunk.end_line,
+                    chunk.start_line + line_offset,
+                    chunk.end_line + line_offset,
                     _hash_text(chunk.content),
                 ),
             )
 
         conn.execute(
             """
-            INSERT INTO memory_files (agent_id, rel_path, source_kind, content_hash, indexed_at)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO memory_files
+                (agent_id, rel_path, source_kind, content_hash, indexed_at, boundary_metadata)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (agent_id, rel_path)
             DO UPDATE SET source_kind = EXCLUDED.source_kind,
                           content_hash = EXCLUDED.content_hash,
-                          indexed_at = EXCLUDED.indexed_at
+                          indexed_at = EXCLUDED.indexed_at,
+                          boundary_metadata = EXCLUDED.boundary_metadata
             """,
-            (agent_id, rel_path, source_kind, _hash_text(content), time.time()),
+            (
+                agent_id, rel_path, source_kind, _hash_text(content), time.time(),
+                json.dumps(boundary_metadata) if boundary_metadata else "",
+            ),
         )
         self._maybe_embed_chunks(chunks)
         return len(chunks)
+
+    def get_boundary(self, agent_id: str, rel_path: str) -> dict[str, str] | None:
+        """Look up one file's cached action-boundary metadata (Stage One Phase 6, slice A).
+
+        Reads the ``boundary_metadata`` cached on ``memory_files`` by the
+        most recent :meth:`reindex_file`/:meth:`force_rebuild_agent` — never
+        re-parses the file from disk. Called by
+        ``memory/service.py``'s ``MemoryService._apply_boundaries`` once per
+        unique ``rel_path`` in a result set.
+
+        Returns:
+            dict[str, str] | None: The parsed frontmatter fields (see
+                ``memory/boundaries.py``'s ``parse_frontmatter``), or
+                ``None`` if the file was never indexed or has no
+                frontmatter block.
+        """
+        row = self._conn().execute(
+            "SELECT boundary_metadata FROM memory_files WHERE agent_id = %s AND rel_path = %s",
+            (agent_id, rel_path),
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        return json.loads(row[0])
 
     def remove_file(self, agent_id: str, rel_path: str) -> None:
         """Remove one file's chunks, ledger row, and pin (e.g. after on-disk deletion).
@@ -804,7 +860,11 @@ class PostgresMemoryIndex:
         processed = 0
         all_chunks = []
         for source_kind, rel_path, content in indexable_files:
-            chunks = chunk_markdown(content)
+            # Stage One Phase 6, slice A: same frontmatter stripping as
+            # reindex_file() — see its comment for why line_offset is added
+            # back onto every chunk's start_line/end_line.
+            boundary_metadata, body, line_offset = parse_frontmatter(content)
+            chunks = chunk_markdown(body)
             all_chunks.extend(chunks)
             for i, chunk in enumerate(chunks):
                 conn.execute(
@@ -816,17 +876,20 @@ class PostgresMemoryIndex:
                     """,
                     (
                         agent_id, source_kind, rel_path, i, " > ".join(chunk.heading_path),
-                        chunk.content, chunk.start_line, chunk.end_line,
+                        chunk.content, chunk.start_line + line_offset, chunk.end_line + line_offset,
                         _hash_text(chunk.content),
                     ),
                 )
             conn.execute(
                 """
                 INSERT INTO memory_files_shadow
-                    (agent_id, rel_path, source_kind, content_hash, indexed_at)
-                VALUES (%s, %s, %s, %s, %s)
+                    (agent_id, rel_path, source_kind, content_hash, indexed_at, boundary_metadata)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (agent_id, rel_path, source_kind, _hash_text(content), time.time()),
+                (
+                    agent_id, rel_path, source_kind, _hash_text(content), time.time(),
+                    json.dumps(boundary_metadata) if boundary_metadata else "",
+                ),
             )
             processed += 1
 
@@ -859,8 +922,9 @@ class PostgresMemoryIndex:
             conn.execute("DELETE FROM memory_files WHERE agent_id = %s", (agent_id,))
             conn.execute(
                 """
-                INSERT INTO memory_files (agent_id, rel_path, source_kind, content_hash, indexed_at)
-                SELECT agent_id, rel_path, source_kind, content_hash, indexed_at
+                INSERT INTO memory_files
+                    (agent_id, rel_path, source_kind, content_hash, indexed_at, boundary_metadata)
+                SELECT agent_id, rel_path, source_kind, content_hash, indexed_at, boundary_metadata
                 FROM memory_files_shadow WHERE agent_id = %s
                 """,
                 (agent_id,),

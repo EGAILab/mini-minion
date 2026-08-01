@@ -54,6 +54,12 @@ class MemoryHit:
             a linear-scan hit (that scoring isn't rank-comparable to
             ``ts_rank``, so it's left unset rather than forced into this
             field).
+        boundary: Stage One Phase 6, slice A — a formatted, advisory
+            ``[Boundary: ...]`` annotation (see ``memory/boundaries.py``'s
+            ``format_boundary_prefix``) when this hit's source note
+            carries action-boundary frontmatter, else ``None``. Only ever
+            set on an indexed-path hit (linear-scan/degraded-mode hits
+            never carry this — see ``MemoryService._apply_boundaries``).
     """
 
     key: str
@@ -63,6 +69,7 @@ class MemoryHit:
     start_line: int | None = None
     end_line: int | None = None
     score: float | None = None
+    boundary: str | None = None
 
 
 @dataclass(frozen=True)

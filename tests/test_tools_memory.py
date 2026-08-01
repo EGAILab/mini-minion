@@ -1,6 +1,9 @@
 """Tests for SaveMemoryTool and SearchMemoryTool."""
 
+from unittest.mock import Mock
+
 from minion_assist.memory.files import MemoryFileRepository
+from minion_assist.memory.models import MemoryHit
 from minion_assist.memory.service import MemoryService
 from minion_assist.tools.memory import SaveMemoryTool, SearchMemoryTool
 
@@ -42,6 +45,36 @@ def test_search_memory_finds_saved_content(tmp_path):
     result = tool.execute(query="REST")
     assert "api-notes" in result
     assert "REST API" in result
+
+
+def test_search_memory_shows_boundary_annotation_when_present():
+    # Stage One Phase 6, slice A. Only an index-backed hit ever carries
+    # hit.boundary -- a Mock stands in rather than a real Postgres index.
+    mem = Mock()
+    mem.search.return_value = [
+        MemoryHit(
+            key="deploy-note", content="Some content.", source="durable",
+            boundary="[Boundary — advisory only, does not itself grant permission — Owner: main]",
+        )
+    ]
+    tool = SearchMemoryTool(mem)
+
+    result = tool.execute(query="deploy")
+
+    assert "Boundary" in result
+    assert "Owner: main" in result
+
+
+def test_search_memory_omits_boundary_text_when_absent():
+    mem = Mock()
+    mem.search.return_value = [
+        MemoryHit(key="plain-note", content="Some content.", source="durable")
+    ]
+    tool = SearchMemoryTool(mem)
+
+    result = tool.execute(query="query")
+
+    assert "Boundary" not in result
 
 
 def test_search_memory_no_results_empty_memory(tmp_path):

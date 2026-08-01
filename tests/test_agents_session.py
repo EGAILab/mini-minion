@@ -14,6 +14,7 @@ from minion_assist.agents.events import (
 from minion_assist.agents.session import AgentSession, build_prompt_section
 from minion_assist.context import Compactor
 from minion_assist.memory.files import MemoryFileRepository
+from minion_assist.memory.models import MemoryHit
 from minion_assist.memory.service import MemoryService
 from minion_assist.memory.short_term import ShortTermMemory
 from minion_assist.messages import EVENT_ID_KEY
@@ -541,6 +542,35 @@ def test_build_prompt_section_omits_citation_without_an_index(tmp_path):
     assert "python-facts.md" not in text
 
 
+def test_build_prompt_section_renders_a_boundary_annotation_when_present(tmp_path):
+    # Stage One Phase 6, slice A. Only an index-backed hit ever carries
+    # hit.boundary (see MemoryService._apply_boundaries) -- a Mock stands
+    # in for that here rather than standing up a real Postgres index.
+    memory = Mock()
+    memory.search.return_value = [
+        MemoryHit(
+            key="deploy-note", content="Some content.", source="durable",
+            boundary="[Boundary — advisory only, does not itself grant permission — Owner: main]",
+        )
+    ]
+
+    text, _injected_hits, _tokens = build_prompt_section(memory, "deploy", max_tokens=1000)
+
+    assert "Boundary" in text
+    assert "Owner: main" in text
+
+
+def test_build_prompt_section_omits_boundary_text_when_absent(tmp_path):
+    memory = Mock()
+    memory.search.return_value = [
+        MemoryHit(key="plain-note", content="Some content.", source="durable")
+    ]
+
+    text, _injected_hits, _tokens = build_prompt_section(memory, "query", max_tokens=1000)
+
+    assert "Boundary" not in text
+
+
 def test_build_prompt_section_respects_a_tiny_token_budget(tmp_path):
     memory = MemoryService(MemoryFileRepository(tmp_path))
     memory.remember("python-facts", "User is a Python expert. " * 50)
@@ -602,6 +632,7 @@ def test_send_marks_injected_recall_telemetry_on_the_index(tmp_path):
         "chunk_index": 0, "heading_path": "", "content": "User is a Python expert.",
         "start_line": 1, "end_line": 1, "score": 0.9,
     }]
+    mock_index.get_boundary.return_value = None  # Stage One Phase 6, slice A
     memory = MemoryService(
         MemoryFileRepository(tmp_path), index=mock_index, agent_id="main"
     )

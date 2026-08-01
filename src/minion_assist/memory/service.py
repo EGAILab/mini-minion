@@ -55,11 +55,14 @@ Talks to
 from __future__ import annotations
 
 import logging
+import time
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..messages import format_message_excerpt
+from .boundaries import format_boundary_prefix, is_boundary_active
 from .files import MemoryFileRepository
 from .models import (
     FLUSH_STATUS_EMPTY,
@@ -249,7 +252,7 @@ class MemoryService:
                 rows = self._index.hybrid_search(
                     self._agent_id, query, corpus=corpus, max_results=max_results
                 )
-                return [
+                hits = [
                     MemoryHit(
                         key=Path(r["rel_path"]).stem,
                         content=r["content"],
@@ -261,6 +264,7 @@ class MemoryService:
                     )
                     for r in rows
                 ]
+                return self._apply_boundaries(hits)
             except Exception as exc:
                 _log.warning(
                     "Hybrid index search failed for agent %s, falling back to linear scan: "
@@ -273,6 +277,56 @@ class MemoryService:
             legacy_source = _CORPUS_TO_LEGACY_SOURCE.get(corpus, corpus)
             hits = [h for h in hits if h.source == legacy_source]
         return hits
+
+    def _apply_boundaries(self, hits: list[MemoryHit]) -> list[MemoryHit]:
+        """Attach an advisory boundary annotation, or drop an inactive one (Stage One Phase 6, slice A).
+
+        Only applies to indexed-path hits (every hit here has ``rel_path``
+        set, since this is only ever called from the branch of
+        :meth:`search` that used the lexical index) — degraded-mode linear
+        scan hits never carry boundary metadata, since it lives in Postgres
+        (see ``memory/boundaries.py``'s module docstring for why the file
+        itself is still the source of truth; this is a cached derivative).
+
+        A hit whose note has boundary metadata but is currently outside its
+        ``[safe_after, expires_at]`` window is *excluded* from the returned
+        list entirely, not merely labeled — see
+        ``memory/boundaries.py``'s ``is_boundary_active`` docstring. This
+        can occasionally return fewer than ``max_results`` hits on a turn
+        where an inactive boundary-bearing note would otherwise have
+        ranked in the top results; a documented, deliberate trade-off in
+        favor of correctness over exact recall-count preservation.
+
+        Never raises: a lookup failure for one file is logged at DEBUG and
+        treated as "no boundary," the same best-effort posture every other
+        index-backed enrichment in this class already has.
+        """
+        if self._index is None or self._agent_id is None:
+            return hits
+        now = time.time()
+        cache: dict[str, dict[str, str] | None] = {}
+        kept: list[MemoryHit] = []
+        for hit in hits:
+            if hit.rel_path is None:
+                kept.append(hit)
+                continue
+            if hit.rel_path not in cache:
+                try:
+                    cache[hit.rel_path] = self._index.get_boundary(self._agent_id, hit.rel_path)
+                except Exception as exc:
+                    _log.debug(
+                        "Boundary lookup failed for %s (%s): %s: %s",
+                        hit.rel_path, self._agent_id, type(exc).__name__, exc,
+                    )
+                    cache[hit.rel_path] = None
+            metadata = cache[hit.rel_path]
+            if not metadata:
+                kept.append(hit)
+                continue
+            if not is_boundary_active(metadata, now):
+                continue
+            kept.append(replace(hit, boundary=format_boundary_prefix(metadata)))
+        return kept
 
     def mark_injected(self, rel_paths: list[str], query: str) -> None:
         """Record that these files (from a prior :meth:`search` call) were actually injected.

@@ -1360,6 +1360,35 @@ minion-assist memory consolidate backfill --agent main          # gap-fill histo
 
 Each pass ranks the configured agent's pending proposals and drafts a preview for up to `top_n` of them — but only ones that don't already have a preview yet, so a proposal sitting `"pending"` for many days doesn't get redrafted (and re-billed) every single day. Never applies, promotes, or rejects anything — 100% human-gated, same as every other part of Phase 5. Starts only when both a database and lexical index are configured, and the configured `agent_id` is actually running.
 
+### Action-sensitive memory boundaries (Stage One Phase 6, slice A)
+
+**Goal: make proactive behavior useful without converting remembered text into authority.** A topic note can optionally carry action-boundary metadata as a small frontmatter block at the very top of the file:
+
+```markdown
+---
+owner: main
+applies_when: deploying to production
+safe_after: 2026-09-01
+expires_at: 2026-12-01
+unlock_condition: explicit user confirmation this quarter
+prohibited_action: do not deploy without a second reviewer
+required_approval: user
+---
+The rest of the note's body, as usual.
+```
+
+All seven fields are optional (`memory/boundaries.py`'s `parse_frontmatter()`); a note with none of them behaves exactly as before. Unknown keys are silently ignored, and a malformed/unterminated block degrades to "no frontmatter" rather than raising — a human hand-editing a note must never be able to break indexing with a typo.
+
+**Advisory only, structurally — not a permission-policy hook.** This metadata is never wired into `tools/policy.py`'s `PermissionPolicy` or any tool-execution path; there is no code anywhere that reads a note's `required_approval`/`prohibited_action` text and uses it to allow or block a tool call. It exists purely to be *rendered* wherever a note is retrieved, so a model reading "requires approval from X" in its own memory sees that as something to ask about, not standing authorization it already has. This is the concrete mechanism behind the plan's acceptance criterion "a remembered approval never bypasses current permission policy" — satisfied by there being no path connecting the two systems at all, not by a runtime check.
+
+**Mechanically enforced vs. purely rendered.** `safe_after`/`expires_at` are the only two fields with a machine-checkable meaning: `is_boundary_active()` treats them as a `[safe_after, expires_at]` window (either side optional), and `MemoryService._apply_boundaries()` *excludes* a hit whose note is currently outside that window from the result set entirely — not merely labeled — satisfying "expired constraints ... do not influence action" by construction. This can occasionally return fewer than `max_results` hits on a turn where an inactive boundary-bearing note would otherwise have ranked in the top results — a documented, deliberate trade-off favoring correctness over exact recall-count preservation. `owner`, `applies_when`, `unlock_condition`, `prohibited_action`, and `required_approval` are pure display text; nothing evaluates them.
+
+**Where it's rendered.** Both primary retrieval surfaces show a note's boundary via `format_boundary_prefix()` — a single bracketed, explicitly-labeled-advisory line — right alongside its content: per-turn `<relevant_memories>` injection (`agents/session.py`'s `build_prompt_section()`) and the `search_memory` tool. (`memory_get`'s bounded exact-line reads are a deliberate scope boundary for this slice — that tool is typically a targeted follow-up to something already seen via search/injection, where the boundary would already have been shown once.)
+
+**Storage.** The frontmatter is stripped before chunking (so it never becomes searchable/embeddable body text) and its parsed form is cached on `memory_files.boundary_metadata` (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, same self-healing pattern every other schema addition in this project uses) — refreshed on every `reindex_file()`/`force_rebuild_agent()`, the same relationship `content_hash` already has to a file's raw text. The file itself stays the source of truth (a human can hand-edit the frontmatter block directly); Postgres is only a derived cache, consistent with Phase 1's founding principle. Chunk citations (`start_line`/`end_line`) still point at the right line in the *original* file on disk — the frontmatter block's line count is added back onto every chunk's line numbers after chunking the frontmatter-stripped body.
+
+No new CLI in this slice — a human (or a future consolidator enhancement) edits the frontmatter directly.
+
 ### `session_search` Tool Modes
 
 | Mode | Description |

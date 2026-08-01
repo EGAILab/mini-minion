@@ -350,7 +350,13 @@ def build_prompt_section(
     for hit in results:
         snippet = hit.content.strip()[:400]
         citation = f" ({hit.rel_path}:{hit.start_line}-{hit.end_line})" if hit.rel_path else ""
-        entry = f"[{hit.source}] {hit.key}{citation}: {snippet}"
+        # Stage One Phase 6, slice A: a boundary-bearing note gets its
+        # advisory annotation rendered right alongside its content, every
+        # time it's injected — never just once, since the model has no
+        # memory of a prior turn's injection (see this function's own
+        # docstring on why nothing here is safely suppressible).
+        boundary_suffix = f" {hit.boundary}" if hit.boundary else ""
+        entry = f"[{hit.source}] {hit.key}{citation}: {snippet}{boundary_suffix}"
         entry_tokens = _estimate_tokens({"content": entry})
         if tokens_used + entry_tokens > max_tokens:
             break

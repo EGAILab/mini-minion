@@ -230,7 +230,12 @@ class SearchMemoryTool(Tool):
         )
         parts = []
         for hit in results:
-            parts.append(f"## {hit.key}\n{hit.content}")
+            # Stage One Phase 6, slice A: a boundary-bearing note's
+            # advisory annotation is shown right under its heading, every
+            # time it's returned by search — see memory/boundaries.py's
+            # module docstring for why this is advisory text, not authority.
+            boundary_line = f"\n{hit.boundary}" if hit.boundary else ""
+            parts.append(f"## {hit.key}{boundary_line}\n{hit.content}")
         output = header + "\n\n".join(parts)
         if capped:
             output += f"\n\n(Results capped at {_SEARCH_MAX_RESULTS}. Use a more specific keyword to narrow results.)"

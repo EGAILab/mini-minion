@@ -24,8 +24,15 @@ def service(tmp_path):
 
 @pytest.fixture
 def indexed_service(tmp_path):
-    """A MemoryService wired to a mock index — Stage One Phase 3, slice B."""
+    """A MemoryService wired to a mock index — Stage One Phase 3, slice B.
+
+    ``get_boundary`` defaults to ``None`` (Stage One Phase 6, slice A) —
+    "no boundary metadata" — so every existing test here that doesn't care
+    about boundaries isn't tripped up by an unconfigured Mock call
+    returning a truthy-but-meaningless Mock object.
+    """
     mock_index = Mock()
+    mock_index.get_boundary.return_value = None
     svc = MemoryService(MemoryFileRepository(tmp_path), index=mock_index, agent_id="main")
     return svc, mock_index
 
@@ -145,6 +152,107 @@ def test_search_uses_the_index_when_configured(indexed_service):
     assert hit.start_line == 1
     assert hit.end_line == 3
     assert hit.score == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Action-boundary annotation and filtering (Stage One Phase 6, slice A)
+# ---------------------------------------------------------------------------
+
+def _iso(epoch: float) -> str:
+    import datetime as _dt
+
+    return _dt.datetime.fromtimestamp(epoch).isoformat()
+
+
+def test_search_attaches_boundary_annotation_when_the_note_has_active_metadata(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.hybrid_search.return_value = [_index_row()]
+    mock_index.get_boundary.return_value = {"owner": "main"}
+
+    [hit] = svc.search("query")
+
+    assert hit.boundary is not None
+    assert "Owner: main" in hit.boundary
+
+
+def test_search_leaves_boundary_none_when_the_note_has_no_metadata(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.hybrid_search.return_value = [_index_row()]
+    mock_index.get_boundary.return_value = None
+
+    [hit] = svc.search("query")
+
+    assert hit.boundary is None
+
+
+def test_search_excludes_a_hit_whose_boundary_has_expired(indexed_service):
+    import time as _time
+
+    svc, mock_index = indexed_service
+    mock_index.hybrid_search.return_value = [_index_row()]
+    mock_index.get_boundary.return_value = {"expires_at": _iso(_time.time() - 3600)}
+
+    results = svc.search("query")
+
+    assert results == []
+
+
+def test_search_excludes_a_hit_that_is_not_yet_safe(indexed_service):
+    import time as _time
+
+    svc, mock_index = indexed_service
+    mock_index.hybrid_search.return_value = [_index_row()]
+    mock_index.get_boundary.return_value = {"safe_after": _iso(_time.time() + 3600)}
+
+    results = svc.search("query")
+
+    assert results == []
+
+
+def test_search_includes_a_hit_within_its_active_boundary_window(indexed_service):
+    import time as _time
+
+    svc, mock_index = indexed_service
+    mock_index.hybrid_search.return_value = [_index_row()]
+    mock_index.get_boundary.return_value = {"expires_at": _iso(_time.time() + 3600)}
+
+    results = svc.search("query")
+
+    assert len(results) == 1
+    assert results[0].boundary is not None
+
+
+def test_search_looks_up_boundary_at_most_once_per_unique_rel_path(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.hybrid_search.return_value = [
+        _index_row(chunk_index=0), _index_row(chunk_index=1),
+    ]
+    mock_index.get_boundary.return_value = None
+
+    svc.search("query")
+
+    mock_index.get_boundary.assert_called_once_with("main", "MEMORY.md")
+
+
+def test_search_treats_a_boundary_lookup_failure_as_no_boundary(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.hybrid_search.return_value = [_index_row()]
+    mock_index.get_boundary.side_effect = RuntimeError("db unavailable")
+
+    [hit] = svc.search("query")  # must not raise
+
+    assert hit.boundary is None
+
+
+def test_search_never_looks_up_boundaries_in_degraded_mode(service):
+    # `service` (no index configured) exercises the linear-scan fallback --
+    # boundary metadata lives only in Postgres, so there's nothing to look
+    # up here; this documents that as intentional rather than a gap.
+    service.remember("project-goals", "Some content mentioning goals.")
+
+    results = service.search("goals")
+
+    assert all(h.boundary is None for h in results)
 
 
 def test_search_passes_corpus_through_to_the_index(indexed_service):

@@ -144,6 +144,101 @@ def test_reindex_file_stores_source_kind_and_heading_path(index, agent_id):
     assert row[3] == 2
 
 
+# ---------------------------------------------------------------------------
+# Action-boundary frontmatter (Stage One Phase 6, slice A)
+# ---------------------------------------------------------------------------
+
+def test_reindex_file_extracts_boundary_metadata_from_frontmatter(index, agent_id):
+    content = "---\nowner: main\nrequired_approval: user\n---\nBody text."
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    boundary = index.get_boundary(agent_id, "topic.md")
+
+    assert boundary == {"owner": "main", "required_approval": "user"}
+
+
+def test_reindex_file_without_frontmatter_has_no_boundary(index, agent_id):
+    index.reindex_file(agent_id, "topic.md", "durable", "Just a normal note.")
+
+    assert index.get_boundary(agent_id, "topic.md") is None
+
+
+def test_get_boundary_returns_none_for_a_file_never_indexed(index, agent_id):
+    assert index.get_boundary(agent_id, "never-indexed.md") is None
+
+
+def test_reindex_file_strips_frontmatter_from_chunk_content(index, agent_id):
+    content = "---\nowner: main\n---\nBody text only."
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    row = index._conn().execute(
+        "SELECT content FROM memory_chunks WHERE agent_id = %s AND rel_path = %s",
+        (agent_id, "topic.md"),
+    ).fetchone()
+
+    assert "owner" not in row[0]
+    assert row[0] == "Body text only."
+
+
+def test_reindex_file_offsets_chunk_line_numbers_past_the_frontmatter_block(index, agent_id):
+    # Original file: ["---", "owner: main", "---", "# Heading", "Body."]
+    # "# Heading" is line 4 of the original file, not line 1 of the body.
+    content = "---\nowner: main\n---\n# Heading\nBody."
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    row = index._conn().execute(
+        "SELECT start_line, end_line FROM memory_chunks WHERE agent_id = %s AND rel_path = %s",
+        (agent_id, "topic.md"),
+    ).fetchone()
+
+    assert row[0] == 4
+    assert row[1] == 5
+
+
+def test_reindex_file_replaces_boundary_metadata_when_frontmatter_changes(index, agent_id):
+    index.reindex_file(agent_id, "topic.md", "durable", "---\nowner: main\n---\nBody.")
+    index.reindex_file(agent_id, "topic.md", "durable", "---\nowner: researcher\n---\nBody.")
+
+    assert index.get_boundary(agent_id, "topic.md") == {"owner": "researcher"}
+
+
+def test_reindex_file_content_hash_reflects_the_full_file_including_frontmatter(index, agent_id):
+    # A frontmatter-only edit (body unchanged) must still be a real content
+    # change for reconciliation purposes -- reconcile_agent() diffs by hash.
+    index.reindex_file(agent_id, "topic.md", "durable", "---\nowner: main\n---\nBody.")
+    first_hash = index._conn().execute(
+        "SELECT content_hash FROM memory_files WHERE agent_id = %s AND rel_path = %s",
+        (agent_id, "topic.md"),
+    ).fetchone()[0]
+
+    index.reindex_file(agent_id, "topic.md", "durable", "---\nowner: researcher\n---\nBody.")
+    second_hash = index._conn().execute(
+        "SELECT content_hash FROM memory_files WHERE agent_id = %s AND rel_path = %s",
+        (agent_id, "topic.md"),
+    ).fetchone()[0]
+
+    assert first_hash != second_hash
+
+
+def test_force_rebuild_agent_preserves_boundary_metadata(index, agent_id):
+    content = "---\nowner: main\n---\nBody text."
+    index.force_rebuild_agent(agent_id, [("durable", "topic.md", content)])
+
+    assert index.get_boundary(agent_id, "topic.md") == {"owner": "main"}
+
+
+def test_force_rebuild_agent_strips_frontmatter_from_chunk_content(index, agent_id):
+    content = "---\nowner: main\n---\nBody text only."
+    index.force_rebuild_agent(agent_id, [("durable", "topic.md", content)])
+
+    row = index._conn().execute(
+        "SELECT content FROM memory_chunks WHERE agent_id = %s AND rel_path = %s",
+        (agent_id, "topic.md"),
+    ).fetchone()
+
+    assert row[0] == "Body text only."
+
+
 def test_reindex_file_without_a_provider_never_embeds(index, agent_id):
     index.reindex_file(agent_id, "topic.md", "durable", "some content")
     # No provider configured -- nothing to assert against a real cache
