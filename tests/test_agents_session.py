@@ -1126,7 +1126,7 @@ def test_date_does_not_lead_system_prompt(tmp_path):
 # PostgreSQL mirroring (Stage One Phase 2, slice A)
 # ---------------------------------------------------------------------------
 
-def _make_session_with_mock_db(tmp_path, mock_db):
+def _make_session_with_mock_db(tmp_path, mock_db, enable_commitments=False):
     """Build an AgentSession wired to a mock SessionDB, for mirroring tests."""
     short_term = ShortTermMemory(tmp_path / "sessions")
     session_store = SessionStore(tmp_path / "sessions.json")
@@ -1142,6 +1142,7 @@ def _make_session_with_mock_db(tmp_path, mock_db):
         short_term=short_term,
         session_store=session_store,
         db=mock_db,
+        enable_commitments=enable_commitments,
     )
 
 
@@ -1204,3 +1205,80 @@ def test_second_turn_does_not_reassign_event_ids_from_first_turn(tmp_path):
     ids_after_second = {m[EVENT_ID_KEY] for m in session.history}
 
     assert ids_after_first.issubset(ids_after_second)
+
+
+# ---------------------------------------------------------------------------
+# Commitment-job enqueueing (Stage One Phase 6, slice B)
+# ---------------------------------------------------------------------------
+
+def test_commitment_job_enqueued_when_enabled(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=[1, 2])
+    session = _make_session_with_mock_db(tmp_path, mock_db, enable_commitments=True)
+
+    session.send("hello")
+
+    mock_db.enqueue_commitment_job.assert_called_once()
+    call_args = mock_db.enqueue_commitment_job.call_args.args
+    assert call_args[0] == "main"
+    assert call_args[1] == "test-session"
+    assert call_args[2] == "cli"  # channel defaults to "cli" when none is passed
+
+
+def test_commitment_job_not_enqueued_when_disabled(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=[1, 2])
+    session = _make_session_with_mock_db(tmp_path, mock_db, enable_commitments=False)
+
+    session.send("hello")
+
+    mock_db.enqueue_commitment_job.assert_not_called()
+
+
+def test_commitment_job_uses_the_passed_channel(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=[1, 2])
+    session = _make_session_with_mock_db(tmp_path, mock_db, enable_commitments=True)
+
+    session.send("hello", channel="!room:example.org")
+
+    call_args = mock_db.enqueue_commitment_job.call_args.args
+    assert call_args[2] == "!room:example.org"
+
+
+def test_commitment_job_not_enqueued_without_a_database(tmp_path):
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    session = AgentSession(
+        agent_id="main",
+        session_id="test-session",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=_mock_provider(),
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        db=None,
+        enable_commitments=True,
+    )
+
+    session.send("hello")  # must not raise even though enable_commitments=True
+
+
+def test_commitment_job_idempotency_key_includes_the_channel(tmp_path):
+    # Two different channels for the "same" message range must not collide
+    # on the same idempotency key.
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=[1, 2])
+    session = _make_session_with_mock_db(tmp_path, mock_db, enable_commitments=True)
+
+    session.send("hello", channel="room-a")
+    key_a = mock_db.enqueue_commitment_job.call_args.args[5]
+
+    mock_db.mirror_message = Mock(side_effect=[3, 4])
+    session.send("hello again", channel="room-b")
+    key_b = mock_db.enqueue_commitment_job.call_args.args[5]
+
+    assert key_a != key_b

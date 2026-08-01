@@ -72,10 +72,21 @@ def _purge_stale_test_rows():
     by session_id prefix, which would otherwise miss exactly this case.
     messages/message_mirrors/sessions predate this feature, so those stay
     scoped to this file's own 'test-' prefixed rows.
+
+    Constructing a throwaway ``SessionDB`` first (rather than connecting
+    directly via psycopg) runs ``_ensure_schema()`` — necessary the very
+    first time a brand-new table (e.g. ``commitments``, Stage One Phase 6)
+    is introduced: this fixture is session-scoped and autouse, so it runs
+    before any test's own ``db`` fixture on a database that has never run
+    this code before, and a bare ``DELETE FROM`` a table that doesn't
+    exist yet would fail outright.
     """
+    SessionDB(_DB_URL)
     conn = _psycopg.connect(_DB_URL, autocommit=True)
     conn.execute("DELETE FROM memory_proposals")
     conn.execute("DELETE FROM memory_capture_jobs")
+    conn.execute("DELETE FROM commitments")
+    conn.execute("DELETE FROM memory_commitment_jobs")
     conn.execute("DELETE FROM message_mirrors WHERE session_id LIKE 'test-%'")
     conn.execute("DELETE FROM messages WHERE session_id LIKE 'test-%'")
     conn.execute("DELETE FROM sessions WHERE id LIKE 'test-%'")
@@ -94,6 +105,12 @@ def _cleanup_after(db, session_id):
         (session_id,),
     )
     conn.execute("DELETE FROM memory_capture_jobs WHERE session_id = %s", (session_id,))
+    conn.execute(
+        "DELETE FROM commitments WHERE session_id = %s", (session_id,)
+    )
+    conn.execute(
+        "DELETE FROM memory_commitment_jobs WHERE session_id = %s", (session_id,)
+    )
     conn.execute("DELETE FROM message_mirrors WHERE session_id = %s", (session_id,))
     conn.execute("DELETE FROM messages WHERE session_id = %s", (session_id,))
     conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
@@ -521,3 +538,256 @@ def test_list_session_ids_for_agent_excludes_a_different_agents_session(db, sess
     db.upsert_session(session_id, "researcher")
 
     assert session_id not in db.list_session_ids_for_agent("main")
+
+
+# ---------------------------------------------------------------------------
+# Durable commitment-extraction jobs (Stage One Phase 6, slice B)
+# ---------------------------------------------------------------------------
+
+def _candidate(**overrides) -> dict:
+    base = {
+        "kind": "open_loop", "sensitivity": "routine", "source": "inferred_user_context",
+        "reason": "User mentioned an interview.", "suggested_text": "How did the interview go?",
+        "dedupe_key": "interview:2026-08-01", "confidence": 0.8,
+        "due_earliest": 2000000000.0, "due_latest": 2000010000.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_enqueue_commitment_job_returns_job_id(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    assert job_id is not None
+
+
+def test_enqueue_commitment_job_idempotent(db, session_id):
+    key = f"commit-key-{session_id}"
+    first = db.enqueue_commitment_job("main", session_id, "cli", 1, 2, idempotency_key=key)
+    second = db.enqueue_commitment_job("main", session_id, "cli", 1, 2, idempotency_key=key)
+
+    assert first is not None
+    assert second is None
+
+
+def test_claim_next_commitment_job_returns_a_pending_job(db, session_id):
+    db.enqueue_commitment_job(
+        "main", session_id, "!room:example.org", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+
+    job = db.claim_next_commitment_job()
+
+    assert job is not None
+    assert job["agent_id"] == "main"
+    assert job["channel"] == "!room:example.org"
+    assert job["source_from_message_id"] == 1
+    assert job["source_to_message_id"] == 2
+    assert job["attempts"] == 0
+
+
+def test_claim_next_commitment_job_returns_none_when_queue_empty(db):
+    assert db.claim_next_commitment_job() is None
+
+
+def test_claim_next_commitment_job_does_not_reclaim_a_running_job(db, session_id):
+    db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    first_claim = db.claim_next_commitment_job()
+
+    second_claim = db.claim_next_commitment_job()
+
+    assert first_claim is not None
+    assert second_claim is None
+
+
+def test_complete_commitment_job_inserts_a_new_commitment(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    db.claim_next_commitment_job()
+
+    results = db.complete_commitment_job(job_id, [_candidate()])
+
+    assert len(results) == 1
+    assert results[0]["created"] is True
+    row = db._conn().execute(
+        "SELECT kind, sensitivity, source, reason, suggested_text, dedupe_key, "
+        "confidence, due_earliest, due_latest, status, source_job_id "
+        "FROM commitments WHERE id = %s",
+        (results[0]["id"],),
+    ).fetchone()
+    assert row[0] == "open_loop"
+    assert row[1] == "routine"
+    assert row[2] == "inferred_user_context"
+    assert row[3] == "User mentioned an interview."
+    assert row[4] == "How did the interview go?"
+    assert row[5] == "interview:2026-08-01"
+    assert row[6] == 0.8
+    assert row[9] == "pending"
+    assert row[10] == job_id
+
+
+def test_complete_commitment_job_marks_the_job_done(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    db.claim_next_commitment_job()
+
+    db.complete_commitment_job(job_id, [])
+
+    state = db._conn().execute(
+        "SELECT state FROM memory_commitment_jobs WHERE id = %s", (job_id,)
+    ).fetchone()[0]
+    assert state == "done"
+
+
+def test_complete_commitment_job_with_no_candidates_returns_empty_list(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    db.claim_next_commitment_job()
+
+    assert db.complete_commitment_job(job_id, []) == []
+
+
+def test_complete_commitment_job_upserts_a_matching_dedupe_key_instead_of_duplicating(
+    db, session_id
+):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    db.complete_commitment_job(job_id, [_candidate(due_earliest=2000000000.0, due_latest=2000001000.0)])
+
+    job_id_2 = db.enqueue_commitment_job(
+        "main", session_id, "cli", 3, 4, idempotency_key=f"commit-key-2-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    results = db.complete_commitment_job(
+        job_id_2, [_candidate(due_earliest=1999999000.0, due_latest=2000010000.0, confidence=0.95)]
+    )
+
+    assert results[0]["created"] is False  # merged, not a new row
+    count = db._conn().execute(
+        "SELECT count(*) FROM commitments WHERE agent_id = %s AND channel = 'cli' "
+        "AND dedupe_key = 'interview:2026-08-01'",
+        ("main",),
+    ).fetchone()[0]
+    assert count == 1
+    row = db._conn().execute(
+        "SELECT due_earliest, due_latest, confidence FROM commitments WHERE id = %s",
+        (results[0]["id"],),
+    ).fetchone()
+    assert row[0] == 1999999000.0  # widened to the earlier of the two
+    assert row[1] == 2000010000.0  # widened to the later of the two
+    assert row[2] == 0.95  # kept the higher confidence
+
+
+def test_complete_commitment_job_does_not_upsert_against_a_non_pending_commitment(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    first = db.complete_commitment_job(job_id, [_candidate()])
+    db._conn().execute(
+        "UPDATE commitments SET status = 'sent' WHERE id = %s", (first[0]["id"],)
+    )
+
+    job_id_2 = db.enqueue_commitment_job(
+        "main", session_id, "cli", 3, 4, idempotency_key=f"commit-key-2-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    results = db.complete_commitment_job(job_id_2, [_candidate()])
+
+    assert results[0]["created"] is True  # a fresh row, since the old one is no longer pending
+
+
+def test_complete_commitment_job_scopes_dedupe_to_the_same_channel(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "room-a", 1, 2, idempotency_key=f"commit-key-a-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    db.complete_commitment_job(job_id, [_candidate()])
+
+    job_id_2 = db.enqueue_commitment_job(
+        "main", session_id, "room-b", 3, 4, idempotency_key=f"commit-key-b-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    results = db.complete_commitment_job(job_id_2, [_candidate()])
+
+    assert results[0]["created"] is True  # different channel, not the same commitment
+
+
+def test_fail_commitment_job_reschedules_with_backoff(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    db.claim_next_commitment_job()
+
+    db.fail_commitment_job(job_id, "boom", backoff_seconds=100.0, max_attempts=5)
+
+    row = db._conn().execute(
+        "SELECT state, attempts, run_after, last_error FROM memory_commitment_jobs WHERE id = %s",
+        (job_id,),
+    ).fetchone()
+    assert row[0] == "pending"
+    assert row[1] == 1
+    assert row[2] > time.time()
+    assert row[3] == "boom"
+
+
+def test_fail_commitment_job_gives_up_after_max_attempts(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    for _ in range(3):
+        db.claim_next_commitment_job()
+        db.fail_commitment_job(job_id, "boom", backoff_seconds=-1.0, max_attempts=3)
+
+    state = db._conn().execute(
+        "SELECT state FROM memory_commitment_jobs WHERE id = %s", (job_id,)
+    ).fetchone()[0]
+    assert state == "failed"
+
+
+def test_list_pending_commitments_for_scope_returns_pending_only(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    results = db.complete_commitment_job(
+        job_id, [_candidate(dedupe_key="a"), _candidate(dedupe_key="b")]
+    )
+    db._conn().execute(
+        "UPDATE commitments SET status = 'sent' WHERE id = %s", (results[0]["id"],)
+    )
+
+    pending = db.list_pending_commitments_for_scope("main", "cli")
+
+    assert [p["dedupe_key"] for p in pending] == ["b"]
+
+
+def test_list_pending_commitments_for_scope_scoped_to_channel(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "room-a", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    db.complete_commitment_job(job_id, [_candidate()])
+
+    assert db.list_pending_commitments_for_scope("main", "room-b") == []
+
+
+def test_list_pending_commitments_for_scope_respects_limit(db, session_id):
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    db.complete_commitment_job(
+        job_id, [_candidate(dedupe_key=f"key-{i}") for i in range(5)]
+    )
+
+    pending = db.list_pending_commitments_for_scope("main", "cli", limit=2)
+
+    assert len(pending) == 2

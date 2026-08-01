@@ -84,6 +84,7 @@ from .bootstrap import build_bootstrap_prompt_block
 from .config import agents as agents_cfg
 from .config import bootstrap as bootstrap_cfg
 from .config import channels as channels_cfg
+from .config import commitments as commitments_cfg
 from .config import compaction as compaction_cfg
 from .config import extra_plugin_manifests
 from .config import dreaming as dreaming_cfg
@@ -690,6 +691,7 @@ def main() -> None:
             memory=memory_service,
             tasks_dir=_tasks_dir,
             enable_memory_extraction=memory_cfg.enable_extraction,
+            enable_commitments=commitments_cfg.enabled,
             bootstrap_context=_agent_bootstrap_context,
             workspace_root=_agent_workspace,
             log_dir=_log_dir,
@@ -782,6 +784,24 @@ def main() -> None:
             _db, lambda aid: _providers_by_agent[aid], index_proposal=_index_proposal
         )
         _capture_worker.start()
+
+    # --- Durable commitment worker (optional — only when a database is
+    # configured and commitments are enabled) ---
+    # Stage One Phase 6, slice B. One worker for the whole process, same
+    # shape as _capture_worker above (structurally identical, separate
+    # table/queue — see session/db.py's module docstring for why).
+    # min_due_seconds uses the configured heartbeat interval — a
+    # commitment due before the next heartbeat tick could possibly check
+    # for it would just sit expired-on-arrival (Task 4's "ensure the due
+    # time is not immediate").
+    _commitment_worker = None
+    if _db is not None and commitments_cfg.enabled:
+        from .memory.commitment_worker import CommitmentWorker  # noqa: PLC0415
+        _commitment_worker = CommitmentWorker(
+            _db, lambda aid: _providers_by_agent[aid],
+            min_due_seconds=float(heartbeat_cfg.interval_seconds),
+        )
+        _commitment_worker.start()
 
     # --- Memory index watcher (optional — only when a database is configured) ---
     # Stage One Phase 3, slice B: catches on-disk edits made outside the app
@@ -937,6 +957,8 @@ def main() -> None:
             mcp_manager.close_sync()
         if _capture_worker is not None:
             _capture_worker.stop()
+        if _commitment_worker is not None:
+            _commitment_worker.stop()
         if _memory_watcher is not None:
             _memory_watcher.stop()
         sys.exit(0)
@@ -1023,6 +1045,8 @@ def main() -> None:
                 mcp_manager.close_sync()
             if _capture_worker is not None:
                 _capture_worker.stop()
+            if _commitment_worker is not None:
+                _commitment_worker.stop()
             if _memory_watcher is not None:
                 _memory_watcher.stop()
         return
@@ -1178,6 +1202,8 @@ def main() -> None:
             mcp_manager.close_sync()
         if _capture_worker is not None:
             _capture_worker.stop()
+        if _commitment_worker is not None:
+            _commitment_worker.stop()
         if _memory_watcher is not None:
             _memory_watcher.stop()
 

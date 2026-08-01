@@ -820,6 +820,36 @@ class MemoryConsolidationConfig:
 
 
 @dataclass(frozen=True)
+class CommitmentsConfig:
+    """Controls inferred, short-lived commitment extraction (Stage One Phase 6, slice B).
+
+    A "commitment" is an *inferred* social follow-up the model notices in
+    a completed exchange — never something the user explicitly asked to
+    be reminded about (see ``memory/commitments.py``'s module docstring
+    for why explicit reminders are deliberately skipped rather than
+    handled here). Opt-in (Task 3) and applied uniformly to every
+    configured agent, the same way ``"memory": {"enable_extraction": ...}``
+    already is — not a per-agent setting.
+
+    Configured in ``config.json`` under the ``"commitments"`` key::
+
+        "commitments": {
+            "enabled": true
+        }
+
+    Attributes:
+        enabled (bool): When ``True`` (default ``False``), every
+            ``AgentSession`` enqueues a commitment-extraction job after
+            each turn, alongside (not instead of) memory extraction.
+            Requires a configured database — there is no degraded-mode
+            fallback for commitments (unlike memory extraction's daemon-
+            thread path), since there is no in-memory commitments store.
+    """
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     """Controls verbose LLM request/response logging.
 
@@ -1382,6 +1412,24 @@ def _resolve_memory_consolidation() -> MemoryConsolidationConfig:
 # separate from `dreaming` above (Task 9) even though both use the same
 # daily wall-clock scheduling shape.
 memory_consolidation: MemoryConsolidationConfig = _resolve_memory_consolidation()
+
+
+def _resolve_commitments() -> CommitmentsConfig:
+    """Read the ``"commitments"`` section from config.json and build a CommitmentsConfig.
+
+    Returns:
+        CommitmentsConfig: Immutable settings; defaults apply when absent.
+    """
+    raw = _raw.get("commitments", {})
+    if not isinstance(raw, dict):
+        return CommitmentsConfig()
+    return CommitmentsConfig(enabled=bool(raw.get("enabled", False)))
+
+
+# commitments: controls inferred, short-lived commitment extraction
+# (Stage One Phase 6, slice B). Disabled by default; enabled via
+# "commitments": {"enabled": true} in config.json.
+commitments: CommitmentsConfig = _resolve_commitments()
 
 
 def _resolve_logging() -> LoggingConfig:

@@ -1389,6 +1389,32 @@ All seven fields are optional (`memory/boundaries.py`'s `parse_frontmatter()`); 
 
 No new CLI in this slice — a human (or a future consolidator enhancement) edits the frontmatter directly.
 
+### Commitments — schema and extraction pipeline (Stage One Phase 6, slice B)
+
+A **commitment** is an *inferred* social follow-up the model notices in a completed exchange — "the user mentioned an interview tomorrow" — never something the user explicitly asked to be reminded about. Grounded against OpenClaw's actual `src/commitments/` module (not just the plan doc): same `kind` (`event_check_in`/`deadline_check`/`care_check_in`/`open_loop`), `sensitivity` (`routine`/`personal`/`care`), `source` (`inferred_user_context`/`agent_promise`), and `status` (`pending`/`sent`/`dismissed`/`snoozed`/`expired`) vocabulary, and a `due_earliest`/`due_latest` *window* rather than a single instant — scaled down for minion-assist's simpler architecture (one exchange per extraction call, not OpenClaw's batched design; no per-user timezone resolution yet).
+
+**Durable extraction queue.** `memory_commitment_jobs` + `CommitmentWorker` (`memory/commitment_worker.py`) mirror Phase 2's proven `memory_capture_jobs`/`CaptureWorker` shape exactly — same claim/complete/fail lifecycle, same idempotency-key mechanism — but as a genuinely separate table/queue, since commitment output (kind/sensitivity/due-window/confidence/dedupe-key) is a completely different shape than `memory_proposals`' plain claim strings. `AgentSession.send()` enqueues a commitment job alongside (not instead of) the existing capture job whenever `commitments.enabled` — independent flags, a turn can trigger one, both, or neither.
+
+**Skipping explicit reminders.** The plan's Task 6 says explicit reminders should route to "the task/scheduler subsystem rather than memory" — minion-assist has no such subsystem. Rather than build one in this slice, the extraction prompt (`memory/commitments.py`'s `_EXTRACT_SYSTEM`) mirrors OpenClaw's real wording: it explicitly instructs the model to skip an exact request like "remind me tomorrow" entirely. Those stay unhandled, exactly as today — a documented scope boundary.
+
+**Confidence-gated, tools-disabled.** `extract_commitments()` calls the provider with `tools=[]` (Task 3: "tools-disabled") and validates every candidate: known kind/sensitivity/source, confidence at or above threshold (0.72 routine, 0.86 for anything `care`-related — OpenClaw's own shipped defaults, reused since minion-assist has no evaluation data yet to derive different numbers from), and a `due_earliest` that parses to a real future timestamp.
+
+**"Ensure the due time is not immediate" (Task 4).** Every validated candidate's `due_earliest` is clamped to at least `now + min_due_seconds` — `minion.py` wires this to the configured heartbeat interval, since a commitment due before the next heartbeat tick could possibly check for it would just sit expired-on-arrival. Mirrors OpenClaw's own `resolveMinimumDueMs`.
+
+**Scoped to exact agent and channel context.** `AgentSession.send()` gained a new optional `channel` parameter (e.g. a Matrix `room_id`; `None` normalizes to `"cli"` everywhere else), threaded into every commitment job/row. `SessionDB.complete_commitment_job()` upserts a candidate whose `dedupe_key` matches an existing *pending* commitment in the same `(agent_id, channel)` scope — widening the due window, keeping the higher confidence — rather than inserting a near-duplicate, mirroring OpenClaw's real `upsertInferredCommitments`.
+
+```json
+{
+  "commitments": {
+    "enabled": true
+  }
+}
+```
+
+Applied uniformly to every configured agent (like `"memory": {"enable_extraction": ...}`), not per-agent. Requires a configured database — there is no degraded-mode fallback (no in-memory commitments store exists).
+
+Nothing in this slice delivers a commitment anywhere yet — that, plus expiry/dismissal/listing/deletion and the CLI, is Stage One Phase 6's next slice.
+
 ### `session_search` Tool Modes
 
 | Mode | Description |

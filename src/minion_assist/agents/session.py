@@ -436,6 +436,7 @@ class AgentSession:
         memory: MemoryService | None = None,
         tasks_dir: Path | None = None,
         enable_memory_extraction: bool = True,
+        enable_commitments: bool = False,
         bootstrap_context: Callable[[], str] | None = None,
         workspace_root: Path | None = None,
         log_dir: Path | None = None,
@@ -460,6 +461,13 @@ class AgentSession:
         # When False, skip the background memory extraction call after each turn.
         # Controlled by config.json "memory.enable_extraction".
         self._enable_memory_extraction = enable_memory_extraction
+        # When True, also enqueue a commitment-extraction job after each turn
+        # (Stage One Phase 6, slice B). Opt-in (Task 3), defaults to off, and
+        # has no degraded-mode fallback — unlike memory extraction, there is
+        # no in-memory commitments store, so this is simply skipped without
+        # a configured database (self._db is None).
+        # Controlled by config.json "commitments.enabled".
+        self._enable_commitments = enable_commitments
         # Optional per-turn callable that returns the workspace bootstrap block.
         # Called on every turn so edits to bootstrap files take effect immediately.
         self._bootstrap_context = bootstrap_context
@@ -553,6 +561,7 @@ class AgentSession:
         system_suffix: str | None = None,
         max_history_turns: int | None = None,
         skip_bootstrap: bool = False,
+        channel: str | None = None,
     ) -> str | None:
         """Send a user message (with optional media attachments) and return the agent's text response.
 
@@ -590,6 +599,12 @@ class AgentSession:
                 Saves ~15 000 tokens and reduces first-token latency.  Voice
                 mode sets this to ``True`` because workspace files are irrelevant
                 during a voice conversation.
+            channel (str | None): Stage One Phase 6, slice B — identifies
+                the channel/room this turn happened in (e.g. a Matrix
+                ``room_id``), for scoping any extracted commitment to
+                "exact agent and channel context" (the plan's Task 4).
+                ``None`` (the default, and every caller outside the Matrix
+                handler) is normalized to the sentinel ``"cli"``.
 
         Returns:
             str | None: The agent's final response text, or ``None`` if the
@@ -610,6 +625,7 @@ class AgentSession:
                 system_suffix=system_suffix,
                 max_history_turns=max_history_turns,
                 skip_bootstrap=skip_bootstrap,
+                channel=channel,
             )
 
     def _send_locked(
@@ -623,6 +639,7 @@ class AgentSession:
         system_suffix: str | None,
         max_history_turns: int | None = None,
         skip_bootstrap: bool = False,
+        channel: str | None = None,
     ) -> str | None:
         """Locked implementation of send() — called with self._lock already held."""
         _trace_id = str(uuid.uuid4())
@@ -891,6 +908,29 @@ class AgentSession:
                         if m.get("role") in ("user", "assistant") and m.get("content")
                     ]
                     extract_and_save_async(self._memory, self._provider, _last[-2:])
+
+            # Trigger commitment extraction from the last exchange (Stage One
+            # Phase 6, slice B). Independent of the memory-extraction flag
+            # above — a user may want one without the other. No degraded-mode
+            # fallback: there is no in-memory commitments store, so this is
+            # simply skipped without a configured database.
+            if self._enable_commitments and self._db is not None:
+                _commitment_ids = _mirrored_ua_ids[-2:]
+                if _commitment_ids:
+                    from ..memory.commitments import _COMMITMENT_PROMPT_VERSION
+                    _c_from_id, _c_to_id = min(_commitment_ids), max(_commitment_ids)
+                    _c_channel = channel or "cli"
+                    _c_idem_key = (
+                        f"{self._agent_id}:{self._session_id}:{_c_channel}:{_c_from_id}-{_c_to_id}:"
+                        f"{_COMMITMENT_PROMPT_VERSION}:{self._model_id}"
+                    )
+                    try:
+                        self._db.enqueue_commitment_job(
+                            self._agent_id, self._session_id, _c_channel,
+                            _c_from_id, _c_to_id, _c_idem_key,
+                        )
+                    except Exception:
+                        pass
 
             # Emit TurnCompleted — ignored by CLI, consumed by structured log handlers.
             if on_event:

@@ -315,6 +315,7 @@ class MatrixMessageHandler:
                     stream=False,
                     extra_tools=extra_tools or None,
                     system_suffix=system_suffix,
+                    channel=room_id,
                 )
                 result_holder.append(resp or "")
             except Exception as exc:

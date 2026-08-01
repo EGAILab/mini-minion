@@ -20,6 +20,17 @@ Schema (created automatically on first connect):
            slice C); status (Stage One Phase 5, slice B) defaults to
            "pending" until a later slice's review flow assigns
            "promoted"/"rejected"/"superseded"
+  memory_commitment_jobs(id, agent_id, session_id, channel,
+           source_from_message_id, source_to_message_id, idempotency_key,
+           state, attempts, run_after, last_error, created_at, updated_at)
+           — durable commitment-extraction queue, same shape as
+           memory_capture_jobs plus a channel column (Stage One Phase 6,
+           slice B)
+  commitments(id, agent_id, session_id, channel, kind, sensitivity,
+           source, status, reason, suggested_text, dedupe_key, confidence,
+           due_earliest, due_latest, source_job_id, created_at, updated_at,
+           sent_at, dismissed_at) — inferred, short-lived social
+           follow-ups (Stage One Phase 6, slice B)
 
 Durable capture jobs (Stage One Phase 2, slice C)
 ----------------------------------------------------
@@ -251,6 +262,86 @@ class SessionDB:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS proposals_agent_idx ON memory_proposals (agent_id)"
         )
+
+        # Durable commitment-extraction job queue — Stage One Phase 6, slice
+        # B. Structurally identical to memory_capture_jobs above (same
+        # claim/complete/fail lifecycle, same idempotency-key mechanism),
+        # but a separate table/queue: commitment output (kind, sensitivity,
+        # due window, confidence, dedupe key) is a completely different
+        # shape than memory_proposals' plain claim strings, so the two
+        # pipelines stay cleanly separated rather than overloading one
+        # table/worker with two incompatible output schemas. The extra
+        # `channel` column (e.g. a Matrix room id, or "cli" outside Matrix)
+        # is what memory_capture_jobs never needed — commitments must be
+        # scoped to "exact agent and channel context" (the plan's Task 4).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_commitment_jobs (
+                id                     BIGSERIAL PRIMARY KEY,
+                agent_id               TEXT NOT NULL,
+                session_id             TEXT NOT NULL,
+                channel                TEXT NOT NULL,
+                source_from_message_id BIGINT NOT NULL,
+                source_to_message_id   BIGINT NOT NULL,
+                idempotency_key        TEXT NOT NULL UNIQUE,
+                state                  TEXT NOT NULL DEFAULT 'pending',
+                attempts               INTEGER NOT NULL DEFAULT 0,
+                run_after              DOUBLE PRECISION NOT NULL,
+                last_error             TEXT,
+                created_at             DOUBLE PRECISION NOT NULL,
+                updated_at             DOUBLE PRECISION NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS commitment_jobs_pending_idx
+            ON memory_commitment_jobs (state, run_after)
+        """)
+
+        # Commitments — inferred, short-lived social follow-ups (Stage One
+        # Phase 6, Task 3). Scaled down from OpenClaw's real
+        # src/commitments/types.ts CommitmentRecord (verified against that
+        # source, not just the plan doc): same kind/sensitivity/source/
+        # status vocabulary and due-window shape, without OpenClaw's
+        # richer accountId/to/threadId/senderId scope fields minion-assist
+        # has no equivalent concept for yet.
+        #
+        # due_earliest/due_latest are epoch seconds, not a single instant —
+        # a window, so "check in tomorrow afternoon" has somewhere to land
+        # rather than needing to resolve to one exact second.
+        # dedupe_key + (agent_id, channel) is what
+        # SessionDB.complete_commitment_job() upserts against, so a
+        # near-identical inferred follow-up extends an existing pending
+        # commitment's window rather than creating a duplicate.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS commitments (
+                id             BIGSERIAL PRIMARY KEY,
+                agent_id       TEXT NOT NULL,
+                session_id     TEXT NOT NULL,
+                channel        TEXT NOT NULL,
+                kind           TEXT NOT NULL,
+                sensitivity    TEXT NOT NULL,
+                source         TEXT NOT NULL,
+                status         TEXT NOT NULL DEFAULT 'pending',
+                reason         TEXT NOT NULL,
+                suggested_text TEXT NOT NULL,
+                dedupe_key     TEXT NOT NULL,
+                confidence     DOUBLE PRECISION NOT NULL,
+                due_earliest   DOUBLE PRECISION NOT NULL,
+                due_latest     DOUBLE PRECISION NOT NULL,
+                source_job_id  BIGINT NOT NULL,
+                created_at     DOUBLE PRECISION NOT NULL,
+                updated_at     DOUBLE PRECISION NOT NULL,
+                sent_at        DOUBLE PRECISION,
+                dismissed_at   DOUBLE PRECISION
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS commitments_scope_idx
+            ON commitments (agent_id, channel, status)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS commitments_dedupe_idx
+            ON commitments (agent_id, channel, dedupe_key)
+        """)
 
     # ------------------------------------------------------------------
     # Session operations
@@ -845,6 +936,239 @@ class SessionDB:
         conn.execute(
             """
             UPDATE memory_capture_jobs
+            SET state = %s, attempts = %s, run_after = %s, last_error = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (state, attempts, now + backoff_seconds, error, now, job_id),
+        )
+
+    # ------------------------------------------------------------------
+    # Durable commitment-extraction jobs (Stage One Phase 6, slice B)
+    # ------------------------------------------------------------------
+    #
+    # Structurally identical to the capture-job methods above — see the
+    # module docstring's commitments schema note for why this is a
+    # separate table/queue rather than an extension of memory_capture_jobs.
+
+    def enqueue_commitment_job(
+        self,
+        agent_id: str,
+        session_id: str,
+        channel: str,
+        source_from_message_id: int,
+        source_to_message_id: int,
+        idempotency_key: str,
+    ) -> int | None:
+        """Enqueue a commitment-extraction job, idempotently.
+
+        Args mirror :meth:`enqueue_capture_job` with one addition:
+        ``channel`` — a Matrix room id, or ``"cli"`` outside Matrix. This
+        is what scopes a later-extracted commitment to "exact agent and
+        channel context" (the plan's Task 4).
+
+        Returns:
+            int | None: The new job's id, or ``None`` if a job with this
+                ``idempotency_key`` already exists.
+        """
+        now = time.time()
+        row = self._conn().execute(
+            """
+            INSERT INTO memory_commitment_jobs
+                (agent_id, session_id, channel, source_from_message_id,
+                 source_to_message_id, idempotency_key, state, attempts,
+                 run_after, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending', 0, %s, %s, %s)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id
+            """,
+            (
+                agent_id, session_id, channel, source_from_message_id,
+                source_to_message_id, idempotency_key, now, now, now,
+            ),
+        ).fetchone()
+        return row[0] if row else None
+
+    def claim_next_commitment_job(self) -> dict | None:
+        """Atomically claim one pending, due commitment-extraction job.
+
+        Same ``FOR UPDATE SKIP LOCKED`` mechanics as
+        :meth:`claim_next_capture_job` — see its docstring.
+
+        Returns:
+            dict | None: ``{"id", "agent_id", "session_id", "channel",
+                "source_from_message_id", "source_to_message_id",
+                "attempts"}``, or ``None`` if no job is currently due.
+        """
+        now = time.time()
+        row = self._conn().execute(
+            """
+            UPDATE memory_commitment_jobs
+            SET state = 'running', updated_at = %s
+            WHERE id = (
+                SELECT id FROM memory_commitment_jobs
+                WHERE state = 'pending' AND run_after <= %s
+                ORDER BY id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, agent_id, session_id, channel, source_from_message_id,
+                      source_to_message_id, attempts
+            """,
+            (now, now),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "agent_id": row[1],
+            "session_id": row[2],
+            "channel": row[3],
+            "source_from_message_id": row[4],
+            "source_to_message_id": row[5],
+            "attempts": row[6],
+        }
+
+    def list_pending_commitments_for_scope(
+        self, agent_id: str, channel: str, limit: int = 8
+    ) -> list[dict]:
+        """List pending commitments already tracked for one (agent, channel) scope.
+
+        Fed into the extraction prompt as ``existing_pending`` context
+        (``memory/commitments.py``'s ``build_commitment_extraction_prompt``)
+        so the model can extend an already-tracked follow-up instead of
+        proposing a near-duplicate — the same anti-duplication input
+        OpenClaw's real extractor uses (verified against
+        ``ref-repos/openclaw/src/commitments/extraction.ts``'s
+        ``hydrateCommitmentExtractionItem``).
+
+        Returns:
+            list[dict]: ``{"kind", "reason", "dedupe_key", "due_earliest",
+                "due_latest"}`` dicts, most recently created first, capped
+                at ``limit``.
+        """
+        rows = self._conn().execute(
+            """
+            SELECT kind, reason, dedupe_key, due_earliest, due_latest
+            FROM commitments
+            WHERE agent_id = %s AND channel = %s AND status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (agent_id, channel, limit),
+        ).fetchall()
+        return [
+            {
+                "kind": r[0], "reason": r[1], "dedupe_key": r[2],
+                "due_earliest": r[3], "due_latest": r[4],
+            }
+            for r in rows
+        ]
+
+    def complete_commitment_job(self, job_id: int, candidates: list[dict]) -> list[dict]:
+        """Mark a commitment job done and record its extracted candidates.
+
+        A candidate whose ``dedupe_key`` matches an existing *pending*
+        commitment in the same ``(agent_id, channel)`` scope is upserted
+        into that row (widening the due window to
+        ``min(earliest)``/``max(latest)``, keeping the higher confidence)
+        rather than inserted as a duplicate — mirrors OpenClaw's real
+        ``upsertInferredCommitments`` (verified against
+        ``ref-repos/openclaw/src/commitments/store.ts``), scaled down to
+        this codebase's simpler needs.
+
+        Args:
+            job_id: The job to complete.
+            candidates: 0 or more validated candidate dicts (see
+                ``memory/commitments.py``'s ``extract_commitments`` —
+                already confidence-gated and due-window-clamped by the
+                time they reach here). Each needs ``kind``, ``sensitivity``,
+                ``source``, ``reason``, ``suggested_text``, ``dedupe_key``,
+                ``confidence``, ``due_earliest``, ``due_latest`` (all as
+                produced by ``extract_commitments``).
+
+        Returns:
+            list[dict]: ``{"id", "created"}`` per candidate — ``created``
+                is ``False`` when the candidate was merged into an
+                existing pending commitment rather than inserted fresh.
+        """
+        now = time.time()
+        conn = self._conn()
+        job_row = conn.execute(
+            "SELECT agent_id, session_id, channel FROM memory_commitment_jobs WHERE id = %s",
+            (job_id,),
+        ).fetchone()
+        agent_id, session_id, channel = job_row if job_row else ("", "", "")
+
+        results = []
+        for candidate in candidates:
+            existing = conn.execute(
+                """
+                SELECT id, due_earliest, due_latest, confidence FROM commitments
+                WHERE agent_id = %s AND channel = %s AND dedupe_key = %s AND status = 'pending'
+                """,
+                (agent_id, channel, candidate["dedupe_key"]),
+            ).fetchone()
+            if existing is not None:
+                existing_id, existing_earliest, existing_latest, existing_confidence = existing
+                conn.execute(
+                    """
+                    UPDATE commitments
+                    SET due_earliest = %s, due_latest = %s, confidence = %s,
+                        reason = %s, suggested_text = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        min(existing_earliest, candidate["due_earliest"]),
+                        max(existing_latest, candidate["due_latest"]),
+                        max(existing_confidence, candidate["confidence"]),
+                        candidate["reason"], candidate["suggested_text"], now,
+                        existing_id,
+                    ),
+                )
+                results.append({"id": existing_id, "created": False})
+                continue
+            row = conn.execute(
+                """
+                INSERT INTO commitments
+                    (agent_id, session_id, channel, kind, sensitivity, source, reason,
+                     suggested_text, dedupe_key, confidence, due_earliest, due_latest,
+                     source_job_id, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    agent_id, session_id, channel, candidate["kind"], candidate["sensitivity"],
+                    candidate["source"], candidate["reason"], candidate["suggested_text"],
+                    candidate["dedupe_key"], candidate["confidence"], candidate["due_earliest"],
+                    candidate["due_latest"], job_id, now, now,
+                ),
+            ).fetchone()
+            results.append({"id": row[0], "created": True})
+
+        conn.execute(
+            "UPDATE memory_commitment_jobs SET state = 'done', updated_at = %s WHERE id = %s",
+            (now, job_id),
+        )
+        return results
+
+    def fail_commitment_job(
+        self, job_id: int, error: str, backoff_seconds: float, max_attempts: int = 5
+    ) -> None:
+        """Record a failed commitment-extraction attempt — retry with backoff, or give up.
+
+        Identical mechanics to :meth:`fail_capture_job` — see its
+        docstring.
+        """
+        now = time.time()
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT attempts FROM memory_commitment_jobs WHERE id = %s", (job_id,)
+        ).fetchone()
+        attempts = (row[0] if row else 0) + 1
+        state = "failed" if attempts >= max_attempts else "pending"
+        conn.execute(
+            """
+            UPDATE memory_commitment_jobs
             SET state = %s, attempts = %s, run_after = %s, last_error = %s, updated_at = %s
             WHERE id = %s
             """,
