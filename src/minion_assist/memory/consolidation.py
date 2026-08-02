@@ -240,6 +240,36 @@ def _topic_key_from_rel_path(rel_path: str) -> str | None:
     return rel_path[len(_TOPICS_PREFIX):-len(".md")]
 
 
+def find_merge_target(index: PostgresMemoryIndex, agent_id: str, claim_text: str) -> str | None:
+    """Find an existing topic note a piece of new text likely belongs in, or ``None``.
+
+    A free function (not a method) so both :class:`MemoryConsolidator` and
+    ``memory/import_review.py``'s ``ImportReviewer`` can share it without
+    duplicating the ``hybrid_search`` call — the same merge-target-finding
+    logic applies whether the "new claim" came from a capture-job proposal
+    or a quarantined import.
+
+    Restricted to ``corpus="durable"`` and, within that, to
+    ``memory/topics/`` hits specifically — never ``MEMORY.md`` itself (out
+    of scope for this slice — see the plan discussion this slice was
+    scoped from), never daily notes (ephemeral) or imports (unreviewed/
+    quarantined per ``docs/adr/0003-per-agent-memory-scope.md``, the same
+    reasoning Phase 4 slice B's pinning scope already used).
+
+    No score threshold is applied: the first topic-note hit (if any) is
+    treated as the merge target. Without real evaluation data an absolute
+    cutoff would be arbitrary (see the module docstring's Task 4 note) —
+    and a wrong guess here only produces a preview a human can reject,
+    never an applied change.
+    """
+    hits = index.hybrid_search(agent_id, claim_text, corpus="durable", max_results=5)
+    for hit in hits:
+        key = _topic_key_from_rel_path(hit["rel_path"])
+        if key is not None:
+            return key
+    return None
+
+
 def rank_proposals(db: SessionDB, index: PostgresMemoryIndex, agent_id: str) -> list[dict]:
     """Rank one agent's pending proposals into a human review queue.
 
@@ -280,8 +310,14 @@ def rank_proposals(db: SessionDB, index: PostgresMemoryIndex, agent_id: str) -> 
     return ranked
 
 
-def _parse_draft_response(text: str) -> tuple[str, str, str]:
-    """Parse :data:`_DRAFT_SYSTEM`'s fixed ``KEY:``/``RATIONALE:``/``---`` response format.
+def parse_draft_response(text: str) -> tuple[str, str, str]:
+    """Parse the fixed ``KEY:``/``RATIONALE:``/``---`` drafting-response format.
+
+    A public free function (Stage One Phase 7, slice E) — not just
+    :data:`_DRAFT_SYSTEM`'s format, ``memory/import_review.py``'s
+    ``_IMPORT_DRAFT_SYSTEM`` prompt uses the exact same shape, so both
+    ``MemoryConsolidator._draft`` and ``ImportReviewer._draft`` share this
+    one parser rather than each keeping their own copy.
 
     Returns:
         tuple[str, str, str]: ``(key, rationale, content)``.
@@ -538,7 +574,7 @@ class MemoryConsolidator:
         Raises:
             ValueError: If ``proposal_id`` doesn't exist, or if the
                 provider's drafting response is malformed (see
-                :func:`_parse_draft_response`).
+                :func:`parse_draft_response`).
         """
         proposal = self._db.get_proposal(proposal_id)
         if proposal is None:
@@ -699,25 +735,12 @@ class MemoryConsolidator:
     def _find_merge_target(self, claim_text: str) -> str | None:
         """Find an existing topic note this claim likely belongs in, or ``None``.
 
-        Restricted to ``corpus="durable"`` and, within that, to
-        ``memory/topics/`` hits specifically — never ``MEMORY.md`` itself
-        (out of scope for this slice — see the plan discussion this slice
-        was scoped from), never daily notes (ephemeral) or imports
-        (unreviewed/quarantined per ``docs/adr/0003-per-agent-memory-scope.md``,
-        the same reasoning Phase 4 slice B's pinning scope already used).
-
-        No score threshold is applied: the first topic-note hit (if any)
-        is treated as the merge target. Without real evaluation data an
-        absolute cutoff would be arbitrary (see the module docstring's
-        Task 4 note) — and a wrong guess here only produces a preview a
-        human can reject, never an applied change.
+        Thin wrapper around the free function :func:`find_merge_target`
+        (Stage One Phase 7, slice E) — kept as a method so existing
+        callers/tests are unaffected; see that function's docstring for
+        the actual logic and reasoning.
         """
-        hits = self._index.hybrid_search(self._agent_id, claim_text, corpus="durable", max_results=5)
-        for hit in hits:
-            key = _topic_key_from_rel_path(hit["rel_path"])
-            if key is not None:
-                return key
-        return None
+        return find_merge_target(self._index, self._agent_id, claim_text)
 
     def _draft(
         self,
@@ -756,4 +779,4 @@ class MemoryConsolidator:
             tools=[],
             max_tokens=1000,
         )
-        return _parse_draft_response((response.text or "").strip())
+        return parse_draft_response((response.text or "").strip())

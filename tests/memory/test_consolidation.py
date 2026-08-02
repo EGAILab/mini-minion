@@ -21,11 +21,12 @@ from minion_assist.memory.consolidation import (
     _chunk_run,
     _compute_backfill_windows,
     _hash_text,
-    _parse_draft_response,
     _topic_key_from_rel_path,
     backfill_agent,
+    find_merge_target,
     format_preview_report,
     is_preview_stale,
+    parse_draft_response,
     rank_proposals,
 )
 from minion_assist.memory.files import MemoryFileRepository
@@ -192,7 +193,7 @@ def files(tmp_path: Path) -> MemoryFileRepository:
 
 
 # ---------------------------------------------------------------------------
-# _hash_text / _topic_key_from_rel_path / _parse_draft_response
+# _hash_text / _topic_key_from_rel_path / parse_draft_response
 # ---------------------------------------------------------------------------
 
 def test_hash_text_is_deterministic():
@@ -219,8 +220,30 @@ def test_topic_key_from_rel_path_is_none_for_an_import():
     assert _topic_key_from_rel_path("memory/imports/scraped.md") is None
 
 
+def test_find_merge_target_returns_the_first_topic_hit():
+    index = Mock()
+    index.hybrid_search.return_value = [
+        {"rel_path": "MEMORY.md"},
+        {"rel_path": "memory/topics/coding-preferences.md"},
+    ]
+
+    result = find_merge_target(index, "main", "User likes tabs.")
+
+    assert result == "coding-preferences"
+    index.hybrid_search.assert_called_once_with(
+        "main", "User likes tabs.", corpus="durable", max_results=5
+    )
+
+
+def test_find_merge_target_returns_none_with_no_topic_hits():
+    index = Mock()
+    index.hybrid_search.return_value = [{"rel_path": "MEMORY.md"}]
+
+    assert find_merge_target(index, "main", "User likes tabs.") is None
+
+
 def test_parse_draft_response_extracts_key_rationale_and_content():
-    key, rationale, content = _parse_draft_response(
+    key, rationale, content = parse_draft_response(
         "KEY: coding-preferences\nRATIONALE: New preference noted.\n---\nUser likes tabs."
     )
     assert key == "coding-preferences"
@@ -230,7 +253,7 @@ def test_parse_draft_response_extracts_key_rationale_and_content():
 
 def test_parse_draft_response_raises_without_a_separator():
     with pytest.raises(ValueError, match="separator"):
-        _parse_draft_response("KEY: x\nRATIONALE: y\nNo separator here.")
+        parse_draft_response("KEY: x\nRATIONALE: y\nNo separator here.")
 
 
 # ---------------------------------------------------------------------------

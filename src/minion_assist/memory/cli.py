@@ -220,6 +220,47 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     c_backfill.add_argument("--agent", required=True)
 
+    import_cmd = sub.add_parser(
+        "import",
+        help=(
+            "Review and promote quarantined imports (memory/imports/, Stage "
+            "One Phase 7, slice E). Requires a configured database."
+        ),
+    )
+    import_sub = import_cmd.add_subparsers(dest="import_subcommand", required=True)
+
+    i_list = import_sub.add_parser("list", help="List one agent's quarantined import keys.")
+    i_list.add_argument("--agent", required=True, help="Which agent's imports to list.")
+
+    i_preview = import_sub.add_parser(
+        "preview", help="Draft a preview for one quarantined import — never writes to disk."
+    )
+    i_preview.add_argument("import_key")
+    i_preview.add_argument("--agent", required=True)
+
+    i_explain = import_sub.add_parser(
+        "explain", help="Show one stored import preview's full review report, plus staleness."
+    )
+    i_explain.add_argument("preview_id", type=int)
+    i_explain.add_argument("--agent", required=True)
+
+    i_approve = import_sub.add_parser(
+        "approve",
+        help=(
+            "Apply an import preview: write its drafted content to disk, reindex it, "
+            "and retire the reviewed import."
+        ),
+    )
+    i_approve.add_argument("preview_id", type=int)
+    i_approve.add_argument("--agent", required=True)
+
+    i_reject = import_sub.add_parser(
+        "reject", help="Discard a quarantined import — nothing promoted, the import is retired."
+    )
+    i_reject.add_argument("import_key")
+    i_reject.add_argument("--agent", required=True)
+    i_reject.add_argument("--reason", default="", help="Optional reason, echoed back only.")
+
     commitments = sub.add_parser(
         "commitments",
         help=(
@@ -905,6 +946,156 @@ def _run_consolidate(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def _run_import_list(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory import list --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    keys = files.list_import_keys()
+    if not keys:
+        print(f"{agent_id}: no quarantined imports.")
+        return 0
+    for key in keys:
+        print(f"- {key}")
+    return 0
+
+
+def _run_import_preview(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory import preview IMPORT_KEY --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .import_review import ImportReviewer, format_import_preview_report  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to preview.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    provider = _build_provider(agent_id)
+    reviewer = ImportReviewer(index, files, provider, agent_id=agent_id)
+    try:
+        preview = reviewer.preview(args.import_key)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print(format_import_preview_report(preview))
+    print(
+        f"\nPreview id: {preview['id']} — approve with "
+        f"`memory import approve {preview['id']} --agent {agent_id}`."
+    )
+    return 0
+
+
+def _run_import_explain(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory import explain PREVIEW_ID --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .import_review import format_import_preview_report, is_import_preview_stale  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to explain.")
+        return 1
+
+    preview = index.get_import_preview(args.preview_id)
+    if preview is None:
+        print(f"Error: no import preview with id {args.preview_id!r}.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    print(format_import_preview_report(preview))
+
+    if is_import_preview_stale(files, preview):
+        print(
+            "\nWARNING: stale — the target has changed since this preview was drafted. "
+            "Re-run `preview` before approving."
+        )
+    return 0
+
+
+def _run_import_approve(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory import approve PREVIEW_ID --agent ID``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .import_review import ImportReviewer, StaleImportError  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to approve.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    reviewer = ImportReviewer(index, files, None, agent_id=agent_id)
+    try:
+        result = reviewer.approve(args.preview_id)
+    except (ValueError, StaleImportError) as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print(
+        f"{agent_id}: applied to {result['rel_path']} — "
+        f"import {result['import_key']!r} retired."
+    )
+    return 0
+
+
+def _run_import_reject(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory import reject IMPORT_KEY --agent ID [--reason TEXT]``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .import_review import ImportReviewer  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to reject.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    # Unlike MemoryConsolidator.reject() (just flips a memory_proposals
+    # status, touches nothing else), ImportReviewer.reject() retires the
+    # import outright — it deletes the file AND its index entries, so a
+    # real index is required here (see memory/import_review.py's module
+    # docstring for why imports have no separate "rejected" status to set).
+    reviewer = ImportReviewer(index, files, None, agent_id=agent_id)
+    try:
+        reviewer.reject(args.import_key, reason=args.reason)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    suffix = f" ({args.reason})" if args.reason else ""
+    print(f"{agent_id}: rejected import {args.import_key!r}{suffix}.")
+    return 0
+
+
+_IMPORT_HANDLERS = {
+    "list": _run_import_list,
+    "preview": _run_import_preview,
+    "explain": _run_import_explain,
+    "approve": _run_import_approve,
+    "reject": _run_import_reject,
+}
+
+
+def _run_import(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory import <list|preview|explain|approve|reject>``."""
+    handler = _IMPORT_HANDLERS[args.import_subcommand]
+    return handler(args)
+
+
 def _format_due(epoch: float) -> str:
     """Render an epoch-seconds timestamp for CLI display."""
     from datetime import datetime  # noqa: PLC0415
@@ -1123,6 +1314,7 @@ _HANDLERS = {
     "unpin": _run_unpin,
     "pins": _run_pins,
     "consolidate": _run_consolidate,
+    "import": _run_import,
     "commitments": _run_commitments,
     "knowledge": _run_knowledge,
 }

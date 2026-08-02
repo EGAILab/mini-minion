@@ -900,6 +900,242 @@ def test_consolidate_backfill_without_a_database_reports_an_error(monkeypatch, t
 
 
 # ---------------------------------------------------------------------------
+# import (Stage One Phase 7, slice E)
+# ---------------------------------------------------------------------------
+
+def _fake_import_preview(**overrides) -> dict:
+    from minion_assist.memory.import_review import _hash_text
+
+    base = {
+        "id": 5, "agent_id": "main", "import_key": "_auto_extracted", "target_kind": "new_topic",
+        "target_key": "dark-mode", "based_on_content_hash": _hash_text(""),
+        "drafted_content": "Drafted.", "rationale": "New preference.",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_import_list_shows_each_import_key(monkeypatch, tmp_path, capsys):
+    root = _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    MemoryFileRepository(root).remember_import("_auto_extracted", "Some content.")
+
+    exit_code = cli.main(["import", "list", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "_auto_extracted" in out
+
+
+def test_import_list_reports_no_imports(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["import", "list", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "no quarantined imports" in out
+
+
+def test_import_preview_shows_the_drafted_report(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.import_review as import_review
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, Mock())
+    _patch_provider(monkeypatch, Mock())
+    mock_reviewer = Mock()
+    mock_reviewer.preview.return_value = _fake_import_preview()
+    monkeypatch.setattr(import_review, "ImportReviewer", lambda *a, **kw: mock_reviewer)
+
+    exit_code = cli.main(["import", "preview", "_auto_extracted", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "dark-mode" in out
+    assert "Preview id: 5" in out
+    mock_reviewer.preview.assert_called_once_with("_auto_extracted")
+
+
+def test_import_preview_reports_an_unknown_key(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.import_review as import_review
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, Mock())
+    _patch_provider(monkeypatch, Mock())
+    mock_reviewer = Mock()
+    mock_reviewer.preview.side_effect = ValueError("No quarantined import with key 'x'")
+    monkeypatch.setattr(import_review, "ImportReviewer", lambda *a, **kw: mock_reviewer)
+
+    exit_code = cli.main(["import", "preview", "x", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+
+
+def test_import_preview_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(["import", "preview", "_auto_extracted", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_import_explain_shows_the_report(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.get_import_preview.return_value = _fake_import_preview()
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["import", "explain", "5", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "dark-mode" in out
+    assert "WARNING: stale" not in out  # nothing on disk yet, hash matches ""
+
+
+def test_import_explain_flags_a_stale_preview(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.get_import_preview.return_value = _fake_import_preview(
+        target_kind="revise_topic", based_on_content_hash="not-the-real-hash"
+    )
+    _patch_index(monkeypatch, mock_index)
+    files = MemoryFileRepository(_agent_root(tmp_path, "main"))
+    files.remember("dark-mode", "Hand-edited content.")
+
+    exit_code = cli.main(["import", "explain", "5", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "WARNING: stale" in out
+
+
+def test_import_explain_reports_an_unknown_preview(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.get_import_preview.return_value = None
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["import", "explain", "999", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+
+
+def test_import_approve_applies_and_reports_success(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.import_review as import_review
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, Mock())
+    mock_reviewer = Mock()
+    mock_reviewer.approve.return_value = {
+        "import_key": "_auto_extracted", "target_key": "dark-mode",
+        "rel_path": "memory/topics/dark-mode.md",
+    }
+    monkeypatch.setattr(import_review, "ImportReviewer", lambda *a, **kw: mock_reviewer)
+
+    exit_code = cli.main(["import", "approve", "5", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "applied" in out
+    assert "retired" in out
+    mock_reviewer.approve.assert_called_once_with(5)
+
+
+def test_import_approve_reports_a_stale_preview(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.import_review as import_review
+    from minion_assist.memory.import_review import StaleImportError
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, Mock())
+    mock_reviewer = Mock()
+    mock_reviewer.approve.side_effect = StaleImportError("Topic changed since draft.")
+    monkeypatch.setattr(import_review, "ImportReviewer", lambda *a, **kw: mock_reviewer)
+
+    exit_code = cli.main(["import", "approve", "5", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+
+
+def test_import_approve_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(["import", "approve", "5", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_import_reject_retires_the_import(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.import_review as import_review
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, Mock())
+    mock_reviewer = Mock()
+    monkeypatch.setattr(import_review, "ImportReviewer", lambda *a, **kw: mock_reviewer)
+
+    exit_code = cli.main(
+        ["import", "reject", "_auto_extracted", "--agent", "main", "--reason", "Not useful."]
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "rejected" in out
+    mock_reviewer.reject.assert_called_once_with("_auto_extracted", reason="Not useful.")
+
+
+def test_import_reject_reports_an_unknown_key(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.import_review as import_review
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, Mock())
+    mock_reviewer = Mock()
+    mock_reviewer.reject.side_effect = ValueError("No quarantined import with key 'x'")
+    monkeypatch.setattr(import_review, "ImportReviewer", lambda *a, **kw: mock_reviewer)
+
+    exit_code = cli.main(["import", "reject", "x", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error:" in out
+
+
+def test_import_reject_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(["import", "reject", "_auto_extracted", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+# ---------------------------------------------------------------------------
 # commitments (Stage One Phase 6, slice C)
 # ---------------------------------------------------------------------------
 

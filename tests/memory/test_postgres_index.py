@@ -98,6 +98,7 @@ def _cleanup_after(index, agent_id):
     conn.execute("DELETE FROM memory_recall_events WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_consolidation_previews WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_topic_revisions WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM memory_import_previews WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM kb_evidence WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM kb_relationships WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM kb_claims WHERE agent_id = %s", (agent_id,))
@@ -1784,3 +1785,90 @@ def test_topic_revisions_do_not_leak_across_agents(index, agent_id):
         index._conn().execute(
             "DELETE FROM memory_topic_revisions WHERE agent_id = %s", (other_agent,)
         )
+
+
+# ---------------------------------------------------------------------------
+# Import review previews (Stage One Phase 7, slice E)
+# ---------------------------------------------------------------------------
+
+def test_record_import_preview_returns_a_new_id_each_time(index, agent_id):
+    first_id = index.record_import_preview(
+        agent_id, "_auto_extracted", "new_topic", "dark-mode", "", "Drafted content.", "New pref."
+    )
+    second_id = index.record_import_preview(
+        agent_id, "_auto_extracted", "new_topic", "dark-mode", "", "Different draft.", "Redrafted."
+    )
+
+    assert first_id != second_id
+
+
+def test_list_import_previews_returns_everything_for_the_agent(index, agent_id):
+    index.record_import_preview(
+        agent_id, "_auto_extracted", "new_topic", "dark-mode", "", "Draft one.", "Reason one."
+    )
+    index.record_import_preview(
+        agent_id, "other-import", "revise_topic", "project-goals", "abc123", "Draft two.", "Reason two."
+    )
+
+    previews = index.list_import_previews(agent_id)
+
+    assert {p["import_key"] for p in previews} == {"_auto_extracted", "other-import"}
+
+
+def test_list_import_previews_restricts_to_one_import_key(index, agent_id):
+    index.record_import_preview(
+        agent_id, "_auto_extracted", "new_topic", "dark-mode", "", "Draft one.", "Reason one."
+    )
+    index.record_import_preview(
+        agent_id, "other-import", "revise_topic", "project-goals", "abc123", "Draft two.", "Reason two."
+    )
+
+    previews = index.list_import_previews(agent_id, import_key="_auto_extracted")
+
+    assert [p["import_key"] for p in previews] == ["_auto_extracted"]
+
+
+def test_list_import_previews_returns_newest_first(index, agent_id):
+    first_id = index.record_import_preview(
+        agent_id, "_auto_extracted", "new_topic", "dark-mode", "", "First draft.", "First."
+    )
+    second_id = index.record_import_preview(
+        agent_id, "_auto_extracted", "new_topic", "dark-mode", "", "Second draft.", "Second."
+    )
+
+    previews = index.list_import_previews(agent_id, import_key="_auto_extracted")
+
+    assert [p["id"] for p in previews] == [second_id, first_id]
+
+
+def test_list_import_previews_is_empty_for_an_agent_with_none(index, agent_id):
+    assert index.list_import_previews(agent_id) == []
+
+
+def test_import_previews_do_not_leak_across_agents(index, agent_id):
+    other_agent = f"other-{agent_id}"
+    index.record_import_preview(
+        other_agent, "_auto_extracted", "new_topic", "dark-mode", "", "Draft.", "Reason."
+    )
+    try:
+        assert index.list_import_previews(agent_id) == []
+    finally:
+        index._conn().execute(
+            "DELETE FROM memory_import_previews WHERE agent_id = %s", (other_agent,)
+        )
+
+
+def test_get_import_preview_returns_the_matching_row(index, agent_id):
+    preview_id = index.record_import_preview(
+        agent_id, "_auto_extracted", "new_topic", "dark-mode", "", "Draft.", "New preference."
+    )
+
+    preview = index.get_import_preview(preview_id)
+
+    assert preview["import_key"] == "_auto_extracted"
+    assert preview["target_key"] == "dark-mode"
+    assert preview["rationale"] == "New preference."
+
+
+def test_get_import_preview_returns_none_for_an_unknown_id(index):
+    assert index.get_import_preview(-1) is None

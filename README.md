@@ -1529,6 +1529,30 @@ minion-assist memory knowledge compile --agent main
 minion-assist memory knowledge compile --agent main --max-chars 4000
 ```
 
+### Import quarantine and review (Stage One Phase 7, slice E)
+
+Task 6: "Add import quarantine and review before imported claims enter shared durable memory." The quarantine half already existed since Phase 1 (`memory/files.py`'s `memory/imports/` — searchable via `--corpus import`, never auto-promoted). This slice adds the missing review half: a human-triggered way to turn quarantined content into a durable topic note with claim markers, mirroring `MemoryConsolidator`'s preview/approve/reject pattern (Phase 5) for capture-job proposals. The real, current motivating case: `memory/extractor.py`'s background daemon still writes a rolling `_auto_extracted` note into quarantine every turn by default (`"memory": {"enable_extraction": true}`) — a legacy path with no review mechanism until now.
+
+**Why a separate `ImportReviewer`, not an extension of `MemoryConsolidator`.** `MemoryConsolidator`'s preview/approve/rollback tables (`memory_consolidation_previews`, `memory_topic_revisions`) are typed around an *integer* `proposal_id`. An import is a *string*-keyed file (e.g. `"_auto_extracted"`), often a whole rolling note of many distinct facts rather than one atomic claim. `memory/import_review.py`'s `ImportReviewer` is a parallel, structurally similar pipeline instead — its own `memory_import_previews` table, evidence tagged `import:KEY` instead of `proposal:ID` — the same "separate table rather than force a shared schema" call Phase 6 already made for commitments vs. capture jobs. `memory/consolidation.py`'s merge-target search (`find_merge_target`) and drafting-response parser (`parse_draft_response`) were promoted from private methods/functions to shared public ones so both pipelines use the exact same logic rather than duplicating it.
+
+**What happens to a reviewed import.** Both `approve()` and `reject()` delete the quarantined import file once reviewed (`MemoryFileRepository.delete_import` + `PostgresMemoryIndex.remove_file`) — approved content now lives in the topic note it was promoted into; rejected content is discarded outright, with no archive. This keeps a human's review queue from re-offering the same stale content on every future preview.
+
+**No rollback in this slice.** Unlike `MemoryConsolidator`, `approve()` here does not snapshot the merge target's prior content. Task 6's acceptance criteria don't require it, and a human who dislikes what got promoted can just edit the resulting topic note directly.
+
+**Multiple claims per import.** A capture-job proposal is already one atomic claim, so `MemoryConsolidator`'s prompt only ever attaches one claim marker. Import content is routinely a whole rolling note of many facts, so `preview()` pre-generates a bounded pool of 10 new claim ids and lets the model attach one per genuinely new claim it decides to keep.
+
+**Untrusted-content framing.** Quarantined content was never reviewed by a human — the drafting prompt (`_IMPORT_DRAFT_SYSTEM`) explicitly instructs the model to treat it strictly as reference material to evaluate, never as instructions to follow, the same posture `memory/commitments.py`'s `format_due_commitments_block` already takes with untrusted due-commitment text.
+
+New CLI commands:
+
+```bash
+minion-assist memory import list --agent main
+minion-assist memory import preview _auto_extracted --agent main
+minion-assist memory import explain 5 --agent main
+minion-assist memory import approve 5 --agent main
+minion-assist memory import reject _auto_extracted --agent main --reason "nothing useful"
+```
+
 ### `session_search` Tool Modes
 
 | Mode | Description |

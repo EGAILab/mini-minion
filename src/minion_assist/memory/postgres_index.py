@@ -457,6 +457,34 @@ class PostgresMemoryIndex:
             "ON memory_topic_revisions (agent_id, target_key)"
         )
 
+        # Import review previews — Stage One Phase 7, slice E. Structurally
+        # identical to memory_consolidation_previews above, but deliberately
+        # a SEPARATE table rather than a shared one: an import is identified
+        # by a TEXT key (e.g. "_auto_extracted"), not the BIGINT proposal_id
+        # memory_consolidation_previews/memory_topic_revisions are typed
+        # around, and ImportReviewer.approve()/reject() delete the reviewed
+        # import file outright rather than flipping a memory_proposals
+        # status — there is no rollback for import review in this slice
+        # (see memory/import_review.py's module docstring), so no
+        # import-side revision-history table exists either.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_import_previews (
+                id                    BIGSERIAL PRIMARY KEY,
+                agent_id              TEXT NOT NULL,
+                import_key            TEXT NOT NULL,
+                target_kind           TEXT NOT NULL,
+                target_key            TEXT NOT NULL,
+                based_on_content_hash TEXT NOT NULL,
+                drafted_content       TEXT NOT NULL,
+                rationale             TEXT NOT NULL,
+                created_at            DOUBLE PRECISION NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_import_previews_key_idx "
+            "ON memory_import_previews (agent_id, import_key)"
+        )
+
         # Shadow copies of both tables above, same shape — scratch space for
         # force_rebuild_agent()'s crash-safe rebuild-and-swap (Stage One
         # Phase 3, slice C). See that method's docstring for the swap
@@ -2273,6 +2301,117 @@ class PostgresMemoryIndex:
         self._conn().execute(
             "DELETE FROM memory_topic_revisions WHERE id = %s", (revision_id,)
         )
+
+    # ------------------------------------------------------------------
+    # Import review previews — Stage One Phase 7, slice E
+    # ------------------------------------------------------------------
+
+    def record_import_preview(
+        self,
+        agent_id: str,
+        import_key: str,
+        target_kind: str,
+        target_key: str,
+        based_on_content_hash: str,
+        drafted_content: str,
+        rationale: str,
+    ) -> int:
+        """Store one drafted import-review preview — never applied, only recorded.
+
+        Called by :class:`~minion_assist.memory.import_review.ImportReviewer`'s
+        ``preview()``. Same "insert, never upsert" shape as
+        :meth:`record_consolidation_preview` — a quarantined import can be
+        re-previewed after its content or a merge target changes, and
+        keeping every draft preserves history for ``explain``.
+
+        Args:
+            agent_id: The agent this preview belongs to.
+            import_key: Which quarantined ``memory/imports/{key}.md`` file
+                this drafts from.
+            target_kind: ``"new_topic"`` or ``"revise_topic"``.
+            target_key: The topic note key this would create/revise.
+            based_on_content_hash: SHA256 of the target's content at the
+                moment this preview was drafted (``""`` for a new topic).
+            drafted_content: The full proposed note content.
+            rationale: One or two sentences explaining the draft.
+
+        Returns:
+            int: The new preview row's id.
+        """
+        row = self._conn().execute(
+            """
+            INSERT INTO memory_import_previews
+                (agent_id, import_key, target_kind, target_key,
+                 based_on_content_hash, drafted_content, rationale, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                agent_id, import_key, target_kind, target_key,
+                based_on_content_hash, drafted_content, rationale, time.time(),
+            ),
+        ).fetchone()
+        return row[0]
+
+    def list_import_previews(self, agent_id: str, import_key: str | None = None) -> list[dict]:
+        """List import-review previews for one agent, most recent first.
+
+        Args:
+            agent_id: Which agent's previews to list.
+            import_key: Restrict to one import's previews, or ``None`` for
+                every preview belonging to the agent.
+
+        Returns:
+            list[dict]: ``{"id", "agent_id", "import_key", "target_kind",
+                "target_key", "based_on_content_hash", "drafted_content",
+                "rationale", "created_at"}`` dicts, newest first.
+        """
+        key_sql = " AND import_key = %s" if import_key is not None else ""
+        params: list = [agent_id]
+        if import_key is not None:
+            params.append(import_key)
+        rows = self._conn().execute(
+            f"""
+            SELECT id, agent_id, import_key, target_kind, target_key,
+                   based_on_content_hash, drafted_content, rationale, created_at
+            FROM memory_import_previews
+            WHERE agent_id = %s {key_sql}
+            ORDER BY created_at DESC
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "agent_id": r[1], "import_key": r[2], "target_kind": r[3],
+                "target_key": r[4], "based_on_content_hash": r[5], "drafted_content": r[6],
+                "rationale": r[7], "created_at": r[8],
+            }
+            for r in rows
+        ]
+
+    def get_import_preview(self, preview_id: int) -> dict | None:
+        """Look up one import-review preview by id.
+
+        Returns:
+            dict | None: Same shape as :meth:`list_import_previews`' rows,
+                or ``None`` if no preview with this id exists.
+        """
+        row = self._conn().execute(
+            """
+            SELECT id, agent_id, import_key, target_kind, target_key,
+                   based_on_content_hash, drafted_content, rationale, created_at
+            FROM memory_import_previews
+            WHERE id = %s
+            """,
+            (preview_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "agent_id": row[1], "import_key": row[2], "target_kind": row[3],
+            "target_key": row[4], "based_on_content_hash": row[5], "drafted_content": row[6],
+            "rationale": row[7], "created_at": row[8],
+        }
 
     # ------------------------------------------------------------------
     # Embedding cache — Stage One Phase 4, slices A & C

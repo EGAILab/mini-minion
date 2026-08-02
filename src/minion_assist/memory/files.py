@@ -218,6 +218,19 @@ class MemoryFileRepository:
     # docs/adr/0003-per-agent-memory-scope.md must stay searchable but must
     # never be auto-promoted into curated memory/topics/ pages.
 
+    def import_path(self, key: str) -> Path:
+        """Resolve the on-disk path for an import key (doesn't require the file to exist).
+
+        Mirrors :meth:`topic_path` exactly, just scoped to
+        ``memory/imports/`` — exposed publicly for the same reason: so a
+        caller (``memory/import_review.py``'s ``ImportReviewer``) can
+        compute an import's ``rel_path`` (e.g. to tell
+        :class:`~minion_assist.memory.postgres_index.PostgresMemoryIndex`
+        which file to remove after a review) without duplicating
+        :func:`_sanitize_key`'s filename rules.
+        """
+        return self._imports_dir / f"{_sanitize_key(key)}.md"
+
     def remember_import(self, key: str, content: str) -> Path:
         """Save quarantined, unreviewed content under ``memory/imports/{key}.md``.
 
@@ -229,18 +242,40 @@ class MemoryFileRepository:
             Path: The file that was written — see :meth:`remember`'s return
                 value for why.
         """
-        path = self._imports_dir / f"{_sanitize_key(key)}.md"
+        path = self.import_path(key)
         _atomic_write_text(path, content)
         return path
 
     def load_import(self, key: str) -> str | None:
         """Load quarantined content by key, or ``None`` if it doesn't exist."""
-        path = self._imports_dir / f"{_sanitize_key(key)}.md"
+        path = self.import_path(key)
         return path.read_text(encoding="utf-8") if path.exists() else None
 
     def list_import_keys(self) -> list[str]:
         """Return every quarantined note's key, sorted alphabetically."""
         return [p.stem for p in sorted(self._imports_dir.glob("*.md"))]
+
+    def delete_import(self, key: str) -> bool:
+        """Delete a quarantined import note (Stage One Phase 7, slice E).
+
+        Called by ``memory/import_review.py``'s ``ImportReviewer`` once an
+        import has been reviewed (whether approved or rejected) — the
+        reviewed snapshot is retired either way, so it never lingers to be
+        offered again in a future ``preview()`` call. Mirrors :meth:`delete`
+        exactly, just scoped to ``memory/imports/`` instead of
+        ``memory/topics/``.
+
+        Args:
+            key: The import identifier to delete.
+
+        Returns:
+            bool: ``True`` if a file was deleted, ``False`` if it didn't exist.
+        """
+        path = self.import_path(key)
+        if path.exists():
+            path.unlink()
+            return True
+        return False
 
     # -----------------------------------------------------------------
     # Daily notes (memory/YYYY-MM-DD.md) — the one merged daily-note path

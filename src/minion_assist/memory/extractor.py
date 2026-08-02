@@ -5,7 +5,9 @@ The note is quarantined (``memory/imports/_auto_extracted.md``, via
 :meth:`MemoryService.remember_import`), not a curated topic page — nobody
 has reviewed these facts, so per
 ``docs/adr/0003-per-agent-memory-scope.md`` they stay searchable but are
-never auto-promoted.
+never auto-promoted. ``memory/import_review.py``'s ``ImportReviewer``
+(Stage One Phase 7, slice E) is the review path that can promote reviewed
+content out of this quarantine into a durable topic note.
 
 Two callers, two failure-handling contracts (Stage One Phase 2, slice C)
 --------------------------------------------------------------------------
