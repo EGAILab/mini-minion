@@ -183,18 +183,27 @@ minion-assist/
 │   │   ├── extractor.py         # Background fact extraction (degraded-mode path, no db)
 │   │   ├── capture_worker.py    # CaptureWorker — durable capture-job queue worker (needs db)
 │   │   ├── chunking.py          # Heading-aware Markdown chunker for the lexical index
-│   │   ├── postgres_index.py    # PostgresMemoryIndex — rebuildable lexical index (needs db)
+│   │   ├── postgres_index.py    # PostgresMemoryIndex — rebuildable lexical/hybrid index + Phase 5-7 tables (needs db)
 │   │   ├── watcher.py           # MemoryIndexWatcher — live debounced fs sync (needs db+watchdog)
 │   │   ├── migration.py         # Phase 0: legacy-root -> merged-root migration tooling
-│   │   ├── cli.py               # `minion-assist memory migrate` subcommand
+│   │   ├── cli.py               # `minion-assist memory <migrate|consolidate|commitments|knowledge|import|...>` subcommands
 │   │   ├── baseline.py          # Retrieval recall/latency measurement vs. fixture corpus
 │   │   ├── long_term.py         # Legacy Markdown notes store (superseded by MemoryService)
+│   │   ├── consolidation.py     # Phase 5: MemoryConsolidator — preview/approve/reject/rollback proposals
+│   │   ├── consolidation_scheduler.py  # Phase 5: daily automated consolidation-preview scheduler
+│   │   ├── boundaries.py        # Phase 6: action-boundary frontmatter parsing (owner/applies_when/expires_at/…)
+│   │   ├── commitments.py       # Phase 6: inferred, short-lived commitment extraction
+│   │   ├── commitment_worker.py # Phase 6: durable commitment-extraction queue worker (needs db)
+│   │   ├── knowledge.py         # Phase 7: claim marker parsing/rendering + compile_digest()
+│   │   ├── digest_scheduler.py  # Phase 7: KnowledgeDigestScheduler — daily KNOWLEDGE_DIGEST.md recompilation
+│   │   ├── import_review.py     # Phase 7: ImportReviewer — quarantined-import preview/approve/reject
+│   │   ├── forgetting.py        # Phase 7: forget_source() — evidence-source deletion cascade
 │   │   └── __init__.py
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
 │       ├── db.py                # SessionDB — PostgreSQL session + message store with FTS (optional)
 │       └── __init__.py
-└── tests/                       # pytest test suite (1104 tests, 2 skipped)
+└── tests/                       # pytest test suite (2689 tests, 2 skipped)
 ```
 
 ---
@@ -286,6 +295,9 @@ Example structure (see `config.example.json` for the full template):
 | `mcp.servers.<name>.args` | *(stdio only)* Arguments passed to the server command |
 | `mcp.servers.<name>.url` | *(sse / streamableHttp only)* URL of the MCP server endpoint |
 | `memory.enable_extraction` | *(Optional, default `true`)* Set to `false` to disable the background fact-extraction API call fired after each turn. Useful for expensive models where the extra call doubles token costs. |
+| `memory_consolidation.*` | *(Optional, disabled by default)* Automated daily consolidation-preview scheduler (Stage One Phase 5, slice D) — `enabled`/`hour`/`minute`/`timezone`/`agent_id`/`top_n`. See "Consolidation ranking and preview drafting". |
+| `commitments.enabled` | *(Optional, default `false`)* Inferred, short-lived commitment extraction (Stage One Phase 6, slice B). Requires a configured database. See "Commitments — schema and extraction pipeline". |
+| `knowledge_digest.*` | *(Optional, disabled by default)* Automated daily `KNOWLEDGE_DIGEST.md` compilation scheduler (Stage One Phase 7, slice D) — `enabled`/`hour`/`minute`/`timezone`/`agent_id`/`max_chars`. See "Compiled knowledge digest". |
 | `database.url` | *(Optional)* PostgreSQL connection string for session history storage and FTS search. Omit to run file-only. Example: `"postgresql://minion:minion@localhost:5433/minion_assist"`. |
 | `extra_plugin_manifests` | *(Optional)* List of additional `plugins.json` file paths to load beyond the two fixed locations (`~/.minion-assist/plugins.json` and `.minion-assist/plugins.json`). Paths support `~` expansion. |
 | `bootstrap.enabled` | *(Optional, default `true`)* Set to `false` to disable workspace bootstrap file injection entirely. |
@@ -407,6 +419,7 @@ AgentSession.send(message, on_event=callback, stream=True/False)
 ├── workspaces/                  ← per-agent memory + bootstrap root (see "Multi-Agent Workspace")
 │   ├── main/
 │   │   ├── AGENTS.md, SOUL.md, USER.md, MEMORY.md, DREAMS.md  ← bootstrap files
+│   │   ├── KNOWLEDGE_DIGEST.md  ← compiled, machine-owned (Stage One Phase 7, slice D)
 │   │   └── memory/
 │   │       ├── YYYY-MM-DD.md    ← daily notes (write_daily_memory)
 │   │       ├── topics/          ← explicit save_memory notes (project-goals.md, …)
@@ -2385,6 +2398,23 @@ minion-assist memory reindex [--agent main] [--force]
 
 `memory/baseline.py` measures the legacy `LongTermMemory.search()` — recall and latency — against the checked-in fixture corpus at `tests/fixtures/memory_corpus/`, so later phases (PostgreSQL lexical index, embeddings) have a real number to compare against rather than an assumption. See `tests/fixtures/memory_corpus/README.md` for the recorded baseline and a known current gap (punctuation-sensitive matching).
 
+#### Stage One Phases 2-7 modules
+
+Everything from the durable capture-job queue onward is documented in depth under [PostgreSQL Session Store](#postgresql-session-store) rather than duplicated here (each module's design rationale lives closest to its schema). Quick index of what lives where in `src/minion_assist/memory/`:
+
+| Module | Phase | Covers |
+|---|---|---|
+| `postgres_index.py` | 3, 4 | `PostgresMemoryIndex` — the rebuildable lexical/hybrid index (`memory_chunks`, `memory_files`, `memory_chunk_embeddings`), plus every Phase 5-7 table (`memory_consolidation_previews`, `memory_topic_revisions`, `memory_import_previews`, `kb_entities`, `kb_claims`, `kb_evidence`, `kb_relationships`) — see "Lexical memory index" and "Hybrid retrieval". |
+| `chunking.py` | 3, 4 | Heading-aware, token-bounded Markdown chunking that feeds `postgres_index.py`'s hybrid (lexical + optional vector) retrieval. |
+| `watcher.py` | 3 | `MemoryIndexWatcher` — live filesystem watcher, see "Keeping the index in sync". |
+| `boundaries.py` | 6 | Action-boundary frontmatter (owner/applies_when/expires_at/…) — see "Action-sensitive memory boundaries". |
+| `commitments.py`, `commitment_worker.py` | 6 | Inferred, short-lived commitment extraction and delivery — see "Commitments — schema and extraction pipeline" and "Commitment delivery, expiry, and lifecycle". |
+| `consolidation.py`, `consolidation_scheduler.py` | 5 | `MemoryConsolidator` (preview/approve/reject/rollback) and its daily auto-preview scheduler — see "Consolidation ranking and preview drafting". |
+| `knowledge.py` | 7A, 7B, 7D, 7F | Claim marker parsing/rendering (`parse_claims`, `remove_evidence_from_content`) and digest compilation (`compile_digest`) — see "Knowledge layer". |
+| `digest_scheduler.py` | 7D | `KnowledgeDigestScheduler` — daily `KNOWLEDGE_DIGEST.md` recompilation. |
+| `import_review.py` | 7E | `ImportReviewer` (preview/approve/reject) — see "Import quarantine and review". |
+| `forgetting.py` | 7F | `forget_source()` — see "Forgetting a source". |
+
 ---
 
 ### `session`
@@ -2682,7 +2712,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **1580 cases** across all modules. One test (`test_create_provider_anthropic`) is skipped unless the `anthropic` package is installed; one is skipped on non-Windows systems (`test_windows_npx_wrapped`). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **2689 cases** across all modules. Two are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met. The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic
