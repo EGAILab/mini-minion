@@ -1185,3 +1185,73 @@ def test_knowledge_dashboard_without_a_database_reports_an_error(monkeypatch, tm
 
     assert exit_code == 1
     assert "no database configured" in out
+
+
+# ---------------------------------------------------------------------
+# memory knowledge compile (Stage One Phase 7, slice D)
+# ---------------------------------------------------------------------
+
+
+def test_knowledge_compile_writes_the_digest_file(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.list_claims.return_value = [
+        {"id": "c-1", "rel_path": "topics/x.md", "text": "Alice prefers dark mode.",
+         "status": "supported"}
+    ]
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["knowledge", "compile", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    digest_path = tmp_path / "workspaces" / "main" / "KNOWLEDGE_DIGEST.md"
+    assert digest_path.exists()
+    assert "Alice prefers dark mode." in digest_path.read_text(encoding="utf-8")
+    assert "compiled 1 supported claim" in out
+    mock_index.list_claims.assert_called_once_with("main", status="supported")
+
+
+def test_knowledge_compile_reports_an_empty_digest_when_no_claims(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.list_claims.return_value = []
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["knowledge", "compile", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    digest_path = tmp_path / "workspaces" / "main" / "KNOWLEDGE_DIGEST.md"
+    assert digest_path.exists()
+    assert digest_path.read_text(encoding="utf-8") == ""
+    assert "no supported claims yet" in out
+
+
+def test_knowledge_compile_passes_max_chars_through(monkeypatch, tmp_path):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = Mock()
+    mock_index.list_claims.return_value = [
+        {"id": "c-1", "rel_path": "topics/x.md", "text": "Fact.", "status": "supported"}
+    ]
+    _patch_index(monkeypatch, mock_index)
+
+    cli.main(["knowledge", "compile", "--agent", "main", "--max-chars", "500"])
+
+    digest_path = tmp_path / "workspaces" / "main" / "KNOWLEDGE_DIGEST.md"
+    assert digest_path.exists()  # max_chars is exercised via compile_digest directly (see test_knowledge.py)
+
+
+def test_knowledge_compile_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(["knowledge", "compile", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out

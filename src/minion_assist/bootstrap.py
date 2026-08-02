@@ -20,10 +20,15 @@ The key design goals are:
 
 Recognized files (in injection order):
 
-    AGENTS.md   SOUL.md   TOOLS.md   IDENTITY.md   USER.md   BOOTSTRAP.md   MEMORY.md
+    AGENTS.md   SOUL.md   TOOLS.md   IDENTITY.md   USER.md   BOOTSTRAP.md
+    MEMORY.md   KNOWLEDGE_DIGEST.md
 
 ``HEARTBEAT.md`` is intentionally omitted from ordinary turns (no heartbeat
-runs exist in Minion Assist yet).
+runs exist in Minion Assist yet). ``KNOWLEDGE_DIGEST.md`` (Stage One Phase
+7, slice D) is a fully machine-compiled file — see
+``memory/knowledge.py``'s ``compile_digest`` and
+``memory/digest_scheduler.py`` — read here exactly like any other
+bootstrap file, no different handling needed.
 
 Typical call path::
 
@@ -69,6 +74,7 @@ _BOOTSTRAP_FILES: tuple[str, ...] = (
     "BOOTSTRAP.md",
     "HEARTBEAT.md",
     "MEMORY.md",
+    "KNOWLEDGE_DIGEST.md",
 )
 
 # Subset of bootstrap files injected into spawned subagents.

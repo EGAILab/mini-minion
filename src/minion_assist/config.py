@@ -850,6 +850,58 @@ class CommitmentsConfig:
 
 
 @dataclass(frozen=True)
+class KnowledgeDigestConfig:
+    """Controls the automated ``KNOWLEDGE_DIGEST.md`` compilation scheduler (Stage One Phase 7, slice D).
+
+    Mirrors ``MemoryConsolidationConfig``'s daily wall-clock scheduling
+    shape (Task 9's "keep the poetic DreamingScheduler independently
+    configurable" reasoning applies equally here — this is a third,
+    separately-configured daily schedule, not folded into either of the
+    other two). Each pass compiles ``status="supported"`` claims into a
+    bounded digest and overwrites ``KNOWLEDGE_DIGEST.md`` at the
+    configured agent's workspace root — see
+    ``memory/knowledge.py``'s ``compile_digest`` and
+    ``memory/digest_scheduler.py``'s ``KnowledgeDigestScheduler``.
+
+    Configured in ``config.json`` under the ``"knowledge_digest"`` key::
+
+        "knowledge_digest": {
+            "enabled": true,
+            "hour": 4,
+            "minute": 30,
+            "timezone": "Australia/Sydney",
+            "agent_id": "main",
+            "max_chars": 8000
+        }
+
+    Attributes:
+        enabled (bool): When ``True`` (default ``False``), the scheduler
+            starts at process startup. Requires a configured database and
+            lexical index — silently does not start without one (see
+            ``minion.py``).
+        hour (int): Wall-clock hour of day to fire (0-23). Default 4.
+        minute (int): Wall-clock minute to fire (0-59). Default 30 —
+            deliberately offset from ``memory_consolidation``'s default
+            04:00 so the two schedulers don't contend for the same
+            provider call slot when both are enabled.
+        timezone (str): IANA timezone name for scheduling. Default
+            ``"Australia/Sydney"``.
+        agent_id (str): Which agent's supported claims to compile a
+            digest for, and whose workspace root ``KNOWLEDGE_DIGEST.md``
+            is written into. Default ``"main"``.
+        max_chars (int): Soft cap on the compiled digest's length, passed
+            straight through to ``compile_digest``. Default 8000.
+    """
+
+    enabled: bool = False
+    hour: int = 4
+    minute: int = 30
+    timezone: str = "Australia/Sydney"
+    agent_id: str = "main"
+    max_chars: int = 8000
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     """Controls verbose LLM request/response logging.
 
@@ -1430,6 +1482,38 @@ def _resolve_commitments() -> CommitmentsConfig:
 # (Stage One Phase 6, slice B). Disabled by default; enabled via
 # "commitments": {"enabled": true} in config.json.
 commitments: CommitmentsConfig = _resolve_commitments()
+
+
+def _resolve_knowledge_digest() -> KnowledgeDigestConfig:
+    """Read the ``"knowledge_digest"`` section from config.json and build a KnowledgeDigestConfig.
+
+    All fields have sensible defaults so the section can be omitted entirely.
+
+    Returns:
+        KnowledgeDigestConfig: Immutable settings; defaults apply when absent.
+    """
+    raw = _raw.get("knowledge_digest", {})
+    if not isinstance(raw, dict):
+        return KnowledgeDigestConfig()
+    hour = int(raw.get("hour", 4))
+    minute = int(raw.get("minute", 30))
+    return KnowledgeDigestConfig(
+        enabled=bool(raw.get("enabled", False)),
+        hour=max(0, min(23, hour)),
+        minute=max(0, min(59, minute)),
+        timezone=str(raw.get("timezone", "Australia/Sydney")),
+        agent_id=str(raw.get("agent_id", "main")),
+        max_chars=max(1, int(raw.get("max_chars", 8000))),
+    )
+
+
+# knowledge_digest: controls the automated KNOWLEDGE_DIGEST.md compilation
+# scheduler (Stage One Phase 7, slice D). Disabled by default; enabled via
+# "knowledge_digest": {"enabled": true} in config.json. A third,
+# separately-configured daily schedule alongside `dreaming` and
+# `memory_consolidation`, for the same "keep each independently
+# configurable" reasoning (Task 9).
+knowledge_digest: KnowledgeDigestConfig = _resolve_knowledge_digest()
 
 
 def _resolve_logging() -> LoggingConfig:

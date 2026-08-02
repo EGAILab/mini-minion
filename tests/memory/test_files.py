@@ -139,6 +139,40 @@ def test_count_notes_all_zero_for_empty_store(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# write_digest (KNOWLEDGE_DIGEST.md, Stage One Phase 7, slice D)
+# ---------------------------------------------------------------------------
+
+def test_write_digest_writes_to_the_workspace_root(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    path = repo.write_digest("# Knowledge Digest\n\n- A fact.")
+
+    assert path == tmp_path / "KNOWLEDGE_DIGEST.md"
+    assert path.read_text(encoding="utf-8") == "# Knowledge Digest\n\n- A fact."
+
+
+def test_write_digest_is_not_nested_under_memory(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.write_digest("content")
+
+    assert not (tmp_path / "memory" / "KNOWLEDGE_DIGEST.md").exists()
+
+
+def test_write_digest_overwrites_an_existing_digest(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.write_digest("first version")
+    repo.write_digest("second version")
+
+    assert (tmp_path / "KNOWLEDGE_DIGEST.md").read_text(encoding="utf-8") == "second version"
+
+
+def test_write_digest_accepts_an_empty_string(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    path = repo.write_digest("")
+
+    assert path.read_text(encoding="utf-8") == ""
+
+
+# ---------------------------------------------------------------------------
 # remember_import / load_import / list_import_keys (memory/imports/)
 # ---------------------------------------------------------------------------
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from minion_assist.memory.knowledge import parse_claims, parse_time_epoch
+from minion_assist.memory.knowledge import compile_digest, parse_claims, parse_time_epoch
 
 # ---------------------------------------------------------------------------
 # parse_claims — basics
@@ -320,3 +320,87 @@ def test_parse_time_epoch_returns_none_for_empty_string():
 
 def test_parse_time_epoch_returns_none_for_garbage():
     assert parse_time_epoch("not a date") is None
+
+
+# ---------------------------------------------------------------------------
+# compile_digest (Stage One Phase 7, slice D)
+# ---------------------------------------------------------------------------
+
+def _claim(rel_path="topics/x.md", text="Some fact.", **overrides) -> dict:
+    base = {"id": "c-1", "rel_path": rel_path, "text": text}
+    base.update(overrides)
+    return base
+
+
+def test_compile_digest_returns_empty_string_for_no_claims():
+    assert compile_digest([]) == ""
+
+
+def test_compile_digest_includes_the_claim_text():
+    digest = compile_digest([_claim(text="Alice prefers dark mode.")])
+
+    assert "Alice prefers dark mode." in digest
+
+
+def test_compile_digest_starts_with_the_header():
+    digest = compile_digest([_claim()])
+
+    assert digest.startswith("# Knowledge Digest")
+
+
+def test_compile_digest_groups_claims_under_a_page_heading():
+    digest = compile_digest([_claim(rel_path="topics/prefs.md", text="Fact one.")])
+
+    assert "## topics/prefs.md" in digest
+    assert digest.index("## topics/prefs.md") < digest.index("Fact one.")
+
+
+def test_compile_digest_only_emits_one_heading_per_consecutive_page():
+    claims = [
+        _claim(id="c-1", rel_path="topics/a.md", text="Fact A1."),
+        _claim(id="c-2", rel_path="topics/a.md", text="Fact A2."),
+        _claim(id="c-3", rel_path="topics/b.md", text="Fact B1."),
+    ]
+
+    digest = compile_digest(claims)
+
+    assert digest.count("## topics/a.md") == 1
+    assert digest.count("## topics/b.md") == 1
+    assert "Fact A1." in digest and "Fact A2." in digest and "Fact B1." in digest
+
+
+def test_compile_digest_is_deterministic_given_the_same_claims():
+    claims = [
+        _claim(id="c-1", rel_path="topics/a.md", text="Fact A1."),
+        _claim(id="c-2", rel_path="topics/b.md", text="Fact B1."),
+    ]
+
+    assert compile_digest(claims) == compile_digest(claims)
+
+
+def test_compile_digest_omits_claims_once_the_budget_is_exhausted():
+    claims = [
+        _claim(id="c-1", rel_path="topics/a.md", text="Short fact one."),
+        _claim(id="c-2", rel_path="topics/a.md", text="Short fact two."),
+    ]
+
+    # A tiny budget that only fits the header + the first claim's section.
+    digest = compile_digest(claims, max_chars=len(claims[0]["text"]) + 20)
+
+    assert "Short fact one." in digest
+    assert "Short fact two." not in digest
+    assert "1 further supported claim(s) omitted" in digest
+
+
+def test_compile_digest_always_includes_at_least_the_first_claim():
+    # Even an unreasonably tiny budget must not produce an empty digest
+    # when there is at least one claim to show.
+    digest = compile_digest([_claim(text="A single very long claim." * 50)], max_chars=10)
+
+    assert "A single very long claim." in digest
+
+
+def test_compile_digest_reports_no_omission_footer_when_everything_fits():
+    digest = compile_digest([_claim(text="Fits easily.")], max_chars=8000)
+
+    assert "omitted" not in digest

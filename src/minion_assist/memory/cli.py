@@ -274,6 +274,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Restrict to one section. Default: show every section.",
     )
 
+    k_compile = knowledge_sub.add_parser(
+        "compile",
+        help=(
+            "Compile status=\"supported\" claims into KNOWLEDGE_DIGEST.md "
+            "(Stage One Phase 7, slice D) — the same thing the scheduler "
+            "does on its daily timer, run on demand."
+        ),
+    )
+    k_compile.add_argument("--agent", required=True, help="Which agent's claims to compile.")
+    k_compile.add_argument(
+        "--max-chars",
+        type=int,
+        default=8000,
+        help="Soft cap on the compiled digest's length. Default 8000.",
+    )
+
     return parser
 
 
@@ -1050,8 +1066,42 @@ def _run_knowledge_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_knowledge_compile(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory knowledge compile --agent ID [--max-chars N]``.
+
+    Does exactly what ``KnowledgeDigestScheduler`` does on its daily
+    timer (Stage One Phase 7, slice D) — fetch this agent's
+    ``status="supported"`` claims, compile them, and overwrite
+    ``KNOWLEDGE_DIGEST.md`` — run on demand instead of waiting for the
+    schedule.
+    """
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .knowledge import compile_digest  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to compile.")
+        return 1
+
+    claims = index.list_claims(agent_id, status="supported")
+    digest = compile_digest(claims, max_chars=args.max_chars)
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    path = files.write_digest(digest)
+
+    if not claims:
+        print(f"{agent_id}: no supported claims yet — wrote an empty {path}.")
+    else:
+        print(f"{agent_id}: compiled {len(claims)} supported claim(s) into {path}.")
+    return 0
+
+
 _KNOWLEDGE_HANDLERS = {
     "dashboard": _run_knowledge_dashboard,
+    "compile": _run_knowledge_compile,
 }
 
 

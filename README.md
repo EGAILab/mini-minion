@@ -1499,6 +1499,36 @@ minion-assist memory knowledge dashboard --agent main                        # a
 minion-assist memory knowledge dashboard --agent main --section stale        # just one
 ```
 
+### Compiled knowledge digest (Stage One Phase 7, slice D)
+
+Task 4: "compile a bounded agent digest rather than scraping Markdown during prompt construction." `KNOWLEDGE_DIGEST.md` is a new, **fully machine-owned** file — a new separate file (the non-default fork chosen for this slice, rather than a marked section inside `MEMORY.md`) written directly under an agent's workspace root, next to `MEMORY.md`/`USER.md`/`DREAMS.md`. Nothing ever hand-edits it, so there's no "don't clobber human edits" concern the way `MemoryFileRepository`'s other writes have to guard against.
+
+**Compilation is a pure function.** `memory/knowledge.py`'s `compile_digest(claims, max_chars=8000)` takes an already-fetched list of `status="supported"` claims (from `PostgresMemoryIndex.list_claims(agent_id, status="supported")`) and renders them grouped by page — the same "fetch, then format" split `memory/commitments.py`'s `format_due_commitments_block` already uses. Only `supported` claims are included: `contested`/`unknown` ones are exactly what a human hasn't resolved yet (see the slice C dashboards), and `superseded` ones are stale by definition. Claims are included whole, in order, until the next one would exceed `max_chars` — never truncated mid-sentence — with a footer noting how many were left out. Nothing wall-clock-dependent or random is in the output, so the same claims always compile to the same digest (Phase 7's "compiled artifacts are reproducible from canonical pages" acceptance criterion).
+
+**Writing to disk.** `MemoryFileRepository.write_digest(content)` atomically overwrites `KNOWLEDGE_DIGEST.md` at the workspace root. `bootstrap.py`'s `_BOOTSTRAP_FILES` now includes `"KNOWLEDGE_DIGEST.md"` (after `MEMORY.md`) — no other bootstrap-layer changes were needed; it's read, budgeted, and injected exactly like every other bootstrap file, and skipped entirely when empty (no supported claims yet).
+
+**`KnowledgeDigestScheduler`** (`memory/digest_scheduler.py`) recompiles and overwrites the file once a day, mirroring `MemoryConsolidationScheduler`'s daily wall-clock shape (`_seconds_until_next`, a daemon `threading.Timer`, reschedule-after-error). A third, separately-configured schedule alongside `dreaming` and `memory_consolidation`, for the same "keep each independently configurable" reasoning (Task 9). Configured under `"knowledge_digest"` in `config.json`:
+
+```json
+"knowledge_digest": {
+    "enabled": true,
+    "hour": 4,
+    "minute": 30,
+    "timezone": "Australia/Sydney",
+    "agent_id": "main",
+    "max_chars": 8000
+}
+```
+
+Disabled by default. `minute` defaults to 30 (rather than `memory_consolidation`'s `:00`) so the two schedulers don't contend for the same provider/database call slot when both are enabled. Requires a configured database and lexical index — silently does not start without one, same degradation as `memory_consolidation`.
+
+New CLI command — runs the exact same compile-and-write step as the scheduler, on demand:
+
+```bash
+minion-assist memory knowledge compile --agent main
+minion-assist memory knowledge compile --agent main --max-chars 4000
+```
+
 ### `session_search` Tool Modes
 
 | Mode | Description |

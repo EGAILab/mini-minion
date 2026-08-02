@@ -9,6 +9,7 @@ the merged per-agent layout Stage One Phase 0 migrates existing data into
 
     workspaces/{agent_id}/
       USER.md, MEMORY.md, DREAMS.md   # untouched here — bootstrap.py/dreaming.py own these
+      KNOWLEDGE_DIGEST.md             # write_digest() — fully machine-owned, no human-edit concern
       memory/
         YYYY-MM-DD.md                 # daily notes — append_daily()
         topics/{key}.md               # explicit notes — remember()/load()/delete()
@@ -173,6 +174,39 @@ class MemoryFileRepository:
             "import": sum(1 for _ in self._imports_dir.glob("*.md")),
             "daily": sum(1 for _ in self._memory_dir.glob("*.md")),
         }
+
+    # -----------------------------------------------------------------
+    # Knowledge digest (KNOWLEDGE_DIGEST.md) — Stage One Phase 7, slice D
+    # -----------------------------------------------------------------
+    #
+    # Unlike MEMORY.md/USER.md/DREAMS.md (root-level files this repository
+    # deliberately never writes — see the module docstring), this file IS
+    # written here: it's a fully machine-owned, regenerated-on-a-schedule
+    # artifact, not something a human ever hand-edits, so there is no
+    # "don't clobber human edits" concern the way there would be for those.
+
+    def write_digest(self, content: str) -> Path:
+        """Overwrite ``KNOWLEDGE_DIGEST.md`` at the workspace root with ``content``.
+
+        Lives directly under the workspace root (next to ``MEMORY.md``),
+        not under ``memory/topics/`` — so ``bootstrap.py``'s existing
+        file-injection machinery picks it up on every turn once
+        ``"KNOWLEDGE_DIGEST.md"`` is added to its ``_BOOTSTRAP_FILES``
+        tuple, with no other changes needed there.
+
+        Args:
+            content: The compiled digest text, typically from
+                :func:`~minion_assist.memory.knowledge.compile_digest`.
+                Written verbatim, including an empty string (which simply
+                leaves an empty file — harmless, since ``bootstrap.py``
+                already skips empty files when building the prompt).
+
+        Returns:
+            Path: The file that was written.
+        """
+        path = self._root / "KNOWLEDGE_DIGEST.md"
+        _atomic_write_text(path, content)
+        return path
 
     # -----------------------------------------------------------------
     # Quarantined notes (memory/imports/) — unreviewed, never auto-promoted

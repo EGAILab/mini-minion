@@ -92,6 +92,7 @@ from .config import heartbeat as heartbeat_cfg
 from .config import codex_cfg, logging_cfg
 from .config import database as database_cfg
 from .config import embeddings as embeddings_cfg
+from .config import knowledge_digest as knowledge_digest_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
 from .config import memory_consolidation as memory_consolidation_cfg
@@ -924,6 +925,44 @@ def main() -> None:
                 f"[memory-consolidation] Scheduler started "
                 f"(daily at {memory_consolidation_cfg.hour:02d}:{memory_consolidation_cfg.minute:02d} "
                 f"{memory_consolidation_cfg.timezone})."
+            )
+
+    # --- Knowledge digest scheduler (optional) ---
+    # Stage One Phase 7, slice D: a third, separately-configured daily
+    # schedule (same reasoning as memory_consolidation above) that compiles
+    # the configured agent's status="supported" claims into
+    # KNOWLEDGE_DIGEST.md at that agent's workspace root. Requires a
+    # database, a lexical index, and the configured agent to actually be
+    # running (its files repo must already exist from the per-agent loop
+    # above).
+    _knowledge_digest: object = None
+    if knowledge_digest_cfg.enabled:
+        if _db is None or _memory_index is None:
+            print(
+                "[knowledge-digest] Warning: no database/index configured — "
+                "digest scheduler disabled.",
+                file=sys.stderr,
+            )
+        elif knowledge_digest_cfg.agent_id not in _agent_files_repos:
+            print(
+                f"[knowledge-digest] Warning: agent "
+                f"'{knowledge_digest_cfg.agent_id}' not found in config — "
+                "digest scheduler disabled.",
+                file=sys.stderr,
+            )
+        else:
+            from .memory.digest_scheduler import KnowledgeDigestScheduler  # noqa: PLC0415
+
+            _knowledge_digest = KnowledgeDigestScheduler(
+                knowledge_digest_cfg,
+                _memory_index,
+                _agent_files_repos[knowledge_digest_cfg.agent_id],
+            )
+            _knowledge_digest.start()  # type: ignore[attr-defined]
+            print(
+                f"[knowledge-digest] Scheduler started "
+                f"(daily at {knowledge_digest_cfg.hour:02d}:{knowledge_digest_cfg.minute:02d} "
+                f"{knowledge_digest_cfg.timezone})."
             )
 
     use_streaming = streaming.chat_mode
