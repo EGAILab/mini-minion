@@ -9,6 +9,7 @@ other or leave rows behind in the shared dev database.
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import date as _date
 
@@ -90,6 +91,9 @@ def _cleanup_after(index, agent_id):
     conn.execute("DELETE FROM memory_recall_events WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_consolidation_previews WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_topic_revisions WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM kb_evidence WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM kb_claims WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM kb_entities WHERE agent_id = %s", (agent_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +241,242 @@ def test_force_rebuild_agent_strips_frontmatter_from_chunk_content(index, agent_
     ).fetchone()
 
     assert row[0] == "Body text only."
+
+
+# ---------------------------------------------------------------------------
+# Knowledge layer: claim sync (Stage One Phase 7, slice A)
+# ---------------------------------------------------------------------------
+
+def test_reindex_file_syncs_a_claim_marker(index, agent_id):
+    content = "- User's dog is named Biscuit.\n  <!-- claim:c-1 status=supported confidence=0.9 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    claim = index.get_claim(agent_id, "c-1")
+
+    assert claim is not None
+    assert claim["text"] == "User's dog is named Biscuit."
+    assert claim["status"] == "supported"
+    assert claim["confidence"] == 0.9
+    assert claim["rel_path"] == "topic.md"
+
+
+def test_reindex_file_with_no_claim_markers_syncs_nothing(index, agent_id):
+    index.reindex_file(agent_id, "topic.md", "durable", "Just a plain note, no markers.")
+
+    assert index.list_claims(agent_id) == []
+
+
+def test_reindex_file_only_syncs_claims_for_durable_source_kind(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 status=supported -->"
+    index.reindex_file(agent_id, "2026-01-01.md", "daily", content)
+
+    assert index.get_claim(agent_id, "c-1") is None
+
+
+def test_reindex_file_syncs_claim_evidence(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 evidence=proposal:42,message:1189 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    claim = index.get_claim(agent_id, "c-1")
+
+    assert claim["evidence"] == [
+        {"source_kind": "proposal", "source_ref": "42"},
+        {"source_kind": "message", "source_ref": "1189"},
+    ]
+
+
+def test_reindex_file_replacing_content_updates_the_existing_claim(index, agent_id):
+    index.reindex_file(
+        agent_id, "topic.md", "durable", "- Some claim.\n  <!-- claim:c-1 status=unknown -->"
+    )
+    index.reindex_file(
+        agent_id, "topic.md", "durable", "- Some claim.\n  <!-- claim:c-1 status=supported -->"
+    )
+
+    claim = index.get_claim(agent_id, "c-1")
+
+    assert claim["status"] == "supported"
+    # Still exactly one row -- an upsert, not a duplicate.
+    assert len(index.list_claims(agent_id, rel_path="topic.md")) == 1
+
+
+def test_reindex_file_removes_a_claim_whose_marker_was_deleted(index, agent_id):
+    index.reindex_file(
+        agent_id, "topic.md", "durable", "- Some claim.\n  <!-- claim:c-1 status=supported -->"
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", "No more claims here.")
+
+    assert index.get_claim(agent_id, "c-1") is None
+
+
+def test_reindex_file_removing_a_claim_also_removes_its_evidence(index, agent_id):
+    index.reindex_file(
+        agent_id, "topic.md", "durable",
+        "- Some claim.\n  <!-- claim:c-1 evidence=proposal:42 -->",
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", "No more claims here.")
+
+    row = index._conn().execute(
+        "SELECT count(*) FROM kb_evidence WHERE agent_id = %s AND claim_id = %s", (agent_id, "c-1")
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_reindex_file_defaults_observed_at_to_sync_time_when_absent(index, agent_id):
+    before = time.time()
+    content = "- Some claim.\n  <!-- claim:c-1 status=supported -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+    after = time.time()
+
+    claim = index.get_claim(agent_id, "c-1")
+
+    assert before <= claim["observed_at"] <= after
+
+
+def test_reindex_file_uses_the_marker_observed_time_when_present(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 observed=2026-06-01 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    claim = index.get_claim(agent_id, "c-1")
+
+    from datetime import datetime as _dt
+    assert claim["observed_at"] == _dt.fromisoformat("2026-06-01").timestamp()
+
+
+def test_reindex_file_offsets_claim_line_number_past_the_frontmatter_block(index, agent_id):
+    content = "---\nowner: main\n---\n- Some claim.\n  <!-- claim:c-1 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    claim = index.get_claim(agent_id, "c-1")
+
+    assert claim["line_number"] == 5
+
+
+def test_remove_file_removes_its_claims(index, agent_id):
+    index.reindex_file(
+        agent_id, "topic.md", "durable", "- Some claim.\n  <!-- claim:c-1 status=supported -->"
+    )
+    index.remove_file(agent_id, "topic.md")
+
+    assert index.get_claim(agent_id, "c-1") is None
+
+
+def test_force_rebuild_agent_syncs_claims(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 status=supported -->"
+    index.force_rebuild_agent(agent_id, [("durable", "topic.md", content)])
+
+    assert index.get_claim(agent_id, "c-1") is not None
+
+
+# ---------------------------------------------------------------------------
+# Knowledge layer: entities (Stage One Phase 7, slice A)
+# ---------------------------------------------------------------------------
+
+def test_get_or_create_entity_creates_a_new_entity(index, agent_id):
+    entity_id = index.get_or_create_entity(agent_id, "Biscuit")
+
+    assert entity_id.startswith("e-")
+    row = index._conn().execute(
+        "SELECT name FROM kb_entities WHERE id = %s", (entity_id,)
+    ).fetchone()
+    assert row[0] == "Biscuit"
+
+
+def test_get_or_create_entity_is_idempotent(index, agent_id):
+    first = index.get_or_create_entity(agent_id, "Biscuit")
+    second = index.get_or_create_entity(agent_id, "Biscuit")
+
+    assert first == second
+
+
+def test_get_or_create_entity_matches_case_insensitively(index, agent_id):
+    first = index.get_or_create_entity(agent_id, "Biscuit")
+    second = index.get_or_create_entity(agent_id, "biscuit")
+
+    assert first == second
+
+
+def test_get_or_create_entity_preserves_the_first_seen_casing(index, agent_id):
+    index.get_or_create_entity(agent_id, "Biscuit")
+    index.get_or_create_entity(agent_id, "BISCUIT")
+
+    row = index._conn().execute(
+        "SELECT name FROM kb_entities WHERE agent_id = %s AND name_normalized = 'biscuit'",
+        (agent_id,),
+    ).fetchone()
+    assert row[0] == "Biscuit"
+
+
+def test_get_or_create_entity_scoped_to_agent(index, agent_id):
+    other_agent = f"other-{agent_id}"
+    other_id = index.get_or_create_entity(other_agent, "Biscuit")
+    try:
+        this_id = index.get_or_create_entity(agent_id, "Biscuit")
+        assert this_id != other_id
+    finally:
+        index._conn().execute("DELETE FROM kb_entities WHERE agent_id = %s", (other_agent,))
+
+
+def test_reindex_file_resolves_a_claims_entity(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 entity=Biscuit -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    claim = index.get_claim(agent_id, "c-1")
+
+    assert claim["entity_id"] is not None
+    entity = index._conn().execute(
+        "SELECT name FROM kb_entities WHERE id = %s", (claim["entity_id"],)
+    ).fetchone()
+    assert entity[0] == "Biscuit"
+
+
+def test_reindex_file_without_entity_field_leaves_entity_id_none(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    claim = index.get_claim(agent_id, "c-1")
+
+    assert claim["entity_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Knowledge layer: get_claim / list_claims (Stage One Phase 7, slice A)
+# ---------------------------------------------------------------------------
+
+def test_get_claim_returns_none_for_an_unknown_id(index, agent_id):
+    assert index.get_claim(agent_id, "c-does-not-exist") is None
+
+
+def test_list_claims_scoped_to_rel_path(index, agent_id):
+    index.reindex_file(agent_id, "a.md", "durable", "- Claim A.\n  <!-- claim:c-a -->")
+    index.reindex_file(agent_id, "b.md", "durable", "- Claim B.\n  <!-- claim:c-b -->")
+
+    results = index.list_claims(agent_id, rel_path="a.md")
+
+    assert [c["id"] for c in results] == ["c-a"]
+
+
+def test_list_claims_scoped_to_status(index, agent_id):
+    content = (
+        "- Claim A.\n  <!-- claim:c-a status=supported -->\n"
+        "- Claim B.\n  <!-- claim:c-b status=contested -->"
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    results = index.list_claims(agent_id, status="contested")
+
+    assert [c["id"] for c in results] == ["c-b"]
+
+
+def test_list_claims_scoped_to_agent(index, agent_id):
+    other_agent = f"other-{agent_id}"
+    try:
+        index.reindex_file(other_agent, "topic.md", "durable", "- Claim.\n  <!-- claim:c-1 -->")
+        assert index.list_claims(agent_id) == []
+    finally:
+        index._conn().execute("DELETE FROM kb_claims WHERE agent_id = %s", (other_agent,))
+        index._conn().execute("DELETE FROM memory_chunks WHERE agent_id = %s", (other_agent,))
+        index._conn().execute("DELETE FROM memory_files WHERE agent_id = %s", (other_agent,))
 
 
 def test_reindex_file_without_a_provider_never_embeds(index, agent_id):

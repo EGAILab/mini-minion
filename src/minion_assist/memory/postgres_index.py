@@ -48,11 +48,13 @@ import logging
 import re
 import threading
 import time
+import uuid
 from datetime import date as _date
 from typing import TYPE_CHECKING
 
 from .boundaries import parse_frontmatter
 from .chunking import Chunk, chunk_markdown
+from .knowledge import parse_claims, parse_time_epoch
 
 if TYPE_CHECKING:
     from ..providers.embeddings import EmbeddingProvider
@@ -516,6 +518,79 @@ class PostgresMemoryIndex:
                 "ON memory_chunk_embeddings USING hnsw (embedding vector_cosine_ops)"
             )
 
+        # Knowledge layer — Stage One Phase 7, slice A. No kb_pages table:
+        # a topic note's (agent_id, rel_path) is already the stable "page"
+        # identifier every other part of this project uses (memory_files,
+        # memory_pins, ...) — see memory/knowledge.py's module docstring
+        # for why a separate pages table would just duplicate that.
+        #
+        # Entity ids are system-assigned (get_or_create_entity), not
+        # human-authored like claim ids — a claim marker only names an
+        # entity by (free-text, case-insensitive) name; name_normalized is
+        # the actual dedup key, name preserves whichever casing first
+        # created the row.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS kb_entities (
+                id              TEXT PRIMARY KEY,
+                agent_id        TEXT NOT NULL,
+                name            TEXT NOT NULL,
+                name_normalized TEXT NOT NULL,
+                created_at      DOUBLE PRECISION NOT NULL,
+                UNIQUE (agent_id, name_normalized)
+            )
+        """)
+
+        # Claim ids are human/model-authored, embedded in the canonical
+        # Markdown page itself (memory/knowledge.py's parse_claims()) —
+        # this table is a synced cache of what the pages currently say,
+        # never the other way around. entity_id has no FOREIGN KEY (this
+        # project never declares cross-table FKs — see
+        # memory_proposals.job_id for the established precedent).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS kb_claims (
+                id           TEXT PRIMARY KEY,
+                agent_id     TEXT NOT NULL,
+                rel_path     TEXT NOT NULL,
+                entity_id    TEXT,
+                text         TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'unknown',
+                confidence   DOUBLE PRECISION,
+                observed_at  DOUBLE PRECISION,
+                valid_from   DOUBLE PRECISION,
+                valid_to     DOUBLE PRECISION,
+                privacy_tier TEXT NOT NULL DEFAULT '',
+                line_number  INTEGER NOT NULL,
+                created_at   DOUBLE PRECISION NOT NULL,
+                updated_at   DOUBLE PRECISION NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS kb_claims_page_idx ON kb_claims (agent_id, rel_path)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS kb_claims_status_idx ON kb_claims (agent_id, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS kb_claims_entity_idx ON kb_claims (agent_id, entity_id)"
+        )
+
+        # A claim's evidence= field, one row per (kind, ref) pair — e.g.
+        # ("proposal", "42"). A claim with zero evidence rows is exactly
+        # what Task 3's provenance-gap dashboard (a later slice) reports.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS kb_evidence (
+                id          BIGSERIAL PRIMARY KEY,
+                agent_id    TEXT NOT NULL,
+                claim_id    TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_ref  TEXT NOT NULL,
+                created_at  DOUBLE PRECISION NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS kb_evidence_claim_idx ON kb_evidence (agent_id, claim_id)"
+        )
+
     # ------------------------------------------------------------------
     # Indexing
     # ------------------------------------------------------------------
@@ -592,7 +667,226 @@ class PostgresMemoryIndex:
             ),
         )
         self._maybe_embed_chunks(chunks)
+        if source_kind == "durable":
+            # Stage One Phase 7, slice A: claim markers are a curated-
+            # knowledge concept — daily notes and unreviewed imports are
+            # deliberately excluded (an import only gets claims once a
+            # later slice's review flow promotes it into a durable page).
+            self._sync_claims(agent_id, rel_path, body, line_offset)
         return len(chunks)
+
+    def get_or_create_entity(self, agent_id: str, name: str) -> str:
+        """Resolve a claim marker's ``entity=`` name to a stable entity id, creating one if needed.
+
+        Matched by exact, case-insensitive name within the agent's scope
+        — deliberately no fuzzy entity resolution/merging (see
+        ``memory/knowledge.py``'s module docstring for why). Race-safe:
+        two concurrent callers creating the same new entity name both end
+        up returning the same id (``ON CONFLICT DO NOTHING`` + re-select).
+
+        Args:
+            agent_id: The agent this entity belongs to.
+            name: The entity's name, as written in a claim marker's
+                ``entity=`` field. Whitespace-trimmed; matched
+                case-insensitively.
+
+        Returns:
+            str: The entity's stable id (``"e-" + 8 hex chars``) — newly
+                generated if this exact name (case-insensitively) has
+                never been seen for this agent before.
+        """
+        normalized = name.strip().lower()
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT id FROM kb_entities WHERE agent_id = %s AND name_normalized = %s",
+            (agent_id, normalized),
+        ).fetchone()
+        if row is not None:
+            return row[0]
+        new_id = f"e-{uuid.uuid4().hex[:8]}"
+        conn.execute(
+            """
+            INSERT INTO kb_entities (id, agent_id, name, name_normalized, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (agent_id, name_normalized) DO NOTHING
+            """,
+            (new_id, agent_id, name.strip(), normalized, time.time()),
+        )
+        row = conn.execute(
+            "SELECT id FROM kb_entities WHERE agent_id = %s AND name_normalized = %s",
+            (agent_id, normalized),
+        ).fetchone()
+        return row[0]
+
+    def _sync_claims(self, agent_id: str, rel_path: str, body: str, line_offset: int) -> int:
+        """Sync one page's claim markers into ``kb_claims``/``kb_evidence`` (Stage One Phase 7, slice A).
+
+        Read-only relative to the page itself — never writes a marker
+        back into the file (see ``memory/knowledge.py``'s module
+        docstring: the file is always the source of truth, this is a
+        derived cache refreshed on every reindex, the same relationship
+        ``memory_chunks``/``boundary_metadata`` already have to a file's
+        raw text). Claims whose markers have been removed from the page
+        since the last sync are deleted here too (and their evidence with
+        them) — the same "diff and remove" shape ``remove_file()``/
+        ``reconcile_agent()`` already use for whole files.
+
+        Args:
+            agent_id: The owning agent.
+            rel_path: The page this content came from.
+            body: The page's content with any action-boundary frontmatter
+                already stripped (Stage One Phase 6, slice A) — the same
+                text ``chunk_markdown()`` chunks.
+            line_offset: Lines to add back onto each claim's reported line
+                number so it points at the right line in the *original*
+                file on disk, mirroring how chunk citations already
+                account for a stripped frontmatter block.
+
+        Returns:
+            int: How many claims are now recorded for this page.
+        """
+        parsed = parse_claims(body)
+        conn = self._conn()
+        now = time.time()
+
+        existing_ids = {
+            r[0]
+            for r in conn.execute(
+                "SELECT id FROM kb_claims WHERE agent_id = %s AND rel_path = %s",
+                (agent_id, rel_path),
+            ).fetchall()
+        }
+        current_ids = {c.id for c in parsed}
+        for removed_id in existing_ids - current_ids:
+            conn.execute(
+                "DELETE FROM kb_evidence WHERE agent_id = %s AND claim_id = %s",
+                (agent_id, removed_id),
+            )
+            conn.execute(
+                "DELETE FROM kb_claims WHERE agent_id = %s AND id = %s", (agent_id, removed_id)
+            )
+
+        for claim in parsed:
+            entity_id = self.get_or_create_entity(agent_id, claim.entity) if claim.entity else None
+            observed_at = parse_time_epoch(claim.observed)
+            if observed_at is None:
+                observed_at = now
+            conn.execute(
+                """
+                INSERT INTO kb_claims
+                    (id, agent_id, rel_path, entity_id, text, status, confidence,
+                     observed_at, valid_from, valid_to, privacy_tier, line_number,
+                     created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    rel_path = EXCLUDED.rel_path,
+                    entity_id = EXCLUDED.entity_id,
+                    text = EXCLUDED.text,
+                    status = EXCLUDED.status,
+                    confidence = EXCLUDED.confidence,
+                    observed_at = EXCLUDED.observed_at,
+                    valid_from = EXCLUDED.valid_from,
+                    valid_to = EXCLUDED.valid_to,
+                    privacy_tier = EXCLUDED.privacy_tier,
+                    line_number = EXCLUDED.line_number,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    claim.id, agent_id, rel_path, entity_id, claim.text, claim.status,
+                    claim.confidence, observed_at, parse_time_epoch(claim.valid_from),
+                    parse_time_epoch(claim.valid_to), claim.privacy, claim.line + line_offset,
+                    now, now,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM kb_evidence WHERE agent_id = %s AND claim_id = %s",
+                (agent_id, claim.id),
+            )
+            for source_kind, source_ref in claim.evidence:
+                conn.execute(
+                    """
+                    INSERT INTO kb_evidence (agent_id, claim_id, source_kind, source_ref, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (agent_id, claim.id, source_kind, source_ref, now),
+                )
+        return len(parsed)
+
+    def get_claim(self, agent_id: str, claim_id: str) -> dict | None:
+        """Look up one claim by id, including its evidence.
+
+        Returns:
+            dict | None: ``{"id", "agent_id", "rel_path", "entity_id",
+                "text", "status", "confidence", "observed_at",
+                "valid_from", "valid_to", "privacy_tier", "line_number",
+                "evidence"}`` — ``evidence`` is a list of
+                ``{"source_kind", "source_ref"}`` dicts. ``None`` if no
+                claim with this id exists for this agent.
+        """
+        row = self._conn().execute(
+            """
+            SELECT id, agent_id, rel_path, entity_id, text, status, confidence,
+                   observed_at, valid_from, valid_to, privacy_tier, line_number
+            FROM kb_claims WHERE agent_id = %s AND id = %s
+            """,
+            (agent_id, claim_id),
+        ).fetchone()
+        if row is None:
+            return None
+        evidence_rows = self._conn().execute(
+            "SELECT source_kind, source_ref FROM kb_evidence WHERE agent_id = %s AND claim_id = %s",
+            (agent_id, claim_id),
+        ).fetchall()
+        return {
+            "id": row[0], "agent_id": row[1], "rel_path": row[2], "entity_id": row[3],
+            "text": row[4], "status": row[5], "confidence": row[6], "observed_at": row[7],
+            "valid_from": row[8], "valid_to": row[9], "privacy_tier": row[10],
+            "line_number": row[11],
+            "evidence": [{"source_kind": r[0], "source_ref": r[1]} for r in evidence_rows],
+        }
+
+    def list_claims(
+        self, agent_id: str, rel_path: str | None = None, status: str | None = None
+    ) -> list[dict]:
+        """List claims for one agent, optionally scoped to one page and/or status.
+
+        Does not include evidence (use :meth:`get_claim` per-claim for
+        that) — this is the lightweight listing primitive later slices'
+        dashboards build on.
+
+        Returns:
+            list[dict]: Same shape as :meth:`get_claim`'s return value
+                minus ``evidence``, ordered by ``rel_path`` then
+                ``line_number``.
+        """
+        clauses = ["agent_id = %s"]
+        params: list = [agent_id]
+        if rel_path is not None:
+            clauses.append("rel_path = %s")
+            params.append(rel_path)
+        if status is not None:
+            clauses.append("status = %s")
+            params.append(status)
+        where_sql = " AND ".join(clauses)
+        rows = self._conn().execute(
+            f"""
+            SELECT id, agent_id, rel_path, entity_id, text, status, confidence,
+                   observed_at, valid_from, valid_to, privacy_tier, line_number
+            FROM kb_claims
+            WHERE {where_sql}
+            ORDER BY rel_path, line_number
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "agent_id": r[1], "rel_path": r[2], "entity_id": r[3],
+                "text": r[4], "status": r[5], "confidence": r[6], "observed_at": r[7],
+                "valid_from": r[8], "valid_to": r[9], "privacy_tier": r[10],
+                "line_number": r[11],
+            }
+            for r in rows
+        ]
 
     def get_boundary(self, agent_id: str, rel_path: str) -> dict[str, str] | None:
         """Look up one file's cached action-boundary metadata (Stage One Phase 6, slice A).
@@ -618,12 +912,13 @@ class PostgresMemoryIndex:
         return json.loads(row[0])
 
     def remove_file(self, agent_id: str, rel_path: str) -> None:
-        """Remove one file's chunks, ledger row, and pin (e.g. after on-disk deletion).
+        """Remove one file's chunks, ledger row, pin, and claims (e.g. after on-disk deletion).
 
         A no-op if this file was never indexed/pinned — safe to call
         unconditionally. Also clears any pin (Stage One Phase 4, slice B)
-        so a deleted note can never linger as an orphaned pin pointing at
-        content that no longer exists.
+        and any claims/evidence synced from this page (Stage One Phase 7,
+        slice A) so a deleted note can never linger as an orphaned pin or
+        orphaned claims pointing at content that no longer exists.
         """
         conn = self._conn()
         conn.execute(
@@ -636,6 +931,15 @@ class PostgresMemoryIndex:
         )
         conn.execute(
             "DELETE FROM memory_pins WHERE agent_id = %s AND rel_path = %s",
+            (agent_id, rel_path),
+        )
+        conn.execute(
+            "DELETE FROM kb_evidence WHERE agent_id = %s AND claim_id IN "
+            "(SELECT id FROM kb_claims WHERE agent_id = %s AND rel_path = %s)",
+            (agent_id, agent_id, rel_path),
+        )
+        conn.execute(
+            "DELETE FROM kb_claims WHERE agent_id = %s AND rel_path = %s",
             (agent_id, rel_path),
         )
 
@@ -891,6 +1195,16 @@ class PostgresMemoryIndex:
                     json.dumps(boundary_metadata) if boundary_metadata else "",
                 ),
             )
+            if source_kind == "durable":
+                # Stage One Phase 7, slice A. Best-effort and outside the
+                # shadow/swap transaction below, same treatment
+                # _maybe_embed_chunks() already gets — claim tracking is
+                # an additive layer on top of the chunk index's own
+                # atomicity guarantee, not part of what that guarantee
+                # protects. An interrupted force-rebuild leaves claims
+                # merely stale until the next reconcile/rebuild, never
+                # incorrect in a way that corrupts search.
+                self._sync_claims(agent_id, rel_path, body, line_offset)
             processed += 1
 
         if processed != len(indexable_files):

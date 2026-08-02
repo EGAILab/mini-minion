@@ -1431,6 +1431,36 @@ minion-assist memory commitments dismiss 42 --agent main   # dismiss without sen
 minion-assist memory commitments delete 42 --agent main    # permanently delete (Task 7's "complete scoped deletion")
 ```
 
+### Knowledge layer — schema, claim markers, and sync (Stage One Phase 7, slice A)
+
+**Goal: add wiki-like belief maintenance only after capture and retrieval are reliable.** Phase 7 is the plan's only phase with no analogous feature in OpenClaw's actual source (verified by searching — no entity/claim/evidence graph, no "belief maintenance" concept exists there); the design here is original to this project, built to stay consistent with everything Stage One already established rather than borrowed from a reference implementation.
+
+**No `kb_pages` table.** Task 1 asks for a "stable page identifier" — a topic note's `(agent_id, rel_path)` already is that, the same stable identifier `memory_files`/`memory_pins`/`memory_consolidation_previews` all already use. A separate pages table would just duplicate it.
+
+**Claims live in the file, not the database.** Consistent with every phase before this one ("files are the source of truth, Postgres is a derived cache"), a claim's stable id and structured fields (Task 2: status/confidence/observed-time/valid-time/privacy-tier) are an inline HTML comment attached to the sentence it annotates:
+
+```markdown
+- User's dog is named Biscuit.
+  <!-- claim:c-a1b2c3d4 status=supported confidence=0.9
+       observed=2026-06-01 evidence=proposal:42 -->
+```
+
+`memory/knowledge.py`'s `parse_claims()` is read-only relative to file content — it never invents a claim from unmarked prose. A sentence only enters `kb_claims` once something (a human, or the consolidator in a later slice) explicitly attaches a marker; everything else in a topic note stays exactly what it's always been, untracked prose. `PostgresMemoryIndex.reindex_file()`/`force_rebuild_agent()` call `parse_claims()` and sync the result into Postgres the same way they already sync chunks and boundary metadata (Stage One Phase 6, slice A) — for `source_kind="durable"` only (daily notes and unreviewed imports are excluded; an import only gets claims once a later slice's review flow promotes it into a durable page).
+
+| Table | Description |
+|---|---|
+| `kb_entities` | `id` (`"e-" + 8 hex chars`, system-assigned), `agent_id`, `name`, `name_normalized` (the actual `UNIQUE (agent_id, name_normalized)` dedup key — case-insensitive exact match, deliberately no fuzzy entity resolution/merging; a genuinely hard NLP problem with no evaluation data yet to justify building, the same "collect data before choosing thresholds" posture the rest of Stage One has taken throughout), `created_at`. |
+| `kb_claims` | `id` (human/model-authored, from the marker), `agent_id`, `rel_path`, `entity_id` (nullable), `text`, `status` (`supported`/`contested`/`superseded`/`unknown`, defaults `unknown`), `confidence`, `observed_at` (falls back to sync time when the marker omits `observed=`), `valid_from`/`valid_to` (the bi-temporal distinction Task 2 asks for — when a claim is/was true in the world, distinct from when it was *observed*), `privacy_tier` (free text), `line_number`, `created_at`, `updated_at`. |
+| `kb_evidence` | One row per `evidence=kind:ref` pair (Task 1's evidence identifiers) — e.g. `("proposal", "42")`. A claim with zero evidence rows is exactly what a later slice's provenance-gap dashboard (Task 3) reports. |
+
+`freshness` (also Task 2) is deliberately **not** a marker field — it's computed at query time from `observed_at` (a decay function, mirroring `postgres_index.py`'s existing `_decay_factor`), not something a human or model would hand-author.
+
+Entity resolution: `get_or_create_entity(agent_id, name)` — race-safe (`ON CONFLICT DO NOTHING` + re-select), matched case-insensitively, preserving whichever casing first created the row.
+
+Removing a page's marker removes its claim (and evidence) on the next sync — the same "diff and remove" shape `remove_file()`/`reconcile_agent()` already use for whole files. `remove_file()` also cleans up a deleted page's claims directly.
+
+No CLI or dashboards yet in this slice — `get_claim()`/`list_claims()` are the lightweight read primitives later slices (dashboards, the compiled digest, import review, forgetting) build on.
+
 ### `session_search` Tool Modes
 
 | Mode | Description |
