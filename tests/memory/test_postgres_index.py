@@ -92,6 +92,7 @@ def _cleanup_after(index, agent_id):
     conn.execute("DELETE FROM memory_consolidation_previews WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM memory_topic_revisions WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM kb_evidence WHERE agent_id = %s", (agent_id,))
+    conn.execute("DELETE FROM kb_relationships WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM kb_claims WHERE agent_id = %s", (agent_id,))
     conn.execute("DELETE FROM kb_entities WHERE agent_id = %s", (agent_id,))
 
@@ -366,6 +367,105 @@ def test_force_rebuild_agent_syncs_claims(index, agent_id):
     index.force_rebuild_agent(agent_id, [("durable", "topic.md", content)])
 
     assert index.get_claim(agent_id, "c-1") is not None
+
+
+# ---------------------------------------------------------------------------
+# Knowledge layer: relationships (Stage One Phase 7, slice B)
+# ---------------------------------------------------------------------------
+
+def test_sync_claims_records_a_contradicts_relationship(index, agent_id):
+    content = (
+        "- Old claim.\n  <!-- claim:c-1 status=supported -->\n"
+        "- New claim.\n  <!-- claim:c-2 status=contested contradicts=c-1 -->"
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    claim = index.get_claim(agent_id, "c-2")
+
+    assert claim["contradicts"] == ["c-1"]
+    assert claim["supersedes"] == []
+
+
+def test_sync_claims_records_a_supersedes_relationship(index, agent_id):
+    content = (
+        "- Old claim.\n  <!-- claim:c-1 status=superseded -->\n"
+        "- New claim.\n  <!-- claim:c-2 supersedes=c-1 -->"
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    claim = index.get_claim(agent_id, "c-2")
+
+    assert claim["supersedes"] == ["c-1"]
+
+
+def test_sync_claims_records_multiple_relationship_targets(index, agent_id):
+    content = "- New claim.\n  <!-- claim:c-3 supersedes=c-1,c-2 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    claim = index.get_claim(agent_id, "c-3")
+
+    assert claim["supersedes"] == ["c-1", "c-2"]
+
+
+def test_list_relationships_to_finds_claims_pointing_at_a_given_claim(index, agent_id):
+    content = (
+        "- Old claim.\n  <!-- claim:c-1 status=supported -->\n"
+        "- New claim.\n  <!-- claim:c-2 status=contested contradicts=c-1 -->"
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    incoming = index.list_relationships_to(agent_id, "c-1")
+
+    assert incoming == [{"from_claim_id": "c-2", "kind": "contradicts"}]
+
+
+def test_list_relationships_to_is_empty_for_a_claim_nothing_points_at(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    assert index.list_relationships_to(agent_id, "c-1") == []
+
+
+def test_reindex_file_replacing_content_updates_relationships(index, agent_id):
+    index.reindex_file(
+        agent_id, "topic.md", "durable",
+        "- New claim.\n  <!-- claim:c-2 contradicts=c-1 -->",
+    )
+    index.reindex_file(
+        agent_id, "topic.md", "durable",
+        "- New claim.\n  <!-- claim:c-2 -->",  # relationship removed on re-sync
+    )
+
+    claim = index.get_claim(agent_id, "c-2")
+
+    assert claim["contradicts"] == []
+
+
+def test_remove_file_removes_relationships_from_its_claims(index, agent_id):
+    content = "- New claim.\n  <!-- claim:c-2 contradicts=c-1 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    index.remove_file(agent_id, "topic.md")
+
+    row = index._conn().execute(
+        "SELECT count(*) FROM kb_relationships WHERE agent_id = %s AND from_claim_id = %s",
+        (agent_id, "c-2"),
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_removing_a_claim_marker_also_removes_its_outgoing_relationships(index, agent_id):
+    index.reindex_file(
+        agent_id, "topic.md", "durable",
+        "- New claim.\n  <!-- claim:c-2 contradicts=c-1 -->",
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", "No more claims here.")
+
+    row = index._conn().execute(
+        "SELECT count(*) FROM kb_relationships WHERE agent_id = %s AND from_claim_id = %s",
+        (agent_id, "c-2"),
+    ).fetchone()
+    assert row[0] == 0
 
 
 # ---------------------------------------------------------------------------

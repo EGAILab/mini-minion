@@ -67,6 +67,16 @@ Recognized fields
   marker with no ``evidence`` field is still parsed and synced — hand-
   authored content can't be retroactively forced to cite a source — but
   shows up in the provenance-gap dashboard (a later slice).
+- ``supersedes`` / ``contradicts`` — comma-separated claim id lists
+  (Task 1's "relationship identifiers", Stage One Phase 7, slice B).
+  Deliberately the *only* two relationship kinds — the two the plan's
+  acceptance criteria actually need ("contradictory preferences remain
+  contested until resolved" and the consolidator's existing supersede
+  capability from Phase 5), not an open-ended relationship-type system.
+  In practice populated by
+  :class:`~minion_assist.memory.consolidation.MemoryConsolidator`'s
+  drafting prompt when it recognizes a conflict while revising a note —
+  see that module's docstring.
 
 ``freshness`` (also Task 2) is deliberately *not* a marker field — it's
 derived at query time from ``observed_at`` (a decay function, mirroring
@@ -78,7 +88,10 @@ Talks to
 - ``memory/postgres_index.py`` — :meth:`PostgresMemoryIndex._sync_claims`
   calls :func:`parse_claims` from ``reindex_file()``/``force_rebuild_agent()``
   (``source_kind == "durable"`` only) and writes the result into
-  ``kb_entities``/``kb_claims``/``kb_evidence``.
+  ``kb_entities``/``kb_claims``/``kb_evidence``/``kb_relationships``.
+- ``memory/consolidation.py`` — :class:`~minion_assist.memory.consolidation.MemoryConsolidator`'s
+  drafting prompt is what actually populates ``contradicts=``/
+  ``supersedes=`` in practice (Stage One Phase 7, slice B).
 """
 
 from __future__ import annotations
@@ -118,6 +131,14 @@ class ParsedClaim:
         evidence: ``(source_kind, source_ref)`` pairs parsed from
             ``evidence=kind:ref,kind:ref``. Empty if the field is absent
             or empty.
+        supersedes: Claim ids parsed from ``supersedes=c-x,c-y`` — this
+            claim replaces those (Task 1's "relationship identifiers").
+            Empty if absent.
+        contradicts: Claim ids parsed from ``contradicts=c-x,c-y`` — this
+            claim conflicts with those; neither is silently resolved
+            (see :class:`~minion_assist.memory.consolidation.MemoryConsolidator`'s
+            drafting prompt, which is what actually populates this field
+            in practice). Empty if absent.
         line: 1-indexed line number the marker itself starts on, for
             citations/debugging.
     """
@@ -132,6 +153,8 @@ class ParsedClaim:
     privacy: str = ""
     entity: str | None = None
     evidence: list[tuple[str, str]] = field(default_factory=list)
+    supersedes: list[str] = field(default_factory=list)
+    contradicts: list[str] = field(default_factory=list)
     line: int = 0
 
 
@@ -184,6 +207,14 @@ def _parse_evidence(raw: str | None) -> list[tuple[str, str]]:
     return pairs
 
 
+def _parse_claim_id_list(raw: str | None) -> list[str]:
+    """Parse a comma-separated list of claim ids, e.g. ``"c-a,c-b"`` — used
+    for both ``supersedes=`` and ``contradicts=``."""
+    if not raw:
+        return []
+    return [item for item in raw.split(",") if item]
+
+
 def parse_claims(content: str) -> list[ParsedClaim]:
     """Parse every claim marker in a page's raw content.
 
@@ -219,6 +250,8 @@ def parse_claims(content: str) -> list[ParsedClaim]:
                 privacy=fields.get("privacy", ""),
                 entity=fields.get("entity"),
                 evidence=_parse_evidence(fields.get("evidence")),
+                supersedes=_parse_claim_id_list(fields.get("supersedes")),
+                contradicts=_parse_claim_id_list(fields.get("contradicts")),
                 line=line_number,
             )
         )

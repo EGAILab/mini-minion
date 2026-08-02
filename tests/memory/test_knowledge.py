@@ -226,6 +226,51 @@ def test_parse_claims_ignores_a_malformed_evidence_entry():
     assert claim.evidence == [("proposal", "42"), ("message", "1189")]
 
 
+# ---------------------------------------------------------------------------
+# parse_claims — relationships (Stage One Phase 7, slice B)
+# ---------------------------------------------------------------------------
+
+def test_parse_claims_supersedes_defaults_to_empty_list():
+    content = "- Some claim.\n  <!-- claim:c-1 -->"
+
+    [claim] = parse_claims(content)
+
+    assert claim.supersedes == []
+
+
+def test_parse_claims_extracts_a_single_supersedes_reference():
+    content = "- Some claim.\n  <!-- claim:c-2 supersedes=c-1 -->"
+
+    [claim] = parse_claims(content)
+
+    assert claim.supersedes == ["c-1"]
+
+
+def test_parse_claims_extracts_multiple_supersedes_references():
+    content = "- Some claim.\n  <!-- claim:c-3 supersedes=c-1,c-2 -->"
+
+    [claim] = parse_claims(content)
+
+    assert claim.supersedes == ["c-1", "c-2"]
+
+
+def test_parse_claims_contradicts_defaults_to_empty_list():
+    content = "- Some claim.\n  <!-- claim:c-1 -->"
+
+    [claim] = parse_claims(content)
+
+    assert claim.contradicts == []
+
+
+def test_parse_claims_extracts_contradicts():
+    content = "- Some claim.\n  <!-- claim:c-2 status=contested contradicts=c-1 -->"
+
+    [claim] = parse_claims(content)
+
+    assert claim.contradicts == ["c-1"]
+    assert claim.status == "contested"
+
+
 def test_parse_claims_multiline_marker():
     content = (
         "- User's dog is named Biscuit.\n"

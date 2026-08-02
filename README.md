@@ -1461,6 +1461,22 @@ Removing a page's marker removes its claim (and evidence) on the next sync — t
 
 No CLI or dashboards yet in this slice — `get_claim()`/`list_claims()` are the lightweight read primitives later slices (dashboards, the compiled digest, import review, forgetting) build on.
 
+### Provenance and relationships (Stage One Phase 7, slice B)
+
+**A minimal relationship vocabulary.** `supersedes=` and `contradicts=` (comma-separated claim id lists) are the only two relationship kinds — the two the plan's acceptance criteria actually need ("contradictory preferences remain contested until resolved" and the consolidator's existing supersede capability from Phase 5), not an open-ended relationship-type system.
+
+| Table | Description |
+|---|---|
+| `kb_relationships` | `from_claim_id`, `to_claim_id`, `kind` (`supersedes`/`contradicts`), `created_at`. No `FOREIGN KEY` on either claim id — a hand-written `contradicts=` referencing a typo'd id is itself useful information for a later slice's dashboards to surface, not something to silently reject at sync time. |
+
+`get_claim()` now also returns `supersedes`/`contradicts` (claims this one points *to*); `list_relationships_to(agent_id, claim_id)` is the reverse lookup (claims pointing *at* this one) — a later slice's contradiction dashboard needs both directions to show a conflict from either claim's perspective.
+
+**Marker-less claims stay allowed.** A claim marker with no `evidence=` field is still parsed and synced normally (already true since slice A) — hand-authored content can't be retroactively forced to cite a source, but it shows up in a later slice's provenance-gap dashboard.
+
+**`MemoryConsolidator` becomes the primary way claims actually get created.** Its drafting prompt (Phase 5, slice C) already instructed the model to flag contradictions in prose rather than silently resolve them — this slice makes that structural instead of just prose. `preview()` now generates a fresh claim id in code (never left to the model to invent — the same reasoning `get_or_create_entity` already applies to entity ids) and, when revising an existing page, shows the model that page's existing claims (id/status/text). The prompt instructs the model to attach a real `<!-- claim:ID ... -->` marker to the new claim and — when it recognizes a conflict — set `status=contested`/`contradicts=EXISTING_ID` on the new marker *and* flip the existing marker's own `status` to `contested` too (leaving everything else about it untouched), so a conflict is contested from both sides, not just the new one.
+
+No new sync code was needed for any of this: `approve()` already calls `reindex_file()` on the drafted content, and slice A's `_sync_claims()` already parses and syncs whatever markers ended up there. A malformed or missing marker in the model's response isn't fatal — that particular claim just never enters `kb_claims`, the same as any hand-authored note with no markers at all.
+
 ### `session_search` Tool Modes
 
 | Mode | Description |

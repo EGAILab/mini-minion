@@ -61,10 +61,15 @@ The *existing* topic-note content a draft merges into is the **merge
 target**, not "evidence" for the new claim — the claim's evidence chain
 runs through its own ``job_id``, unaffected by what it's being merged
 into. See ``tests/memory/test_consolidation.py`` for an explicit
-regression test of this boundary.
+regression test of this boundary. Stage One Phase 7, slice B adds the
+target's *existing claim markers* (id/status/text — see
+``memory/knowledge.py``) to the drafting prompt too, but this is the
+same existing-content data already covered by this boundary, just
+restructured for the model to reference by id — not a new evidence
+source.
 
-Contradictions
---------------
+Contradictions and claim markers (Stage One Phase 7, slice B)
+------------------------------------------------------------------
 The drafting prompt (:data:`_DRAFT_SYSTEM`) explicitly instructs the model
 to keep both statements and flag the disagreement in the drafted text
 rather than silently pick one, whenever a new claim contradicts the
@@ -73,6 +78,24 @@ criterion "contradictory preferences remain contested until resolved and
 are never merged into a false synthesis" requires of *this* slice (the
 resolution itself is a human's job, in whatever review flow a later slice
 adds).
+
+Since Phase 7, slice B, this isn't just prose anymore: ``preview()``
+generates a fresh claim id (code-generated, never left to the model to
+invent — the same reasoning ``PostgresMemoryIndex.get_or_create_entity``
+already applies to entity ids) and gives it to the model along with the
+target's existing claim markers (id/status/text). The prompt instructs
+the model to attach a real ``<!-- claim:ID ... -->`` marker to the new
+claim, and — when it recognizes a conflict — to set ``status=contested``
+and ``contradicts=EXISTING_ID`` on it *and* flip the existing marker's
+own ``status`` field to ``contested`` too (leaving everything else about
+that existing marker untouched). Nothing about this requires new sync
+code here: once a human calls ``approve()``, the existing
+``reindex_file()`` call already parses and syncs whatever markers ended
+up in the drafted content — see ``memory/knowledge.py``'s module
+docstring for that whole mechanism. A malformed or missing marker in the
+model's response is not fatal — it just means this particular claim
+never enters ``kb_claims``, the same as any other hand-authored note
+that has no markers at all.
 
 Staleness and rollback (Task 6, slice D)
 ------------------------------------------
@@ -115,7 +138,12 @@ Talks to
   :meth:`~PostgresMemoryIndex.get_consolidation_preview`, and
   :meth:`~PostgresMemoryIndex.record_topic_revision`/
   :meth:`~PostgresMemoryIndex.latest_topic_revision`/
-  :meth:`~PostgresMemoryIndex.delete_topic_revision`.
+  :meth:`~PostgresMemoryIndex.delete_topic_revision`, and (Stage One
+  Phase 7, slice B) :meth:`~PostgresMemoryIndex.list_claims` (the
+  target's existing claims, shown to the drafting prompt) —
+  :meth:`~PostgresMemoryIndex.reindex_file`, already called by
+  ``approve()``, is what actually syncs any claim marker the model
+  drafted; this module never writes to ``kb_claims`` directly.
 - ``memory/files.py`` — :meth:`MemoryFileRepository.load` reads a merge
   target's current content; ``approve()``/``rollback()`` are the only
   methods in this module that call ``remember()``/``delete()``.
@@ -128,6 +156,8 @@ Talks to
 from __future__ import annotations
 
 import hashlib
+import uuid
+from datetime import date
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -161,6 +191,24 @@ unresolved in the drafted text, so a human decides.
 "coding-preferences") and draft a new note from scratch.
 - Keep the note short, factual, and free of filler — matching the style \
 of a personal memory note, not an essay.
+
+Claim markers:
+- Attach exactly one claim marker to the specific line stating the new \
+claim, using exactly this id (never invent your own — it's given to you \
+below): <!-- claim:NEW_CLAIM_ID status=STATUS confidence=N \
+observed=DATE evidence=proposal:PROPOSAL_ID -->
+- status is "supported" by default.
+- If the new claim contradicts one of the "Existing claims" listed \
+below, set status=contested and add contradicts=EXISTING_ID (that \
+claim's id) to the new marker. Also find that existing claim's own \
+marker, already present in "Existing note content", and change only \
+its status field to contested — leave its id, confidence, evidence, \
+and everything else about it exactly as given. Never silently pick a \
+side.
+- confidence is your own 0.0-1.0 estimate of how reliable the new \
+claim is.
+- observed is today's date (given below), in ISO format (YYYY-MM-DD).
+- Do not add or modify any claim marker besides these.
 
 Respond in exactly this format, nothing before or after it:
 KEY: <kebab-case-key>
@@ -501,12 +549,23 @@ class MemoryConsolidator:
         if target_key is not None:
             target_kind = "revise_topic"
             existing_content = self._files.load(target_key) or ""
+            target_rel_path = (
+                self._files.topic_path(target_key).relative_to(self._files.root).as_posix()
+            )
+            existing_claims = self._index.list_claims(self._agent_id, rel_path=target_rel_path)
         else:
             target_kind = "new_topic"
             existing_content = ""
+            existing_claims = []
 
         based_on_content_hash = _hash_text(existing_content)
-        drafted_key, rationale, drafted_content = self._draft(claim_text, existing_content)
+        # Code-generated, never left to the model to invent -- the same
+        # reasoning PostgresMemoryIndex.get_or_create_entity already
+        # applies to entity ids (Stage One Phase 7, slice B).
+        new_claim_id = f"c-{uuid.uuid4().hex[:8]}"
+        drafted_key, rationale, drafted_content = self._draft(
+            claim_text, existing_content, existing_claims, new_claim_id, proposal_id
+        )
         final_key = target_key if target_kind == "revise_topic" else drafted_key
 
         preview_id = self._index.record_consolidation_preview(
@@ -660,19 +719,41 @@ class MemoryConsolidator:
                 return key
         return None
 
-    def _draft(self, claim_text: str, existing_content: str) -> tuple[str, str, str]:
+    def _draft(
+        self,
+        claim_text: str,
+        existing_content: str,
+        existing_claims: list[dict],
+        new_claim_id: str,
+        proposal_id: int,
+    ) -> tuple[str, str, str]:
         """Call the provider to draft the revised/new note text.
 
         Only ``claim_text`` (traceable to real captured messages) and the
-        merge target's own existing content are ever included in the
-        prompt — see the module docstring's "Evidence provenance" section.
+        merge target's own existing content — ``existing_claims`` is that
+        same content, restructured — are ever included in the prompt; see
+        the module docstring's "Evidence provenance" section.
+        ``new_claim_id``/``proposal_id`` are code-generated/already-known
+        values, not new evidence.
         """
         existing_block = existing_content or "(no existing note — propose a new one)"
-        user_message = f"New claim:\n{claim_text}\n\nExisting note content:\n{existing_block}"
+        claims_block = "(none)"
+        if existing_claims:
+            claims_block = "\n".join(
+                f"- {c['id']} ({c['status']}): {c['text']}" for c in existing_claims
+            )
+        user_message = (
+            f"New claim:\n{claim_text}\n\n"
+            f"Existing note content:\n{existing_block}\n\n"
+            f"Existing claims in this note:\n{claims_block}\n\n"
+            f"New claim id to use: {new_claim_id}\n"
+            f"Proposal id (for evidence=proposal:...): {proposal_id}\n"
+            f"Today's date: {date.today().isoformat()}"
+        )
         response = self._provider.chat(
             system=_DRAFT_SYSTEM,
             messages=[{"role": "user", "content": user_message}],
             tools=[],
-            max_tokens=800,
+            max_tokens=1000,
         )
         return _parse_draft_response((response.text or "").strip())

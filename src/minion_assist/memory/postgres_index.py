@@ -591,6 +591,35 @@ class PostgresMemoryIndex:
             "CREATE INDEX IF NOT EXISTS kb_evidence_claim_idx ON kb_evidence (agent_id, claim_id)"
         )
 
+        # Claim relationships — Stage One Phase 7, slice B. Deliberately
+        # only two kinds ("supersedes"/"contradicts") — see
+        # memory/knowledge.py's module docstring for why this isn't an
+        # open-ended relationship-type system. No FOREIGN KEY on
+        # from_claim_id/to_claim_id (this project never declares
+        # cross-table FKs); to_claim_id may reference a claim that
+        # doesn't (or no longer) exists — e.g. a hand-written
+        # contradicts= referencing a typo'd id — which is itself useful
+        # information for a later slice's dashboards to surface, not
+        # something to silently reject at sync time.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS kb_relationships (
+                id            BIGSERIAL PRIMARY KEY,
+                agent_id      TEXT NOT NULL,
+                from_claim_id TEXT NOT NULL,
+                to_claim_id   TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                created_at    DOUBLE PRECISION NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS kb_relationships_from_idx "
+            "ON kb_relationships (agent_id, from_claim_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS kb_relationships_to_idx "
+            "ON kb_relationships (agent_id, to_claim_id)"
+        )
+
     # ------------------------------------------------------------------
     # Indexing
     # ------------------------------------------------------------------
@@ -719,15 +748,16 @@ class PostgresMemoryIndex:
         return row[0]
 
     def _sync_claims(self, agent_id: str, rel_path: str, body: str, line_offset: int) -> int:
-        """Sync one page's claim markers into ``kb_claims``/``kb_evidence`` (Stage One Phase 7, slice A).
+        """Sync one page's claim markers into ``kb_claims``/``kb_evidence``/``kb_relationships``.
 
-        Read-only relative to the page itself — never writes a marker
-        back into the file (see ``memory/knowledge.py``'s module
-        docstring: the file is always the source of truth, this is a
-        derived cache refreshed on every reindex, the same relationship
-        ``memory_chunks``/``boundary_metadata`` already have to a file's
-        raw text). Claims whose markers have been removed from the page
-        since the last sync are deleted here too (and their evidence with
+        Stage One Phase 7, slices A-B. Read-only relative to the page
+        itself — never writes a marker back into the file (see
+        ``memory/knowledge.py``'s module docstring: the file is always
+        the source of truth, this is a derived cache refreshed on every
+        reindex, the same relationship ``memory_chunks``/
+        ``boundary_metadata`` already have to a file's raw text). Claims
+        whose markers have been removed from the page since the last
+        sync are deleted here too (and their evidence/relationships with
         them) — the same "diff and remove" shape ``remove_file()``/
         ``reconcile_agent()`` already use for whole files.
 
@@ -760,6 +790,10 @@ class PostgresMemoryIndex:
         for removed_id in existing_ids - current_ids:
             conn.execute(
                 "DELETE FROM kb_evidence WHERE agent_id = %s AND claim_id = %s",
+                (agent_id, removed_id),
+            )
+            conn.execute(
+                "DELETE FROM kb_relationships WHERE agent_id = %s AND from_claim_id = %s",
                 (agent_id, removed_id),
             )
             conn.execute(
@@ -810,18 +844,42 @@ class PostgresMemoryIndex:
                     """,
                     (agent_id, claim.id, source_kind, source_ref, now),
                 )
+            conn.execute(
+                "DELETE FROM kb_relationships WHERE agent_id = %s AND from_claim_id = %s",
+                (agent_id, claim.id),
+            )
+            for to_claim_id in claim.supersedes:
+                conn.execute(
+                    """
+                    INSERT INTO kb_relationships (agent_id, from_claim_id, to_claim_id, kind, created_at)
+                    VALUES (%s, %s, %s, 'supersedes', %s)
+                    """,
+                    (agent_id, claim.id, to_claim_id, now),
+                )
+            for to_claim_id in claim.contradicts:
+                conn.execute(
+                    """
+                    INSERT INTO kb_relationships (agent_id, from_claim_id, to_claim_id, kind, created_at)
+                    VALUES (%s, %s, %s, 'contradicts', %s)
+                    """,
+                    (agent_id, claim.id, to_claim_id, now),
+                )
         return len(parsed)
 
     def get_claim(self, agent_id: str, claim_id: str) -> dict | None:
-        """Look up one claim by id, including its evidence.
+        """Look up one claim by id, including its evidence and outgoing relationships.
 
         Returns:
             dict | None: ``{"id", "agent_id", "rel_path", "entity_id",
                 "text", "status", "confidence", "observed_at",
                 "valid_from", "valid_to", "privacy_tier", "line_number",
-                "evidence"}`` — ``evidence`` is a list of
-                ``{"source_kind", "source_ref"}`` dicts. ``None`` if no
-                claim with this id exists for this agent.
+                "evidence", "supersedes", "contradicts"}`` — ``evidence``
+                is a list of ``{"source_kind", "source_ref"}`` dicts;
+                ``supersedes``/``contradicts`` are lists of claim ids
+                this claim points *to* (Stage One Phase 7, slice B — not
+                claims pointing at this one; use
+                :meth:`list_relationships_to` for the reverse direction).
+                ``None`` if no claim with this id exists for this agent.
         """
         row = self._conn().execute(
             """
@@ -837,13 +895,37 @@ class PostgresMemoryIndex:
             "SELECT source_kind, source_ref FROM kb_evidence WHERE agent_id = %s AND claim_id = %s",
             (agent_id, claim_id),
         ).fetchall()
+        relationship_rows = self._conn().execute(
+            "SELECT kind, to_claim_id FROM kb_relationships WHERE agent_id = %s AND from_claim_id = %s",
+            (agent_id, claim_id),
+        ).fetchall()
         return {
             "id": row[0], "agent_id": row[1], "rel_path": row[2], "entity_id": row[3],
             "text": row[4], "status": row[5], "confidence": row[6], "observed_at": row[7],
             "valid_from": row[8], "valid_to": row[9], "privacy_tier": row[10],
             "line_number": row[11],
             "evidence": [{"source_kind": r[0], "source_ref": r[1]} for r in evidence_rows],
+            "supersedes": [r[1] for r in relationship_rows if r[0] == "supersedes"],
+            "contradicts": [r[1] for r in relationship_rows if r[0] == "contradicts"],
         }
+
+    def list_relationships_to(self, agent_id: str, claim_id: str) -> list[dict]:
+        """Find every claim that points *at* ``claim_id`` (Stage One Phase 7, slice B).
+
+        The reverse of :meth:`get_claim`'s ``supersedes``/``contradicts``
+        fields — e.g. "which claims contradict claim X," not "what does
+        claim X contradict." A later slice's contradiction dashboard
+        needs both directions to show a conflict from either claim's
+        perspective.
+
+        Returns:
+            list[dict]: ``{"from_claim_id", "kind"}`` dicts.
+        """
+        rows = self._conn().execute(
+            "SELECT from_claim_id, kind FROM kb_relationships WHERE agent_id = %s AND to_claim_id = %s",
+            (agent_id, claim_id),
+        ).fetchall()
+        return [{"from_claim_id": r[0], "kind": r[1]} for r in rows]
 
     def list_claims(
         self, agent_id: str, rel_path: str | None = None, status: str | None = None
@@ -916,9 +998,10 @@ class PostgresMemoryIndex:
 
         A no-op if this file was never indexed/pinned — safe to call
         unconditionally. Also clears any pin (Stage One Phase 4, slice B)
-        and any claims/evidence synced from this page (Stage One Phase 7,
-        slice A) so a deleted note can never linger as an orphaned pin or
-        orphaned claims pointing at content that no longer exists.
+        and any claims/evidence/relationships synced from this page
+        (Stage One Phase 7, slices A-B) so a deleted note can never
+        linger as an orphaned pin or orphaned claims pointing at content
+        that no longer exists.
         """
         conn = self._conn()
         conn.execute(
@@ -935,6 +1018,11 @@ class PostgresMemoryIndex:
         )
         conn.execute(
             "DELETE FROM kb_evidence WHERE agent_id = %s AND claim_id IN "
+            "(SELECT id FROM kb_claims WHERE agent_id = %s AND rel_path = %s)",
+            (agent_id, agent_id, rel_path),
+        )
+        conn.execute(
+            "DELETE FROM kb_relationships WHERE agent_id = %s AND from_claim_id IN "
             "(SELECT id FROM kb_claims WHERE agent_id = %s AND rel_path = %s)",
             (agent_id, agent_id, rel_path),
         )

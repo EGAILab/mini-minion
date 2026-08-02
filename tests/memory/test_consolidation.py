@@ -99,9 +99,15 @@ _EMPTY_STATS = {"recall_count": 0, "unique_queries": 0, "injected_count": 0, "la
 class _FakeIndex:
     """Fakes just the PostgresMemoryIndex methods this module calls."""
 
-    def __init__(self, recall_stats: dict[str, dict] | None = None, hits: list[dict] | None = None):
+    def __init__(
+        self,
+        recall_stats: dict[str, dict] | None = None,
+        hits: list[dict] | None = None,
+        claims_by_rel_path: dict[str, list[dict]] | None = None,
+    ):
         self._recall_stats = recall_stats or {}
         self._hits = hits or []
+        self._claims_by_rel_path = claims_by_rel_path or {}
         self.recorded_previews: list[dict] = []
         self.recorded_revisions: list[dict] = []
         self.removed_proposals: list[tuple] = []
@@ -115,6 +121,9 @@ class _FakeIndex:
     def hybrid_search(self, agent_id: str, query: str, *, corpus: str | None = None,
                        max_results: int = 20) -> list[dict]:
         return self._hits
+
+    def list_claims(self, agent_id: str, rel_path: str | None = None, status=None) -> list[dict]:
+        return self._claims_by_rel_path.get(rel_path, [])
 
     def record_consolidation_preview(
         self, agent_id, proposal_id, target_kind, target_key,
@@ -419,11 +428,11 @@ def test_draft_prompt_contains_only_the_claim_and_the_merge_targets_content(file
     consolidator.preview(1)
 
     sent_messages = provider.chat.call_args.kwargs["messages"]
-    assert sent_messages == [{
-        "role": "user",
-        "content": "New claim:\nUser prefers dark mode.\n\n"
-                    "Existing note content:\n(no existing note — propose a new one)",
-    }]
+    assert len(sent_messages) == 1
+    content = sent_messages[0]["content"]
+    assert "User prefers dark mode." in content
+    assert "(no existing note — propose a new one)" in content
+    assert "Existing claims in this note:\n(none)" in content
 
 
 def test_draft_prompt_never_mentions_dreams_md(files):
@@ -442,6 +451,139 @@ def test_draft_prompt_never_mentions_dreams_md(files):
     sent_messages = provider.chat.call_args.kwargs["messages"]
     assert "DREAMS" not in sent_messages[0]["content"]
     assert "dream" not in sent_messages[0]["content"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Claim markers in the drafting prompt (Stage One Phase 7, slice B)
+# ---------------------------------------------------------------------------
+
+def test_draft_system_prompt_explains_claim_markers():
+    from minion_assist.memory.consolidation import _DRAFT_SYSTEM
+
+    assert "claim:" in _DRAFT_SYSTEM
+    assert "contradicts=" in _DRAFT_SYSTEM
+    assert "status=contested" in _DRAFT_SYSTEM
+
+
+def test_preview_shows_no_existing_claims_for_a_new_topic(files):
+    db = _FakeDB([_proposal(id=1, claim_text="User prefers dark mode.")])
+    index = _FakeIndex(hits=[])
+    provider = _draft_response()
+    consolidator = MemoryConsolidator(db, index, files, provider, agent_id="main")
+
+    consolidator.preview(1)
+
+    content = provider.chat.call_args.kwargs["messages"][0]["content"]
+    assert "Existing claims in this note:\n(none)" in content
+
+
+def test_preview_shows_existing_claims_when_revising(files):
+    files.remember("project-goals", "Existing goal: ship v1.")
+    db = _FakeDB([_proposal(id=1, claim_text="Goal deadline moved to March.")])
+    index = _FakeIndex(
+        hits=[{"rel_path": "memory/topics/project-goals.md", "score": 1.0}],
+        claims_by_rel_path={
+            "memory/topics/project-goals.md": [
+                {"id": "c-old1", "status": "supported", "text": "Ship v1 by June."},
+            ]
+        },
+    )
+    provider = _draft_response()
+    consolidator = MemoryConsolidator(db, index, files, provider, agent_id="main")
+
+    consolidator.preview(1)
+
+    content = provider.chat.call_args.kwargs["messages"][0]["content"]
+    assert "c-old1 (supported): Ship v1 by June." in content
+
+
+def test_preview_looks_up_claims_for_the_correct_rel_path(files):
+    files.remember("project-goals", "Existing goal: ship v1.")
+    db = _FakeDB([_proposal(id=1)])
+    index = _FakeIndex(hits=[{"rel_path": "memory/topics/project-goals.md", "score": 1.0}])
+    calls = []
+    index.list_claims = lambda agent_id, rel_path=None, status=None: calls.append(
+        (agent_id, rel_path)
+    ) or []
+    provider = _draft_response()
+    consolidator = MemoryConsolidator(db, index, files, provider, agent_id="main")
+
+    consolidator.preview(1)
+
+    assert calls == [("main", "memory/topics/project-goals.md")]
+
+
+def test_preview_never_calls_list_claims_for_a_new_topic(files):
+    db = _FakeDB([_proposal(id=1)])
+    index = _FakeIndex(hits=[])
+    called = []
+    index.list_claims = lambda *a, **kw: called.append(True) or []
+    provider = _draft_response()
+    consolidator = MemoryConsolidator(db, index, files, provider, agent_id="main")
+
+    consolidator.preview(1)
+
+    assert called == []
+
+
+def test_preview_generates_a_new_claim_id_and_passes_it_to_the_prompt(files):
+    db = _FakeDB([_proposal(id=1)])
+    index = _FakeIndex(hits=[])
+    provider = _draft_response()
+    consolidator = MemoryConsolidator(db, index, files, provider, agent_id="main")
+
+    consolidator.preview(1)
+
+    content = provider.chat.call_args.kwargs["messages"][0]["content"]
+    assert "New claim id to use: c-" in content
+
+
+def test_preview_generates_a_different_claim_id_each_call(files):
+    db = _FakeDB([_proposal(id=1)])
+    index = _FakeIndex(hits=[])
+    provider = _draft_response()
+    consolidator = MemoryConsolidator(db, index, files, provider, agent_id="main")
+
+    consolidator.preview(1)
+    first_content = provider.chat.call_args.kwargs["messages"][0]["content"]
+    provider2 = _draft_response()
+    consolidator2 = MemoryConsolidator(db, index, files, provider2, agent_id="main")
+    consolidator2.preview(1)
+    second_content = provider2.chat.call_args.kwargs["messages"][0]["content"]
+
+    def _extract_id(content: str) -> str:
+        for line in content.splitlines():
+            if line.startswith("New claim id to use: "):
+                return line.split(": ", 1)[1]
+        return ""
+
+    assert _extract_id(first_content) != _extract_id(second_content)
+
+
+def test_preview_passes_the_proposal_id_to_the_prompt(files):
+    db = _FakeDB([_proposal(id=7)])
+    index = _FakeIndex(hits=[])
+    provider = _draft_response()
+    consolidator = MemoryConsolidator(db, index, files, provider, agent_id="main")
+
+    consolidator.preview(7)
+
+    content = provider.chat.call_args.kwargs["messages"][0]["content"]
+    assert "Proposal id (for evidence=proposal:...): 7" in content
+
+
+def test_preview_passes_todays_date_to_the_prompt(files):
+    from datetime import date as _date
+
+    db = _FakeDB([_proposal(id=1)])
+    index = _FakeIndex(hits=[])
+    provider = _draft_response()
+    consolidator = MemoryConsolidator(db, index, files, provider, agent_id="main")
+
+    consolidator.preview(1)
+
+    content = provider.chat.call_args.kwargs["messages"][0]["content"]
+    assert f"Today's date: {_date.today().isoformat()}" in content
 
 
 # ---------------------------------------------------------------------------
