@@ -62,6 +62,7 @@ Talks to
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -249,6 +250,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     m_delete.add_argument("commitment_id", type=int)
     m_delete.add_argument("--agent", required=True)
+
+    knowledge = sub.add_parser(
+        "knowledge",
+        help=(
+            "Report on the knowledge layer's claims (Stage One Phase 7, "
+            "slice C). Requires a configured database."
+        ),
+    )
+    knowledge_sub = knowledge.add_subparsers(dest="knowledge_subcommand", required=True)
+
+    k_dashboard = knowledge_sub.add_parser(
+        "dashboard", help="Show claim-review reports: contradictions, stale, low-confidence, etc."
+    )
+    k_dashboard.add_argument("--agent", required=True, help="Which agent's claims to report on.")
+    k_dashboard.add_argument(
+        "--section",
+        choices=[
+            "contradictions", "stale", "low-confidence", "missing-provenance",
+            "open-questions", "privacy-review",
+        ],
+        default=None,
+        help="Restrict to one section. Default: show every section.",
+    )
 
     return parser
 
@@ -948,6 +972,95 @@ def _run_commitments(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+_ALL_DASHBOARD_SECTIONS = (
+    "contradictions", "stale", "low-confidence", "missing-provenance",
+    "open-questions", "privacy-review",
+)
+
+
+def _print_claim_rows(rows: list[dict]) -> None:
+    """Shared row-printing for dashboard sections that just list claims."""
+    if not rows:
+        print("  (none)")
+        return
+    for c in rows:
+        print(f"  {c['id']} [{c['status']}] ({c['rel_path']}): {c['text']}")
+
+
+def _run_knowledge_dashboard(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory knowledge dashboard --agent ID [--section S]``."""
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to report.")
+        return 1
+
+    sections = [args.section] if args.section else list(_ALL_DASHBOARD_SECTIONS)
+    now = time.time()
+
+    if "contradictions" in sections:
+        print("== Contradictions ==")
+        rows = index.list_contradictions(agent_id)
+        if not rows:
+            print("  (none)")
+        for r in rows:
+            print(f"  {r['from_claim_id']} [{r['from_status']}]: {r['from_text']}")
+            if r["to_text"] is None:
+                print(f"    contradicts -> {r['to_claim_id']} (no such claim — dangling reference)")
+            else:
+                print(f"    contradicts -> {r['to_claim_id']} [{r['to_status']}]: {r['to_text']}")
+        print()
+
+    if "stale" in sections:
+        print("== Stale claims ==")
+        rows = index.list_stale_claims(agent_id, now)
+        if not rows:
+            print("  (none)")
+        for c in rows:
+            print(f"  {c['id']} [{c['status']}] (freshness {c['freshness']:.2f}): {c['text']}")
+        print()
+
+    if "low-confidence" in sections:
+        print("== Low confidence ==")
+        rows = index.list_low_confidence_claims(agent_id)
+        if not rows:
+            print("  (none)")
+        for c in rows:
+            confidence = "unrated" if c["confidence"] is None else f"{c['confidence']:.2f}"
+            print(f"  {c['id']} [{c['status']}] (confidence {confidence}): {c['text']}")
+        print()
+
+    if "missing-provenance" in sections:
+        print("== Missing provenance ==")
+        _print_claim_rows(index.list_claims_missing_evidence(agent_id))
+        print()
+
+    if "open-questions" in sections:
+        print("== Open questions ==")
+        _print_claim_rows(index.list_claims(agent_id, status="unknown"))
+        print()
+
+    if "privacy-review" in sections:
+        print("== Privacy review ==")
+        _print_claim_rows(index.list_claims_needing_privacy_review(agent_id))
+        print()
+
+    return 0
+
+
+_KNOWLEDGE_HANDLERS = {
+    "dashboard": _run_knowledge_dashboard,
+}
+
+
+def _run_knowledge(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory knowledge <dashboard>``."""
+    handler = _KNOWLEDGE_HANDLERS[args.knowledge_subcommand]
+    return handler(args)
+
+
 _HANDLERS = {
     "migrate": _run_migrate,
     "status": _run_status,
@@ -961,6 +1074,7 @@ _HANDLERS = {
     "pins": _run_pins,
     "consolidate": _run_consolidate,
     "commitments": _run_commitments,
+    "knowledge": _run_knowledge,
 }
 
 

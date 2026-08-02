@@ -37,6 +37,13 @@ from minion_assist.memory.postgres_index import (  # noqa: E402
 )
 
 
+def _iso(epoch: float) -> str:
+    """ISO-format an epoch-seconds timestamp for embedding in a claim marker's observed= field."""
+    import datetime as _dt
+
+    return _dt.datetime.fromtimestamp(epoch).isoformat()
+
+
 @pytest.fixture
 def index():
     return PostgresMemoryIndex(_DB_URL)
@@ -577,6 +584,132 @@ def test_list_claims_scoped_to_agent(index, agent_id):
         index._conn().execute("DELETE FROM kb_claims WHERE agent_id = %s", (other_agent,))
         index._conn().execute("DELETE FROM memory_chunks WHERE agent_id = %s", (other_agent,))
         index._conn().execute("DELETE FROM memory_files WHERE agent_id = %s", (other_agent,))
+
+
+# ---------------------------------------------------------------------------
+# Knowledge dashboards (Stage One Phase 7, slice C)
+# ---------------------------------------------------------------------------
+
+def test_list_contradictions_returns_a_recorded_contradiction(index, agent_id):
+    content = (
+        "- Old claim.\n  <!-- claim:c-1 status=contested -->\n"
+        "- New claim.\n  <!-- claim:c-2 status=contested contradicts=c-1 -->"
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    contradictions = index.list_contradictions(agent_id)
+
+    assert len(contradictions) == 1
+    row = contradictions[0]
+    assert row["from_claim_id"] == "c-2"
+    assert row["from_text"] == "New claim."
+    assert row["to_claim_id"] == "c-1"
+    assert row["to_text"] == "Old claim."
+
+
+def test_list_contradictions_surfaces_a_dangling_reference(index, agent_id):
+    content = "- New claim.\n  <!-- claim:c-2 status=contested contradicts=c-does-not-exist -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    [row] = index.list_contradictions(agent_id)
+
+    assert row["to_claim_id"] == "c-does-not-exist"
+    assert row["to_text"] is None
+    assert row["to_status"] is None
+
+
+def test_list_contradictions_is_empty_with_no_relationships(index, agent_id):
+    index.reindex_file(agent_id, "topic.md", "durable", "- Some claim.\n  <!-- claim:c-1 -->")
+
+    assert index.list_contradictions(agent_id) == []
+
+
+def test_list_stale_claims_finds_an_old_claim(index, agent_id):
+    old = time.time() - 200 * 86400  # 200 days ago, well past a 90-day half-life
+    content = f"- Old fact.\n  <!-- claim:c-1 observed={_iso(old)} -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    stale = index.list_stale_claims(agent_id, time.time())
+
+    assert [c["id"] for c in stale] == ["c-1"]
+    assert stale[0]["freshness"] < 0.5
+
+
+def test_list_stale_claims_excludes_a_recent_claim(index, agent_id):
+    content = f"- Recent fact.\n  <!-- claim:c-1 observed={_iso(time.time())} -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    assert index.list_stale_claims(agent_id, time.time()) == []
+
+
+def test_list_stale_claims_orders_stalest_first(index, agent_id):
+    now = time.time()
+    content = (
+        f"- Somewhat old.\n  <!-- claim:c-1 observed={_iso(now - 150 * 86400)} -->\n"
+        f"- Very old.\n  <!-- claim:c-2 observed={_iso(now - 300 * 86400)} -->"
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    stale = index.list_stale_claims(agent_id, now)
+
+    assert [c["id"] for c in stale] == ["c-2", "c-1"]
+
+
+def test_list_low_confidence_claims_finds_a_below_threshold_claim(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 confidence=0.2 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    results = index.list_low_confidence_claims(agent_id)
+
+    assert [c["id"] for c in results] == ["c-1"]
+
+
+def test_list_low_confidence_claims_includes_unrated_claims(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    results = index.list_low_confidence_claims(agent_id)
+
+    assert results[0]["confidence"] is None
+
+
+def test_list_low_confidence_claims_excludes_a_high_confidence_claim(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 confidence=0.95 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    assert index.list_low_confidence_claims(agent_id) == []
+
+
+def test_list_claims_missing_evidence_finds_a_claim_with_no_evidence(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    results = index.list_claims_missing_evidence(agent_id)
+
+    assert [c["id"] for c in results] == ["c-1"]
+
+
+def test_list_claims_missing_evidence_excludes_a_claim_with_evidence(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 evidence=proposal:42 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    assert index.list_claims_missing_evidence(agent_id) == []
+
+
+def test_list_claims_needing_privacy_review_finds_an_unclassified_claim(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    results = index.list_claims_needing_privacy_review(agent_id)
+
+    assert [c["id"] for c in results] == ["c-1"]
+
+
+def test_list_claims_needing_privacy_review_excludes_a_classified_claim(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 privacy=private -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    assert index.list_claims_needing_privacy_review(agent_id) == []
 
 
 def test_reindex_file_without_a_provider_never_embeds(index, agent_id):

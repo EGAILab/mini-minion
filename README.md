@@ -1477,6 +1477,28 @@ No CLI or dashboards yet in this slice — `get_claim()`/`list_claims()` are the
 
 No new sync code was needed for any of this: `approve()` already calls `reindex_file()` on the drafted content, and slice A's `_sync_claims()` already parses and syncs whatever markers ended up there. A malformed or missing marker in the model's response isn't fatal — that particular claim just never enters `kb_claims`, the same as any hand-authored note with no markers at all.
 
+### Knowledge dashboards (Stage One Phase 7, slice C)
+
+`minion-assist memory knowledge dashboard --agent ID [--section SECTION]` reports on the knowledge layer's claim quality — six read-only reports over `kb_claims`/`kb_relationships`/`kb_evidence`, meant for a human periodically reviewing what the consolidator and hand-authored notes have accumulated. Requires a configured database (same "Error: no database configured" degradation as `consolidate`/`commitments`).
+
+| Section | Backed by | Reports |
+|---|---|---|
+| `contradictions` | `list_contradictions()` | Every recorded `contradicts` relationship, both claims' current text/status. A `contradicts=` referencing a typo'd/nonexistent claim id shows as a dangling reference (via `LEFT JOIN`) rather than being silently dropped. |
+| `stale` | `list_stale_claims()` | Claims whose freshness (a 90-day-half-life decay of `observed_at`, computed at query time — never stored) has dropped below 0.5, stalest first. |
+| `low-confidence` | `list_low_confidence_claims()` | Claims with `confidence < 0.5` or no confidence rating at all (an unrated claim and a low-rated one both mean "don't trust this without a closer look"). |
+| `missing-provenance` | `list_claims_missing_evidence()` | Claims with zero `kb_evidence` rows. Not an error state — hand-authored claims can't be retroactively forced to cite a source — just a gap surfaced for review. |
+| `open-questions` | `list_claims(status="unknown")` | No new query method — `status="unknown"` already means exactly this. |
+| `privacy-review` | `list_claims_needing_privacy_review()` | Claims with no `privacy_tier` assigned yet. |
+
+`--section` restricts the report to one of the six names above; omitted, all six print in the order listed. A "deletion coverage" section (auditing that forgetting a source removed or re-flagged every derived claim) is deliberately **not** included here — there's nothing to audit before slice F's forgetting mechanism exists to produce deletions in the first place; it's deferred to that slice.
+
+New CLI command:
+
+```bash
+minion-assist memory knowledge dashboard --agent main                        # all six sections
+minion-assist memory knowledge dashboard --agent main --section stale        # just one
+```
+
 ### `session_search` Tool Modes
 
 | Mode | Description |

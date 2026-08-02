@@ -151,6 +151,40 @@ def _decay_factor(rel_path: str, source_kind: str) -> float:
     return 0.5 ** (days_old / _DECAY_HALF_LIFE_DAYS)
 
 
+# Half-life for a claim's freshness (Stage One Phase 7, slice C's "stale
+# claims" dashboard) — longer than daily-note decay above (90 vs 30 days):
+# a knowledge claim is meant to be a more durable fact than a daily-note
+# scratch entry, so it should take longer to be considered stale. A
+# documented placeholder, not evaluated data, the same "collect data
+# before choosing thresholds" posture the rest of Stage One has taken
+# throughout.
+_FRESHNESS_HALF_LIFE_DAYS = 90.0
+
+
+def _freshness(observed_at: float, now: float) -> float:
+    """A claim's freshness — 1.0 when just observed, halving every ``_FRESHNESS_HALF_LIFE_DAYS`` days since.
+
+    Mirrors :func:`_decay_factor`'s shape but is unconditional (every
+    claim has an ``observed_at``, unlike a chunk's ``source_kind``-gated
+    decay) and query-time only — never stored (see
+    ``memory/knowledge.py``'s module docstring for why ``freshness`` is
+    deliberately not a marker field).
+
+    Args:
+        observed_at: The claim's ``observed_at`` (epoch seconds).
+        now: Epoch seconds "now" is evaluated at.
+
+    Returns:
+        float: 1.0 for a claim observed at or after ``now`` (never
+            negative "days old"), otherwise ``0.5 ** (days_old /
+            _FRESHNESS_HALF_LIFE_DAYS)``.
+    """
+    days_old = (now - observed_at) / 86400.0
+    if days_old <= 0:
+        return 1.0
+    return 0.5 ** (days_old / _FRESHNESS_HALF_LIFE_DAYS)
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Cosine similarity between two equal-length vectors, in [-1, 1] (0.0 if either is zero)."""
     dot = sum(x * y for x, y in zip(a, b))
@@ -969,6 +1003,147 @@ class PostgresMemoryIndex:
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Knowledge dashboards — Stage One Phase 7, slice C (Task 3)
+    # ------------------------------------------------------------------
+    #
+    # "Open questions" (status="unknown") needs no dedicated method —
+    # list_claims(agent_id, status="unknown") already covers it. Task 3
+    # also asks for "deletion coverage"; that dashboard is deferred to
+    # the slice that actually builds the forgetting mechanism (Task 6/
+    # acceptance criterion 4) — there is nothing to report on before a
+    # "forget" operation exists to audit.
+
+    def list_contradictions(self, agent_id: str) -> list[dict]:
+        """List every recorded ``contradicts`` relationship, with both claims' current text/status.
+
+        Not deduplicated by pair — a hand-authored note could record
+        both directions (A contradicts B *and* B contradicts A), which
+        would show as two rows here rather than being silently merged
+        into one; a human reviewing this report can tell they're the
+        same conflict from the claim ids shown.
+
+        Returns:
+            list[dict]: ``{"from_claim_id", "from_text", "from_status",
+                "to_claim_id", "to_text", "to_status"}``. ``to_text``/
+                ``to_status`` are ``None`` when ``to_claim_id`` doesn't
+                resolve to a real claim — a dangling reference (e.g. a
+                typo in a hand-written ``contradicts=``) surfaced here
+                rather than silently dropped by an inner join.
+        """
+        rows = self._conn().execute(
+            """
+            SELECT r.from_claim_id, a.text, a.status, r.to_claim_id, b.text, b.status
+            FROM kb_relationships r
+            JOIN kb_claims a ON a.agent_id = r.agent_id AND a.id = r.from_claim_id
+            LEFT JOIN kb_claims b ON b.agent_id = r.agent_id AND b.id = r.to_claim_id
+            WHERE r.agent_id = %s AND r.kind = 'contradicts'
+            ORDER BY r.created_at
+            """,
+            (agent_id,),
+        ).fetchall()
+        return [
+            {
+                "from_claim_id": r[0], "from_text": r[1], "from_status": r[2],
+                "to_claim_id": r[3], "to_text": r[4], "to_status": r[5],
+            }
+            for r in rows
+        ]
+
+    def list_stale_claims(self, agent_id: str, now: float, threshold: float = 0.5) -> list[dict]:
+        """List claims whose :func:`_freshness` has decayed below ``threshold``.
+
+        Args:
+            agent_id: Which agent's claims to check.
+            now: Epoch seconds "now" is evaluated at.
+            threshold: Freshness cutoff (0.0-1.0). Default 0.5 — one
+                half-life old.
+
+        Returns:
+            list[dict]: ``{"id", "rel_path", "text", "status",
+                "observed_at", "freshness"}``, stalest (lowest
+                freshness) first.
+        """
+        rows = self._conn().execute(
+            "SELECT id, rel_path, text, status, observed_at FROM kb_claims WHERE agent_id = %s",
+            (agent_id,),
+        ).fetchall()
+        stale = []
+        for r in rows:
+            freshness = _freshness(r[4], now)
+            if freshness < threshold:
+                stale.append({
+                    "id": r[0], "rel_path": r[1], "text": r[2], "status": r[3],
+                    "observed_at": r[4], "freshness": freshness,
+                })
+        stale.sort(key=lambda c: c["freshness"])
+        return stale
+
+    def list_low_confidence_claims(self, agent_id: str, threshold: float = 0.5) -> list[dict]:
+        """List claims with no confidence estimate, or one below ``threshold``.
+
+        A ``NULL`` confidence (never rated) and a low rated confidence
+        are different situations, but both mean "a human shouldn't trust
+        this without a closer look" — the reason this dashboard groups
+        them together rather than reporting them separately.
+
+        Returns:
+            list[dict]: ``{"id", "rel_path", "text", "status",
+                "confidence"}`` (``confidence`` is ``None`` for an
+                unrated claim), unrated claims first.
+        """
+        rows = self._conn().execute(
+            """
+            SELECT id, rel_path, text, status, confidence FROM kb_claims
+            WHERE agent_id = %s AND (confidence IS NULL OR confidence < %s)
+            ORDER BY confidence NULLS FIRST
+            """,
+            (agent_id, threshold),
+        ).fetchall()
+        return [
+            {"id": r[0], "rel_path": r[1], "text": r[2], "status": r[3], "confidence": r[4]}
+            for r in rows
+        ]
+
+    def list_claims_missing_evidence(self, agent_id: str) -> list[dict]:
+        """List claims with zero ``kb_evidence`` rows — the provenance-gap report.
+
+        A marker-less claim is allowed to exist (hand-authored content
+        can't be retroactively forced to cite a source — see
+        ``memory/knowledge.py``'s module docstring); this is where it
+        surfaces instead.
+
+        Returns:
+            list[dict]: ``{"id", "rel_path", "text", "status"}``.
+        """
+        rows = self._conn().execute(
+            """
+            SELECT id, rel_path, text, status FROM kb_claims
+            WHERE agent_id = %s AND id NOT IN (
+                SELECT DISTINCT claim_id FROM kb_evidence WHERE agent_id = %s
+            )
+            ORDER BY rel_path, line_number
+            """,
+            (agent_id, agent_id),
+        ).fetchall()
+        return [{"id": r[0], "rel_path": r[1], "text": r[2], "status": r[3]} for r in rows]
+
+    def list_claims_needing_privacy_review(self, agent_id: str) -> list[dict]:
+        """List claims with no ``privacy_tier`` assigned yet.
+
+        Returns:
+            list[dict]: ``{"id", "rel_path", "text", "status"}``.
+        """
+        rows = self._conn().execute(
+            """
+            SELECT id, rel_path, text, status FROM kb_claims
+            WHERE agent_id = %s AND privacy_tier = ''
+            ORDER BY rel_path, line_number
+            """,
+            (agent_id,),
+        ).fetchall()
+        return [{"id": r[0], "rel_path": r[1], "text": r[2], "status": r[3]} for r in rows]
 
     def get_boundary(self, agent_id: str, rel_path: str) -> dict[str, str] | None:
         """Look up one file's cached action-boundary metadata (Stage One Phase 6, slice A).

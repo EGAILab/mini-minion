@@ -1064,3 +1064,124 @@ def test_commitments_delete_without_a_database_reports_an_error(monkeypatch, tmp
 
     assert exit_code == 1
     assert "no database configured" in out
+
+
+# ---------------------------------------------------------------------
+# memory knowledge dashboard (Stage One Phase 7, slice C)
+# ---------------------------------------------------------------------
+
+
+def _empty_knowledge_index():
+    """A mock PostgresMemoryIndex where every dashboard query returns nothing."""
+    mock_index = Mock()
+    mock_index.list_contradictions.return_value = []
+    mock_index.list_stale_claims.return_value = []
+    mock_index.list_low_confidence_claims.return_value = []
+    mock_index.list_claims_missing_evidence.return_value = []
+    mock_index.list_claims.return_value = []
+    mock_index.list_claims_needing_privacy_review.return_value = []
+    return mock_index
+
+
+def test_knowledge_dashboard_shows_all_sections_by_default(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = _empty_knowledge_index()
+    mock_index.list_contradictions.return_value = [
+        {
+            "from_claim_id": "c-1", "from_text": "The sky is green.", "from_status": "contested",
+            "to_claim_id": "c-2", "to_text": "The sky is blue.", "to_status": "contested",
+        }
+    ]
+    mock_index.list_stale_claims.return_value = [
+        {"id": "c-3", "rel_path": "topics/x.md", "text": "Old fact.", "status": "supported",
+         "observed_at": 0.0, "freshness": 0.1}
+    ]
+    mock_index.list_low_confidence_claims.return_value = [
+        {"id": "c-4", "rel_path": "topics/x.md", "text": "Shaky fact.", "status": "unknown",
+         "confidence": None}
+    ]
+    mock_index.list_claims_missing_evidence.return_value = [
+        {"id": "c-5", "rel_path": "topics/x.md", "text": "Unsourced fact.", "status": "supported"}
+    ]
+    mock_index.list_claims.return_value = [
+        {"id": "c-6", "rel_path": "topics/x.md", "text": "Open question.", "status": "unknown"}
+    ]
+    mock_index.list_claims_needing_privacy_review.return_value = [
+        {"id": "c-7", "rel_path": "topics/x.md", "text": "Unclassified fact.", "status": "supported"}
+    ]
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["knowledge", "dashboard", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Contradictions" in out and "The sky is green." in out and "The sky is blue." in out
+    assert "Stale claims" in out and "Old fact." in out
+    assert "Low confidence" in out and "Shaky fact." in out
+    assert "Missing provenance" in out and "Unsourced fact." in out
+    assert "Open questions" in out and "Open question." in out
+    assert "Privacy review" in out and "Unclassified fact." in out
+    mock_index.list_claims.assert_called_once_with("main", status="unknown")
+
+
+def test_knowledge_dashboard_reports_none_for_empty_sections(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, _empty_knowledge_index())
+
+    exit_code = cli.main(["knowledge", "dashboard", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert out.count("(none)") == 6
+
+
+def test_knowledge_dashboard_shows_a_dangling_contradiction_reference(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = _empty_knowledge_index()
+    mock_index.list_contradictions.return_value = [
+        {
+            "from_claim_id": "c-1", "from_text": "Some claim.", "from_status": "contested",
+            "to_claim_id": "c-typo", "to_text": None, "to_status": None,
+        }
+    ]
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["knowledge", "dashboard", "--agent", "main", "--section", "contradictions"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "dangling reference" in out
+
+
+def test_knowledge_dashboard_section_flag_restricts_to_one_section(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_index = _empty_knowledge_index()
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["knowledge", "dashboard", "--agent", "main", "--section", "stale"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Stale claims" in out
+    assert "Contradictions" not in out
+    assert "Low confidence" not in out
+    mock_index.list_stale_claims.assert_called_once()
+    mock_index.list_contradictions.assert_not_called()
+    mock_index.list_low_confidence_claims.assert_not_called()
+    mock_index.list_claims.assert_not_called()
+
+
+def test_knowledge_dashboard_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(["knowledge", "dashboard", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
