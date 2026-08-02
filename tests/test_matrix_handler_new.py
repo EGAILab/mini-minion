@@ -6,8 +6,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from minion_assist.matrix.handler import MatrixMessageHandler
 from minion_assist.matrix.config import MatrixConfig, MatrixRoomConfig
 
@@ -15,6 +13,21 @@ from minion_assist.matrix.config import MatrixConfig, MatrixRoomConfig
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _run(coro):
+    """Drive a coroutine to completion without the pytest-asyncio plugin.
+
+    Mirrors tests/matrix/test_handler.py's own helper — the established,
+    dependency-free convention every other async Matrix handler test in
+    this project already uses, instead of @pytest.mark.asyncio (which
+    needs a plugin this project never declared as a dependency).
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
 
 def _make_config(user_id="@bot:example.org", groups=None):
     cfg = MagicMock(spec=MatrixConfig)
@@ -105,47 +118,44 @@ def test_is_mentioned_case_insensitive():
 # Mention gate (require_mention=True)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_mention_gate_blocks_unmentioned_message():
+def test_mention_gate_blocks_unmentioned_message():
     room_cfg = MatrixRoomConfig(require_mention=True)
     config = _make_config(groups={"!room:example.org": room_cfg})
     session = MagicMock()
     handler = _make_handler(config=config, sessions={"main": session})
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="hello everyone", sender="@user:example.org"),
-    )
+    ))
     session.send.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_mention_gate_allows_mentioned_message():
+def test_mention_gate_allows_mentioned_message():
     room_cfg = MatrixRoomConfig(require_mention=True)
     config = _make_config(groups={"!room:example.org": room_cfg})
     session = MagicMock()
     session.send.return_value = "I'm here!"
     handler = _make_handler(config=config, sessions={"main": session})
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="@bot:example.org can you help?", sender="@user:example.org"),
-    )
+    ))
     session.send.assert_called_once()
 
 
-@pytest.mark.asyncio
-async def test_no_mention_gate_when_require_mention_false():
+def test_no_mention_gate_when_require_mention_false():
     room_cfg = MatrixRoomConfig(require_mention=False)
     config = _make_config(groups={"!room:example.org": room_cfg})
     session = MagicMock()
     session.send.return_value = "response"
     handler = _make_handler(config=config, sessions={"main": session})
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="hello", sender="@user:example.org"),
-    )
+    ))
     session.send.assert_called_once()
 
 
@@ -153,29 +163,27 @@ async def test_no_mention_gate_when_require_mention_false():
 # HEARTBEAT_OK suppression
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_heartbeat_ok_reply_is_suppressed():
+def test_heartbeat_ok_reply_is_suppressed():
     session = MagicMock()
     session.send.return_value = "HEARTBEAT_OK"
     handler = _make_handler(sessions={"main": session})
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="heartbeat check"),
-    )
+    ))
     handler._outbound.send_text.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_normal_reply_is_not_suppressed():
+def test_normal_reply_is_not_suppressed():
     session = MagicMock()
     session.send.return_value = "Hello there!"
     handler = _make_handler(sessions={"main": session})
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="hi"),
-    )
+    ))
     handler._outbound.send_text.assert_called_once()
 
 
@@ -214,90 +222,83 @@ def _make_agents_cfg():
     return {"main": cfg}
 
 
-@pytest.mark.asyncio
-async def test_slash_command_new_clears_history():
+def test_slash_command_new_clears_history():
     session = MagicMock()
     session.send.return_value = "response"
     handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="/new"),
-    )
+    ))
     session.reset.assert_called_once()
     session.send.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_slash_command_reply_sent_to_room():
+def test_slash_command_reply_sent_to_room():
     session = MagicMock()
     handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="/new"),
-    )
+    ))
     handler._outbound.send_text.assert_called_once()
     call_args = handler._outbound.send_text.call_args
     assert "Cleared" in call_args[0][1]
 
 
-@pytest.mark.asyncio
-async def test_slash_disallowed_command_quit_blocked():
+def test_slash_disallowed_command_quit_blocked():
     session = MagicMock()
     handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="/quit"),
-    )
+    ))
     session.send.assert_not_called()
     handler._outbound.send_text.assert_called_once()
     assert "not available" in handler._outbound.send_text.call_args[0][1]
 
 
-@pytest.mark.asyncio
-async def test_slash_disallowed_command_export_blocked():
+def test_slash_disallowed_command_export_blocked():
     session = MagicMock()
     handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="/export /tmp/out.md"),
-    )
+    ))
     session.send.assert_not_called()
     handler._outbound.send_text.assert_called_once()
 
 
-@pytest.mark.asyncio
-async def test_unknown_slash_command_falls_through_to_llm():
+def test_unknown_slash_command_falls_through_to_llm():
     session = MagicMock()
     session.send.return_value = "I don't know that command"
     handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="/frobnicate"),
-    )
+    ))
     session.send.assert_called_once()
 
 
-@pytest.mark.asyncio
-async def test_bang_prefix_new_clears_history():
+def test_bang_prefix_new_clears_history():
     """!new should work identically to /new (Element-safe prefix)."""
     session = MagicMock()
     handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="!new"),
-    )
+    ))
     session.reset.assert_called_once()
     session.send.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_bang_prefix_session_dispatched():
+def test_bang_prefix_session_dispatched():
     """!session 2 should dispatch /session with args '2'."""
     session = MagicMock()
     handler = _make_handler(
@@ -306,53 +307,50 @@ async def test_bang_prefix_session_dispatched():
     # short_term.list_sessions returns empty list → "No session history found" message
     handler._short_term.list_sessions.return_value = []
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="!session 2"),
-    )
+    ))
     session.send.assert_not_called()
     handler._outbound.send_text.assert_called_once()
     assert "session" in handler._outbound.send_text.call_args[0][1].lower()
 
 
-@pytest.mark.asyncio
-async def test_bang_quit_blocked():
+def test_bang_quit_blocked():
     """!quit should be blocked just like /quit."""
     session = MagicMock()
     handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="!quit"),
-    )
+    ))
     session.send.assert_not_called()
     assert "not available" in handler._outbound.send_text.call_args[0][1]
 
 
-@pytest.mark.asyncio
-async def test_bang_plain_message_not_treated_as_command():
+def test_bang_plain_message_not_treated_as_command():
     """A lone '!' or '! text' (space after !) is not a command."""
     session = MagicMock()
     session.send.return_value = "response"
     handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="! not a command"),
-    )
+    ))
     session.send.assert_called_once()
 
 
-@pytest.mark.asyncio
-async def test_slash_command_skipped_when_agents_cfg_none():
+def test_slash_command_skipped_when_agents_cfg_none():
     """Without agents_cfg, /new goes to the LLM unchanged (backward compat)."""
     session = MagicMock()
     session.send.return_value = "response"
     handler = _make_handler(sessions={"main": session}, agents_cfg=None)
 
-    await handler.handle_room_message(
+    _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="/new"),
-    )
+    ))
     session.send.assert_called_once()
     session.reset.assert_not_called()
