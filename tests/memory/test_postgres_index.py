@@ -713,6 +713,61 @@ def test_list_claims_needing_privacy_review_excludes_a_classified_claim(index, a
     assert index.list_claims_needing_privacy_review(agent_id) == []
 
 
+def test_list_claims_needing_reevaluation_finds_an_unknown_claim_with_no_evidence(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 status=unknown -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    results = index.list_claims_needing_reevaluation(agent_id)
+
+    assert [c["id"] for c in results] == ["c-1"]
+
+
+def test_list_claims_needing_reevaluation_excludes_an_unknown_claim_with_evidence(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 status=unknown evidence=proposal:42 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    assert index.list_claims_needing_reevaluation(agent_id) == []
+
+
+def test_list_claims_needing_reevaluation_excludes_a_supported_claim_with_no_evidence(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 status=supported -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    assert index.list_claims_needing_reevaluation(agent_id) == []
+
+
+def test_list_claims_citing_evidence_finds_a_matching_claim(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 evidence=proposal:42 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    results = index.list_claims_citing_evidence(agent_id, "proposal", "42")
+
+    assert [c["id"] for c in results] == ["c-1"]
+
+
+def test_list_claims_citing_evidence_excludes_a_non_matching_claim(index, agent_id):
+    content = "- Some claim.\n  <!-- claim:c-1 evidence=proposal:99 -->"
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    assert index.list_claims_citing_evidence(agent_id, "proposal", "42") == []
+
+
+def test_list_claims_citing_evidence_finds_every_claim_citing_a_shared_source(index, agent_id):
+    content = (
+        "- Claim one.\n  <!-- claim:c-1 evidence=import:_auto_extracted -->\n\n"
+        "- Claim two.\n  <!-- claim:c-2 evidence=import:_auto_extracted -->"
+    )
+    index.reindex_file(agent_id, "topic.md", "durable", content)
+
+    results = index.list_claims_citing_evidence(agent_id, "import", "_auto_extracted")
+
+    assert {c["id"] for c in results} == {"c-1", "c-2"}
+
+
+def test_list_claims_citing_evidence_is_empty_with_no_matching_evidence(index, agent_id):
+    assert index.list_claims_citing_evidence(agent_id, "proposal", "1") == []
+
+
 def test_reindex_file_without_a_provider_never_embeds(index, agent_id):
     index.reindex_file(agent_id, "topic.md", "durable", "some content")
     # No provider configured -- nothing to assert against a real cache

@@ -1316,6 +1316,7 @@ def _empty_knowledge_index():
     mock_index.list_claims_missing_evidence.return_value = []
     mock_index.list_claims.return_value = []
     mock_index.list_claims_needing_privacy_review.return_value = []
+    mock_index.list_claims_needing_reevaluation.return_value = []
     return mock_index
 
 
@@ -1346,6 +1347,9 @@ def test_knowledge_dashboard_shows_all_sections_by_default(monkeypatch, tmp_path
     mock_index.list_claims_needing_privacy_review.return_value = [
         {"id": "c-7", "rel_path": "topics/x.md", "text": "Unclassified fact.", "status": "supported"}
     ]
+    mock_index.list_claims_needing_reevaluation.return_value = [
+        {"id": "c-8", "rel_path": "topics/x.md", "text": "Forgotten-source fact.", "status": "unknown"}
+    ]
     _patch_index(monkeypatch, mock_index)
 
     exit_code = cli.main(["knowledge", "dashboard", "--agent", "main"])
@@ -1358,6 +1362,7 @@ def test_knowledge_dashboard_shows_all_sections_by_default(monkeypatch, tmp_path
     assert "Missing provenance" in out and "Unsourced fact." in out
     assert "Open questions" in out and "Open question." in out
     assert "Privacy review" in out and "Unclassified fact." in out
+    assert "Deletion coverage" in out and "Forgotten-source fact." in out
     mock_index.list_claims.assert_called_once_with("main", status="unknown")
 
 
@@ -1370,7 +1375,7 @@ def test_knowledge_dashboard_reports_none_for_empty_sections(monkeypatch, tmp_pa
     out = capsys.readouterr().out
 
     assert exit_code == 0
-    assert out.count("(none)") == 6
+    assert out.count("(none)") == 7
 
 
 def test_knowledge_dashboard_shows_a_dangling_contradiction_reference(monkeypatch, tmp_path, capsys):
@@ -1487,6 +1492,98 @@ def test_knowledge_compile_without_a_database_reports_an_error(monkeypatch, tmp_
     _patch_index(monkeypatch, None)
 
     exit_code = cli.main(["knowledge", "compile", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+# ---------------------------------------------------------------------
+# memory knowledge forget (Stage One Phase 7, slice F)
+# ---------------------------------------------------------------------
+
+
+def test_knowledge_forget_reports_reevaluated_and_still_grounded_claims(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.forgetting as forgetting
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, Mock())
+    monkeypatch.setattr(
+        forgetting, "forget_source",
+        lambda index, files, agent_id, source_kind, source_ref: {
+            "source_kind": source_kind, "source_ref": source_ref,
+            "reevaluated": ["c-1"], "still_grounded": ["c-2"], "skipped_manual_review": [],
+        },
+    )
+
+    exit_code = cli.main(
+        ["knowledge", "forget", "--agent", "main", "--source-kind", "proposal", "--source-ref", "42"]
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "forgot proposal:42" in out
+    assert "c-1" in out
+    assert "c-2" in out
+
+
+def test_knowledge_forget_reports_claims_needing_manual_review(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.forgetting as forgetting
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, Mock())
+    monkeypatch.setattr(
+        forgetting, "forget_source",
+        lambda index, files, agent_id, source_kind, source_ref: {
+            "source_kind": source_kind, "source_ref": source_ref,
+            "reevaluated": [], "still_grounded": [],
+            "skipped_manual_review": [{"claim_id": "c-1", "rel_path": "MEMORY.md"}],
+        },
+    )
+
+    exit_code = cli.main(
+        ["knowledge", "forget", "--agent", "main", "--source-kind", "proposal", "--source-ref", "42"]
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "manual review" in out
+    assert "MEMORY.md" in out
+
+
+def test_knowledge_forget_reports_a_harmless_no_op(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.forgetting as forgetting
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, Mock())
+    monkeypatch.setattr(
+        forgetting, "forget_source",
+        lambda index, files, agent_id, source_kind, source_ref: {
+            "source_kind": source_kind, "source_ref": source_ref,
+            "reevaluated": [], "still_grounded": [], "skipped_manual_review": [],
+        },
+    )
+
+    exit_code = cli.main(
+        ["knowledge", "forget", "--agent", "main", "--source-kind", "proposal", "--source-ref", "999"]
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "nothing to do" in out
+
+
+def test_knowledge_forget_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(
+        ["knowledge", "forget", "--agent", "main", "--source-kind", "proposal", "--source-ref", "42"]
+    )
     out = capsys.readouterr().out
 
     assert exit_code == 1

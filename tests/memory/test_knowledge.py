@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from minion_assist.memory.knowledge import compile_digest, parse_claims, parse_time_epoch
+from minion_assist.memory.knowledge import (
+    compile_digest,
+    parse_claims,
+    parse_time_epoch,
+    remove_evidence_from_content,
+)
 
 # ---------------------------------------------------------------------------
 # parse_claims — basics
@@ -404,3 +409,95 @@ def test_compile_digest_reports_no_omission_footer_when_everything_fits():
     digest = compile_digest([_claim(text="Fits easily.")], max_chars=8000)
 
     assert "omitted" not in digest
+
+
+# ---------------------------------------------------------------------------
+# remove_evidence_from_content (Stage One Phase 7, slice F)
+# ---------------------------------------------------------------------------
+
+def test_remove_evidence_from_content_removes_the_only_citation_and_marks_unknown():
+    content = "- Some claim.\n  <!-- claim:c-1 status=supported evidence=proposal:42 -->"
+
+    new_content, has_remaining = remove_evidence_from_content(content, "c-1", "proposal", "42")
+
+    assert has_remaining is False
+    assert "evidence=" not in new_content
+    assert "status=unknown" in new_content
+    claim = parse_claims(new_content)[0]
+    assert claim.status == "unknown"
+    assert claim.evidence == []
+
+
+def test_remove_evidence_from_content_keeps_other_evidence_and_status():
+    content = (
+        "- Some claim.\n"
+        "  <!-- claim:c-1 status=supported evidence=proposal:42,message:1189 -->"
+    )
+
+    new_content, has_remaining = remove_evidence_from_content(content, "c-1", "proposal", "42")
+
+    assert has_remaining is True
+    claim = parse_claims(new_content)[0]
+    assert claim.status == "supported"  # untouched -- still grounded by the other citation
+    assert claim.evidence == [("message", "1189")]
+
+
+def test_remove_evidence_from_content_preserves_the_claim_text_and_other_fields():
+    content = (
+        "- User's dog is named Biscuit.\n"
+        "  <!-- claim:c-1 status=supported confidence=0.9 observed=2026-06-01 "
+        "evidence=proposal:42 -->"
+    )
+
+    new_content, _ = remove_evidence_from_content(content, "c-1", "proposal", "42")
+
+    claim = parse_claims(new_content)[0]
+    assert claim.text == "User's dog is named Biscuit."
+    assert claim.confidence == 0.9
+    assert claim.observed == "2026-06-01"
+
+
+def test_remove_evidence_from_content_preserves_other_claims_and_prose_untouched():
+    content = (
+        "- Claim one.\n  <!-- claim:c-1 evidence=proposal:42 -->\n\n"
+        "- Claim two.\n  <!-- claim:c-2 evidence=proposal:99 -->\n\n"
+        "Some ordinary unmarked prose."
+    )
+
+    new_content, _ = remove_evidence_from_content(content, "c-1", "proposal", "42")
+
+    claims = parse_claims(new_content)
+    assert claims[1].id == "c-2"
+    assert claims[1].evidence == [("proposal", "99")]  # untouched
+    assert "Some ordinary unmarked prose." in new_content
+
+
+def test_remove_evidence_from_content_no_op_when_claim_does_not_cite_this_source():
+    content = "- Some claim.\n  <!-- claim:c-1 evidence=proposal:99 -->"
+
+    new_content, has_remaining = remove_evidence_from_content(content, "c-1", "proposal", "42")
+
+    assert new_content == content
+    assert has_remaining is True
+
+
+def test_remove_evidence_from_content_no_op_when_claim_id_not_found():
+    content = "- Some claim.\n  <!-- claim:c-1 evidence=proposal:42 -->"
+
+    new_content, has_remaining = remove_evidence_from_content(content, "c-999", "proposal", "42")
+
+    assert new_content == content
+    assert has_remaining is True
+
+
+def test_remove_evidence_from_content_preserves_supersedes_and_contradicts():
+    content = (
+        "- Some claim.\n  <!-- claim:c-1 status=contested evidence=proposal:42 "
+        "contradicts=c-old -->"
+    )
+
+    new_content, _ = remove_evidence_from_content(content, "c-1", "proposal", "42")
+
+    claim = parse_claims(new_content)[0]
+    assert claim.contradicts == ["c-old"]
+    assert claim.status == "unknown"  # flipped since evidence is now empty

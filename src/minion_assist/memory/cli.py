@@ -295,8 +295,8 @@ def _build_parser() -> argparse.ArgumentParser:
     knowledge = sub.add_parser(
         "knowledge",
         help=(
-            "Report on the knowledge layer's claims (Stage One Phase 7, "
-            "slice C). Requires a configured database."
+            "Report on, compile, and forget from the knowledge layer's claims "
+            "(Stage One Phase 7, slices C-F). Requires a configured database."
         ),
     )
     knowledge_sub = knowledge.add_subparsers(dest="knowledge_subcommand", required=True)
@@ -309,7 +309,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--section",
         choices=[
             "contradictions", "stale", "low-confidence", "missing-provenance",
-            "open-questions", "privacy-review",
+            "open-questions", "privacy-review", "deletion-coverage",
         ],
         default=None,
         help="Restrict to one section. Default: show every section.",
@@ -329,6 +329,22 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8000,
         help="Soft cap on the compiled digest's length. Default 8000.",
+    )
+
+    k_forget = knowledge_sub.add_parser(
+        "forget",
+        help=(
+            "Forget one evidence source: re-flag (or leave grounded) every claim "
+            "citing it, editing the affected pages directly (Stage One Phase 7, "
+            "slice F)."
+        ),
+    )
+    k_forget.add_argument("--agent", required=True, help="Which agent's claims to search.")
+    k_forget.add_argument(
+        "--source-kind", required=True, help='Evidence kind to forget, e.g. "proposal".'
+    )
+    k_forget.add_argument(
+        "--source-ref", required=True, help="Evidence reference to forget, e.g. a proposal id."
     )
 
     return parser
@@ -1181,7 +1197,7 @@ def _run_commitments(args: argparse.Namespace) -> int:
 
 _ALL_DASHBOARD_SECTIONS = (
     "contradictions", "stale", "low-confidence", "missing-provenance",
-    "open-questions", "privacy-review",
+    "open-questions", "privacy-review", "deletion-coverage",
 )
 
 
@@ -1254,6 +1270,11 @@ def _run_knowledge_dashboard(args: argparse.Namespace) -> int:
         _print_claim_rows(index.list_claims_needing_privacy_review(agent_id))
         print()
 
+    if "deletion-coverage" in sections:
+        print("== Deletion coverage ==")
+        _print_claim_rows(index.list_claims_needing_reevaluation(agent_id))
+        print()
+
     return 0
 
 
@@ -1290,14 +1311,57 @@ def _run_knowledge_compile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_knowledge_forget(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory knowledge forget --agent ID --source-kind K --source-ref R``.
+
+    Stage One Phase 7, slice F. Immediate, not previewed — mirrors
+    ``consolidate reject``/``import reject``'s "deliberate, explicitly-
+    named cleanup action" precedent (see ``memory/forgetting.py``'s
+    module docstring).
+    """
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+    from .forgetting import forget_source  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    index = _build_index()
+    if index is None:
+        print("Error: no database configured (or it's unreachable) — nothing to forget.")
+        return 1
+
+    files = MemoryFileRepository(_resolve_agent_root(workspace, agent_id, bootstrap_cfg))
+    result = forget_source(index, files, agent_id, args.source_kind, args.source_ref)
+
+    total = (
+        len(result["reevaluated"]) + len(result["still_grounded"])
+        + len(result["skipped_manual_review"])
+    )
+    if total == 0:
+        print(f"{agent_id}: nothing cites {args.source_kind}:{args.source_ref} — nothing to do.")
+        return 0
+
+    print(f"{agent_id}: forgot {args.source_kind}:{args.source_ref}.")
+    if result["reevaluated"]:
+        print(f"  re-flagged status=unknown: {', '.join(result['reevaluated'])}")
+    if result["still_grounded"]:
+        print(f"  still grounded by other evidence: {', '.join(result['still_grounded'])}")
+    if result["skipped_manual_review"]:
+        print("  needs manual review (not auto-edited):")
+        for entry in result["skipped_manual_review"]:
+            print(f"    {entry['claim_id']} in {entry['rel_path']}")
+    return 0
+
+
 _KNOWLEDGE_HANDLERS = {
     "dashboard": _run_knowledge_dashboard,
     "compile": _run_knowledge_compile,
+    "forget": _run_knowledge_forget,
 }
 
 
 def _run_knowledge(args: argparse.Namespace) -> int:
-    """Handle ``minion-assist memory knowledge <dashboard>``."""
+    """Handle ``minion-assist memory knowledge <dashboard|compile|forget>``."""
     handler = _KNOWLEDGE_HANDLERS[args.knowledge_subcommand]
     return handler(args)
 

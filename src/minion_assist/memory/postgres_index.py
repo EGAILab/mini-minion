@@ -1033,15 +1033,15 @@ class PostgresMemoryIndex:
         ]
 
     # ------------------------------------------------------------------
-    # Knowledge dashboards — Stage One Phase 7, slice C (Task 3)
+    # Knowledge dashboards — Stage One Phase 7, slices C & F (Task 3)
     # ------------------------------------------------------------------
     #
     # "Open questions" (status="unknown") needs no dedicated method —
-    # list_claims(agent_id, status="unknown") already covers it. Task 3
-    # also asks for "deletion coverage"; that dashboard is deferred to
-    # the slice that actually builds the forgetting mechanism (Task 6/
-    # acceptance criterion 4) — there is nothing to report on before a
-    # "forget" operation exists to audit.
+    # list_claims(agent_id, status="unknown") already covers it.
+    # "Deletion coverage" (list_claims_needing_reevaluation, added slice
+    # F below) was deferred from slice C to here — there was nothing to
+    # report on before memory/forgetting.py's forget_source() existed to
+    # produce claims in this state.
 
     def list_contradictions(self, agent_id: str) -> list[dict]:
         """List every recorded ``contradicts`` relationship, with both claims' current text/status.
@@ -1170,6 +1170,73 @@ class PostgresMemoryIndex:
             ORDER BY rel_path, line_number
             """,
             (agent_id,),
+        ).fetchall()
+        return [{"id": r[0], "rel_path": r[1], "text": r[2], "status": r[3]} for r in rows]
+
+    def list_claims_needing_reevaluation(self, agent_id: str) -> list[dict]:
+        """List claims left with ``status="unknown"`` and zero evidence — the "deletion coverage" report.
+
+        Stage One Phase 7, slice F. This is exactly the signature
+        ``memory/forgetting.py``'s ``forget_source()`` leaves behind on a
+        claim once its last evidence citation is removed: the marker and
+        its text stay in the note (never silently deleted), but its
+        status flips to ``"unknown"`` so it surfaces here as something a
+        human should look at again — the audit trail a human reviewing
+        "did forgetting correctly leave things in a re-evaluate-me
+        state, and is there anything left to act on" wants to see.
+
+        Overlaps in principle with ``list_claims(status="unknown")``
+        (open questions) and :meth:`list_claims_missing_evidence`
+        (provenance gaps), but the *intersection* of both is a distinct,
+        meaningful signal on its own — a claim that was never classified
+        yet is not the same situation as one that lost its only
+        grounding.
+
+        Returns:
+            list[dict]: ``{"id", "rel_path", "text", "status"}``.
+        """
+        rows = self._conn().execute(
+            """
+            SELECT id, rel_path, text, status FROM kb_claims
+            WHERE agent_id = %s AND status = 'unknown' AND id NOT IN (
+                SELECT DISTINCT claim_id FROM kb_evidence WHERE agent_id = %s
+            )
+            ORDER BY rel_path, line_number
+            """,
+            (agent_id, agent_id),
+        ).fetchall()
+        return [{"id": r[0], "rel_path": r[1], "text": r[2], "status": r[3]} for r in rows]
+
+    def list_claims_citing_evidence(self, agent_id: str, source_kind: str, source_ref: str) -> list[dict]:
+        """List every claim whose evidence includes ``(source_kind, source_ref)``.
+
+        Stage One Phase 7, slice F: the lookup behind
+        ``memory/forgetting.py``'s ``forget_source()`` — a purely
+        read-only query (this method never mutates anything; the caller
+        edits the affected pages' claim markers directly and reindexes,
+        the same "files are the source of truth" discipline every other
+        write in this project follows).
+
+        Args:
+            agent_id: Which agent's claims to search.
+            source_kind: The evidence kind to match, e.g. ``"proposal"``,
+                ``"import"``, or ``"message"``.
+            source_ref: The evidence reference to match, e.g. a proposal
+                id or import key, as a string.
+
+        Returns:
+            list[dict]: ``{"id", "rel_path", "text", "status"}`` for
+                every matching claim, ordered by page.
+        """
+        rows = self._conn().execute(
+            """
+            SELECT c.id, c.rel_path, c.text, c.status
+            FROM kb_claims c
+            JOIN kb_evidence e ON e.agent_id = c.agent_id AND e.claim_id = c.id
+            WHERE c.agent_id = %s AND e.source_kind = %s AND e.source_ref = %s
+            ORDER BY c.rel_path, c.line_number
+            """,
+            (agent_id, source_kind, source_ref),
         ).fetchall()
         return [{"id": r[0], "rel_path": r[1], "text": r[2], "status": r[3]} for r in rows]
 

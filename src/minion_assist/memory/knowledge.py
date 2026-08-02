@@ -128,6 +128,9 @@ Talks to
 - ``memory/files.py`` / ``memory/digest_scheduler.py`` — write
   :func:`compile_digest`'s output to ``KNOWLEDGE_DIGEST.md`` on a daily
   timer; ``bootstrap.py`` injects it into every turn's prompt.
+- ``memory/forgetting.py`` — :func:`remove_evidence_from_content` is the
+  marker-editing primitive ``forget_source()`` (Stage One Phase 7,
+  slice F) uses to cascade a forgotten source to every claim citing it.
 """
 
 from __future__ import annotations
@@ -386,3 +389,75 @@ def compile_digest(claims: list[dict], max_chars: int = _DEFAULT_DIGEST_MAX_CHAR
         )
 
     return _DIGEST_HEADER + "\n\n" + "".join(body_parts).rstrip() + footer
+
+
+# ---------------------------------------------------------------------------
+# Forgetting a source (Stage One Phase 7, slice F)
+# ---------------------------------------------------------------------------
+
+def remove_evidence_from_content(
+    content: str, claim_id: str, source_kind: str, source_ref: str
+) -> tuple[str, bool]:
+    """Remove one evidence citation from a claim marker, directly in raw page content.
+
+    Used by ``memory/forgetting.py``'s ``forget_source()`` to cascade a
+    forgotten source to every claim marker citing it — in the *file*, not
+    just Postgres. An edit that only touched ``kb_claims``/``kb_evidence``
+    would be silently reverted the next time this page is reindexed
+    (``reindex_file()``/``force_rebuild_agent()`` always re-derive those
+    tables from the file's actual marker text) — this is the "files are
+    the source of truth" principle applied to deletion, the same as every
+    other write in this project.
+
+    If removing this citation leaves the claim with no evidence at all,
+    also sets ``status=unknown`` on the marker — the marker and its text
+    stay in the note (nothing is silently deleted), but there is no more
+    citation for a human to verify it against, so it becomes something to
+    re-evaluate. Matches the same "surface gaps, don't hide them" pattern
+    :meth:`~minion_assist.memory.postgres_index.PostgresMemoryIndex.list_contradictions`/
+    ``list_claims_missing_evidence`` already established.
+
+    Every other field on the marker (id, confidence, observed, valid
+    time, privacy, entity, supersedes, contradicts) is preserved exactly
+    as given — only ``evidence=`` and, conditionally, ``status=`` change.
+
+    Args:
+        content: The page's full, unmodified text.
+        claim_id: Which claim marker to edit — the caller (``forget_source()``)
+            already knows this from
+            :meth:`~minion_assist.memory.postgres_index.PostgresMemoryIndex.list_claims_citing_evidence`.
+        source_kind: The evidence kind to remove, e.g. ``"proposal"``.
+        source_ref: The evidence reference to remove, e.g. a proposal id.
+
+    Returns:
+        tuple[str, bool]: ``(new_content, has_remaining_evidence)``.
+            ``has_remaining_evidence`` is ``True`` if the claim still
+            cites at least one other source after this one is removed,
+            ``False`` if this was its last citation (status is then also
+            set to ``"unknown"``). If ``claim_id`` has no marker in
+            ``content``, or its marker doesn't actually cite this source,
+            ``content`` is returned unchanged and this returns ``True``
+            — nothing to reconcile, since no removal happened.
+    """
+    for match in _CLAIM_MARKER_RE.finditer(content):
+        if match.group(1) != claim_id:
+            continue
+        fields = dict(_FIELD_RE.findall(match.group(2)))
+        evidence_pairs = _parse_evidence(fields.get("evidence"))
+        remaining = [
+            (k, r) for k, r in evidence_pairs if not (k == source_kind and r == source_ref)
+        ]
+        if len(remaining) == len(evidence_pairs):
+            return content, True  # this marker doesn't cite this source — nothing to do
+
+        if remaining:
+            fields["evidence"] = ",".join(f"{k}:{r}" for k, r in remaining)
+        else:
+            fields.pop("evidence", None)
+            fields["status"] = "unknown"
+
+        rendered_fields = " ".join(f"{k}={v}" for k, v in fields.items())
+        new_marker = f"<!-- claim:{claim_id} {rendered_fields} -->"
+        return content[: match.start()] + new_marker + content[match.end() :], bool(remaining)
+
+    return content, True  # claim id has no marker in this content — nothing to do

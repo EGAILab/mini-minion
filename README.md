@@ -1553,6 +1553,29 @@ minion-assist memory import approve 5 --agent main
 minion-assist memory import reject _auto_extracted --agent main --reason "nothing useful"
 ```
 
+### Forgetting a source (Stage One Phase 7, slice F)
+
+Phase 7's last acceptance criterion: "forgetting a source identifies and removes or re-evaluates all derivatives." A "source" is an evidence citation — the same `(kind, ref)` pairs a claim marker's `evidence=` field encodes, e.g. `("proposal", "42")` or `("import", "_auto_extracted")`. `memory/forgetting.py`'s `forget_source(index, files, agent_id, source_kind, source_ref)` finds every claim citing that source (`PostgresMemoryIndex.list_claims_citing_evidence`) and edits each affected page's claim marker directly.
+
+**Why the edit has to happen in the file, not just Postgres.** `kb_claims`/`kb_evidence` are a fully derived cache — `force_rebuild_agent()` can always re-derive them from scratch by re-parsing every page. A "forget" that only touched those tables would be silently reverted the next time the affected page gets reindexed. `memory/knowledge.py`'s new `remove_evidence_from_content(content, claim_id, source_kind, source_ref)` rewrites the marker's `evidence=` field directly in the page's raw text (removing just the one citation, preserving every other field — id, confidence, observed, supersedes, contradicts, etc. — exactly as given), and `forget_source()` writes that back via `MemoryFileRepository.remember()` + `reindex_file()`, the same write-then-reindex shape every other mutation in this project uses.
+
+**Evidence-less claims are re-flagged, not deleted.** If removing a citation leaves a claim with no evidence at all, its marker's `status` flips to `unknown` — the marker and its text stay in the note, nothing is silently lost. This is the recommended, chosen behavior (a genuine fork — "removes or re-evaluates" per the plan) — it matches the same "surface gaps, don't hide them" posture the rest of Phase 7 already takes (dangling contradictions, provenance gaps). A claim that still has *other* evidence after the forgotten one is removed keeps its status untouched.
+
+**`MEMORY.md` is skipped, not edited.** A claim can technically live in `MEMORY.md` (it's `source_kind="durable"` too), but nothing in this project ever programmatically writes `MEMORY.md` — it's human/bootstrap-owned everywhere else. Claims found there are left untouched and reported back under `skipped_manual_review` for a human to handle by hand, rather than breaking that invariant.
+
+**No preview step, no rollback.** Mirrors `reject()`'s precedent in both `consolidate` and `import` — forgetting is a deliberate, explicitly-named cleanup action a human types directly, not a draft awaiting review.
+
+**"Deletion coverage" dashboard** (deferred from slice C) is now built: `PostgresMemoryIndex.list_claims_needing_reevaluation(agent_id)` lists claims with `status="unknown"` AND zero evidence — exactly the signature `forget_source()` leaves behind, the audit trail for "did forgetting correctly leave things in a re-evaluate-me state." Added as a 7th `minion-assist memory knowledge dashboard` section.
+
+New CLI command:
+
+```bash
+minion-assist memory knowledge forget --agent main --source-kind proposal --source-ref 42
+minion-assist memory knowledge dashboard --agent main --section deletion-coverage
+```
+
+This completes Stage One Phase 7 (the plan's optional personal knowledge layer) — all six slices (A: schema/markers/sync, B: provenance/relationships, C: dashboards, D: compiled digest, E: import review, F: forgetting) are now implemented.
+
 ### `session_search` Tool Modes
 
 | Mode | Description |
