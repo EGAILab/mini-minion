@@ -163,8 +163,8 @@ minion-assist/
 │   │   ├── bot_loop.py          # Sliding-window rate limiter per room
 │   │   ├── exec_approvals.py    # DM-based remote tool approval via ✅/❌ reactions
 │   │   ├── auto_join.py         # Invite handler — always / allowlist / off policy
-│   │   ├── crypto.py            # E2E encryption setup via SqliteCryptoStore + libolm
-│   │   ├── auth.py              # Authentication — access token / password / SSO
+│   │   ├── crypto.py            # E2E key upload after auth wires up encryption (needs libolm)
+│   │   ├── auth.py              # Authentication (token/password/SSO) — also wires up E2E crypto
 │   │   ├── config.py            # MatrixConfig and nested dataclasses
 │   │   ├── allowlist.py         # User-ID normalisation and wildcard allowlist check
 │   │   └── __init__.py
@@ -705,7 +705,7 @@ Add a `channels.matrix` block to `config.json`:
 
 **Exec approvals:** when an agent calls a bash command, the `MatrixExecApprovalHandler` sends a DM to each configured approver. Reacting ✅ approves the command; reacting ❌ denies it. Commands time out after 60 seconds (denied by default).
 
-**E2E encryption:** if libolm is installed, the bot automatically uses `SqliteCryptoStore` for end-to-end encryption. Without libolm, the bot falls back to unencrypted communication with a console warning — it does not fail to start.
+**E2E encryption:** set `"encryption": true` under `channels.matrix` to enable it (requires libolm — see install notes above). When active, the bot uses matrix-nio's own SQLite-backed crypto store, keyed to a specific device ID. If `deviceId` isn't set in config.json, the bot looks it up automatically via `whoami()` on first connect (the store must be keyed to the same device the access token was issued for). Without libolm, or if no device ID can be resolved, the bot falls back to unencrypted communication with a console warning — it does not fail to start.
 
 **Bot-loop protection:** `BotLoopProtection` tracks event rates per room in a sliding window and enters a cooldown period if too many events arrive too quickly, preventing runaway bot-to-bot loops.
 

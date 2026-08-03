@@ -1,53 +1,39 @@
-"""E2E encryption setup for the Matrix channel.
+"""E2E encryption follow-up for the Matrix channel.
 
-Initialises matrix-nio's ``SqliteCryptoStore`` so the bot can participate in
-encrypted rooms.  Requires ``libolm`` to be installed on the host system.
-
-When ``libolm`` is not available a clear error is printed and the function
-returns without enabling encryption so the bot can still function in
-unencrypted rooms.
+The actual crypto store and ``client.olm`` (matrix-nio's encrypt/decrypt
+engine) are now wired up during authentication — see
+:func:`minion_assist.matrix.auth.resolve_matrix_auth` — because matrix-nio
+only builds them from ``store_path`` + an encryption-enabled config that must
+be present *before* login/restore_login runs. This module just uploads
+device keys once that's done.
 """
 
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 
-async def setup_crypto(client, store_path: Path) -> bool:
-    """Configure E2E encryption on ``client`` using a SQLite crypto store.
-
-    Creates the store file at ``store_path`` on first call and uploads device
-    keys to the homeserver.  Subsequent calls reuse the existing store.
+async def setup_crypto(client) -> bool:
+    """Upload E2E device keys if encryption was wired up during auth.
 
     Args:
-        client:     An authenticated matrix-nio ``AsyncClient``.
-        store_path: Path to the SQLite crypto store file.
+        client: An authenticated matrix-nio ``AsyncClient`` returned by
+                :func:`~minion_assist.matrix.auth.resolve_matrix_auth`.
 
     Returns:
-        True if encryption was successfully set up, False if libolm is missing.
+        True if ``client.olm`` is set (encryption is active) and a key-upload
+        was attempted, False if encryption isn't active for this client (e.g.
+        libolm was missing, so ``resolve_matrix_auth`` already degraded and
+        printed its own warning).
     """
-    try:
-        # SqliteCryptoStore is only available when matrix-nio[e2e] is installed
-        # AND the native libolm C library is present on the system.
-        from nio import SqliteCryptoStore  # noqa: PLC0415
-    except ImportError:
-        # Gracefully degrade: warn the user but keep the bot running without
-        # E2E encryption rather than crashing.
-        print(
-            "[matrix] ERROR: encryption=true is set but 'libolm' is not installed. "
-            "Install it via your system package manager (e.g. 'libolm-dev' on Debian/Ubuntu, "
-            "'libolm' via Homebrew on macOS) and reinstall matrix-nio[e2e]. "
-            "Continuing WITHOUT encryption.",
-            file=sys.stderr,
-        )
+    # client.olm is only set by matrix-nio's load_store(), which runs inside
+    # restore_login()/login() — and only when encryption_enabled was True at
+    # AsyncClient construction time. If it's still None here, encryption never
+    # activated (resolve_matrix_auth already explained why and printed a
+    # warning), so there's nothing to upload.
+    if not getattr(client, "olm", None):
         return False
 
-    store_path.parent.mkdir(parents=True, exist_ok=True)
-    # SqliteCryptoStore persists Olm session keys and Megolm group session keys
-    # across restarts.  Without it the bot would lose decryption ability on restart.
-    store = SqliteCryptoStore(str(store_path))
-    client.crypto = store
     try:
         # Upload the device's Ed25519 identity key and Curve25519 one-time keys
         # to the homeserver so other users can encrypt messages to this device.

@@ -5,8 +5,9 @@ runs ``client.sync_forever()`` until the ``stop_event`` is set.
 
 Lifecycle
 ---------
-1. Authenticate via :func:`~minion_assist.matrix.auth.resolve_matrix_auth`.
-2. Set up E2E crypto if ``config.encryption`` is True.
+1. Authenticate via :func:`~minion_assist.matrix.auth.resolve_matrix_auth`,
+   which also wires up E2E crypto if ``config.encryption`` is True.
+2. Upload device keys if encryption activated (:func:`~minion_assist.matrix.crypto.setup_crypto`).
 3. Open the inbound-dedupe and thread-binding databases.
 4. Construct the outbound adapter, bot-loop protection, exec-approval handler,
    and room-message handler.
@@ -66,14 +67,18 @@ async def monitor_matrix(
     matrix_dir = workspace / "matrix"
     dedupe_db = matrix_dir / "inbound_dedupe.db"
     thread_db = matrix_dir / "thread_bindings.db"
-    crypto_db = matrix_dir / "crypto.db"
+    # A directory, not a single file: matrix-nio's SqliteStore derives its own
+    # filename (f"{user_id}_{device_id}.db") inside whatever path it's given.
+    crypto_dir = matrix_dir / "crypto"
 
-    # Step 1: authenticate.  Returns a fully configured AsyncClient.
-    client = await resolve_matrix_auth(config)
+    # Step 1: authenticate.  Also wires up E2E encryption when config.encryption
+    # is True — matrix-nio requires store_path to be known at AsyncClient
+    # construction time, so this can't happen as a separate step afterwards.
+    client = await resolve_matrix_auth(config, crypto_store_dir=crypto_dir)
 
-    # Step 2: optional E2E encryption.  Skipped if encryption=false in config.
+    # Step 2: upload device keys if encryption actually activated above.
     if config.encryption:
-        await setup_crypto(client, crypto_db)
+        await setup_crypto(client)
 
     # Step 3: open supporting databases.
     dedupe = MatrixInboundDeduper(dedupe_db)
