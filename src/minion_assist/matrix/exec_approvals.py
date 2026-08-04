@@ -30,18 +30,15 @@ class MatrixExecApprovalHandler:
     """Remote exec-approval via Matrix DM reaction.
 
     Args:
-        client:   An authenticated matrix-nio ``AsyncClient``.
         outbound: :class:`~minion_assist.matrix.outbound.MatrixOutbound` for sending DMs.
         config:   Exec-approval settings from config.
     """
 
     def __init__(
         self,
-        client,
         outbound: MatrixOutbound,
         config: MatrixExecApprovalsConfig,
     ) -> None:
-        self._client = client
         self._outbound = outbound
         self._config = config
         # Maps pending_event_id → asyncio.Future[bool] (True=approve, False=deny).
@@ -66,7 +63,7 @@ class MatrixExecApprovalHandler:
         # Only the first approver is consulted.  Multi-approver support is
         # a future enhancement.
         approver_id = approvers[0]
-        dm_room_id = await self._resolve_or_create_dm(approver_id)
+        dm_room_id = await self._outbound.resolve_or_create_dm(approver_id)
         if not dm_room_id:
             return "deny"
 
@@ -155,27 +152,3 @@ class MatrixExecApprovalHandler:
             return result
 
         return _sync_callback
-
-    async def _resolve_or_create_dm(self, user_id: str) -> str | None:
-        """Find or open a DM room with ``user_id``.
-
-        Returns the room ID string, or None on failure.
-        """
-        try:
-            # Check if the client already knows about a DM room with this user
-            # from a previous session (loaded during the initial sync).
-            direct_rooms = getattr(self._client, "direct_rooms", {})
-            if user_id in direct_rooms:
-                rooms = direct_rooms[user_id]
-                if rooms:
-                    # Return the first known DM room for this user.
-                    return list(rooms)[0]
-            # No existing DM room found — create a new one via the API.
-            # is_direct=True tags it as a DM in the homeserver's account data.
-            resp = await self._client.room_create(
-                is_direct=True,
-                invite=[user_id],
-            )
-            return getattr(resp, "room_id", None)
-        except Exception:
-            return None

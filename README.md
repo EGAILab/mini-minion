@@ -162,6 +162,7 @@ minion-assist/
 │   │   ├── thread_bindings.py   # SQLite thread-root → agent session key mapping
 │   │   ├── bot_loop.py          # Sliding-window rate limiter per room
 │   │   ├── exec_approvals.py    # DM-based remote tool approval via ✅/❌ reactions
+│   │   ├── verification.py      # Interactive SAS device-verification responder
 │   │   ├── auto_join.py         # Invite handler — always / allowlist / off policy
 │   │   ├── crypto.py            # E2E key upload after auth wires up encryption (needs libolm)
 │   │   ├── auth.py              # Authentication (token/password/SSO) — also wires up E2E crypto
@@ -662,6 +663,9 @@ Add a `channels.matrix` block to `config.json`:
         "enabled": true,
         "approvers": ["@alice:example.org"]
       },
+      "verification": {
+        "enabled": true
+      },
       "botLoop": {
         "enabled": true,
         "maxEventsPerWindow": 10,
@@ -690,6 +694,7 @@ Add a `channels.matrix` block to `config.json`:
 | `threadBindings.enabled` | `true` to persist Matrix thread → conversation mapping in SQLite |
 | `execApprovals.enabled` | `true` to send bash tool approval requests via DM |
 | `execApprovals.approvers` | List of Matrix user IDs who receive approval DMs |
+| `verification.enabled` | `true` to let Ada respond to interactive SAS ("emoji") device-verification requests from users in `execApprovals.approvers` |
 | `botLoop.enabled` | `true` to rate-limit events per room (prevents bot loops) |
 | `storePath` | Directory for SQLite state and E2E crypto store |
 
@@ -704,6 +709,8 @@ Add a `channels.matrix` block to `config.json`:
 **Typing indicators:** while the agent is processing a message, a typing notification appears in the Matrix room so users know the bot is working. The indicator is cleared automatically when the reply is sent, even if the agent errors.
 
 **Exec approvals:** when an agent calls a bash command, the `MatrixExecApprovalHandler` sends a DM to each configured approver. Reacting ✅ approves the command; reacting ❌ denies it. Commands time out after 60 seconds (denied by default).
+
+**Device verification:** matrix-nio implements the SAS ("emoji") verification protocol itself but does nothing with it unless a client wires up accept/confirm calls — that's what `verification.enabled` does. When someone in `execApprovals.approvers` starts interactive verification with Ada (e.g. Element's "Start verification"), `MatrixVerificationHandler` accepts it, DMs the emoji short-authentication-string for comparison, and confirms or rejects based on a ✅/❌ reaction — reusing the same reaction mechanism as exec approvals. Requests from anyone not in that list are cancelled automatically rather than left hanging.
 
 **E2E encryption:** set `"encryption": true` under `channels.matrix` to enable it (requires libolm — see install notes above). When active, the bot uses matrix-nio's own SQLite-backed crypto store, keyed to a specific device ID. If `deviceId` isn't set in config.json, the bot looks it up automatically via `whoami()` on first connect (the store must be keyed to the same device the access token was issued for). Without libolm, or if no device ID can be resolved, the bot falls back to unencrypted communication with a console warning — it does not fail to start.
 

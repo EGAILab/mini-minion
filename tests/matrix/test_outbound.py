@@ -166,3 +166,39 @@ def test_send_typing_error_does_not_raise():
     client.room_typing = AsyncMock(side_effect=Exception("network error"))
     # Should swallow the exception silently
     _run(outbound.send_typing("!room:ex.org", True))
+
+
+# ---------------------------------------------------------------------------
+# resolve_or_create_dm
+# ---------------------------------------------------------------------------
+
+def test_resolve_or_create_dm_uses_existing_room():
+    outbound, client = _make_outbound()
+    client.direct_rooms = {"@user:ex.org": ["!existing:ex.org"]}
+    client.room_create = AsyncMock()  # should NOT be called
+
+    room_id = _run(outbound.resolve_or_create_dm("@user:ex.org"))
+
+    assert room_id == "!existing:ex.org"
+    client.room_create.assert_not_called()
+
+
+def test_resolve_or_create_dm_creates_new_room_when_none_known():
+    outbound, client = _make_outbound()
+    client.direct_rooms = {}
+    client.room_create = AsyncMock(return_value=MagicMock(room_id="!new:ex.org"))
+
+    room_id = _run(outbound.resolve_or_create_dm("@user:ex.org"))
+
+    assert room_id == "!new:ex.org"
+    client.room_create.assert_called_once_with(is_direct=True, invite=["@user:ex.org"])
+
+
+def test_resolve_or_create_dm_returns_none_on_failure():
+    outbound, client = _make_outbound()
+    client.direct_rooms = {}
+    client.room_create = AsyncMock(side_effect=Exception("network error"))
+
+    room_id = _run(outbound.resolve_or_create_dm("@user:ex.org"))
+
+    assert room_id is None

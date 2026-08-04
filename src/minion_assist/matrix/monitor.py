@@ -10,8 +10,10 @@ Lifecycle
 2. Upload device keys if encryption activated (:func:`~minion_assist.matrix.crypto.setup_crypto`).
 3. Open the inbound-dedupe and thread-binding databases.
 4. Construct the outbound adapter, bot-loop protection, exec-approval handler,
-   and room-message handler.
-5. Register matrix-nio callbacks for ``RoomMessageText`` and ``InviteEvent``.
+   verification handler, and room-message handler.
+5. Register matrix-nio callbacks for ``RoomMessageText``, ``InviteEvent``,
+   ``ReactionEvent`` (shared by exec approvals and verification), and — when
+   ``config.verification.enabled`` — the ``KeyVerification*`` to-device events.
 6. Start ``client.sync_forever()`` in a cancellation-aware task.
 7. On ``stop_event`` set: cancel the sync task and clean up.
 
@@ -35,6 +37,7 @@ from .handler import MatrixMessageHandler
 from .inbound_dedupe import MatrixInboundDeduper
 from .outbound import MatrixOutbound
 from .thread_bindings import MatrixThreadBindingManager
+from .verification import MatrixVerificationHandler
 
 
 async def monitor_matrix(
@@ -94,7 +97,15 @@ async def monitor_matrix(
     # Exec-approval handler is optional; only built when enabled in config.
     exec_approval: MatrixExecApprovalHandler | None = None
     if config.exec_approvals.enabled:
-        exec_approval = MatrixExecApprovalHandler(client, outbound, config.exec_approvals)
+        exec_approval = MatrixExecApprovalHandler(outbound, config.exec_approvals)
+
+    # Verification handler is optional too. It reuses exec_approvals.approvers
+    # as its allowlist rather than a second "people Ada trusts" list.
+    verification: MatrixVerificationHandler | None = None
+    if config.verification.enabled:
+        verification = MatrixVerificationHandler(
+            client, outbound, config.exec_approvals.approvers
+        )
 
     # Step 5: build the message handler that ties everything together.
     msg_handler = MatrixMessageHandler(
@@ -115,7 +126,7 @@ async def monitor_matrix(
 
     try:
         # Import matrix-nio event types for use as callback type filters.
-        from nio import InviteEvent, RoomMessageText  # noqa: PLC0415
+        from nio import InviteEvent, ReactionEvent, RoomMessageText  # noqa: PLC0415
     except ImportError as exc:
         raise RuntimeError(
             "matrix-nio is not installed. "
@@ -132,6 +143,49 @@ async def monitor_matrix(
 
     client.add_event_callback(_on_room_message, RoomMessageText)
     client.add_event_callback(_on_invite, InviteEvent)
+
+    # Reactions are the shared confirm/deny mechanism for both exec approvals
+    # and device verification — one callback, dispatched to whichever handler
+    # (if any) is waiting on that specific event ID.
+    if exec_approval or verification:
+        async def _on_reaction(room, event):
+            if exec_approval:
+                exec_approval.handle_reaction(event.reacts_to, event.key)
+            if verification:
+                await verification.handle_reaction(event.reacts_to, event.key)
+
+        client.add_event_callback(_on_reaction, ReactionEvent)
+
+    # Device verification runs entirely over to-device events — matrix-nio
+    # handles the crypto protocol internally, these callbacks just decide
+    # whether to accept and show the human the emoji to confirm.
+    if verification:
+        try:
+            from nio import (  # noqa: PLC0415
+                KeyVerificationCancel,
+                KeyVerificationKey,
+                KeyVerificationMac,
+                KeyVerificationStart,
+            )
+        except ImportError:
+            pass
+        else:
+            async def _on_verification_start(event):
+                await verification.handle_verification_start(event)
+
+            async def _on_verification_key(event):
+                await verification.handle_verification_key(event)
+
+            async def _on_verification_mac(event):
+                await verification.handle_verification_mac(event)
+
+            async def _on_verification_cancel(event):
+                await verification.handle_verification_cancel(event)
+
+            client.add_to_device_callback(_on_verification_start, KeyVerificationStart)
+            client.add_to_device_callback(_on_verification_key, KeyVerificationKey)
+            client.add_to_device_callback(_on_verification_mac, KeyVerificationMac)
+            client.add_to_device_callback(_on_verification_cancel, KeyVerificationCancel)
 
     print(f"[matrix] Connected as {config.user_id} on {config.homeserver}")
 

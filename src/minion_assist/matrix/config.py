@@ -104,6 +104,26 @@ class MatrixExecApprovalsConfig:
 
 
 @dataclass
+class MatrixVerificationConfig:
+    """Device-verification settings under ``channels.matrix.verification``.
+
+    When enabled, Ada responds to interactive SAS ("emoji") device
+    verification requests instead of leaving them to hang forever (nio
+    implements the crypto side of the protocol, but does nothing on its own
+    without a client wiring up accept/confirm calls). The list of users
+    allowed to initiate verification is ``exec_approvals.approvers`` — the
+    same "people Ada trusts" list already used for exec-approval DMs — rather
+    than a second allowlist to keep in sync.
+    """
+    enabled: bool = False
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "MatrixVerificationConfig":
+        """Parse a raw config dict into a MatrixVerificationConfig."""
+        return cls(enabled=raw.get("enabled", False))
+
+
+@dataclass
 class MatrixBotLoopConfig:
     """Bot-loop protection settings under ``channels.matrix.botLoopProtection``."""
     enabled: bool = True
@@ -144,6 +164,7 @@ class MatrixConfig:
         groups:            Per-room config keyed by room ID or alias.
         thread_bindings:   Thread-binding (thread = isolated session) config.
         exec_approvals:    Remote approval-via-DM config for tool execution.
+        verification:      Interactive SAS device-verification config.
         bot_loop:          Bot-loop rate-limit protection config.
         default_agent_id:  Agent to use when no per-room mapping matches.
         history_limit:     Number of past messages to inject as context per turn.
@@ -166,6 +187,7 @@ class MatrixConfig:
     groups: dict[str, MatrixRoomConfig] = field(default_factory=dict)
     thread_bindings: MatrixThreadBindingsConfig = field(default_factory=MatrixThreadBindingsConfig)
     exec_approvals: MatrixExecApprovalsConfig = field(default_factory=MatrixExecApprovalsConfig)
+    verification: MatrixVerificationConfig = field(default_factory=MatrixVerificationConfig)
     bot_loop: MatrixBotLoopConfig = field(default_factory=MatrixBotLoopConfig)
     default_agent_id: str = "main"
     history_limit: int = 0
@@ -202,6 +224,7 @@ class MatrixConfig:
         dm_raw = raw.get("dm") or {}
         thread_raw = raw.get("threadBindings") or {}
         exec_raw = raw.get("execApprovals") or {}
+        verification_raw = raw.get("verification") or {}
         loop_raw = raw.get("botLoopProtection") or {}
 
         return cls(
@@ -222,6 +245,7 @@ class MatrixConfig:
             groups=groups,
             thread_bindings=MatrixThreadBindingsConfig.from_dict(thread_raw),
             exec_approvals=MatrixExecApprovalsConfig.from_dict(exec_raw),
+            verification=MatrixVerificationConfig.from_dict(verification_raw),
             bot_loop=MatrixBotLoopConfig.from_dict(loop_raw),
             default_agent_id=raw.get("defaultAgent", "main"),
             history_limit=int(raw.get("historyLimit", 0)),

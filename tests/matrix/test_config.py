@@ -9,6 +9,7 @@ from minion_assist.matrix.config import (
     MatrixExecApprovalsConfig,
     MatrixRoomConfig,
     MatrixThreadBindingsConfig,
+    MatrixVerificationConfig,
 )
 
 _VALID = {
@@ -74,6 +75,8 @@ def test_optional_fields_defaults():
     assert isinstance(cfg.dm, MatrixDmConfig)
     assert isinstance(cfg.thread_bindings, MatrixThreadBindingsConfig)
     assert isinstance(cfg.exec_approvals, MatrixExecApprovalsConfig)
+    assert isinstance(cfg.verification, MatrixVerificationConfig)
+    assert cfg.verification.enabled is False
     assert isinstance(cfg.bot_loop, MatrixBotLoopConfig)
 
 
@@ -116,6 +119,12 @@ def test_exec_approvals_parsed():
     cfg = MatrixConfig.from_dict(raw)
     assert cfg.exec_approvals.enabled is True
     assert "@admin:example.org" in cfg.exec_approvals.approvers
+
+
+def test_verification_parsed():
+    raw = {**_VALID, "verification": {"enabled": True}}
+    cfg = MatrixConfig.from_dict(raw)
+    assert cfg.verification.enabled is True
 
 
 def test_bot_loop_parsed():

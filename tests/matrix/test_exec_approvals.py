@@ -21,16 +21,10 @@ def _make_config(approvers=None, enabled=True):
     return cfg
 
 
-def _make_client(dm_room_id="!dm:ex.org"):
-    client = MagicMock()
-    client.direct_rooms = {}
-    client.room_create = AsyncMock(return_value=MagicMock(room_id=dm_room_id))
-    return client
-
-
-def _make_outbound(event_id="$req_event"):
+def _make_outbound(event_id="$req_event", dm_room_id="!dm:ex.org"):
     out = MagicMock(spec=MatrixOutbound)
     out.send_text = AsyncMock(return_value=event_id)
+    out.resolve_or_create_dm = AsyncMock(return_value=dm_room_id)
     return out
 
 
@@ -43,10 +37,9 @@ def _run(coro):
 
 
 def test_approve_reaction_returns_allow_once():
-    client = _make_client()
     outbound = _make_outbound(event_id="$req")
     cfg = _make_config()
-    handler = MatrixExecApprovalHandler(client, outbound, cfg)
+    handler = MatrixExecApprovalHandler(outbound, cfg)
 
     async def _run_with_reaction():
         loop = asyncio.get_running_loop()
@@ -66,10 +59,9 @@ def test_approve_reaction_returns_allow_once():
 
 
 def test_deny_reaction_returns_deny():
-    client = _make_client()
     outbound = _make_outbound(event_id="$req")
     cfg = _make_config()
-    handler = MatrixExecApprovalHandler(client, outbound, cfg)
+    handler = MatrixExecApprovalHandler(outbound, cfg)
 
     async def _run_with_denial():
         async def _simulate_denial():
@@ -87,10 +79,9 @@ def test_deny_reaction_returns_deny():
 
 def test_timeout_returns_deny():
     """With no approvers list, should return deny immediately."""
-    client = _make_client()
     outbound = _make_outbound()
     cfg = _make_config(approvers=[])  # no approvers → immediate deny
-    handler = MatrixExecApprovalHandler(client, outbound, cfg)
+    handler = MatrixExecApprovalHandler(outbound, cfg)
 
     result = _run(handler.request_approval("some command"))
     assert result == "deny"
@@ -98,17 +89,14 @@ def test_timeout_returns_deny():
 
 def test_handle_reaction_no_pending_is_safe():
     """handle_reaction with an unknown event_id should not raise."""
-    handler = MatrixExecApprovalHandler(
-        _make_client(), _make_outbound(), _make_config()
-    )
+    handler = MatrixExecApprovalHandler(_make_outbound(), _make_config())
     handler.handle_reaction("$unknown_event", _APPROVE_EMOJI)  # should not raise
 
 
 def test_handle_reaction_only_resolves_matching_event():
-    client = _make_client()
     outbound = _make_outbound(event_id="$req_a")
     cfg = _make_config()
-    handler = MatrixExecApprovalHandler(client, outbound, cfg)
+    handler = MatrixExecApprovalHandler(outbound, cfg)
 
     async def _run_test():
         fut = asyncio.get_event_loop().create_future()

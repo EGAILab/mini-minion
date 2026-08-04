@@ -172,3 +172,34 @@ class MatrixOutbound:
                 }
             },
         )
+
+    async def resolve_or_create_dm(self, user_id: str) -> str | None:
+        """Find or open a DM room with ``user_id``.
+
+        Shared by any feature that needs to message a specific user directly
+        (exec approvals, device verification) rather than a configured room.
+
+        Args:
+            user_id: The Matrix user ID to DM, e.g. ``"@admin:example.org"``.
+
+        Returns:
+            The room ID string, or None on failure.
+        """
+        try:
+            # Check if the client already knows about a DM room with this user
+            # from a previous session (loaded during the initial sync).
+            direct_rooms = getattr(self._client, "direct_rooms", {})
+            if user_id in direct_rooms:
+                rooms = direct_rooms[user_id]
+                if rooms:
+                    # Return the first known DM room for this user.
+                    return list(rooms)[0]
+            # No existing DM room found — create a new one via the API.
+            # is_direct=True tags it as a DM in the homeserver's account data.
+            resp = await self._client.room_create(
+                is_direct=True,
+                invite=[user_id],
+            )
+            return getattr(resp, "room_id", None)
+        except Exception:
+            return None
