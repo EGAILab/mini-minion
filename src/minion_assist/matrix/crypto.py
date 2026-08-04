@@ -34,12 +34,21 @@ async def setup_crypto(client) -> bool:
     if not getattr(client, "olm", None):
         return False
 
+    # should_upload_keys is False once the account's keys are already on the
+    # homeserver (e.g. a previous run already uploaded them for this device).
+    # keys_upload() raises LocalProtocolError("No key upload needed.") in that
+    # case -- that's matrix-nio's normal way of saying "nothing to do", not a
+    # failure, so skip the call entirely rather than treating it as one.
+    if not getattr(client, "should_upload_keys", True):
+        return True
+
     try:
         # Upload the device's Ed25519 identity key and Curve25519 one-time keys
         # to the homeserver so other users can encrypt messages to this device.
         await client.keys_upload()
     except Exception as exc:
-        # Keys upload failure is non-fatal — the bot may already have uploaded
-        # keys from a previous run.
+        # Any other failure here is non-fatal -- sync_forever() retries key
+        # upload automatically on later sync cycles when should_upload_keys
+        # is True (see matrix-nio's async_client.py sync loop).
         print(f"[matrix] Warning: failed to upload device keys: {exc}", file=sys.stderr)
     return True
