@@ -22,7 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0"]
 tiktoken  = ["tiktoken>=0.7.0"]
-matrix    = ["matrix-nio[e2e]>=0.21", "aiosqlite>=0.19", "linkify-it-py>=2.0"]
+matrix    = ["matrix-nio>=0.21", "aiosqlite>=0.19", "linkify-it-py>=2.0"]
 postgres  = [
     "pgvector>=0.5.0",
     "psycopg[binary]>=3.1",

@@ -5,17 +5,14 @@ runs ``client.sync_forever()`` until the ``stop_event`` is set.
 
 Lifecycle
 ---------
-1. Authenticate via :func:`~minion_assist.matrix.auth.resolve_matrix_auth`,
-   which also wires up E2E crypto if ``config.encryption`` is True.
-2. Upload device keys if encryption activated (:func:`~minion_assist.matrix.crypto.setup_crypto`).
-3. Open the inbound-dedupe and thread-binding databases.
-4. Construct the outbound adapter, bot-loop protection, exec-approval handler,
-   verification handler, and room-message handler.
-5. Register matrix-nio callbacks for ``RoomMessageText``, ``InviteEvent``,
-   ``ReactionEvent`` (shared by exec approvals and verification), and — when
-   ``config.verification.enabled`` — the ``KeyVerification*`` to-device events.
-6. Start ``client.sync_forever()`` in a cancellation-aware task.
-7. On ``stop_event`` set: cancel the sync task and clean up.
+1. Authenticate via :func:`~minion_assist.matrix.auth.resolve_matrix_auth`.
+2. Open the inbound-dedupe and thread-binding databases.
+3. Construct the outbound adapter, bot-loop protection, exec-approval handler,
+   and room-message handler.
+4. Register matrix-nio callbacks for ``RoomMessageText``, ``InviteEvent``, and
+   ``ReactionEvent`` (used by exec approvals).
+5. Start ``client.sync_forever()`` in a cancellation-aware task.
+6. On ``stop_event`` set: cancel the sync task and clean up.
 
 This coroutine runs in a background daemon thread with its own asyncio event
 loop.  The main thread's REPL continues unaffected.
@@ -31,13 +28,11 @@ from .auth import resolve_matrix_auth
 from .auto_join import handle_invite
 from .bot_loop import BotLoopProtection
 from .config import MatrixConfig
-from .crypto import setup_crypto
 from .exec_approvals import MatrixExecApprovalHandler
 from .handler import MatrixMessageHandler
 from .inbound_dedupe import MatrixInboundDeduper
 from .outbound import MatrixOutbound
 from .thread_bindings import MatrixThreadBindingManager
-from .verification import MatrixVerificationHandler
 
 
 async def monitor_matrix(
@@ -70,27 +65,18 @@ async def monitor_matrix(
     matrix_dir = workspace / "matrix"
     dedupe_db = matrix_dir / "inbound_dedupe.db"
     thread_db = matrix_dir / "thread_bindings.db"
-    # A directory, not a single file: matrix-nio's SqliteStore derives its own
-    # filename (f"{user_id}_{device_id}.db") inside whatever path it's given.
-    crypto_dir = matrix_dir / "crypto"
 
-    # Step 1: authenticate.  Also wires up E2E encryption when config.encryption
-    # is True — matrix-nio requires store_path to be known at AsyncClient
-    # construction time, so this can't happen as a separate step afterwards.
-    client = await resolve_matrix_auth(config, crypto_store_dir=crypto_dir)
+    # Step 1: authenticate.
+    client = await resolve_matrix_auth(config)
 
-    # Step 2: upload device keys if encryption actually activated above.
-    if config.encryption:
-        await setup_crypto(client)
-
-    # Step 3: open supporting databases.
+    # Step 2: open supporting databases.
     dedupe = MatrixInboundDeduper(dedupe_db)
     await dedupe.start()
 
     thread_mgr = MatrixThreadBindingManager(thread_db, config.thread_bindings)
     await thread_mgr.start()
 
-    # Step 4: build the outbound adapter and optional helpers.
+    # Step 3: build the outbound adapter and optional helpers.
     outbound = MatrixOutbound(client, config)
     bot_loop = BotLoopProtection(config.bot_loop)
 
@@ -99,15 +85,7 @@ async def monitor_matrix(
     if config.exec_approvals.enabled:
         exec_approval = MatrixExecApprovalHandler(outbound, config.exec_approvals)
 
-    # Verification handler is optional too. It reuses exec_approvals.approvers
-    # as its allowlist rather than a second "people Ada trusts" list.
-    verification: MatrixVerificationHandler | None = None
-    if config.verification.enabled:
-        verification = MatrixVerificationHandler(
-            client, outbound, config.exec_approvals.approvers
-        )
-
-    # Step 5: build the message handler that ties everything together.
+    # Step 4: build the message handler that ties everything together.
     msg_handler = MatrixMessageHandler(
         client=client,
         config=config,
@@ -130,10 +108,10 @@ async def monitor_matrix(
     except ImportError as exc:
         raise RuntimeError(
             "matrix-nio is not installed. "
-            "Run: uv add --optional matrix 'matrix-nio[e2e]' aiosqlite"
+            "Run: uv add --optional matrix matrix-nio aiosqlite"
         ) from exc
 
-    # Step 6: register callbacks.  matrix-nio calls these for each matching event
+    # Step 5: register callbacks.  matrix-nio calls these for each matching event
     # during the sync loop.
     async def _on_room_message(room, event):
         await msg_handler.handle_room_message(room, event)
@@ -144,52 +122,16 @@ async def monitor_matrix(
     client.add_event_callback(_on_room_message, RoomMessageText)
     client.add_event_callback(_on_invite, InviteEvent)
 
-    # Reactions are the shared confirm/deny mechanism for both exec approvals
-    # and device verification — one callback, dispatched to whichever handler
-    # (if any) is waiting on that specific event ID.
-    if exec_approval or verification:
+    # Reactions are exec approvals' confirm/deny mechanism.
+    if exec_approval:
         async def _on_reaction(room, event):
-            if exec_approval:
-                exec_approval.handle_reaction(event.reacts_to, event.key)
-            if verification:
-                await verification.handle_reaction(event.reacts_to, event.key)
+            exec_approval.handle_reaction(event.reacts_to, event.key)
 
         client.add_event_callback(_on_reaction, ReactionEvent)
 
-    # Device verification runs entirely over to-device events — matrix-nio
-    # handles the crypto protocol internally, these callbacks just decide
-    # whether to accept and show the human the emoji to confirm.
-    if verification:
-        try:
-            from nio import (  # noqa: PLC0415
-                KeyVerificationCancel,
-                KeyVerificationKey,
-                KeyVerificationMac,
-                KeyVerificationStart,
-            )
-        except ImportError:
-            pass
-        else:
-            async def _on_verification_start(event):
-                await verification.handle_verification_start(event)
-
-            async def _on_verification_key(event):
-                await verification.handle_verification_key(event)
-
-            async def _on_verification_mac(event):
-                await verification.handle_verification_mac(event)
-
-            async def _on_verification_cancel(event):
-                await verification.handle_verification_cancel(event)
-
-            client.add_to_device_callback(_on_verification_start, KeyVerificationStart)
-            client.add_to_device_callback(_on_verification_key, KeyVerificationKey)
-            client.add_to_device_callback(_on_verification_mac, KeyVerificationMac)
-            client.add_to_device_callback(_on_verification_cancel, KeyVerificationCancel)
-
     print(f"[matrix] Connected as {config.user_id} on {config.homeserver}")
 
-    # Step 7: start the sync loop in the background.
+    # Step 6: start the sync loop in the background.
     # create_task() schedules the coroutine on the running event loop WITHOUT
     # blocking here — it runs concurrently while we await the stop signal.
     # timeout=30_000ms keeps long-polling efficient; full_state=True loads room
@@ -198,7 +140,7 @@ async def monitor_matrix(
         client.sync_forever(timeout=30_000, full_state=True)
     )
 
-    # Step 8: wait for either a fatal sync error OR a stop signal.
+    # Step 7: wait for either a fatal sync error OR a stop signal.
     # asyncio.wait() returns (done_set, pending_set) as soon as the first task
     # completes.  We use FIRST_COMPLETED so a stop() call exits immediately
     # rather than waiting for the sync loop to time out on its own.

@@ -152,7 +152,7 @@ minion-assist/
 │   ├── workspace.py             # Per-agent workspace management: ensure_workspace, check_workspace, WorkspaceVanishedError
 │   ├── spawn_registry.py        # Multi-agent spawn limits: get_spawn_depth, count_active_children, MAX_SPAWN_DEPTH
 │   ├── plugins.py               # Plugin manifest loader — tools, hooks, skills, and trust from plugins.json
-│   ├── matrix/                  # Optional Matrix channel (requires matrix-nio[e2e] + aiosqlite)
+│   ├── matrix/                  # Optional Matrix channel (requires matrix-nio + aiosqlite; no E2E — see ADR 0005)
 │   │   ├── channel.py           # MatrixChannel — lifecycle manager (daemon thread + asyncio loop)
 │   │   ├── monitor.py           # monitor_matrix() — auth, callbacks, sync loop, teardown
 │   │   ├── handler.py           # MatrixMessageHandler — full inbound pipeline
@@ -162,10 +162,8 @@ minion-assist/
 │   │   ├── thread_bindings.py   # SQLite thread-root → agent session key mapping
 │   │   ├── bot_loop.py          # Sliding-window rate limiter per room
 │   │   ├── exec_approvals.py    # DM-based remote tool approval via ✅/❌ reactions
-│   │   ├── verification.py      # Interactive SAS device-verification responder
 │   │   ├── auto_join.py         # Invite handler — always / allowlist / off policy
-│   │   ├── crypto.py            # E2E key upload after auth wires up encryption (needs libolm)
-│   │   ├── auth.py              # Authentication (token/password/SSO) — also wires up E2E crypto
+│   │   ├── auth.py              # Authentication — access token / password / SSO
 │   │   ├── config.py            # MatrixConfig and nested dataclasses
 │   │   ├── allowlist.py         # User-ID normalisation and wildcard allowlist check
 │   │   └── __init__.py
@@ -634,11 +632,14 @@ minion-assist can connect to a Matrix homeserver so agents are reachable from an
 ```bash
 # Install Matrix channel dependencies
 uv add "minion-assist[matrix]"
-
-# E2E encryption also requires libolm at the OS level (optional but recommended)
-# Ubuntu/Debian: apt install libolm-dev
-# macOS: brew install libolm
 ```
+
+> **No E2E encryption support.** This channel intentionally does not implement
+> Matrix's end-to-end encryption — see
+> [ADR 0005](docs/adr/0005-no-matrix-e2e-encryption.md) for why. Use an
+> unencrypted room; Matrix rooms cannot be un-encrypted once
+> `m.room.encryption` is set, so don't enable encryption on the room you
+> point this bot at.
 
 ### Configuration
 
@@ -662,9 +663,6 @@ Add a `channels.matrix` block to `config.json`:
       "execApprovals": {
         "enabled": true,
         "approvers": ["@alice:example.org"]
-      },
-      "verification": {
-        "enabled": true
       },
       "botLoop": {
         "enabled": true,
@@ -694,9 +692,8 @@ Add a `channels.matrix` block to `config.json`:
 | `threadBindings.enabled` | `true` to persist Matrix thread → conversation mapping in SQLite |
 | `execApprovals.enabled` | `true` to send bash tool approval requests via DM |
 | `execApprovals.approvers` | List of Matrix user IDs who receive approval DMs |
-| `verification.enabled` | `true` to let Ada respond to interactive SAS ("emoji") device-verification requests from users in `execApprovals.approvers` |
 | `botLoop.enabled` | `true` to rate-limit events per room (prevents bot loops) |
-| `storePath` | Directory for SQLite state and E2E crypto store |
+| `storePath` | Directory for SQLite state (dedupe, thread bindings) |
 
 ### How It Works
 
@@ -710,9 +707,7 @@ Add a `channels.matrix` block to `config.json`:
 
 **Exec approvals:** when an agent calls a bash command, the `MatrixExecApprovalHandler` sends a DM to each configured approver. Reacting ✅ approves the command; reacting ❌ denies it. Commands time out after 60 seconds (denied by default).
 
-**Device verification:** matrix-nio implements the SAS ("emoji") verification protocol itself but does nothing with it unless a client wires up accept/confirm calls — that's what `verification.enabled` does. When someone in `execApprovals.approvers` starts interactive verification with Ada (e.g. Element's "Start verification"), `MatrixVerificationHandler` accepts it, DMs the emoji short-authentication-string for comparison, and confirms or rejects based on a ✅/❌ reaction — reusing the same reaction mechanism as exec approvals. Requests from anyone not in that list are cancelled automatically rather than left hanging.
-
-**E2E encryption:** set `"encryption": true` under `channels.matrix` to enable it (requires libolm — see install notes above). When active, the bot uses matrix-nio's own SQLite-backed crypto store, keyed to a specific device ID. If `deviceId` isn't set in config.json, the bot looks it up automatically via `whoami()` on first connect (the store must be keyed to the same device the access token was issued for). Without libolm, or if no device ID can be resolved, the bot falls back to unencrypted communication with a console warning — it does not fail to start.
+**No E2E encryption:** this channel does not implement Matrix's end-to-end encryption, deliberately — see [ADR 0005](docs/adr/0005-no-matrix-e2e-encryption.md). Point it at an unencrypted room. If a room already has `m.room.encryption` set, create a fresh unencrypted room instead — Matrix rooms cannot be un-encrypted once that state event exists.
 
 **Bot-loop protection:** `BotLoopProtection` tracks event rates per room in a sliding window and enters a cooldown period if too many events arrive too quickly, preventing runaway bot-to-bot loops.
 
