@@ -391,15 +391,23 @@ class SessionDB:
             f"UPDATE sessions SET {', '.join(sets)} WHERE id = %s", params
         )
 
-    def get_sessions_by_ids(self, session_ids: list[str]) -> dict[str, dict]:
+    def get_sessions_by_ids(self, session_ids: list[str], agent_id: str) -> dict[str, dict]:
+        """Return session metadata for ``session_ids``, filtered to ``agent_id``.
+
+        The ``agent_id`` filter (MEM-GAP-002) means a session belonging to a
+        different agent is silently omitted from the result rather than
+        raising — callers (e.g. the session-search tool) treat "not in the
+        dict" the same as "doesn't exist", so a cross-agent id can't be used
+        to read another agent's session metadata.
+        """
         if not session_ids:
             return {}
         rows = self._conn().execute(
             """
             SELECT id, agent_id, title, started_at, last_active, turn_count
-            FROM sessions WHERE id = ANY(%s)
+            FROM sessions WHERE id = ANY(%s) AND agent_id = %s
             """,
-            (session_ids,),
+            (session_ids, agent_id),
         ).fetchall()
         return {
             r[0]: {
@@ -409,8 +417,14 @@ class SessionDB:
             for r in rows
         }
 
-    def list_sessions(self, limit: int = 20) -> list[dict]:
-        """Return most recent sessions, newest first."""
+    def list_sessions(self, agent_id: str, limit: int = 20) -> list[dict]:
+        """Return this agent's most recent sessions, newest first.
+
+        ``agent_id`` is mandatory (MEM-GAP-002) so one agent's browse/search
+        tool can never enumerate another agent's session history — every
+        agent's memory stays private to that agent, even from other agents
+        in the same deployment.
+        """
         rows = self._conn().execute(
             """
             SELECT s.id, s.agent_id, s.title, s.started_at, s.last_active, s.turn_count,
@@ -418,10 +432,11 @@ class SessionDB:
                  WHERE session_id = s.id AND role = 'user'
                  ORDER BY id LIMIT 1) AS first_message
             FROM sessions s
+            WHERE s.agent_id = %s
             ORDER BY s.last_active DESC
             LIMIT %s
             """,
-            (limit,),
+            (agent_id, limit),
         ).fetchall()
         return [
             {
@@ -507,8 +522,14 @@ class SessionDB:
         )
         return message_id
 
-    def search_messages(self, query: str, limit: int = 10) -> list[dict]:
-        """FTS search across all message content. Returns ranked matches."""
+    def search_messages(self, query: str, agent_id: str, limit: int = 10) -> list[dict]:
+        """FTS search across this agent's own message content only.
+
+        Joins to ``sessions`` and filters on ``agent_id`` (MEM-GAP-002) so a
+        full-text query can never surface another agent's conversation
+        history — agents are meant to be completely isolated from each
+        other's memory, even though they share one PostgreSQL database.
+        """
         rows = self._conn().execute(
             """
             SELECT
@@ -524,11 +545,13 @@ class SessionDB:
                 ) AS snippet,
                 ts_rank(m.search_vector, websearch_to_tsquery('english', %s)) AS rank
             FROM messages m
-            WHERE m.search_vector @@ websearch_to_tsquery('english', %s)
+            JOIN sessions s ON s.id = m.session_id
+            WHERE s.agent_id = %s
+              AND m.search_vector @@ websearch_to_tsquery('english', %s)
             ORDER BY rank DESC
             LIMIT %s
             """,
-            (query, query, query, limit),
+            (query, query, agent_id, query, limit),
         ).fetchall()
         return [
             {
@@ -539,10 +562,30 @@ class SessionDB:
             for r in rows
         ]
 
+    def _session_owned_by(self, session_id: str, agent_id: str) -> bool:
+        """Return ``True`` if ``session_id`` exists and belongs to ``agent_id``.
+
+        Used to fail closed (MEM-GAP-002) before reading any message content
+        keyed only by ``session_id`` — ``messages`` has no ``agent_id``
+        column of its own, so this ownership check is what stops a caller
+        from guessing another agent's session_id and scrolling through it.
+        """
+        row = self._conn().execute(
+            "SELECT 1 FROM sessions WHERE id = %s AND agent_id = %s",
+            (session_id, agent_id),
+        ).fetchone()
+        return row is not None
+
     def get_messages_around(
-        self, session_id: str, anchor_id: int, window: int = 5
+        self, session_id: str, agent_id: str, anchor_id: int, window: int = 5
     ) -> list[dict]:
-        """Return messages in [anchor_id-window, anchor_id+window] for a session."""
+        """Return messages in [anchor_id-window, anchor_id+window] for a session.
+
+        Returns an empty list (rather than raising) if ``session_id`` isn't
+        owned by ``agent_id`` — see :meth:`_session_owned_by`.
+        """
+        if not self._session_owned_by(session_id, agent_id):
+            return []
         if anchor_id <= 0:
             row = self._conn().execute(
                 "SELECT id FROM messages WHERE session_id = %s ORDER BY id DESC LIMIT 1",
@@ -566,9 +609,15 @@ class SessionDB:
         ]
 
     def get_session_bookends(
-        self, session_id: str, n: int = 3
+        self, session_id: str, agent_id: str, n: int = 3
     ) -> tuple[list[dict], list[dict]]:
-        """Return first n and last n user/assistant messages for a session."""
+        """Return first n and last n user/assistant messages for a session.
+
+        Returns ``([], [])`` if ``session_id`` isn't owned by ``agent_id``
+        (MEM-GAP-002) — see :meth:`_session_owned_by`.
+        """
+        if not self._session_owned_by(session_id, agent_id):
+            return [], []
         conn = self._conn()
         first = conn.execute(
             """

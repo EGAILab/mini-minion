@@ -35,7 +35,6 @@ def _make_config(user_id="@bot:example.org", groups=None):
     cfg.group_policy = "open"
     cfg.group_allow_from = []
     cfg.ack_reaction = None
-    cfg.thread_bindings = MagicMock(enabled=False)
     cfg.groups = groups or {}
     return cfg
 
@@ -58,7 +57,8 @@ def _make_handler(config=None, sessions=None, user_id="@bot:example.org", agents
     dedupe.is_seen = AsyncMock(return_value=False)
     bot_loop = MagicMock()
     bot_loop.should_suppress.return_value = False
-    thread_mgr = MagicMock()
+    room_session_mgr = MagicMock()
+    room_session_mgr.get_or_create_session_id = AsyncMock(return_value="room-session-abc")
     return MatrixMessageHandler(
         client=_make_client(user_id),
         config=config,
@@ -66,7 +66,7 @@ def _make_handler(config=None, sessions=None, user_id="@bot:example.org", agents
         outbound=outbound,
         dedupe=dedupe,
         bot_loop=bot_loop,
-        thread_binding_mgr=thread_mgr,
+        room_session_mgr=room_session_mgr,
         agents_cfg=agents_cfg,
         session_store=session_store,
         mcp_manager=mcp_manager,

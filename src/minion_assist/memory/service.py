@@ -272,7 +272,15 @@ class MemoryService:
                     self._agent_id, type(exc).__name__, exc,
                 )
 
-        hits = self._files.search(query, max_results=max_results)
+        # MEM-GAP-004: quarantined imports must not enter a corpus-agnostic
+        # search's results (the automatic per-turn injection path, and a
+        # plain search_memory call) — only an explicit corpus="import"
+        # request may see them, matching the indexed path's policy above.
+        # Excluding them from the candidate pool (rather than filtering
+        # after the fact) also means an excluded import can never crowd out
+        # an eligible note within max_results — see files.py's docstring.
+        exclude = frozenset() if corpus == "import" else frozenset({"import"})
+        hits = self._files.search(query, max_results=max_results, exclude_sources=exclude)
         if corpus is not None:
             legacy_source = _CORPUS_TO_LEGACY_SOURCE.get(corpus, corpus)
             hits = [h for h in hits if h.source == legacy_source]

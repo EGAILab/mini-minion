@@ -141,7 +141,7 @@ minion-assist/
 │   │   ├── todo.py              # TodoWriteTool, TodoReadTool — session-scoped todo list
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
 │   │   ├── write_daily_memory.py # WriteDailyMemoryTool — daily log append
-│   │   ├── session_search.py    # SessionSearchTool — FTS search across all past sessions (requires PostgreSQL)
+│   │   ├── session_search.py    # SessionSearchTool — FTS search across this agent's own past sessions (requires PostgreSQL)
 │   │   ├── browser.py           # BrowserTool — Playwright browser automation (start/navigate/evaluate/screenshot/pick/cookies/stop)
 │   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
@@ -159,7 +159,7 @@ minion-assist/
 │   │   ├── outbound.py          # MatrixOutbound — markdown-formatted chunked send, draft preview, reactions, typing indicators
 │   │   ├── format.py            # to_matrix_html() / build_content() — markdown → org.matrix.custom.html
 │   │   ├── inbound_dedupe.py    # SQLite-backed event-ID deduplication (24 h TTL)
-│   │   ├── thread_bindings.py   # SQLite thread-root → agent session key mapping
+│   │   ├── room_sessions.py     # SQLite (room_id, agent_id) → session_id mapping (MEM-GAP-001)
 │   │   ├── bot_loop.py          # Sliding-window rate limiter per room
 │   │   ├── exec_approvals.py    # DM-based remote tool approval via ✅/❌ reactions
 │   │   ├── auto_join.py         # Invite handler — always / allowlist / off policy
@@ -625,7 +625,7 @@ Ada: [tool: mcp__playwright__browser_navigate({'url': 'https://news.ycombinator.
 
 ## Matrix Channel
 
-minion-assist can connect to a Matrix homeserver so agents are reachable from any Matrix client (Element, Cinny, etc.). The channel runs in a background thread and shares the same `AgentSession` instances as the REPL — both can be active simultaneously.
+minion-assist can connect to a Matrix homeserver so agents are reachable from any Matrix client (Element, Cinny, etc.). The channel runs in a background thread. Each Matrix room gets its own isolated `AgentSession` (see "Room-scoped sessions" below) — the REPL's own session is separate and only used as a last-resort fallback.
 
 ### Prerequisites
 
@@ -659,7 +659,6 @@ Add a `channels.matrix` block to `config.json`:
       "groups": {
         "!roomid:example.org": {"agent": "researcher", "enabled": true}
       },
-      "threadBindings": {"enabled": true},
       "execApprovals": {
         "enabled": true,
         "approvers": ["@alice:example.org"]
@@ -689,17 +688,16 @@ Add a `channels.matrix` block to `config.json`:
 | `groupPolicy` | `"open"` (anyone may send) or `"allowlist"` (only listed users) |
 | `groupAllowFrom` | Global allowlist of Matrix user IDs; `"*"` permits everyone |
 | `groups` | Per-room overrides — map room IDs to `{"agent": "...", "enabled": true/false}` |
-| `threadBindings.enabled` | `true` to persist Matrix thread → conversation mapping in SQLite |
 | `execApprovals.enabled` | `true` to send bash tool approval requests via DM |
 | `execApprovals.approvers` | List of Matrix user IDs who receive approval DMs |
 | `botLoop.enabled` | `true` to rate-limit events per room (prevents bot loops) |
-| `storePath` | Directory for SQLite state (dedupe, thread bindings) |
+| `storePath` | Directory for SQLite state (dedupe, room sessions) |
 
 ### How It Works
 
 **Room routing:** each Matrix room can be mapped to a specific agent via `groups`. Messages in unmapped rooms go to `defaultAgentId`.
 
-**Thread continuity:** when `threadBindings.enabled = true`, each Matrix thread maps to a dedicated `AgentSession` history key persisted in SQLite. Replies within the same thread continue the same conversation across restarts.
+**Room-scoped sessions:** every `(room_id, agent_id)` pair gets its own persistent `AgentSession` — a room is this deployment's unit of conversation isolation (e.g. a "Movie" room and a "Work" room routed to the same agent never share history), not the Matrix thread feature. The binding is stored in SQLite (`matrix/room_sessions.db`) and survives restarts; a room's first message always starts a fresh session rather than inheriting any other room's history. See [ADR 0006](docs/adr/0006-room-scoped-matrix-sessions.md) for the full rationale.
 
 **Markdown formatting:** agent responses are automatically converted from markdown to `org.matrix.custom.html` before sending, so bold, code blocks, lists, and links render natively in Element and other Matrix clients. The `matrix/format.py` module handles conversion (using `markdown-it-py`) and intelligent paragraph chunking.
 
@@ -1103,7 +1101,7 @@ All ML packages (`silero_vad`, `torch`, `nemo`, `transformers`, `kokoro`, `piper
 
 ## PostgreSQL Session Store
 
-minion-assist can mirror every conversation message into a PostgreSQL database, enabling full-text search across all historical sessions via the `session_search` tool.  The file-based JSONL store always remains active — PostgreSQL is an additive layer, not a replacement.
+minion-assist can mirror every conversation message into a PostgreSQL database, enabling full-text search across an agent's own historical sessions via the `session_search` tool (strictly agent-scoped — see "session_search Tool Modes" below).  The file-based JSONL store always remains active — PostgreSQL is an additive layer, not a replacement.
 
 ### Setup
 
@@ -1200,7 +1198,7 @@ Without a configured database, none of the above run: `_memory_index`/`_memory_w
 
 ### Search, citations, and crash-safe reindex (Stage One Phase 3, slice C)
 
-`MemoryService.search()` now uses the lexical index when one is configured — a strictly larger corpus than the Phase 1 linear scan, since the index also covers root `MEMORY.md` (the linear scan never returns it at all). Each hit is a `MemoryHit` as before, now optionally carrying `rel_path`/`start_line`/`end_line`/`score` when it came from the index (`None` for a linear-scan hit). Pass `corpus="durable"|"daily"|"import"` to restrict results to one part of the memory root (`"proposal"` also works since Phase 5 slice B, but is excluded from the default `corpus=None` search — see "Proposals become searchable" below); the plan's fourth corpus, "sessions", is deliberately not offered here since it's already the separate `session_search` tool's job.
+`MemoryService.search()` now uses the lexical index when one is configured — a strictly larger corpus than the Phase 1 linear scan, since the index also covers root `MEMORY.md` (the linear scan never returns it at all). Each hit is a `MemoryHit` as before, now optionally carrying `rel_path`/`start_line`/`end_line`/`score` when it came from the index (`None` for a linear-scan hit). Pass `corpus="durable"|"daily"|"import"` to restrict results to one part of the memory root; `"proposal"` also works (Phase 5 slice B). A plain `corpus=None` search — used both for automatic per-turn injection and a bare `search_memory` call — excludes both `"proposal"` and `"import"` chunks by default (MEM-GAP-004): unreviewed capture-job proposals and quarantined imports never enter automatic recall unless a caller explicitly asks for that corpus, since neither has been reviewed and imports in particular can carry externally-sourced text. This applies to the no-index linear-scan fallback too (`MemoryFileRepository.search()`'s `exclude_sources` parameter). The plan's fourth corpus, "sessions", is deliberately not offered here since it's already the separate `session_search` tool's job.
 
 **Fallback behavior:** without a configured database, or if an index search call raises (e.g. a transient connection drop), `search()` falls back to the Phase 1 linear scan rather than failing the caller — a turn's `<relevant_memories>` injection must never break over a database hiccup. This fallback is not silent: a failed index search is logged at `WARNING`, and `deep_status()`/`memory status --deep` surface ongoing index health so a persistently broken index isn't invisible.
 
@@ -1299,7 +1297,7 @@ All of this is best-effort and never blocks a search or a turn: a failed telemet
 
 Every proposal `CaptureWorker` records (`memory_proposals`, Phase 2 slice C) is now also indexed into `PostgresMemoryIndex` right after it's created, under a new `source_kind = "proposal"` and a synthetic `rel_path` of `proposals/{proposal_id}` (a proposal has no real file on disk). This is what lets Phase 5's later consolidation-ranking slice reuse the same recall-telemetry machinery (`hash_query`/`recall_stats`) on proposals that already exists for real notes.
 
-**Gated, not just indexed.** Making proposals searchable does **not** mean they show up in normal conversation. `hybrid_search()`'s corpus-agnostic default (`corpus=None`) explicitly excludes `source_kind = "proposal"` chunks — every lane (lexical, path, vector) adds `AND source_kind != 'proposal'` unless the caller passes `corpus="proposal"` explicitly. Per-turn `<relevant_memories>` injection and a normal `search_memory` call never pass that, so an unreviewed proposal can never masquerade as a reviewed note in the model's context. (The pinned and recent lanes need no such guard: pins can only ever point at topic notes, and the recent lane only surfaces files with a `memory_files` ledger row — which proposals deliberately never get, see below.)
+**Gated, not just indexed.** Making proposals searchable does **not** mean they show up in normal conversation. `hybrid_search()`'s corpus-agnostic default (`corpus=None`) explicitly excludes `source_kind IN ('proposal', 'import')` chunks — every lane (lexical, path, vector, pinned, recent) applies this same exclusion unless the caller passes `corpus="proposal"` or `corpus="import"` explicitly (MEM-GAP-004 extended the same policy to imports). Per-turn `<relevant_memories>` injection and a normal `search_memory` call never pass that, so an unreviewed proposal or quarantined import can never masquerade as a reviewed note in the model's context. (For proposals specifically, the pinned/recent lanes' guard is defense-in-depth rather than closing an active gap: pins can only ever point at topic notes, and the recent lane only surfaces files with a `memory_files` ledger row — which proposals deliberately never get, see below. Imports *do* get a real ledger row like any other file, so the same guard on those two lanes is what actually keeps a freshly-indexed or pinned import out of automatic recall.)
 
 **No reconciliation ledger row.** Unlike a real file, a proposal never gets a `memory_files` row: that ledger exists to hash-diff indexed content against on-disk content (`reconcile_agent()`), which doesn't apply to a proposal — it's written once and never edited in place. Because it has no ledger row, `rebuild_agent()`/`reconcile_agent()` (which only ever look at `memory_files`) never touch it; `force_rebuild_agent()`'s crash-safe live-swap explicitly excludes `source_kind = 'proposal'` from the ledger-driven DELETE it does for files, so a force-rebuild (a files-only operation) can never wipe out proposal chunks that happen to share the same `memory_chunks` table.
 
@@ -1593,11 +1591,18 @@ This completes Stage One Phase 7 (the plan's optional personal knowledge layer) 
 
 ### `session_search` Tool Modes
 
+Every mode is scoped to the calling agent's own sessions only (MEM-GAP-002)
+— `SessionSearchTool` is constructed per-agent with that agent's `agent_id`,
+and every underlying `SessionDB` query filters on it. An agent can search
+across all of *its own* rooms/topics, but can never see another agent's
+sessions, even a guessed session_id from a different agent — the query
+simply returns nothing for it, the same as a session_id that doesn't exist.
+
 | Mode | Description |
 |---|---|
-| `DISCOVER` | FTS query across all sessions. Returns ranked matches with a snippet, ±3 message context window, and session bookends (first/last messages). Supports AND (default), OR, `"quoted phrase"`, `-exclude`, `prefix*`. |
-| `SCROLL` | Read messages around a specific message ID in one session. Accepts `anchor_message_id` (0 = end of session) and `window` (default 5, max 20). |
-| `BROWSE` | List the 20 most recent sessions with title, turn count, age, and first-message preview. |
+| `DISCOVER` | FTS query across this agent's own sessions. Returns ranked matches with a snippet, ±3 message context window, and session bookends (first/last messages). Supports AND (default), OR, `"quoted phrase"`, `-exclude`, `prefix*`. |
+| `SCROLL` | Read messages around a specific message ID in one of this agent's own sessions. Accepts `anchor_message_id` (0 = end of session) and `window` (default 5, max 20). |
+| `BROWSE` | List this agent's own 20 most recent sessions with title, turn count, age, and first-message preview. |
 
 ### Data directory
 
@@ -2006,7 +2011,7 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `GitStatusTool` | `git_status` | Show git working-tree status (`git status --short --branch`): branch name, staged, modified, and untracked files. `is_read_only=True`. |
 | `GitDiffTool` | `git_diff` | Show a unified diff of changes. Optional `staged=true` for staged changes; optional `path` to limit to a file. `is_read_only=True`. |
 | `GitCommitTool` | `git_commit` | Stage files (optional `files` list) and create a git commit with the given `message`. Calls the `bash_confirm` callback before executing, same as `BashTool`. |
-| `SessionSearchTool` | `session_search` | Search, scroll, or browse past conversation sessions stored in PostgreSQL. Three modes: **DISCOVER** (FTS across all sessions — supports quoted phrases, `-exclude`, `prefix*`), **SCROLL** (paginate within a session by message ID), **BROWSE** (list recent sessions). Only registered when a `database.url` is configured. `is_read_only=True`. |
+| `SessionSearchTool` | `session_search` | Search, scroll, or browse past conversation sessions stored in PostgreSQL, scoped to the calling agent's own sessions only (MEM-GAP-002). Three modes: **DISCOVER** (FTS across this agent's own sessions — supports quoted phrases, `-exclude`, `prefix*`), **SCROLL** (paginate within one of this agent's own sessions by message ID), **BROWSE** (list this agent's own recent sessions). Only registered when a `database.url` is configured *and* an `agent_id` is known. `is_read_only=True`. |
 | `McpStatusTool` | `mcp_status` | List all configured MCP servers and their connection status. |
 | `ListMcpResourcesTool` | `list_mcp_resources` | List resources available on a connected MCP server. |
 | `ReadMcpResourceTool` | `read_mcp_resource` | Read a specific resource from a connected MCP server. Output capped at 8 000 chars. |

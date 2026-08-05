@@ -1649,15 +1649,19 @@ class PostgresMemoryIndex:
                 and ``score`` (the ``ts_rank`` value).
         """
         conn = self._conn()
-        # Proposals (Stage One Phase 5, slice B) are unreviewed capture-job
-        # output — never surfaced by a corpus-agnostic search (which is what
-        # per-turn injection and search_memory both do) unless a caller
-        # explicitly asks for corpus="proposal" (Phase 5 slice C/D's
-        # consolidation review). Every lane below follows this same rule.
+        # Proposals (unreviewed capture-job output) AND imports (unreviewed
+        # quarantined notes — MEM-GAP-004) are never surfaced by a
+        # corpus-agnostic search (which is what per-turn injection and
+        # search_memory both do by default) unless a caller explicitly asks
+        # for corpus="proposal" or corpus="import". Without this, unreviewed
+        # or externally-sourced text could be injected straight into the
+        # system prompt (or a search result) as if it were reviewed,
+        # trusted memory — a prompt-injection path. Every lane below follows
+        # this same rule.
         if corpus:
             corpus_sql = " AND source_kind = %s"
         else:
-            corpus_sql = " AND source_kind != 'proposal'"
+            corpus_sql = " AND source_kind NOT IN ('proposal', 'import')"
         params: list = [query, agent_id, query]
         if corpus:
             params.append(corpus)
@@ -1804,13 +1808,13 @@ class PostgresMemoryIndex:
         conn = self._conn()
         term_conditions = " OR ".join(["rel_path ILIKE %s"] * len(terms))
         params: list = [agent_id] + [f"%{t}%" for t in terms]
-        # See search()'s comment: proposals are excluded from a
+        # See search()'s comment: proposals and imports are excluded from a
         # corpus-agnostic query unless explicitly requested.
         if corpus:
             corpus_sql = " AND source_kind = %s"
             params.append(corpus)
         else:
-            corpus_sql = " AND source_kind != 'proposal'"
+            corpus_sql = " AND source_kind NOT IN ('proposal', 'import')"
         params.append(limit)
 
         rows = conn.execute(
@@ -1850,12 +1854,12 @@ class PostgresMemoryIndex:
             return []
 
         conn = self._conn()
-        # See search()'s comment: proposals are excluded from a
+        # See search()'s comment: proposals and imports are excluded from a
         # corpus-agnostic query unless explicitly requested.
         if corpus:
             corpus_sql = " AND mc.source_kind = %s"
         else:
-            corpus_sql = " AND mc.source_kind != 'proposal'"
+            corpus_sql = " AND mc.source_kind NOT IN ('proposal', 'import')"
         # Parameter order must match the SQL's %s occurrences top-to-bottom:
         # similarity's query_vector, the JOIN's model_identity, agent_id,
         # (corpus), ORDER BY's query_vector again, then LIMIT.
@@ -1893,12 +1897,18 @@ class PostgresMemoryIndex:
         ]
 
     def _pinned_lane(self, agent_id: str, corpus: str | None) -> list[dict]:
-        """Every chunk of every currently pinned file, most recently pinned first."""
+        """Every chunk of every currently pinned file, most recently pinned first.
+
+        See ``search()``'s comment: proposals and imports are excluded from
+        a corpus-agnostic query unless explicitly requested — applied here
+        too so an unreviewed note can't reach automatic recall just because
+        it happens to be pinned.
+        """
         pinned_paths = self.pinned_files(agent_id)
         if not pinned_paths:
             return []
         conn = self._conn()
-        corpus_sql = " AND source_kind = %s" if corpus else ""
+        corpus_sql = " AND source_kind = %s" if corpus else " AND source_kind NOT IN ('proposal', 'import')"
         params: list = [agent_id, pinned_paths]
         if corpus:
             params.append(corpus)
@@ -1922,9 +1932,17 @@ class PostgresMemoryIndex:
         ]
 
     def _recent_lane(self, agent_id: str, corpus: str | None, limit: int) -> list[dict]:
-        """Most recently indexed files' chunks, regardless of content match."""
+        """Most recently indexed files' chunks, regardless of content match.
+
+        See ``search()``'s comment: proposals and imports are excluded from
+        a corpus-agnostic query unless explicitly requested — applied here
+        too so a just-captured unreviewed note can't reach automatic recall
+        merely by being the most recently indexed file.
+        """
         conn = self._conn()
-        corpus_sql = " AND mf.source_kind = %s" if corpus else ""
+        corpus_sql = (
+            " AND mf.source_kind = %s" if corpus else " AND mf.source_kind NOT IN ('proposal', 'import')"
+        )
         params: list = [agent_id]
         if corpus:
             params.append(corpus)

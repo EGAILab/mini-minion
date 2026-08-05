@@ -1,5 +1,7 @@
 """Tests for default_registry factory."""
 
+from unittest.mock import Mock
+
 from minion_assist.tools import default_registry
 
 
@@ -102,3 +104,25 @@ def test_default_registry_bash_confirm_callable_cancel():
     reg = default_registry(bash_confirm=lambda _: False)
     result = reg.execute("bash", {"command": "echo should-not-run"})
     assert "cancelled" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# session_search tool registration — agent scoping (MEM-GAP-002)
+# ---------------------------------------------------------------------------
+
+
+def test_session_search_not_registered_without_a_db():
+    reg = default_registry(agent_id="main")
+    assert "session_search" not in {d["function"]["name"] for d in reg.definitions}
+
+
+def test_session_search_not_registered_without_an_agent_id():
+    # A db without a known owning agent must not register the tool at all —
+    # there's no safe unscoped fallback (MEM-GAP-002).
+    reg = default_registry(db=Mock())
+    assert "session_search" not in {d["function"]["name"] for d in reg.definitions}
+
+
+def test_session_search_registered_when_db_and_agent_id_are_both_given():
+    reg = default_registry(db=Mock(), agent_id="main")
+    assert "session_search" in {d["function"]["name"] for d in reg.definitions}

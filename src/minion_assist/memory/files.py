@@ -322,7 +322,13 @@ class MemoryFileRepository:
     # Search — same scoring as LongTermMemory.search(), now spanning three sources
     # -----------------------------------------------------------------
 
-    def search(self, query: str, max_results: int = _SEARCH_MAX_RESULTS) -> list[MemoryHit]:
+    def search(
+        self,
+        query: str,
+        max_results: int = _SEARCH_MAX_RESULTS,
+        *,
+        exclude_sources: frozenset[str] = frozenset(),
+    ) -> list[MemoryHit]:
         """Search topic notes, imported notes, and daily notes, ranked by term frequency.
 
         Scoring is unchanged from ``LongTermMemory.search()``: notes matching
@@ -335,6 +341,14 @@ class MemoryFileRepository:
         Args:
             query: One or more keywords, space-separated.
             max_results: Maximum notes to return.
+            exclude_sources: Source tags to leave out of the candidate pool
+                entirely (MEM-GAP-004) — applied *before* scoring/truncation,
+                so an excluded source can never crowd out an eligible one
+                within ``max_results``. ``MemoryService.search()`` passes
+                ``{"import"}`` here for a corpus-agnostic call, so quarantined
+                notes never reach automatic per-turn recall in the
+                degraded/local-fallback path (they're still reachable via an
+                explicit ``corpus="import"`` search — see its docstring).
 
         Returns:
             list[MemoryHit]: Best matches first, each tagged with its source
@@ -345,12 +359,15 @@ class MemoryFileRepository:
             return []
 
         candidates: list[tuple[str, Path]] = []
-        candidates.extend(("topic", p) for p in self._topics_dir.glob("*.md"))
-        candidates.extend(("import", p) for p in self._imports_dir.glob("*.md"))
+        if "topic" not in exclude_sources:
+            candidates.extend(("topic", p) for p in self._topics_dir.glob("*.md"))
+        if "import" not in exclude_sources:
+            candidates.extend(("import", p) for p in self._imports_dir.glob("*.md"))
         # Non-recursive glob on memory_dir itself only matches YYYY-MM-DD.md
         # files directly inside it — topics/ and imports/ are subdirectories
         # and are not matched again here.
-        candidates.extend(("daily", p) for p in self._memory_dir.glob("*.md"))
+        if "daily" not in exclude_sources:
+            candidates.extend(("daily", p) for p in self._memory_dir.glob("*.md"))
 
         scored: list[tuple[float, str, str, str]] = []  # (score, key, content, source)
         for source, p in candidates:

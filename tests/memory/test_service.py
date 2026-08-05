@@ -124,6 +124,27 @@ def test_search_with_corpus_filters_linear_scan_results_by_legacy_source(service
     assert durable_only[0].key == "topic-note"
 
 
+def test_search_excludes_imports_by_default_in_the_linear_scan(service):
+    # MEM-GAP-004: a corpus-agnostic search (the default — used for
+    # automatic per-turn injection) must not surface unreviewed imports,
+    # even in the no-index local/basic fallback path.
+    service.remember("topic-note", "shared keyword")
+    service.remember_import("import-note", "shared keyword")
+
+    results = service.search("shared keyword")
+
+    assert [hit.key for hit in results] == ["topic-note"]
+
+
+def test_search_with_corpus_import_still_finds_import_notes_in_the_linear_scan(service):
+    # Explicit review access to quarantined content must still work.
+    service.remember_import("import-note", "shared keyword")
+
+    results = service.search("shared keyword", corpus="import")
+
+    assert [hit.key for hit in results] == ["import-note"]
+
+
 # ---------------------------------------------------------------------------
 # search — with a configured lexical index (Stage One Phase 3, slice C)
 # ---------------------------------------------------------------------------

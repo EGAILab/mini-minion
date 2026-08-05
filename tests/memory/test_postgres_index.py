@@ -934,6 +934,43 @@ def test_hybrid_search_finds_proposals_when_explicitly_requested(index, agent_id
     assert [r["rel_path"] for r in results] == ["proposals/42"]
 
 
+def test_search_excludes_imports_by_default(index, agent_id):
+    # MEM-GAP-004: unreviewed imports must not surface in a corpus-agnostic
+    # search, same as proposals above.
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User likes dark mode.")
+    index.reindex_file(agent_id, "memory/imports/wiki-note.md", "import", "User prefers dark mode.")
+
+    results = index.search(agent_id, "dark mode")
+
+    assert [r["rel_path"] for r in results] == ["MEMORY.md"]
+
+
+def test_search_finds_imports_when_explicitly_requested(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User likes dark mode.")
+    index.reindex_file(agent_id, "memory/imports/wiki-note.md", "import", "User prefers dark mode.")
+
+    results = index.search(agent_id, "dark mode", corpus="import")
+
+    assert [r["rel_path"] for r in results] == ["memory/imports/wiki-note.md"]
+
+
+def test_hybrid_search_excludes_imports_by_default(index, agent_id):
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "User likes dark mode.")
+    index.reindex_file(agent_id, "memory/imports/wiki-note.md", "import", "User prefers dark mode.")
+
+    results = index.hybrid_search(agent_id, "dark mode")
+
+    assert all(r["rel_path"] != "memory/imports/wiki-note.md" for r in results)
+
+
+def test_hybrid_search_finds_imports_when_explicitly_requested(index, agent_id):
+    index.reindex_file(agent_id, "memory/imports/wiki-note.md", "import", "User prefers dark mode.")
+
+    results = index.hybrid_search(agent_id, "dark mode", corpus="import")
+
+    assert [r["rel_path"] for r in results] == ["memory/imports/wiki-note.md"]
+
+
 def test_force_rebuild_agent_does_not_delete_proposal_chunks(index, agent_id):
     # force_rebuild_agent is a files-only operation (see its docstring) —
     # proposal chunks share memory_chunks but must survive it untouched.

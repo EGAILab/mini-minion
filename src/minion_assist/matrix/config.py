@@ -70,23 +70,6 @@ class MatrixDmConfig:
 
 
 @dataclass
-class MatrixThreadBindingsConfig:
-    """Thread-binding settings under ``channels.matrix.threadBindings``."""
-    enabled: bool = True
-    idle_hours: float = 1.0
-    max_age_hours: float = 24.0
-
-    @classmethod
-    def from_dict(cls, raw: dict) -> "MatrixThreadBindingsConfig":
-        """Parse a raw config dict into a MatrixThreadBindingsConfig."""
-        return cls(
-            enabled=raw.get("enabled", True),
-            idle_hours=float(raw.get("idleHours", 1.0)),
-            max_age_hours=float(raw.get("maxAgeHours", 24.0)),
-        )
-
-
-@dataclass
 class MatrixExecApprovalsConfig:
     """Exec-approval settings under ``channels.matrix.execApprovals``."""
     enabled: bool = False
@@ -141,7 +124,6 @@ class MatrixConfig:
         group_allow_from:  Global sender allowlist for group rooms.
         dm:                DM-specific policy config.
         groups:            Per-room config keyed by room ID or alias.
-        thread_bindings:   Thread-binding (thread = isolated session) config.
         exec_approvals:    Remote approval-via-DM config for tool execution.
         bot_loop:          Bot-loop rate-limit protection config.
         default_agent_id:  Agent to use when no per-room mapping matches.
@@ -162,7 +144,6 @@ class MatrixConfig:
     group_allow_from: list[str] = field(default_factory=list)
     dm: MatrixDmConfig = field(default_factory=MatrixDmConfig)
     groups: dict[str, MatrixRoomConfig] = field(default_factory=dict)
-    thread_bindings: MatrixThreadBindingsConfig = field(default_factory=MatrixThreadBindingsConfig)
     exec_approvals: MatrixExecApprovalsConfig = field(default_factory=MatrixExecApprovalsConfig)
     bot_loop: MatrixBotLoopConfig = field(default_factory=MatrixBotLoopConfig)
     default_agent_id: str = "main"
@@ -198,7 +179,6 @@ class MatrixConfig:
             groups[room_id] = MatrixRoomConfig.from_dict(room_raw or {})
 
         dm_raw = raw.get("dm") or {}
-        thread_raw = raw.get("threadBindings") or {}
         exec_raw = raw.get("execApprovals") or {}
         loop_raw = raw.get("botLoopProtection") or {}
 
@@ -217,7 +197,6 @@ class MatrixConfig:
             group_allow_from=list(raw.get("groupAllowFrom") or []),
             dm=MatrixDmConfig.from_dict(dm_raw),
             groups=groups,
-            thread_bindings=MatrixThreadBindingsConfig.from_dict(thread_raw),
             exec_approvals=MatrixExecApprovalsConfig.from_dict(exec_raw),
             bot_loop=MatrixBotLoopConfig.from_dict(loop_raw),
             default_agent_id=raw.get("defaultAgent", "main"),

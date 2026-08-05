@@ -17,10 +17,19 @@ if TYPE_CHECKING:
 
 
 class SessionSearchTool(Tool):
-    """Search, scroll, or browse past conversation sessions stored in PostgreSQL."""
+    """Search, scroll, or browse past conversation sessions stored in PostgreSQL.
 
-    def __init__(self, db: "SessionDB") -> None:
+    Scoped to a single owning agent (MEM-GAP-002): every DB call below
+    passes ``self._agent_id``, so this tool can only ever see the
+    conversation history that belongs to the agent it was built for. Agents
+    are meant to have completely private memory from each other, even when
+    they share one PostgreSQL database — one agent's `session_search` must
+    never be able to enumerate or read another agent's sessions.
+    """
+
+    def __init__(self, db: "SessionDB", agent_id: str) -> None:
         self._db = db
+        self._agent_id = agent_id
 
     @property
     def schema(self) -> ToolSchema:
@@ -83,7 +92,7 @@ class SessionSearchTool(Tool):
         if not query.strip():
             return "Error: 'query' is required for DISCOVER mode."
         try:
-            matches = self._db.search_messages(query, limit=15)
+            matches = self._db.search_messages(query, self._agent_id, limit=15)
         except Exception as exc:
             return f"Search error: {exc}"
 
@@ -97,7 +106,7 @@ class SessionSearchTool(Tool):
             if sid not in seen or m["rank"] > seen[sid]["rank"]:
                 seen[sid] = m
 
-        session_metas = self._db.get_sessions_by_ids(list(seen.keys()))
+        session_metas = self._db.get_sessions_by_ids(list(seen.keys()), self._agent_id)
 
         parts = [
             f"[Session search: {query!r} — {len(seen)} session(s) matched]\n"
@@ -108,8 +117,10 @@ class SessionSearchTool(Tool):
             title = meta.get("title") or "(untitled)"
             agent_id = meta.get("agent_id", "?")
 
-            start_msgs, end_msgs = self._db.get_session_bookends(session_id, n=2)
-            context_msgs = self._db.get_messages_around(session_id, m["id"], window=3)
+            start_msgs, end_msgs = self._db.get_session_bookends(session_id, self._agent_id, n=2)
+            context_msgs = self._db.get_messages_around(
+                session_id, self._agent_id, m["id"], window=3
+            )
 
             parts.append(f"## [{agent_id}] {session_id[:8]}… — {title}")
             snippet = m.get("snippet") or (m["content"] or "")[:200]
@@ -148,7 +159,9 @@ class SessionSearchTool(Tool):
             return "Error: 'session_id' is required for SCROLL mode."
         window = max(1, min(20, window))
         try:
-            msgs = self._db.get_messages_around(session_id, anchor_id, window=window)
+            msgs = self._db.get_messages_around(
+                session_id, self._agent_id, anchor_id, window=window
+            )
         except Exception as exc:
             return f"Scroll error: {exc}"
 
@@ -170,7 +183,7 @@ class SessionSearchTool(Tool):
 
     def _browse(self) -> str:
         try:
-            sessions = self._db.list_sessions(limit=20)
+            sessions = self._db.list_sessions(self._agent_id, limit=20)
         except Exception as exc:
             return f"Browse error: {exc}"
 

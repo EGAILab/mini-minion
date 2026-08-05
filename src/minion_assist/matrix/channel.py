@@ -46,6 +46,7 @@ class MatrixChannel:
         self._mcp_manager: object = None
         self._skills: dict | None = None
         self._short_term: object = None
+        self._session_factories: dict | None = None
 
     def start(
         self,
@@ -55,6 +56,7 @@ class MatrixChannel:
         mcp_manager: object = None,
         skills: dict | None = None,
         short_term: object = None,
+        session_factories: dict | None = None,
     ) -> None:
         """Start the Matrix listener in a background daemon thread.
 
@@ -65,6 +67,11 @@ class MatrixChannel:
             mcp_manager:  McpClientManager instance (for /mcp-* commands).
             skills:       Loaded skill map (for /skills command).
             short_term:   ShortTermMemory instance (for /session and /rename commands).
+            session_factories: Dict mapping agent_id → a callable that builds
+                a fresh ``AgentSession`` for that agent given a session_id.
+                Used to give each Matrix room its own isolated session
+                (MEM-GAP-001) instead of every room sharing ``sessions``'
+                single entry per agent.
         """
         if self._started:
             return
@@ -74,6 +81,7 @@ class MatrixChannel:
         self._mcp_manager = mcp_manager
         self._skills = skills
         self._short_term = short_term
+        self._session_factories = session_factories
         # daemon=True means the thread is killed automatically when the main
         # process exits — no need to call stop() on a clean REPL exit.
         self._thread = threading.Thread(
@@ -132,4 +140,5 @@ class MatrixChannel:
             mcp_manager=self._mcp_manager,
             skills=self._skills,
             short_term=self._short_term,
+            session_factories=self._session_factories,
         )

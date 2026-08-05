@@ -326,6 +326,35 @@ def test_search_respects_max_results(tmp_path):
     assert len(results) == 2
 
 
+def test_search_exclude_sources_omits_import_notes(tmp_path):
+    # MEM-GAP-004: exclude_sources lets a caller keep unreviewed imports out
+    # of a corpus-agnostic search entirely.
+    repo = MemoryFileRepository(tmp_path)
+    (tmp_path / "memory" / "imports" / "wiki-note.md").write_text(
+        "rate limit is 100 requests per minute", encoding="utf-8"
+    )
+    assert repo.search("rate limit", exclude_sources=frozenset({"import"})) == []
+
+
+def test_search_exclude_sources_does_not_affect_other_sources(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember("api-notes", "rate limit best practices")
+    [hit] = repo.search("rate limit", exclude_sources=frozenset({"import"}))
+    assert hit.key == "api-notes"
+
+
+def test_search_exclude_sources_does_not_let_an_excluded_hit_crowd_out_max_results(tmp_path):
+    # An excluded import must not consume one of max_results' slots even
+    # though it would otherwise rank first (exact match vs. partial).
+    repo = MemoryFileRepository(tmp_path)
+    (tmp_path / "memory" / "imports" / "best-match.md").write_text(
+        "python django rest python django rest", encoding="utf-8"
+    )
+    repo.remember("other-match", "python")
+    results = repo.search("python django rest", max_results=1, exclude_sources=frozenset({"import"}))
+    assert [hit.key for hit in results] == ["other-match"]
+
+
 # ---------------------------------------------------------------------------
 # resolve_path
 # ---------------------------------------------------------------------------

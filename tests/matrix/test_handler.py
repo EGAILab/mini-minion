@@ -20,16 +20,13 @@ def _run(coro):
 
 
 def _make_config(group_policy="open", group_allow_from=None, groups=None, ack_reaction="👀",
-                 default_agent_id="main", thread_bindings_enabled=False):
+                 default_agent_id="main"):
     cfg = MagicMock(spec=MatrixConfig)
     cfg.group_policy = group_policy
     cfg.group_allow_from = group_allow_from or []
     cfg.groups = groups or {}
     cfg.ack_reaction = ack_reaction
     cfg.default_agent_id = default_agent_id
-    tb = MagicMock()
-    tb.enabled = thread_bindings_enabled
-    cfg.thread_bindings = tb
     return cfg
 
 
@@ -58,10 +55,10 @@ def _make_outbound():
     return o
 
 
-def _make_thread_mgr():
-    t = MagicMock()
-    t.get_or_create_session_key = AsyncMock(return_value="matrix-thread-abc")
-    return t
+def _make_room_session_mgr():
+    m = MagicMock()
+    m.get_or_create_session_id = AsyncMock(return_value="room-session-abc")
+    return m
 
 
 def _make_session(response="Agent reply"):
@@ -91,7 +88,7 @@ def _make_handler(config=None, sessions=None, dedupe=None, bot_loop=None, outbou
     dedupe = dedupe or _make_dedupe()
     bot_loop = bot_loop or _make_bot_loop()
     outbound = outbound or _make_outbound()
-    thread_mgr = _make_thread_mgr()
+    room_session_mgr = _make_room_session_mgr()
     return MatrixMessageHandler(
         client=_make_client(),
         config=config,
@@ -99,7 +96,7 @@ def _make_handler(config=None, sessions=None, dedupe=None, bot_loop=None, outbou
         outbound=outbound,
         dedupe=dedupe,
         bot_loop=bot_loop,
-        thread_binding_mgr=thread_mgr,
+        room_session_mgr=room_session_mgr,
         exec_approval_handler=None,
     )
 

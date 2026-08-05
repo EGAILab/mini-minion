@@ -165,9 +165,12 @@ def default_registry(
     ]:
         registry.register(tool)
 
-    # Session search tool — only when a PostgreSQL db is connected.
-    if db is not None:
-        registry.register(SessionSearchTool(db))
+    # Session search tool — only when a PostgreSQL db is connected AND we know
+    # which agent owns this registry. agent_id is required (not just db) so
+    # the tool is always built scoped to one agent (MEM-GAP-002) rather than
+    # ever defaulting to an unscoped/global view of every agent's sessions.
+    if db is not None and agent_id is not None:
+        registry.register(SessionSearchTool(db, agent_id))
 
     # Memory tools — only when a backend is provided.
     # SaveMemoryTool and WriteDailyMemoryTool receive policy so /plan read-only

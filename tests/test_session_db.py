@@ -1021,3 +1021,102 @@ def test_delete_commitment_is_scoped_to_the_given_agent(db, session_id):
 
     assert deleted is False
     assert db.get_commitment(created["id"]) is not None
+
+
+# ---------------------------------------------------------------------------
+# Agent isolation for session-search reads (MEM-GAP-002)
+#
+# SessionSearchTool lets an agent search/browse/scroll its own past
+# conversations. Before this fix, none of the methods below took an
+# agent_id, so any agent (or a guessed session_id) could read any other
+# agent's session history. Every test here plants a "main" session and
+# proves a "researcher"-scoped call can't see it — including via an id it
+# already knows, not just via listing/searching.
+# ---------------------------------------------------------------------------
+
+def test_search_messages_excludes_another_agents_session(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "the secret password is hunter2")
+
+    results = db.search_messages("hunter2", "researcher")
+
+    assert results == []
+
+
+def test_search_messages_finds_the_owning_agents_own_session(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "the secret password is hunter2")
+
+    results = db.search_messages("hunter2", "main")
+
+    assert [r["session_id"] for r in results] == [session_id]
+
+
+def test_list_sessions_excludes_another_agents_session(db, session_id):
+    # This is a shared dev database, so "researcher" may already have real
+    # sessions of its own — the assertion is membership, not an empty list.
+    db.upsert_session(session_id, "main")
+
+    ids = {s["id"] for s in db.list_sessions("researcher", limit=1000)}
+
+    assert session_id not in ids
+
+
+def test_list_sessions_includes_the_owning_agents_own_session(db, session_id):
+    db.upsert_session(session_id, "main")
+
+    ids = {s["id"] for s in db.list_sessions("main", limit=1000)}
+
+    assert session_id in ids
+
+
+def test_get_sessions_by_ids_excludes_another_agents_session(db, session_id):
+    db.upsert_session(session_id, "main")
+
+    assert db.get_sessions_by_ids([session_id], "researcher") == {}
+
+
+def test_get_sessions_by_ids_includes_the_owning_agents_own_session(db, session_id):
+    db.upsert_session(session_id, "main")
+
+    result = db.get_sessions_by_ids([session_id], "main")
+
+    assert session_id in result
+
+
+def test_get_messages_around_denies_a_guessed_session_id_from_another_agent(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    # "researcher" already knows the exact session_id (e.g. from a prior
+    # DISCOVER result shown to a different agent) — ownership must still
+    # be checked, not just discoverability.
+    assert db.get_messages_around(session_id, "researcher", 0) == []
+
+
+def test_get_messages_around_returns_messages_for_the_owning_agent(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    result = db.get_messages_around(session_id, "main", 0)
+
+    assert [m["content"] for m in result] == ["hello"]
+
+
+def test_get_session_bookends_denies_a_guessed_session_id_from_another_agent(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    first, last = db.get_session_bookends(session_id, "researcher")
+
+    assert first == []
+    assert last == []
+
+
+def test_get_session_bookends_returns_messages_for_the_owning_agent(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    first, last = db.get_session_bookends(session_id, "main")
+
+    assert len(first) == 1

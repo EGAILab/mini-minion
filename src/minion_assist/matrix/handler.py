@@ -31,11 +31,14 @@ from .config import MatrixConfig
 from ..heartbeat_token import is_heartbeat_ok, strip_heartbeat_token
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from ..agents.session import AgentSession
     from .bot_loop import BotLoopProtection
     from .exec_approvals import MatrixExecApprovalHandler
     from .inbound_dedupe import MatrixInboundDeduper
     from .outbound import MatrixOutbound
-    from .thread_bindings import MatrixThreadBindingManager
+    from .room_sessions import MatrixRoomSessionManager
 
 # Commands that make no sense outside a CLI REPL and must not be forwarded to
 # the LLM or echoed back to the room as text.
@@ -48,11 +51,22 @@ class MatrixMessageHandler:
     Args:
         client:              Authenticated matrix-nio ``AsyncClient``.
         config:              Active :class:`~minion_assist.matrix.config.MatrixConfig`.
-        sessions:            Dict mapping agent_id → ``AgentSession``.
+        sessions:            Dict mapping agent_id → ``AgentSession``. This is the
+                              REPL's shared default session, used only as a fallback
+                              (see ``_get_or_build_session``) — normal Matrix traffic
+                              is dispatched to a room-scoped session instead
+                              (MEM-GAP-001).
         outbound:            :class:`~minion_assist.matrix.outbound.MatrixOutbound`.
         dedupe:              :class:`~minion_assist.matrix.inbound_dedupe.MatrixInboundDeduper`.
         bot_loop:            :class:`~minion_assist.matrix.bot_loop.BotLoopProtection`.
-        thread_binding_mgr:  :class:`~minion_assist.matrix.thread_bindings.MatrixThreadBindingManager`.
+        room_session_mgr:    :class:`~minion_assist.matrix.room_sessions.MatrixRoomSessionManager`
+                              — resolves the ``session_id`` bound to each ``(room_id, agent_id)``.
+        session_factories:   Dict mapping agent_id → a callable that builds a fresh
+                              ``AgentSession`` for that agent given a session_id
+                              (built in ``minion.py``, sharing the agent's provider/
+                              tools/memory). Every message's ``AgentSession`` comes
+                              from here, keyed by room, instead of the one shared
+                              per-agent entry in ``sessions``.
         exec_approval_handler: Optional exec-approval handler for tool calls.
     """
 
@@ -64,13 +78,14 @@ class MatrixMessageHandler:
         outbound: "MatrixOutbound",
         dedupe: "MatrixInboundDeduper",
         bot_loop: "BotLoopProtection",
-        thread_binding_mgr: "MatrixThreadBindingManager",
+        room_session_mgr: "MatrixRoomSessionManager",
         exec_approval_handler: "MatrixExecApprovalHandler | None" = None,
         agents_cfg: dict | None = None,
         session_store: object = None,
         mcp_manager: object = None,
         skills: dict | None = None,
         short_term: object = None,
+        session_factories: "dict[str, Callable[[str], AgentSession]] | None" = None,
     ) -> None:
         self._client = client
         self._config = config
@@ -78,13 +93,45 @@ class MatrixMessageHandler:
         self._outbound = outbound
         self._dedupe = dedupe
         self._bot_loop = bot_loop
-        self._thread_mgr = thread_binding_mgr
+        self._room_session_mgr = room_session_mgr
         self._exec_approval = exec_approval_handler
         self._agents_cfg = agents_cfg
         self._session_store = session_store
         self._mcp_manager = mcp_manager
         self._skills = skills
         self._short_term = short_term
+        self._session_factories = session_factories or {}
+        # Lazily built, then reused for the life of this handler — each
+        # (agent_id, room_id) gets exactly one long-lived AgentSession
+        # instance, the same way `sessions[agent_id]` is a long-lived
+        # singleton for the REPL (MEM-GAP-001).
+        self._room_sessions: dict[tuple[str, str], "AgentSession"] = {}
+
+    def _get_or_build_session(self, agent_id: str, room_id: str, session_id: str) -> "AgentSession":
+        """Return this room's isolated ``AgentSession``, building it on first use.
+
+        Falls back to the shared ``sessions[agent_id]`` (the REPL's default
+        session) only if no factory was wired for ``agent_id`` — logged
+        loudly rather than silently, since that fallback reintroduces the
+        exact cross-room history sharing this method exists to prevent.
+        """
+        cache_key = (agent_id, room_id)
+        cached = self._room_sessions.get(cache_key)
+        if cached is not None:
+            return cached
+        factory = self._session_factories.get(agent_id)
+        if factory is None:
+            print(
+                f"[matrix] Warning: no room-session factory for agent '{agent_id}' — "
+                f"falling back to the shared default session for room {room_id}. "
+                "Every room routed to this agent will share history until this is fixed.",
+                file=sys.stderr,
+            )
+            session = self._sessions[agent_id]
+        else:
+            session = factory(session_id)
+        self._room_sessions[cache_key] = session
+        return session
 
     async def handle_room_message(self, room, event) -> None:
         """Process one inbound Matrix room message event.
@@ -151,17 +198,16 @@ class MatrixMessageHandler:
             if not self._is_mentioned(body):
                 return
 
-        # Step 6 — Thread binding.
-        # If this message is part of a Matrix thread, map the thread root event ID
-        # to an isolated session key so threaded convos don't bleed into each other.
+        # Step 6 — Room session resolution (MEM-GAP-001).
+        # A room is this deployment's unit of conversation isolation (see
+        # docs/adr/0006-room-scoped-matrix-sessions.md) — every room gets its
+        # own session_id, resolved unconditionally, not just when a message
+        # happens to be posted inside a Matrix thread.
+        session_id = await self._room_session_mgr.get_or_create_session_id(room_id, agent_id)
+        # thread_id is unrelated to session isolation: it's only used below to
+        # reply inside the same Matrix thread UI-wise, if the incoming message
+        # happened to be posted in one.
         thread_id = self._resolve_thread_id(event)
-        session_key: str | None = None
-        if thread_id and self._config.thread_bindings.enabled:
-            session_key = await self._thread_mgr.get_or_create_session_key(
-                thread_event_id=thread_id,
-                room_id=room_id,
-                agent_id=agent_id,
-            )
 
         # Step 7 — Ack reaction.
         # Post a 👀 (or configured emoji) to acknowledge receipt before the agent
@@ -180,6 +226,7 @@ class MatrixMessageHandler:
             event_id=event_id,
             text=body,
             agent_id=agent_id,
+            session_id=session_id,
             thread_id=thread_id,
             room_cfg=room_cfg,
         )
@@ -231,6 +278,7 @@ class MatrixMessageHandler:
         event_id: str,
         text: str,
         agent_id: str,
+        session_id: str,
         thread_id: str | None,
         room_cfg=None,
     ) -> None:
@@ -275,7 +323,7 @@ class MatrixMessageHandler:
                         await self._outbound.send_text(room_id, result.message, thread_id=thread_id)
                     return  # consumed — skip LLM
 
-        session = self._sessions[agent_id]
+        session = self._get_or_build_session(agent_id, room_id, session_id)
         loop = asyncio.get_running_loop()
 
         # Build per-turn extra tools (injected for this turn only).

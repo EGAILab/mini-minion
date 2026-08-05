@@ -8,7 +8,6 @@ from minion_assist.matrix.config import (
     MatrixDmConfig,
     MatrixExecApprovalsConfig,
     MatrixRoomConfig,
-    MatrixThreadBindingsConfig,
 )
 
 _VALID = {
@@ -71,7 +70,6 @@ def test_optional_fields_defaults():
     assert cfg.ack_reaction == "👀"
     assert cfg.group_policy == "open"
     assert isinstance(cfg.dm, MatrixDmConfig)
-    assert isinstance(cfg.thread_bindings, MatrixThreadBindingsConfig)
     assert isinstance(cfg.exec_approvals, MatrixExecApprovalsConfig)
     assert isinstance(cfg.bot_loop, MatrixBotLoopConfig)
 
@@ -98,13 +96,6 @@ def test_dm_config_parsed():
     cfg = MatrixConfig.from_dict(raw)
     assert cfg.dm.policy == "allowlist"
     assert "@alice:example.org" in cfg.dm.allow_from
-
-
-def test_thread_bindings_parsed():
-    raw = {**_VALID, "threadBindings": {"enabled": True, "idleHours": 2, "maxAgeHours": 48}}
-    cfg = MatrixConfig.from_dict(raw)
-    assert cfg.thread_bindings.idle_hours == 2.0
-    assert cfg.thread_bindings.max_age_hours == 48.0
 
 
 def test_exec_approvals_parsed():

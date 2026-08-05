@@ -6,7 +6,7 @@ runs ``client.sync_forever()`` until the ``stop_event`` is set.
 Lifecycle
 ---------
 1. Authenticate via :func:`~minion_assist.matrix.auth.resolve_matrix_auth`.
-2. Open the inbound-dedupe and thread-binding databases.
+2. Open the inbound-dedupe and room-session databases.
 3. Construct the outbound adapter, bot-loop protection, exec-approval handler,
    and room-message handler.
 4. Register matrix-nio callbacks for ``RoomMessageText``, ``InviteEvent``, and
@@ -32,7 +32,7 @@ from .exec_approvals import MatrixExecApprovalHandler
 from .handler import MatrixMessageHandler
 from .inbound_dedupe import MatrixInboundDeduper
 from .outbound import MatrixOutbound
-from .thread_bindings import MatrixThreadBindingManager
+from .room_sessions import MatrixRoomSessionManager
 
 
 async def monitor_matrix(
@@ -45,12 +45,15 @@ async def monitor_matrix(
     mcp_manager: object = None,
     skills: dict | None = None,
     short_term: object = None,
+    session_factories: dict | None = None,
 ) -> None:
     """Run the Matrix sync loop until ``stop_event`` is set.
 
     Args:
         config:       Active :class:`~minion_assist.matrix.config.MatrixConfig`.
-        sessions:     Dict mapping agent_id → ``AgentSession`` (shared with REPL).
+        sessions:     Dict mapping agent_id → ``AgentSession`` (shared with REPL;
+                      used by the Matrix handler only as a last-resort fallback —
+                      see :meth:`~minion_assist.matrix.handler.MatrixMessageHandler._get_or_build_session`).
         stop_event:   asyncio.Event; set by :class:`~minion_assist.matrix.channel.MatrixChannel`
                       to initiate a clean shutdown.
         workspace:    Root workspace path for database files.
@@ -59,12 +62,16 @@ async def monitor_matrix(
         mcp_manager:  McpClientManager instance (for /mcp-* commands).
         skills:       Loaded skill map (for /skills command).
         short_term:   ShortTermMemory instance (for /session and /rename commands).
+        session_factories: Dict mapping agent_id → a callable that builds a
+                      fresh ``AgentSession`` for that agent given a session_id
+                      (MEM-GAP-001) — see ``minion.py``'s
+                      ``matrix_session_factories``.
     """
     # All database files live under workspace/matrix/ so they're easy to find
     # and back up alongside other workspace data.
     matrix_dir = workspace / "matrix"
     dedupe_db = matrix_dir / "inbound_dedupe.db"
-    thread_db = matrix_dir / "thread_bindings.db"
+    room_sessions_db = matrix_dir / "room_sessions.db"
 
     # Step 1: authenticate.
     client = await resolve_matrix_auth(config)
@@ -73,8 +80,8 @@ async def monitor_matrix(
     dedupe = MatrixInboundDeduper(dedupe_db)
     await dedupe.start()
 
-    thread_mgr = MatrixThreadBindingManager(thread_db, config.thread_bindings)
-    await thread_mgr.start()
+    room_session_mgr = MatrixRoomSessionManager(room_sessions_db)
+    await room_session_mgr.start()
 
     # Step 3: build the outbound adapter and optional helpers.
     outbound = MatrixOutbound(client, config)
@@ -93,13 +100,14 @@ async def monitor_matrix(
         outbound=outbound,
         dedupe=dedupe,
         bot_loop=bot_loop,
-        thread_binding_mgr=thread_mgr,
+        room_session_mgr=room_session_mgr,
         exec_approval_handler=exec_approval,
         agents_cfg=agents_cfg,
         session_store=session_store,
         mcp_manager=mcp_manager,
         skills=skills,
         short_term=short_term,
+        session_factories=session_factories,
     )
 
     try:
@@ -162,11 +170,13 @@ async def monitor_matrix(
         if exc:
             print(f"[matrix] Sync loop exited with error: {exc}", file=sys.stderr)
 
-    await _cleanup(client, dedupe, thread_mgr)
+    await _cleanup(client, dedupe, room_session_mgr)
     print("[matrix] Disconnected.")
 
 
-async def _cleanup(client, dedupe: MatrixInboundDeduper, thread_mgr: MatrixThreadBindingManager) -> None:
+async def _cleanup(
+    client, dedupe: MatrixInboundDeduper, room_session_mgr: MatrixRoomSessionManager
+) -> None:
     # Each step is wrapped individually: one failure shouldn't prevent the others
     # from running during shutdown.
     try:
@@ -178,6 +188,6 @@ async def _cleanup(client, dedupe: MatrixInboundDeduper, thread_mgr: MatrixThrea
     except Exception:
         pass
     try:
-        await thread_mgr.stop()
+        await room_session_mgr.stop()
     except Exception:
         pass

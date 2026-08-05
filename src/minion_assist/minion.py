@@ -581,6 +581,12 @@ def main() -> None:
     # Populated below, per agent — the memory index watcher (Stage One
     # Phase 3, slice B) watches every agent's own workspace root.
     _agent_files_repos: dict[str, MemoryFileRepository] = {}
+    # Populated below, per agent — lets the Matrix channel build an
+    # additional, room-scoped AgentSession on demand (MEM-GAP-001) that
+    # shares this agent's provider/tools/memory/compactor but has its own
+    # session_id/history, instead of every Matrix room sharing the one
+    # AgentSession in `sessions`.
+    matrix_session_factories: dict[str, "Callable[[str], AgentSession]"] = {}
     for agent_id, cfg in agents_cfg.items():
         # Per-agent workspace root: resolved before building the memory service
         # and calling default_registry() so both point at the same directory
@@ -702,6 +708,49 @@ def main() -> None:
         # Tracked so the durable capture worker (Stage One Phase 2, slice C)
         # can look up the right provider per job — it isn't tied to one agent.
         _providers_by_agent[agent_id] = provider
+
+        # Matrix room-scoped session factory (MEM-GAP-001). Shares every
+        # per-agent resource with `sessions[agent_id]` above (same provider,
+        # tools, memory, compactor — these are expensive/stateful and meant
+        # to be reused); only session_id/history differ per call, so each
+        # Matrix room gets its own isolated conversation instead of every
+        # room sharing one AgentSession. Default-argument binding prevents
+        # the loop-closure gotcha — same pattern as `_dream_factory` above.
+        def _matrix_session_factory(
+            session_id: str,
+            _agent_id=agent_id,
+            _agent=AGENTS[agent_id],
+            _provider=provider,
+            _cfg=cfg,
+            _tools=tools,
+            _compactor=compactor,
+            _memory_service=memory_service,
+            _bootstrap_context=_agent_bootstrap_context,
+            _workspace_root=_agent_workspace,
+        ) -> AgentSession:
+            return AgentSession(
+                agent_id=_agent_id,
+                session_id=session_id,
+                agent=_agent,
+                provider=_provider,
+                max_output_tokens=_cfg.model.max_output_tokens,
+                tools=_tools,
+                compactor=_compactor,
+                short_term=short_term,
+                session_store=session_store,
+                soul_suffix=_skills_suffix,
+                memory=_memory_service,
+                tasks_dir=_tasks_dir,
+                enable_memory_extraction=memory_cfg.enable_extraction,
+                enable_commitments=commitments_cfg.enabled,
+                bootstrap_context=_bootstrap_context,
+                workspace_root=_workspace_root,
+                log_dir=_log_dir,
+                db=_db,
+                model_id=_cfg.model.id,
+            )
+
+        matrix_session_factories[agent_id] = _matrix_session_factory
 
         # Phase 4: build a relay function that tags subagent events with
         # [sub:{agent_id}] and forwards them to the parent's terminal handler.
@@ -833,6 +882,7 @@ def main() -> None:
             mcp_manager=mcp_manager,
             skills=skills,
             short_term=short_term,
+            session_factories=matrix_session_factories,
         )
         print("[matrix] Listener started.")
 
