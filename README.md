@@ -1129,7 +1129,7 @@ Add a `"database"` section to `config.json` (or `~/.minion-assist/config.json`):
 ```
 
 On every startup minion-assist will:
-1. Connect to the database and create the schema automatically.
+1. Connect to the database and apply schema migrations automatically (see "Schema migrations" below).
 2. Reconcile every JSONL session file against `message_mirrors` (Stage One Phase 2, slice A) — mirrors exactly the messages that aren't mirrored yet. Safe to run every time, not just once: a session partially mirrored by a prior crash is completed here rather than left behind.
 3. Register the `session_search` tool in every agent's tool registry.
 4. Dual-write every new message to both JSONL and PostgreSQL, idempotently (see below).
@@ -1145,6 +1145,18 @@ On every startup minion-assist will:
 | `message_mirrors` | Idempotency ledger, `PRIMARY KEY (session_id, event_id)`. Every mirror attempt is keyed by a message's stable `event_id` (see below) — mirroring the same message twice is a no-op, not a duplicate row. |
 | `memory_capture_jobs` | Durable fact-extraction queue. Columns: `id` (BIGSERIAL), `agent_id`, `session_id`, `source_from_message_id`, `source_to_message_id`, `idempotency_key` (UNIQUE), `state` (`pending`/`running`/`done`/`failed`), `attempts`, `run_after`, `last_error`, `created_at`, `updated_at`. |
 | `memory_proposals` | Unreviewed extracted claims. Columns: `id` (BIGSERIAL), `job_id`, `agent_id`, `claim_text`, `created_at`. |
+
+### Schema migrations (MEM-GAP-010)
+
+Schema evolution is versioned and checksum-verified via `schema_migrations.py`'s `run_migrations()`, not just unconditional `CREATE TABLE IF NOT EXISTS` calls. A `schema_migrations` ledger table (`component`, `version`, `name`, `checksum`, `applied_at`) tracks what's been applied — `SessionDB` and `PostgresMemoryIndex` are independent components (`"session_db"`/`"memory_index"`) sharing one ledger table. Both classes' entire pre-migration schema became a single "baseline" migration (version 1) — every statement in it was already idempotent, so an existing database just gets retroactively marked "at version 1" the first time this version of the code runs against it; nothing breaks and no data migration is needed.
+
+Every applied migration's actual source code is hashed (via `inspect.getsource`) and re-verified on every startup:
+- If an already-applied migration's source no longer matches its recorded checksum (edited in place instead of adding a new migration), startup refuses to continue.
+- If the ledger contains a migration version this code doesn't define at all (the database was touched by a newer version of the app), startup also refuses to continue.
+
+Both are deliberate — an unverifiable schema is exactly the failure mode this exists to prevent, not something to warn about and continue past. Going forward, any *new* schema change is added as a new, higher-numbered `Migration` in `_SESSION_DB_MIGRATIONS`/`_MEMORY_INDEX_MIGRATIONS`, never an edit to the baseline.
+
+One deliberate exception: `PostgresMemoryIndex`'s `memory_chunk_embeddings` table (vector width parameterized by the configured embedding model's dimensions, plus its own self-healing old-primary-key-detection logic) stays outside the checksummed ledger — its shape depends on runtime config, not fixed schema history. Safely changing an existing deployment's embedding dimensions remains a known open gap (MEM-GAP-006).
 
 ### Idempotent mirroring (Stage One Phase 2, slice A)
 

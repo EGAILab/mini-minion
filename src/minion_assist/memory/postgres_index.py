@@ -52,6 +52,7 @@ import uuid
 from datetime import date as _date
 from typing import TYPE_CHECKING
 
+from ..schema_migrations import Migration, run_migrations
 from .boundaries import parse_frontmatter
 from .chunking import Chunk, chunk_markdown
 from .knowledge import parse_claims, parse_time_epoch
@@ -227,6 +228,359 @@ def hash_query(query: str) -> str:
     return _hash_text(normalized)
 
 
+def _migration_001_baseline(conn) -> None:
+    """Baseline migration (MEM-GAP-010): every table/index PostgresMemoryIndex needs.
+
+    This is exactly what ``_ensure_schema()`` unconditionally ran before
+    versioned migrations existed — every statement here is idempotent, so
+    replaying it against an existing database (retroactively marking it
+    "at version 1" the first time this code runs) is always safe. Do not
+    edit this function once it has shipped: add a new, higher-numbered
+    migration instead — :func:`~minion_assist.schema_migrations.run_migrations`
+    will refuse to start if this function's source ever changes after being
+    recorded in the ``schema_migrations`` ledger.
+
+    Deliberately excludes ``memory_chunk_embeddings``: that table's vector
+    width is parameterized by the configured embedding model's dimensions
+    (a runtime config value, not a fixed schema fact), and already has its
+    own self-healing old-primary-key migration logic — see
+    ``PostgresMemoryIndex._ensure_schema()``'s trailing block, which stays
+    outside the checksummed ledger on purpose. Safely changing an existing
+    deployment's embedding dimensions is MEM-GAP-006's territory, not
+    solved here.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_chunks (
+            id            BIGSERIAL PRIMARY KEY,
+            agent_id      TEXT NOT NULL,
+            source_kind   TEXT NOT NULL,
+            rel_path      TEXT NOT NULL,
+            chunk_index   INTEGER NOT NULL,
+            heading_path  TEXT NOT NULL DEFAULT '',
+            content       TEXT NOT NULL,
+            start_line    INTEGER NOT NULL,
+            end_line      INTEGER NOT NULL,
+            chunk_hash    TEXT NOT NULL,
+            search_vector tsvector GENERATED ALWAYS AS (
+                setweight(to_tsvector('english', coalesce(heading_path, '')), 'A') ||
+                setweight(to_tsvector('english', coalesce(content, '')), 'B')
+            ) STORED
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_chunks_fts_idx "
+        "ON memory_chunks USING GIN (search_vector)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_chunks_file_idx "
+        "ON memory_chunks (agent_id, rel_path)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_chunks_corpus_idx "
+        "ON memory_chunks (agent_id, source_kind)"
+    )
+
+    # Per-file reconciliation ledger — same role as session/db.py's
+    # message_mirrors: lets a later slice B diff "what's on disk" against
+    # "what's indexed" by content hash rather than reindexing everything
+    # unconditionally on every startup.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_files (
+            agent_id     TEXT NOT NULL,
+            rel_path     TEXT NOT NULL,
+            source_kind  TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            indexed_at   DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (agent_id, rel_path)
+        )
+    """)
+    # boundary_metadata added in Stage One Phase 6, slice A — ADD COLUMN
+    # IF NOT EXISTS so a database that already has this table from an
+    # earlier phase picks it up without a manual migration. JSON-encoded
+    # dict from memory/boundaries.py's parse_frontmatter(); '' means the
+    # file has no action-boundary frontmatter. The file itself is the
+    # source of truth (a human can hand-edit the frontmatter block
+    # directly) — this column is a cache refreshed on every reindex, the
+    # same relationship content_hash already has to the file's raw text.
+    conn.execute(
+        "ALTER TABLE memory_files ADD COLUMN IF NOT EXISTS "
+        "boundary_metadata TEXT NOT NULL DEFAULT ''"
+    )
+
+    # Pinned files — Stage One Phase 4, slice B. Backs the "pinned" fusion
+    # lane (slice C): a pinned file's chunks are always surfaced,
+    # regardless of query match. Scoped to topic notes only (see
+    # memory/service.py's pin()/unpin() docstrings for why).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_pins (
+            agent_id   TEXT NOT NULL,
+            rel_path   TEXT NOT NULL,
+            pinned_at  DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (agent_id, rel_path)
+        )
+    """)
+
+    # Recall telemetry — Stage One Phase 5, slice A. Keyed by rel_path,
+    # not a memory_chunks row id: chunk ids aren't stable across a
+    # reindex (the same lesson learned fixing the embedding cache in
+    # Phase 4), and promotion decisions (Phase 5 slice C) operate at
+    # the file/note level anyway. query_hash is a normalized-and-hashed
+    # query (Task 2: "hash normalized queries rather than storing
+    # unnecessary raw query text") — see hash_query().
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_recall_events (
+            id           BIGSERIAL PRIMARY KEY,
+            agent_id     TEXT NOT NULL,
+            rel_path     TEXT NOT NULL,
+            query_hash   TEXT NOT NULL,
+            surfaced_at  DOUBLE PRECISION NOT NULL,
+            was_injected BOOLEAN NOT NULL DEFAULT FALSE
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_recall_events_file_idx "
+        "ON memory_recall_events (agent_id, rel_path)"
+    )
+
+    # Consolidation previews — Stage One Phase 5, slice C. A row is a
+    # draft, never an applied change: MemoryConsolidator.preview() never
+    # writes to disk, it only records what it *would* write, for a human
+    # to review (a later slice adds apply/reject/rollback on top of
+    # these rows). No FOREIGN KEY to memory_proposals — this codebase
+    # never declares cross-table FKs (see memory_proposals.job_id for
+    # the same plain-BIGINT precedent), partly because memory_proposals
+    # is owned by session/db.py's SessionDB, a separate connection/class
+    # entirely. based_on_content_hash captures the target file's content
+    # hash *at preview time* — Task 6's "detect human edits before
+    # applying a stale proposal" needs to compare this against the
+    # file's hash again at apply time, which only works if it was
+    # captured when the preview was drafted, not reconstructed later.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_consolidation_previews (
+            id                    BIGSERIAL PRIMARY KEY,
+            agent_id              TEXT NOT NULL,
+            proposal_id           BIGINT NOT NULL,
+            target_kind           TEXT NOT NULL,
+            target_key            TEXT NOT NULL,
+            based_on_content_hash TEXT NOT NULL,
+            drafted_content       TEXT NOT NULL,
+            rationale             TEXT NOT NULL,
+            created_at            DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_consolidation_previews_proposal_idx "
+        "ON memory_consolidation_previews (agent_id, proposal_id)"
+    )
+
+    # Topic revision history — Stage One Phase 5, slice D. A row is a
+    # snapshot of a topic note's content taken right BEFORE
+    # MemoryConsolidator.approve() overwrites it, so rollback() can
+    # restore exactly what was there (an empty string means the topic
+    # didn't exist before this apply — rollback() deletes the file
+    # rather than writing "" back). Acts as a one-entry-per-apply undo
+    # stack: rollback() consumes (deletes) the row it restores from,
+    # so repeated rollbacks step back through history one apply at a
+    # time, the same shape as a normal undo stack.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_topic_revisions (
+            id            BIGSERIAL PRIMARY KEY,
+            agent_id      TEXT NOT NULL,
+            target_key    TEXT NOT NULL,
+            proposal_id   BIGINT NOT NULL,
+            prior_content TEXT NOT NULL,
+            created_at    DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_topic_revisions_key_idx "
+        "ON memory_topic_revisions (agent_id, target_key)"
+    )
+
+    # Import review previews — Stage One Phase 7, slice E. Structurally
+    # identical to memory_consolidation_previews above, but deliberately
+    # a SEPARATE table rather than a shared one: an import is identified
+    # by a TEXT key (e.g. "_auto_extracted"), not the BIGINT proposal_id
+    # memory_consolidation_previews/memory_topic_revisions are typed
+    # around, and ImportReviewer.approve()/reject() delete the reviewed
+    # import file outright rather than flipping a memory_proposals
+    # status — there is no rollback for import review in this slice
+    # (see memory/import_review.py's module docstring), so no
+    # import-side revision-history table exists either.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_import_previews (
+            id                    BIGSERIAL PRIMARY KEY,
+            agent_id              TEXT NOT NULL,
+            import_key            TEXT NOT NULL,
+            target_kind           TEXT NOT NULL,
+            target_key            TEXT NOT NULL,
+            based_on_content_hash TEXT NOT NULL,
+            drafted_content       TEXT NOT NULL,
+            rationale             TEXT NOT NULL,
+            created_at            DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_import_previews_key_idx "
+        "ON memory_import_previews (agent_id, import_key)"
+    )
+
+    # Shadow copies of both tables above, same shape — scratch space for
+    # force_rebuild_agent()'s crash-safe rebuild-and-swap (Stage One
+    # Phase 3, slice C). See that method's docstring for the swap
+    # mechanics. Never queried by search()/chunk_count()/etc. — only
+    # force_rebuild_agent() ever touches these.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_chunks_shadow (
+            id            BIGSERIAL PRIMARY KEY,
+            agent_id      TEXT NOT NULL,
+            source_kind   TEXT NOT NULL,
+            rel_path      TEXT NOT NULL,
+            chunk_index   INTEGER NOT NULL,
+            heading_path  TEXT NOT NULL DEFAULT '',
+            content       TEXT NOT NULL,
+            start_line    INTEGER NOT NULL,
+            end_line      INTEGER NOT NULL,
+            chunk_hash    TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_chunks_shadow_agent_idx "
+        "ON memory_chunks_shadow (agent_id)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_files_shadow (
+            agent_id     TEXT NOT NULL,
+            rel_path     TEXT NOT NULL,
+            source_kind  TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            indexed_at   DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_files_shadow_agent_idx "
+        "ON memory_files_shadow (agent_id)"
+    )
+    # Same self-healing ADD COLUMN IF NOT EXISTS as memory_files above —
+    # this scratch table's CREATE TABLE IF NOT EXISTS is a no-op on an
+    # existing database, so the column needs adding explicitly too.
+    conn.execute(
+        "ALTER TABLE memory_files_shadow ADD COLUMN IF NOT EXISTS "
+        "boundary_metadata TEXT NOT NULL DEFAULT ''"
+    )
+
+    # Knowledge layer — Stage One Phase 7, slice A. No kb_pages table:
+    # a topic note's (agent_id, rel_path) is already the stable "page"
+    # identifier every other part of this project uses (memory_files,
+    # memory_pins, ...) — see memory/knowledge.py's module docstring
+    # for why a separate pages table would just duplicate that.
+    #
+    # Entity ids are system-assigned (get_or_create_entity), not
+    # human-authored like claim ids — a claim marker only names an
+    # entity by (free-text, case-insensitive) name; name_normalized is
+    # the actual dedup key, name preserves whichever casing first
+    # created the row.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kb_entities (
+            id              TEXT PRIMARY KEY,
+            agent_id        TEXT NOT NULL,
+            name            TEXT NOT NULL,
+            name_normalized TEXT NOT NULL,
+            created_at      DOUBLE PRECISION NOT NULL,
+            UNIQUE (agent_id, name_normalized)
+        )
+    """)
+
+    # Claim ids are human/model-authored, embedded in the canonical
+    # Markdown page itself (memory/knowledge.py's parse_claims()) —
+    # this table is a synced cache of what the pages currently say,
+    # never the other way around. entity_id has no FOREIGN KEY (this
+    # project never declares cross-table FKs — see
+    # memory_proposals.job_id for the established precedent).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kb_claims (
+            id           TEXT PRIMARY KEY,
+            agent_id     TEXT NOT NULL,
+            rel_path     TEXT NOT NULL,
+            entity_id    TEXT,
+            text         TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'unknown',
+            confidence   DOUBLE PRECISION,
+            observed_at  DOUBLE PRECISION,
+            valid_from   DOUBLE PRECISION,
+            valid_to     DOUBLE PRECISION,
+            privacy_tier TEXT NOT NULL DEFAULT '',
+            line_number  INTEGER NOT NULL,
+            created_at   DOUBLE PRECISION NOT NULL,
+            updated_at   DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS kb_claims_page_idx ON kb_claims (agent_id, rel_path)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS kb_claims_status_idx ON kb_claims (agent_id, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS kb_claims_entity_idx ON kb_claims (agent_id, entity_id)"
+    )
+
+    # A claim's evidence= field, one row per (kind, ref) pair — e.g.
+    # ("proposal", "42"). A claim with zero evidence rows is exactly
+    # what Task 3's provenance-gap dashboard (a later slice) reports.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kb_evidence (
+            id          BIGSERIAL PRIMARY KEY,
+            agent_id    TEXT NOT NULL,
+            claim_id    TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_ref  TEXT NOT NULL,
+            created_at  DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS kb_evidence_claim_idx ON kb_evidence (agent_id, claim_id)"
+    )
+
+    # Claim relationships — Stage One Phase 7, slice B. Deliberately
+    # only two kinds ("supersedes"/"contradicts") — see
+    # memory/knowledge.py's module docstring for why this isn't an
+    # open-ended relationship-type system. No FOREIGN KEY on
+    # from_claim_id/to_claim_id (this project never declares
+    # cross-table FKs); to_claim_id may reference a claim that
+    # doesn't (or no longer) exists — e.g. a hand-written
+    # contradicts= referencing a typo'd id — which is itself useful
+    # information for a later slice's dashboards to surface, not
+    # something to silently reject at sync time.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kb_relationships (
+            id            BIGSERIAL PRIMARY KEY,
+            agent_id      TEXT NOT NULL,
+            from_claim_id TEXT NOT NULL,
+            to_claim_id   TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            created_at    DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS kb_relationships_from_idx "
+        "ON kb_relationships (agent_id, from_claim_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS kb_relationships_to_idx "
+        "ON kb_relationships (agent_id, to_claim_id)"
+    )
+
+
+# Every migration PostgresMemoryIndex knows about, in the order they were
+# introduced. Append new migrations here — never edit an existing entry's
+# `apply` function once it has shipped (see _migration_001_baseline's
+# docstring).
+_MEMORY_INDEX_MIGRATIONS = [
+    Migration(1, "baseline", _migration_001_baseline),
+]
+
+
 class PostgresMemoryIndex:
     """Rebuildable PostgreSQL lexical index over one or more agents' memory files.
 
@@ -300,6 +654,9 @@ class PostgresMemoryIndex:
         # on *this* connection immediately since _conn() only registers it
         # for connections created *after* self._has_vector becomes True —
         # this first connection was already open before that happened.
+        # Kept here rather than inside a migration: this mutates self, which
+        # a migration function (checksummed, self-less by design — see
+        # schema_migrations.py) has no access to.
         try:
             conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             self._has_vector = True
@@ -309,225 +666,7 @@ class PostgresMemoryIndex:
         except Exception:
             pass
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_chunks (
-                id            BIGSERIAL PRIMARY KEY,
-                agent_id      TEXT NOT NULL,
-                source_kind   TEXT NOT NULL,
-                rel_path      TEXT NOT NULL,
-                chunk_index   INTEGER NOT NULL,
-                heading_path  TEXT NOT NULL DEFAULT '',
-                content       TEXT NOT NULL,
-                start_line    INTEGER NOT NULL,
-                end_line      INTEGER NOT NULL,
-                chunk_hash    TEXT NOT NULL,
-                search_vector tsvector GENERATED ALWAYS AS (
-                    setweight(to_tsvector('english', coalesce(heading_path, '')), 'A') ||
-                    setweight(to_tsvector('english', coalesce(content, '')), 'B')
-                ) STORED
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS memory_chunks_fts_idx "
-            "ON memory_chunks USING GIN (search_vector)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS memory_chunks_file_idx "
-            "ON memory_chunks (agent_id, rel_path)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS memory_chunks_corpus_idx "
-            "ON memory_chunks (agent_id, source_kind)"
-        )
-
-        # Per-file reconciliation ledger — same role as session/db.py's
-        # message_mirrors: lets a later slice B diff "what's on disk" against
-        # "what's indexed" by content hash rather than reindexing everything
-        # unconditionally on every startup.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_files (
-                agent_id     TEXT NOT NULL,
-                rel_path     TEXT NOT NULL,
-                source_kind  TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                indexed_at   DOUBLE PRECISION NOT NULL,
-                PRIMARY KEY (agent_id, rel_path)
-            )
-        """)
-        # boundary_metadata added in Stage One Phase 6, slice A — ADD COLUMN
-        # IF NOT EXISTS so a database that already has this table from an
-        # earlier phase picks it up without a manual migration. JSON-encoded
-        # dict from memory/boundaries.py's parse_frontmatter(); '' means the
-        # file has no action-boundary frontmatter. The file itself is the
-        # source of truth (a human can hand-edit the frontmatter block
-        # directly) — this column is a cache refreshed on every reindex, the
-        # same relationship content_hash already has to the file's raw text.
-        conn.execute(
-            "ALTER TABLE memory_files ADD COLUMN IF NOT EXISTS "
-            "boundary_metadata TEXT NOT NULL DEFAULT ''"
-        )
-
-        # Pinned files — Stage One Phase 4, slice B. Backs the "pinned" fusion
-        # lane (slice C): a pinned file's chunks are always surfaced,
-        # regardless of query match. Scoped to topic notes only (see
-        # memory/service.py's pin()/unpin() docstrings for why).
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_pins (
-                agent_id   TEXT NOT NULL,
-                rel_path   TEXT NOT NULL,
-                pinned_at  DOUBLE PRECISION NOT NULL,
-                PRIMARY KEY (agent_id, rel_path)
-            )
-        """)
-
-        # Recall telemetry — Stage One Phase 5, slice A. Keyed by rel_path,
-        # not a memory_chunks row id: chunk ids aren't stable across a
-        # reindex (the same lesson learned fixing the embedding cache in
-        # Phase 4), and promotion decisions (Phase 5 slice C) operate at
-        # the file/note level anyway. query_hash is a normalized-and-hashed
-        # query (Task 2: "hash normalized queries rather than storing
-        # unnecessary raw query text") — see hash_query().
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_recall_events (
-                id           BIGSERIAL PRIMARY KEY,
-                agent_id     TEXT NOT NULL,
-                rel_path     TEXT NOT NULL,
-                query_hash   TEXT NOT NULL,
-                surfaced_at  DOUBLE PRECISION NOT NULL,
-                was_injected BOOLEAN NOT NULL DEFAULT FALSE
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS memory_recall_events_file_idx "
-            "ON memory_recall_events (agent_id, rel_path)"
-        )
-
-        # Consolidation previews — Stage One Phase 5, slice C. A row is a
-        # draft, never an applied change: MemoryConsolidator.preview() never
-        # writes to disk, it only records what it *would* write, for a human
-        # to review (a later slice adds apply/reject/rollback on top of
-        # these rows). No FOREIGN KEY to memory_proposals — this codebase
-        # never declares cross-table FKs (see memory_proposals.job_id for
-        # the same plain-BIGINT precedent), partly because memory_proposals
-        # is owned by session/db.py's SessionDB, a separate connection/class
-        # entirely. based_on_content_hash captures the target file's content
-        # hash *at preview time* — Task 6's "detect human edits before
-        # applying a stale proposal" needs to compare this against the
-        # file's hash again at apply time, which only works if it was
-        # captured when the preview was drafted, not reconstructed later.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_consolidation_previews (
-                id                    BIGSERIAL PRIMARY KEY,
-                agent_id              TEXT NOT NULL,
-                proposal_id           BIGINT NOT NULL,
-                target_kind           TEXT NOT NULL,
-                target_key            TEXT NOT NULL,
-                based_on_content_hash TEXT NOT NULL,
-                drafted_content       TEXT NOT NULL,
-                rationale             TEXT NOT NULL,
-                created_at            DOUBLE PRECISION NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS memory_consolidation_previews_proposal_idx "
-            "ON memory_consolidation_previews (agent_id, proposal_id)"
-        )
-
-        # Topic revision history — Stage One Phase 5, slice D. A row is a
-        # snapshot of a topic note's content taken right BEFORE
-        # MemoryConsolidator.approve() overwrites it, so rollback() can
-        # restore exactly what was there (an empty string means the topic
-        # didn't exist before this apply — rollback() deletes the file
-        # rather than writing "" back). Acts as a one-entry-per-apply undo
-        # stack: rollback() consumes (deletes) the row it restores from,
-        # so repeated rollbacks step back through history one apply at a
-        # time, the same shape as a normal undo stack.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_topic_revisions (
-                id            BIGSERIAL PRIMARY KEY,
-                agent_id      TEXT NOT NULL,
-                target_key    TEXT NOT NULL,
-                proposal_id   BIGINT NOT NULL,
-                prior_content TEXT NOT NULL,
-                created_at    DOUBLE PRECISION NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS memory_topic_revisions_key_idx "
-            "ON memory_topic_revisions (agent_id, target_key)"
-        )
-
-        # Import review previews — Stage One Phase 7, slice E. Structurally
-        # identical to memory_consolidation_previews above, but deliberately
-        # a SEPARATE table rather than a shared one: an import is identified
-        # by a TEXT key (e.g. "_auto_extracted"), not the BIGINT proposal_id
-        # memory_consolidation_previews/memory_topic_revisions are typed
-        # around, and ImportReviewer.approve()/reject() delete the reviewed
-        # import file outright rather than flipping a memory_proposals
-        # status — there is no rollback for import review in this slice
-        # (see memory/import_review.py's module docstring), so no
-        # import-side revision-history table exists either.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_import_previews (
-                id                    BIGSERIAL PRIMARY KEY,
-                agent_id              TEXT NOT NULL,
-                import_key            TEXT NOT NULL,
-                target_kind           TEXT NOT NULL,
-                target_key            TEXT NOT NULL,
-                based_on_content_hash TEXT NOT NULL,
-                drafted_content       TEXT NOT NULL,
-                rationale             TEXT NOT NULL,
-                created_at            DOUBLE PRECISION NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS memory_import_previews_key_idx "
-            "ON memory_import_previews (agent_id, import_key)"
-        )
-
-        # Shadow copies of both tables above, same shape — scratch space for
-        # force_rebuild_agent()'s crash-safe rebuild-and-swap (Stage One
-        # Phase 3, slice C). See that method's docstring for the swap
-        # mechanics. Never queried by search()/chunk_count()/etc. — only
-        # force_rebuild_agent() ever touches these.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_chunks_shadow (
-                id            BIGSERIAL PRIMARY KEY,
-                agent_id      TEXT NOT NULL,
-                source_kind   TEXT NOT NULL,
-                rel_path      TEXT NOT NULL,
-                chunk_index   INTEGER NOT NULL,
-                heading_path  TEXT NOT NULL DEFAULT '',
-                content       TEXT NOT NULL,
-                start_line    INTEGER NOT NULL,
-                end_line      INTEGER NOT NULL,
-                chunk_hash    TEXT NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS memory_chunks_shadow_agent_idx "
-            "ON memory_chunks_shadow (agent_id)"
-        )
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_files_shadow (
-                agent_id     TEXT NOT NULL,
-                rel_path     TEXT NOT NULL,
-                source_kind  TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                indexed_at   DOUBLE PRECISION NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS memory_files_shadow_agent_idx "
-            "ON memory_files_shadow (agent_id)"
-        )
-        # Same self-healing ADD COLUMN IF NOT EXISTS as memory_files above —
-        # this scratch table's CREATE TABLE IF NOT EXISTS is a no-op on an
-        # existing database, so the column needs adding explicitly too.
-        conn.execute(
-            "ALTER TABLE memory_files_shadow ADD COLUMN IF NOT EXISTS "
-            "boundary_metadata TEXT NOT NULL DEFAULT ''"
-        )
+        run_migrations(conn, "memory_index", _MEMORY_INDEX_MIGRATIONS)
 
         # Embedding cache — only created when pgvector is available AND an
         # embedding backend is actually configured (Stage One Phase 4,
@@ -579,108 +718,6 @@ class PostgresMemoryIndex:
                 "CREATE INDEX IF NOT EXISTS memory_chunk_embeddings_hnsw "
                 "ON memory_chunk_embeddings USING hnsw (embedding vector_cosine_ops)"
             )
-
-        # Knowledge layer — Stage One Phase 7, slice A. No kb_pages table:
-        # a topic note's (agent_id, rel_path) is already the stable "page"
-        # identifier every other part of this project uses (memory_files,
-        # memory_pins, ...) — see memory/knowledge.py's module docstring
-        # for why a separate pages table would just duplicate that.
-        #
-        # Entity ids are system-assigned (get_or_create_entity), not
-        # human-authored like claim ids — a claim marker only names an
-        # entity by (free-text, case-insensitive) name; name_normalized is
-        # the actual dedup key, name preserves whichever casing first
-        # created the row.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS kb_entities (
-                id              TEXT PRIMARY KEY,
-                agent_id        TEXT NOT NULL,
-                name            TEXT NOT NULL,
-                name_normalized TEXT NOT NULL,
-                created_at      DOUBLE PRECISION NOT NULL,
-                UNIQUE (agent_id, name_normalized)
-            )
-        """)
-
-        # Claim ids are human/model-authored, embedded in the canonical
-        # Markdown page itself (memory/knowledge.py's parse_claims()) —
-        # this table is a synced cache of what the pages currently say,
-        # never the other way around. entity_id has no FOREIGN KEY (this
-        # project never declares cross-table FKs — see
-        # memory_proposals.job_id for the established precedent).
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS kb_claims (
-                id           TEXT PRIMARY KEY,
-                agent_id     TEXT NOT NULL,
-                rel_path     TEXT NOT NULL,
-                entity_id    TEXT,
-                text         TEXT NOT NULL,
-                status       TEXT NOT NULL DEFAULT 'unknown',
-                confidence   DOUBLE PRECISION,
-                observed_at  DOUBLE PRECISION,
-                valid_from   DOUBLE PRECISION,
-                valid_to     DOUBLE PRECISION,
-                privacy_tier TEXT NOT NULL DEFAULT '',
-                line_number  INTEGER NOT NULL,
-                created_at   DOUBLE PRECISION NOT NULL,
-                updated_at   DOUBLE PRECISION NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS kb_claims_page_idx ON kb_claims (agent_id, rel_path)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS kb_claims_status_idx ON kb_claims (agent_id, status)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS kb_claims_entity_idx ON kb_claims (agent_id, entity_id)"
-        )
-
-        # A claim's evidence= field, one row per (kind, ref) pair — e.g.
-        # ("proposal", "42"). A claim with zero evidence rows is exactly
-        # what Task 3's provenance-gap dashboard (a later slice) reports.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS kb_evidence (
-                id          BIGSERIAL PRIMARY KEY,
-                agent_id    TEXT NOT NULL,
-                claim_id    TEXT NOT NULL,
-                source_kind TEXT NOT NULL,
-                source_ref  TEXT NOT NULL,
-                created_at  DOUBLE PRECISION NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS kb_evidence_claim_idx ON kb_evidence (agent_id, claim_id)"
-        )
-
-        # Claim relationships — Stage One Phase 7, slice B. Deliberately
-        # only two kinds ("supersedes"/"contradicts") — see
-        # memory/knowledge.py's module docstring for why this isn't an
-        # open-ended relationship-type system. No FOREIGN KEY on
-        # from_claim_id/to_claim_id (this project never declares
-        # cross-table FKs); to_claim_id may reference a claim that
-        # doesn't (or no longer) exists — e.g. a hand-written
-        # contradicts= referencing a typo'd id — which is itself useful
-        # information for a later slice's dashboards to surface, not
-        # something to silently reject at sync time.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS kb_relationships (
-                id            BIGSERIAL PRIMARY KEY,
-                agent_id      TEXT NOT NULL,
-                from_claim_id TEXT NOT NULL,
-                to_claim_id   TEXT NOT NULL,
-                kind          TEXT NOT NULL,
-                created_at    DOUBLE PRECISION NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS kb_relationships_from_idx "
-            "ON kb_relationships (agent_id, from_claim_id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS kb_relationships_to_idx "
-            "ON kb_relationships (agent_id, to_claim_id)"
-        )
 
     # ------------------------------------------------------------------
     # Indexing

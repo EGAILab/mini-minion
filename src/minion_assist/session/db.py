@@ -91,9 +91,236 @@ import time
 from typing import Any
 
 from ..messages import EVENT_ID_KEY, ensure_event_id
+from ..schema_migrations import Migration, run_migrations
 
 # Thread-local connection cache — one psycopg connection per OS thread.
 _local = threading.local()
+
+
+def _migration_001_baseline(conn) -> None:
+    """Baseline migration (MEM-GAP-010): every table/index SessionDB needs.
+
+    This is exactly what ``_ensure_schema()`` unconditionally ran before
+    versioned migrations existed — every statement here is idempotent, so
+    replaying it against an existing database (retroactively marking it
+    "at version 1" the first time this code runs) is always safe. Do not
+    edit this function once it has shipped: add a new, higher-numbered
+    migration instead — :func:`~minion_assist.schema_migrations.run_migrations`
+    will refuse to start if this function's source ever changes after being
+    recorded in the ``schema_migrations`` ledger.
+
+    The pgvector-dependent ``message_embeddings`` table/index are wrapped in
+    their own ``try``/``except`` (safe under this class's autocommit
+    connections — one failed statement doesn't poison the others) rather
+    than a pre-checked flag, since this function has no access to
+    ``SessionDB._has_vector`` — it only ever receives a raw connection.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id          TEXT PRIMARY KEY,
+            agent_id    TEXT NOT NULL,
+            source      TEXT NOT NULL DEFAULT 'cli',
+            started_at  DOUBLE PRECISION NOT NULL,
+            last_active DOUBLE PRECISION NOT NULL,
+            turn_count  INTEGER NOT NULL DEFAULT 0,
+            title       TEXT,
+            parent_id   TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS sessions_agent_idx ON sessions (agent_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS sessions_last_active_idx ON sessions (last_active DESC)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id           BIGSERIAL PRIMARY KEY,
+            session_id   TEXT NOT NULL,
+            role         TEXT NOT NULL,
+            content      TEXT,
+            tool_name    TEXT,
+            timestamp    DOUBLE PRECISION NOT NULL,
+            search_vector tsvector GENERATED ALWAYS AS (
+                to_tsvector('english',
+                    coalesce(content, '') || ' ' || coalesce(tool_name, ''))
+            ) STORED
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS messages_fts_idx ON messages USING GIN (search_vector)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS messages_session_idx ON messages (session_id)"
+    )
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS message_embeddings (
+                message_id BIGINT PRIMARY KEY,
+                embedding  vector(1536) NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS msg_emb_hnsw
+            ON message_embeddings USING hnsw (embedding vector_cosine_ops)
+        """)
+    except Exception:
+        pass
+
+    # Idempotency ledger for mirroring — see the module docstring's
+    # "Idempotent mirroring" section.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_mirrors (
+            session_id  TEXT NOT NULL,
+            event_id    TEXT NOT NULL,
+            message_id  BIGINT NOT NULL,
+            mirrored_at DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (session_id, event_id)
+        )
+    """)
+
+    # Durable capture-job queue — see the module docstring's "Durable
+    # capture jobs" section.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_capture_jobs (
+            id                     BIGSERIAL PRIMARY KEY,
+            agent_id               TEXT NOT NULL,
+            session_id             TEXT NOT NULL,
+            source_from_message_id BIGINT NOT NULL,
+            source_to_message_id   BIGINT NOT NULL,
+            idempotency_key        TEXT NOT NULL UNIQUE,
+            state                  TEXT NOT NULL DEFAULT 'pending',
+            attempts               INTEGER NOT NULL DEFAULT 0,
+            run_after              DOUBLE PRECISION NOT NULL,
+            last_error             TEXT,
+            created_at             DOUBLE PRECISION NOT NULL,
+            updated_at             DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS capture_jobs_pending_idx
+        ON memory_capture_jobs (state, run_after)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_proposals (
+            id              BIGSERIAL PRIMARY KEY,
+            job_id          BIGINT NOT NULL,
+            agent_id        TEXT NOT NULL,
+            claim_text      TEXT NOT NULL,
+            created_at      DOUBLE PRECISION NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            rejected_reason TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    # status added in Stage One Phase 5, slice B; rejected_reason in
+    # slice D — both ADD COLUMN IF NOT EXISTS so a database that
+    # already has this table from an earlier slice picks them up
+    # without a manual migration. status: "pending" (not yet
+    # reviewed), "promoted"/"rejected"/"superseded" (assigned by
+    # MemoryConsolidator's approve()/reject()/rollback()).
+    # rejected_reason: the human-readable reason passed to reject() —
+    # cleared back to "" on any other status transition (approve,
+    # rollback) so it can never linger as a stale explanation for a
+    # decision that's since been reversed.
+    conn.execute(
+        "ALTER TABLE memory_proposals ADD COLUMN IF NOT EXISTS "
+        "status TEXT NOT NULL DEFAULT 'pending'"
+    )
+    conn.execute(
+        "ALTER TABLE memory_proposals ADD COLUMN IF NOT EXISTS "
+        "rejected_reason TEXT NOT NULL DEFAULT ''"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS proposals_agent_idx ON memory_proposals (agent_id)"
+    )
+
+    # Durable commitment-extraction job queue — Stage One Phase 6, slice
+    # B. Structurally identical to memory_capture_jobs above (same
+    # claim/complete/fail lifecycle, same idempotency-key mechanism),
+    # but a separate table/queue: commitment output (kind, sensitivity,
+    # due window, confidence, dedupe key) is a completely different
+    # shape than memory_proposals' plain claim strings, so the two
+    # pipelines stay cleanly separated rather than overloading one
+    # table/worker with two incompatible output schemas. The extra
+    # `channel` column (e.g. a Matrix room id, or "cli" outside Matrix)
+    # is what memory_capture_jobs never needed — commitments must be
+    # scoped to "exact agent and channel context" (the plan's Task 4).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_commitment_jobs (
+            id                     BIGSERIAL PRIMARY KEY,
+            agent_id               TEXT NOT NULL,
+            session_id             TEXT NOT NULL,
+            channel                TEXT NOT NULL,
+            source_from_message_id BIGINT NOT NULL,
+            source_to_message_id   BIGINT NOT NULL,
+            idempotency_key        TEXT NOT NULL UNIQUE,
+            state                  TEXT NOT NULL DEFAULT 'pending',
+            attempts               INTEGER NOT NULL DEFAULT 0,
+            run_after              DOUBLE PRECISION NOT NULL,
+            last_error             TEXT,
+            created_at             DOUBLE PRECISION NOT NULL,
+            updated_at             DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS commitment_jobs_pending_idx
+        ON memory_commitment_jobs (state, run_after)
+    """)
+
+    # Commitments — inferred, short-lived social follow-ups (Stage One
+    # Phase 6, Task 3). Scaled down from OpenClaw's real
+    # src/commitments/types.ts CommitmentRecord (verified against that
+    # source, not just the plan doc): same kind/sensitivity/source/
+    # status vocabulary and due-window shape, without OpenClaw's
+    # richer accountId/to/threadId/senderId scope fields minion-assist
+    # has no equivalent concept for yet.
+    #
+    # due_earliest/due_latest are epoch seconds, not a single instant —
+    # a window, so "check in tomorrow afternoon" has somewhere to land
+    # rather than needing to resolve to one exact second.
+    # dedupe_key + (agent_id, channel) is what
+    # SessionDB.complete_commitment_job() upserts against, so a
+    # near-identical inferred follow-up extends an existing pending
+    # commitment's window rather than creating a duplicate.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS commitments (
+            id             BIGSERIAL PRIMARY KEY,
+            agent_id       TEXT NOT NULL,
+            session_id     TEXT NOT NULL,
+            channel        TEXT NOT NULL,
+            kind           TEXT NOT NULL,
+            sensitivity    TEXT NOT NULL,
+            source         TEXT NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'pending',
+            reason         TEXT NOT NULL,
+            suggested_text TEXT NOT NULL,
+            dedupe_key     TEXT NOT NULL,
+            confidence     DOUBLE PRECISION NOT NULL,
+            due_earliest   DOUBLE PRECISION NOT NULL,
+            due_latest     DOUBLE PRECISION NOT NULL,
+            source_job_id  BIGINT NOT NULL,
+            created_at     DOUBLE PRECISION NOT NULL,
+            updated_at     DOUBLE PRECISION NOT NULL,
+            sent_at        DOUBLE PRECISION,
+            dismissed_at   DOUBLE PRECISION
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS commitments_scope_idx
+        ON commitments (agent_id, channel, status)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS commitments_dedupe_idx
+        ON commitments (agent_id, channel, dedupe_key)
+    """)
+
+
+# Every migration SessionDB knows about, in the order they were introduced.
+# Append new migrations here — never edit an existing entry's `apply`
+# function once it has shipped (see _migration_001_baseline's docstring).
+_SESSION_DB_MIGRATIONS = [
+    Migration(1, "baseline", _migration_001_baseline),
+]
 
 
 def _msg_text(msg: dict) -> str | None:
@@ -139,209 +366,17 @@ class SessionDB:
 
     def _ensure_schema(self) -> None:
         conn = self._conn()
-        # pgvector extension (optional — silently skipped if not available)
+        # pgvector extension (optional — silently skipped if not available).
+        # Kept here rather than inside a migration: this mutates self, which
+        # a migration function (checksummed, self-less by design — see
+        # schema_migrations.py) has no access to.
         try:
             conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             self._has_vector = True
         except Exception:
             pass
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id          TEXT PRIMARY KEY,
-                agent_id    TEXT NOT NULL,
-                source      TEXT NOT NULL DEFAULT 'cli',
-                started_at  DOUBLE PRECISION NOT NULL,
-                last_active DOUBLE PRECISION NOT NULL,
-                turn_count  INTEGER NOT NULL DEFAULT 0,
-                title       TEXT,
-                parent_id   TEXT
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS sessions_agent_idx ON sessions (agent_id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS sessions_last_active_idx ON sessions (last_active DESC)"
-        )
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id           BIGSERIAL PRIMARY KEY,
-                session_id   TEXT NOT NULL,
-                role         TEXT NOT NULL,
-                content      TEXT,
-                tool_name    TEXT,
-                timestamp    DOUBLE PRECISION NOT NULL,
-                search_vector tsvector GENERATED ALWAYS AS (
-                    to_tsvector('english',
-                        coalesce(content, '') || ' ' || coalesce(tool_name, ''))
-                ) STORED
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS messages_fts_idx ON messages USING GIN (search_vector)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS messages_session_idx ON messages (session_id)"
-        )
-        if self._has_vector:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS message_embeddings (
-                    message_id BIGINT PRIMARY KEY,
-                    embedding  vector(1536) NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS msg_emb_hnsw
-                ON message_embeddings USING hnsw (embedding vector_cosine_ops)
-            """)
-
-        # Idempotency ledger for mirroring — see the module docstring's
-        # "Idempotent mirroring" section.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS message_mirrors (
-                session_id  TEXT NOT NULL,
-                event_id    TEXT NOT NULL,
-                message_id  BIGINT NOT NULL,
-                mirrored_at DOUBLE PRECISION NOT NULL,
-                PRIMARY KEY (session_id, event_id)
-            )
-        """)
-
-        # Durable capture-job queue — see the module docstring's "Durable
-        # capture jobs" section.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_capture_jobs (
-                id                     BIGSERIAL PRIMARY KEY,
-                agent_id               TEXT NOT NULL,
-                session_id             TEXT NOT NULL,
-                source_from_message_id BIGINT NOT NULL,
-                source_to_message_id   BIGINT NOT NULL,
-                idempotency_key        TEXT NOT NULL UNIQUE,
-                state                  TEXT NOT NULL DEFAULT 'pending',
-                attempts               INTEGER NOT NULL DEFAULT 0,
-                run_after              DOUBLE PRECISION NOT NULL,
-                last_error             TEXT,
-                created_at             DOUBLE PRECISION NOT NULL,
-                updated_at             DOUBLE PRECISION NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS capture_jobs_pending_idx
-            ON memory_capture_jobs (state, run_after)
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_proposals (
-                id              BIGSERIAL PRIMARY KEY,
-                job_id          BIGINT NOT NULL,
-                agent_id        TEXT NOT NULL,
-                claim_text      TEXT NOT NULL,
-                created_at      DOUBLE PRECISION NOT NULL,
-                status          TEXT NOT NULL DEFAULT 'pending',
-                rejected_reason TEXT NOT NULL DEFAULT ''
-            )
-        """)
-        # status added in Stage One Phase 5, slice B; rejected_reason in
-        # slice D — both ADD COLUMN IF NOT EXISTS so a database that
-        # already has this table from an earlier slice picks them up
-        # without a manual migration. status: "pending" (not yet
-        # reviewed), "promoted"/"rejected"/"superseded" (assigned by
-        # MemoryConsolidator's approve()/reject()/rollback()).
-        # rejected_reason: the human-readable reason passed to reject() —
-        # cleared back to "" on any other status transition (approve,
-        # rollback) so it can never linger as a stale explanation for a
-        # decision that's since been reversed.
-        conn.execute(
-            "ALTER TABLE memory_proposals ADD COLUMN IF NOT EXISTS "
-            "status TEXT NOT NULL DEFAULT 'pending'"
-        )
-        conn.execute(
-            "ALTER TABLE memory_proposals ADD COLUMN IF NOT EXISTS "
-            "rejected_reason TEXT NOT NULL DEFAULT ''"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS proposals_agent_idx ON memory_proposals (agent_id)"
-        )
-
-        # Durable commitment-extraction job queue — Stage One Phase 6, slice
-        # B. Structurally identical to memory_capture_jobs above (same
-        # claim/complete/fail lifecycle, same idempotency-key mechanism),
-        # but a separate table/queue: commitment output (kind, sensitivity,
-        # due window, confidence, dedupe key) is a completely different
-        # shape than memory_proposals' plain claim strings, so the two
-        # pipelines stay cleanly separated rather than overloading one
-        # table/worker with two incompatible output schemas. The extra
-        # `channel` column (e.g. a Matrix room id, or "cli" outside Matrix)
-        # is what memory_capture_jobs never needed — commitments must be
-        # scoped to "exact agent and channel context" (the plan's Task 4).
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_commitment_jobs (
-                id                     BIGSERIAL PRIMARY KEY,
-                agent_id               TEXT NOT NULL,
-                session_id             TEXT NOT NULL,
-                channel                TEXT NOT NULL,
-                source_from_message_id BIGINT NOT NULL,
-                source_to_message_id   BIGINT NOT NULL,
-                idempotency_key        TEXT NOT NULL UNIQUE,
-                state                  TEXT NOT NULL DEFAULT 'pending',
-                attempts               INTEGER NOT NULL DEFAULT 0,
-                run_after              DOUBLE PRECISION NOT NULL,
-                last_error             TEXT,
-                created_at             DOUBLE PRECISION NOT NULL,
-                updated_at             DOUBLE PRECISION NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS commitment_jobs_pending_idx
-            ON memory_commitment_jobs (state, run_after)
-        """)
-
-        # Commitments — inferred, short-lived social follow-ups (Stage One
-        # Phase 6, Task 3). Scaled down from OpenClaw's real
-        # src/commitments/types.ts CommitmentRecord (verified against that
-        # source, not just the plan doc): same kind/sensitivity/source/
-        # status vocabulary and due-window shape, without OpenClaw's
-        # richer accountId/to/threadId/senderId scope fields minion-assist
-        # has no equivalent concept for yet.
-        #
-        # due_earliest/due_latest are epoch seconds, not a single instant —
-        # a window, so "check in tomorrow afternoon" has somewhere to land
-        # rather than needing to resolve to one exact second.
-        # dedupe_key + (agent_id, channel) is what
-        # SessionDB.complete_commitment_job() upserts against, so a
-        # near-identical inferred follow-up extends an existing pending
-        # commitment's window rather than creating a duplicate.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS commitments (
-                id             BIGSERIAL PRIMARY KEY,
-                agent_id       TEXT NOT NULL,
-                session_id     TEXT NOT NULL,
-                channel        TEXT NOT NULL,
-                kind           TEXT NOT NULL,
-                sensitivity    TEXT NOT NULL,
-                source         TEXT NOT NULL,
-                status         TEXT NOT NULL DEFAULT 'pending',
-                reason         TEXT NOT NULL,
-                suggested_text TEXT NOT NULL,
-                dedupe_key     TEXT NOT NULL,
-                confidence     DOUBLE PRECISION NOT NULL,
-                due_earliest   DOUBLE PRECISION NOT NULL,
-                due_latest     DOUBLE PRECISION NOT NULL,
-                source_job_id  BIGINT NOT NULL,
-                created_at     DOUBLE PRECISION NOT NULL,
-                updated_at     DOUBLE PRECISION NOT NULL,
-                sent_at        DOUBLE PRECISION,
-                dismissed_at   DOUBLE PRECISION
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS commitments_scope_idx
-            ON commitments (agent_id, channel, status)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS commitments_dedupe_idx
-            ON commitments (agent_id, channel, dedupe_key)
-        """)
+        run_migrations(conn, "session_db", _SESSION_DB_MIGRATIONS)
 
     # ------------------------------------------------------------------
     # Session operations
