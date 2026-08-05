@@ -232,6 +232,21 @@ def _make_session_with_memory(tmp_path, memory):
     )
 
 
+def test_memory_property_returns_the_configured_memory_service(tmp_path):
+    # MEM-GAP-003: /delete-session reaches a session's MemoryService via
+    # this property to clean up proposal-derived index/evidence data.
+    memory = MemoryService(MemoryFileRepository(tmp_path / "workspace"))
+    session = _make_session_with_memory(tmp_path, memory)
+
+    assert session.memory is memory
+
+
+def test_memory_property_is_none_when_no_memory_service_was_configured(tmp_path):
+    session = _make_session(tmp_path)
+
+    assert session.memory is None
+
+
 def test_flush_head_writes_daily_note_before_compaction(tmp_path):
     """Compaction's about-to-be-summarized head is flushed to a daily note first."""
     memory = MemoryService(MemoryFileRepository(tmp_path / "workspace"))

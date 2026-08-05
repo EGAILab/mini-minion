@@ -1833,6 +1833,41 @@ def test_get_consolidation_preview_returns_none_for_an_unknown_id(index):
 
 
 # ---------------------------------------------------------------------------
+# remove_consolidation_previews_for_proposal (MEM-GAP-003)
+# ---------------------------------------------------------------------------
+
+def test_remove_consolidation_previews_for_proposal_deletes_matching_previews(index, agent_id):
+    index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Draft.", "Reason."
+    )
+    index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Redraft.", "Reason two."
+    )
+
+    index.remove_consolidation_previews_for_proposal(agent_id, 1)
+
+    assert index.list_consolidation_previews(agent_id, proposal_id=1) == []
+
+
+def test_remove_consolidation_previews_for_proposal_leaves_other_proposals_alone(index, agent_id):
+    index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Draft one.", "Reason one."
+    )
+    index.record_consolidation_preview(
+        agent_id, 2, "revise_topic", "project-goals", "abc123", "Draft two.", "Reason two."
+    )
+
+    index.remove_consolidation_previews_for_proposal(agent_id, 1)
+
+    remaining = index.list_consolidation_previews(agent_id)
+    assert [p["proposal_id"] for p in remaining] == [2]
+
+
+def test_remove_consolidation_previews_for_proposal_is_a_no_op_when_none_exist(index, agent_id):
+    index.remove_consolidation_previews_for_proposal(agent_id, 999)  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # Topic revisions (Stage One Phase 5, slice D)
 # ---------------------------------------------------------------------------
 

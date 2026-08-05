@@ -546,6 +546,19 @@ class AgentSession:
         return self._session_id
 
     @property
+    def memory(self) -> MemoryService | None:
+        """This agent's :class:`~minion_assist.memory.service.MemoryService`, if configured.
+
+        Exposed (MEM-GAP-003) so a caller that already has an ``AgentSession``
+        handy — e.g. ``commands.py``'s ``/delete-session`` — can reach the
+        matching per-agent memory service (for
+        :meth:`~minion_assist.memory.service.MemoryService.forget_proposals`)
+        without minion.py needing to also thread a separate
+        ``agent_id -> MemoryService`` map through every caller.
+        """
+        return self._memory
+
+    @property
     def history(self) -> list[dict]:
         """Snapshot of the current conversation history (defensive copy)."""
         return list(self._history)

@@ -67,6 +67,9 @@ class MatrixMessageHandler:
                               tools/memory). Every message's ``AgentSession`` comes
                               from here, keyed by room, instead of the one shared
                               per-agent entry in ``sessions``.
+        db:                  Optional ``SessionDB`` instance — enables
+                              ``/delete-session``'s cross-store cleanup
+                              (MEM-GAP-003) when a database is configured.
         exec_approval_handler: Optional exec-approval handler for tool calls.
     """
 
@@ -86,6 +89,7 @@ class MatrixMessageHandler:
         skills: dict | None = None,
         short_term: object = None,
         session_factories: "dict[str, Callable[[str], AgentSession]] | None" = None,
+        db: object = None,
     ) -> None:
         self._client = client
         self._config = config
@@ -100,6 +104,7 @@ class MatrixMessageHandler:
         self._mcp_manager = mcp_manager
         self._skills = skills
         self._short_term = short_term
+        self._db = db
         self._session_factories = session_factories or {}
         # Lazily built, then reused for the life of this handler — each
         # (agent_id, room_id) gets exactly one long-lived AgentSession
@@ -316,6 +321,7 @@ class MatrixMessageHandler:
                     mcp_manager=self._mcp_manager,
                     skills=self._skills,
                     short_term=self._short_term,
+                    db=self._db,
                 )
                 result = dispatch_command(ctx)
                 if result.handled:

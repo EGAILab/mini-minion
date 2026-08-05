@@ -579,6 +579,50 @@ def test_remember_import_reindexes_as_the_import_corpus(indexed_service):
     )
 
 
+def test_forget_proposals_without_an_index_is_a_no_op(service):
+    result = service.forget_proposals([1, 2])
+
+    assert result == {"proposal_ids": [1, 2], "forget_results": []}
+
+
+def test_forget_proposals_with_an_empty_list_never_touches_the_index(indexed_service):
+    svc, mock_index = indexed_service
+
+    result = svc.forget_proposals([])
+
+    mock_index.remove_proposal.assert_not_called()
+    assert result == {"proposal_ids": [], "forget_results": []}
+
+
+def test_forget_proposals_removes_each_proposals_chunk_and_previews(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.list_claims_citing_evidence.return_value = []  # forget_source no-op
+
+    svc.forget_proposals([10, 11])
+
+    assert mock_index.remove_proposal.call_args_list == [
+        (("main", 10),), (("main", 11),)
+    ]
+    assert mock_index.remove_consolidation_previews_for_proposal.call_args_list == [
+        (("main", 10),), (("main", 11),)
+    ]
+
+
+def test_forget_proposals_forgets_each_id_as_an_evidence_source(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.list_claims_citing_evidence.return_value = []
+
+    result = svc.forget_proposals([10, 11])
+
+    assert [r["source_kind"] for r in result["forget_results"]] == ["proposal", "proposal"]
+    assert [r["source_ref"] for r in result["forget_results"]] == ["10", "11"]
+    # list_claims_citing_evidence is forget_source's actual lookup call —
+    # this proves the real cascade ran, not just a stub.
+    assert mock_index.list_claims_citing_evidence.call_args_list == [
+        (("main", "proposal", "10"),), (("main", "proposal", "11"),)
+    ]
+
+
 def test_delete_removes_from_index_only_when_a_file_was_actually_deleted(indexed_service):
     svc, mock_index = indexed_service
     svc.remember("project-goals", "content")

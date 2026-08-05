@@ -447,6 +447,83 @@ class SessionDB:
             for r in rows
         ]
 
+    def delete_session(self, agent_id: str, session_id: str) -> dict | None:
+        """Delete every row this database owns for one session (MEM-GAP-003).
+
+        Removes, in dependency order: ``message_embeddings`` (keyed by
+        message id, no ``session_id`` column of its own), ``message_mirrors``,
+        ``messages``, this session's ``memory_proposals`` (via their
+        ``memory_capture_jobs``), ``memory_capture_jobs``,
+        ``memory_commitment_jobs``, ``commitments``, and finally the
+        ``sessions`` row itself.
+
+        Deliberately does **not** touch anything outside this database, and
+        does **not** touch any durable memory note a *promoted* proposal's
+        content was already merged into (``memory/topics/*.md``) — that
+        content became independent, reviewed memory the moment it was
+        approved, and deleting the source conversation doesn't retroactively
+        invalidate it. The proposal *bookkeeping row* is still deleted here
+        regardless of its status (pending/rejected/promoted): it's pure
+        session-derived tracking data, not the note itself. Cleaning up the
+        matching indexed proposal chunk, draft previews, and knowledge-graph
+        evidence citations in :class:`~minion_assist.memory.postgres_index.PostgresMemoryIndex`
+        is the caller's job (:meth:`~minion_assist.memory.service.MemoryService.forget_proposals`)
+        — a separate class/connection this method has no access to, using
+        the ``proposal_ids`` this method returns.
+
+        Args:
+            agent_id: The agent this session must belong to.
+            session_id: The session to delete.
+
+        Returns:
+            dict | None: ``None`` if ``session_id`` isn't owned by
+                ``agent_id`` (fail closed — matches every other MEM-GAP-002
+                scoped method's behavior; a missing/foreign session_id is
+                treated as "nothing to delete," not an error). Otherwise
+                ``{"messages": int, "proposal_ids": list[int]}`` — the
+                message count deleted, and every deleted
+                ``memory_proposals`` row's id, for the caller's PostgresMemoryIndex
+                cleanup pass.
+        """
+        if not self._session_owned_by(session_id, agent_id):
+            return None
+        conn = self._conn()
+
+        message_ids = [
+            r[0] for r in conn.execute(
+                "SELECT id FROM messages WHERE session_id = %s", (session_id,)
+            ).fetchall()
+        ]
+        if message_ids and self._has_vector:
+            conn.execute(
+                "DELETE FROM message_embeddings WHERE message_id = ANY(%s)", (message_ids,)
+            )
+        conn.execute("DELETE FROM message_mirrors WHERE session_id = %s", (session_id,))
+        conn.execute("DELETE FROM messages WHERE session_id = %s", (session_id,))
+
+        job_ids = [
+            r[0] for r in conn.execute(
+                "SELECT id FROM memory_capture_jobs WHERE session_id = %s", (session_id,)
+            ).fetchall()
+        ]
+        proposal_ids: list[int] = []
+        if job_ids:
+            proposal_ids = [
+                r[0] for r in conn.execute(
+                    "SELECT id FROM memory_proposals WHERE job_id = ANY(%s)", (job_ids,)
+                ).fetchall()
+            ]
+            if proposal_ids:
+                conn.execute(
+                    "DELETE FROM memory_proposals WHERE id = ANY(%s)", (proposal_ids,)
+                )
+        conn.execute("DELETE FROM memory_capture_jobs WHERE session_id = %s", (session_id,))
+        conn.execute("DELETE FROM memory_commitment_jobs WHERE session_id = %s", (session_id,))
+        conn.execute("DELETE FROM commitments WHERE session_id = %s", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+        return {"messages": len(message_ids), "proposal_ids": proposal_ids}
+
     # ------------------------------------------------------------------
     # Message operations
     # ------------------------------------------------------------------

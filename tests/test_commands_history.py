@@ -494,3 +494,165 @@ def test_delete_session_no_match_prefix(tmp_path):
     result = dispatch_command(_delete_ctx("zzz", stm))
     assert result.handled
     assert "No session matching" in result.message
+
+
+# ---------------------------------------------------------------------------
+# Tests: /delete-session cross-store cleanup (MEM-GAP-003)
+# ---------------------------------------------------------------------------
+
+def _delete_ctx_with_db(
+    args: str,
+    stm: ShortTermMemory,
+    db: MagicMock,
+    agent_id: str = "main",
+    session_id: str = "cur-001",
+    memory: MagicMock | None = None,
+) -> CommandContext:
+    """Like _delete_ctx, but with a mock SessionDB (and optionally a mock
+    MemoryService reachable via sessions[agent_id].memory) wired in."""
+    session = _make_session_mock(session_id)
+    session.memory = memory  # plain instance attribute — no class-level property tricks
+    return CommandContext(
+        raw=f"/delete-session {args}".strip(),
+        command="/delete-session",
+        args=args,
+        target_agent_id=agent_id,
+        sessions={agent_id: session},
+        agents_cfg={},
+        short_term=stm,
+        db=db,
+    )
+
+
+def test_delete_session_without_db_has_no_database_note(tmp_path):
+    """No ctx.db configured (the default) — behavior is unchanged from before MEM-GAP-003."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    result = dispatch_command(_delete_ctx("2", stm, session_id="cur-001"))
+
+    assert result.message.rstrip(".") == "Deleted session old-001"
+    assert "database" not in result.message.lower()
+
+
+def test_delete_session_with_db_reports_counts_and_forgets_proposals(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.return_value = {"messages": 5, "proposal_ids": [10, 11]}
+    memory = MagicMock()
+
+    result = dispatch_command(
+        _delete_ctx_with_db("2", stm, db, session_id="cur-001", memory=memory)
+    )
+
+    assert result.handled
+    db.delete_session.assert_called_once_with("main", "old-001")
+    memory.forget_proposals.assert_called_once_with([10, 11])
+    assert "5 database message" in result.message
+    assert "2 proposal" in result.message
+    # The JSONL file is still gone regardless of the database cleanup outcome.
+    assert not (tmp_path / "sessions" / "main" / "old-001.jsonl").exists()
+
+
+def test_delete_session_with_db_and_no_proposals_skips_memory_call(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.return_value = {"messages": 3, "proposal_ids": []}
+    memory = MagicMock()
+
+    result = dispatch_command(
+        _delete_ctx_with_db("2", stm, db, session_id="cur-001", memory=memory)
+    )
+
+    assert result.handled
+    memory.forget_proposals.assert_not_called()
+    assert "3 database message" in result.message
+    assert "0 proposal" in result.message
+
+
+def test_delete_session_db_returns_none_reports_only_jsonl_deletion(tmp_path):
+    """delete_session() returns None when this session was never mirrored to PostgreSQL."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.return_value = None
+    memory = MagicMock()
+
+    result = dispatch_command(
+        _delete_ctx_with_db("2", stm, db, session_id="cur-001", memory=memory)
+    )
+
+    assert result.handled
+    memory.forget_proposals.assert_not_called()
+    assert "Deleted session" in result.message
+    assert "database" not in result.message.lower()
+
+
+def test_delete_session_db_failure_still_deletes_jsonl_and_warns(tmp_path):
+    """A PostgreSQL cleanup failure must not hide that the JSONL file is already gone."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.side_effect = Exception("connection refused")
+
+    result = dispatch_command(_delete_ctx_with_db("2", stm, db, session_id="cur-001"))
+
+    assert result.handled
+    assert "WARNING" in result.message
+    assert "connection refused" in result.message
+    assert not (tmp_path / "sessions" / "main" / "old-001.jsonl").exists()
+
+
+def test_delete_session_forget_proposals_failure_is_reported_not_swallowed(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.return_value = {"messages": 1, "proposal_ids": [42]}
+    memory = MagicMock()
+    memory.forget_proposals.side_effect = Exception("index unreachable")
+
+    result = dispatch_command(
+        _delete_ctx_with_db("2", stm, db, session_id="cur-001", memory=memory)
+    )
+
+    assert result.handled
+    assert "index unreachable" in result.message
+    # The database-level deletion itself still succeeded and is reported.
+    assert "1 database message" in result.message
+
+
+def test_delete_session_with_db_but_no_memory_available_skips_forget_silently(tmp_path):
+    """If sessions[agent_id].memory is None, forget_proposals is simply not called."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.return_value = {"messages": 2, "proposal_ids": [1]}
+
+    result = dispatch_command(
+        _delete_ctx_with_db("2", stm, db, session_id="cur-001", memory=None)
+    )
+
+    assert result.handled
+    assert "2 database message" in result.message

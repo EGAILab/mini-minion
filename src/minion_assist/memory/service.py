@@ -197,6 +197,69 @@ class MemoryService:
         return self._files.list_import_keys()
 
     # -----------------------------------------------------------------
+    # Session-derived cleanup (MEM-GAP-003)
+    # -----------------------------------------------------------------
+
+    def forget_proposals(self, proposal_ids: list[int]) -> dict:
+        """Remove every indexed trace of deleted ``memory_proposals`` rows.
+
+        Called by ``commands.py``'s ``/delete-session`` after
+        :meth:`~minion_assist.session.db.SessionDB.delete_session` returns
+        the ids of the proposal rows it just deleted — ``SessionDB`` owns
+        those rows but has no access to :class:`PostgresMemoryIndex`
+        (separate class/connection by design), so this is where the two
+        stores' cleanup meets.
+
+        For each proposal id:
+
+        1. **Forgets it as a knowledge-graph evidence source**
+           (:func:`~minion_assist.memory.forgetting.forget_source`) — edits
+           the actual claim markers in any topic note citing
+           ``("proposal", str(proposal_id))``, not just the derived
+           ``kb_evidence`` cache (which a later reindex would otherwise
+           silently restore). A claim left with no other evidence is
+           re-flagged ``status=unknown``, never silently deleted.
+        2. Removes its indexed chunk (:meth:`PostgresMemoryIndex.remove_proposal`).
+        3. Removes any draft preview referencing it
+           (:meth:`PostgresMemoryIndex.remove_consolidation_previews_for_proposal`).
+
+        Deliberately does **not** touch ``memory_topic_revisions`` or any
+        durable note a *promoted* proposal's content was merged into — that
+        note is independent, reviewed memory now, and survives deletion of
+        the session it originally came from.
+
+        A no-op (returns empty results) if no index is configured, since
+        none of the rows this cleans up can exist without one.
+
+        Args:
+            proposal_ids: Ids of ``memory_proposals`` rows that were just
+                deleted from ``SessionDB``.
+
+        Returns:
+            dict: ``{"proposal_ids": [...], "forget_results": [...]}`` —
+                ``forget_results`` is one
+                :func:`~minion_assist.memory.forgetting.forget_source`
+                result dict per proposal id, in order, for callers that want
+                to report exactly what was re-evaluated.
+        """
+        if self._index is None or self._agent_id is None or not proposal_ids:
+            return {"proposal_ids": list(proposal_ids), "forget_results": []}
+
+        from .forgetting import forget_source  # noqa: PLC0415
+
+        forget_results = []
+        for proposal_id in proposal_ids:
+            forget_results.append(
+                forget_source(
+                    self._index, self._files, self._agent_id, "proposal", str(proposal_id)
+                )
+            )
+            self._index.remove_proposal(self._agent_id, proposal_id)
+            self._index.remove_consolidation_previews_for_proposal(self._agent_id, proposal_id)
+
+        return {"proposal_ids": list(proposal_ids), "forget_results": forget_results}
+
+    # -----------------------------------------------------------------
     # Search and recall
     # -----------------------------------------------------------------
 

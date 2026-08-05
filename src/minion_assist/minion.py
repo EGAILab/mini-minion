@@ -883,6 +883,7 @@ def main() -> None:
             skills=skills,
             short_term=short_term,
             session_factories=matrix_session_factories,
+            db=_db,
         )
         print("[matrix] Listener started.")
 
@@ -1241,6 +1242,7 @@ def main() -> None:
                         mcp_manager=mcp_manager,
                         skills=skills,
                         short_term=short_term,
+                        db=_db,
                     )
                     result = dispatch_command(ctx)
                     if result.handled:

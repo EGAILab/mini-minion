@@ -1120,3 +1120,140 @@ def test_get_session_bookends_returns_messages_for_the_owning_agent(db, session_
     first, last = db.get_session_bookends(session_id, "main")
 
     assert len(first) == 1
+
+
+# ---------------------------------------------------------------------------
+# delete_session (MEM-GAP-003)
+# ---------------------------------------------------------------------------
+
+def test_delete_session_returns_none_for_a_session_owned_by_another_agent(db, session_id):
+    db.upsert_session(session_id, "researcher")
+
+    assert db.delete_session("main", session_id) is None
+    # Untouched — still owned by researcher and still readable.
+    assert db._session_owned_by(session_id, "researcher") is True
+
+
+def test_delete_session_returns_none_for_an_unknown_session_id(db):
+    assert db.delete_session("main", "does-not-exist") is None
+
+
+def test_delete_session_removes_the_sessions_row(db, session_id):
+    db.upsert_session(session_id, "main")
+
+    db.delete_session("main", session_id)
+
+    assert db._session_owned_by(session_id, "main") is False
+
+
+def test_delete_session_removes_messages_and_returns_the_count(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+    db.mirror_message(session_id, "e2", "assistant", "hi there")
+
+    result = db.delete_session("main", session_id)
+
+    assert result["messages"] == 2
+    assert _message_count(db, session_id) == 0
+
+
+def test_delete_session_removes_message_mirrors(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    db.delete_session("main", session_id)
+
+    assert db.is_mirrored(session_id, "e1") is False
+
+
+def test_delete_session_removes_capture_jobs(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+
+    db.delete_session("main", session_id)
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM memory_capture_jobs WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_delete_session_removes_commitment_jobs(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+
+    db.delete_session("main", session_id)
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM memory_commitment_jobs WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_delete_session_removes_commitments(db, session_id):
+    db.upsert_session(session_id, "main")
+    _create_commitment(db, session_id)
+
+    db.delete_session("main", session_id)
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM commitments WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_delete_session_removes_proposals_and_returns_their_ids(db, session_id):
+    db.upsert_session(session_id, "main")
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()
+    new_proposals = db.complete_capture_job(
+        job_id, ["User prefers dark mode.", "User's dog is named Biscuit."]
+    )
+    proposal_ids = [p["id"] for p in new_proposals]
+
+    result = db.delete_session("main", session_id)
+
+    assert sorted(result["proposal_ids"]) == sorted(proposal_ids)
+    row = db._conn().execute(
+        "SELECT count(*) FROM memory_proposals WHERE id = ANY(%s)", (proposal_ids,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_delete_session_with_no_proposals_returns_empty_proposal_ids(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    result = db.delete_session("main", session_id)
+
+    assert result["proposal_ids"] == []
+
+
+def test_delete_session_does_not_touch_a_different_sessions_data(db, session_id):
+    other_session_id = f"{session_id}-other"
+    db.upsert_session(session_id, "main")
+    db.upsert_session(other_session_id, "main")
+    db.mirror_message(other_session_id, "e1", "user", "should survive")
+
+    db.delete_session("main", session_id)
+
+    assert db._session_owned_by(other_session_id, "main") is True
+    assert _message_count(db, other_session_id) == 1
+
+    # Manual cleanup since other_session_id isn't the fixture's own session_id
+    # (the autouse _cleanup_after fixture only scopes to the `session_id` fixture value).
+    db._conn().execute("DELETE FROM messages WHERE session_id = %s", (other_session_id,))
+    db._conn().execute("DELETE FROM sessions WHERE id = %s", (other_session_id,))
+
+
+def test_delete_session_is_a_harmless_no_op_the_second_time(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    first = db.delete_session("main", session_id)
+    second = db.delete_session("main", session_id)
+
+    assert first is not None
+    assert second is None

@@ -1380,6 +1380,25 @@ class PostgresMemoryIndex:
             (agent_id, f"proposals/{proposal_id}"),
         )
 
+    def remove_consolidation_previews_for_proposal(self, agent_id: str, proposal_id: int) -> None:
+        """Delete every drafted-but-never-applied preview for one proposal (MEM-GAP-003).
+
+        A preview only ever records what :class:`~minion_assist.memory.consolidation.MemoryConsolidator`
+        *would* write (see :meth:`record_consolidation_preview`) — once its
+        source proposal no longer exists (e.g. the session it came from was
+        deleted), there's nothing left to apply or reject it against, so the
+        draft becomes meaningless clutter rather than a real audit record.
+        Safe to call unconditionally — a no-op if none exist. Does not touch
+        ``memory_topic_revisions``: that table records rollback history for
+        an *already-applied* (promoted) proposal's resulting note, which is
+        independent memory that survives deletion of its source session —
+        see :meth:`~minion_assist.memory.service.MemoryService.forget_proposals`.
+        """
+        self._conn().execute(
+            "DELETE FROM memory_consolidation_previews WHERE agent_id = %s AND proposal_id = %s",
+            (agent_id, proposal_id),
+        )
+
     def rebuild_agent(self, agent_id: str, indexable_files: list[tuple[str, str, str]]) -> int:
         """Rebuild one agent's entire index from a fresh file listing.
 

@@ -463,7 +463,7 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/agents` | List all known agents with turn counts and last-active timestamps |
 | `/session [N\|uuid-prefix]` | List past conversation sessions for the active agent; restore one by index or UUID prefix |
 | `/rename [N] <name>` | Give the current session (or session N from /session) a descriptive name |
-| `/delete-session [N\|uuid-prefix]` | Permanently delete a past session (cannot delete the active session) |
+| `/delete-session [N\|uuid-prefix]` | Permanently delete a past session (cannot delete the active session). When a database is configured, also removes that session's PostgreSQL mirror, capture/commitment jobs, proposals (and their indexed chunks/draft previews/knowledge-graph evidence citations), and commitments — not just the local JSONL file (MEM-GAP-003). Any note already promoted from a proposal is left untouched, since it's independent, reviewed memory by then. |
 | `/switch [agent_id]` | Switch the active agent routing target (e.g. `/switch researcher`); defaults to current agent |
 | `/diagnose` | Check each agent's provider configuration and API key status |
 | `/mcp-reload` | Reconnect all MCP servers and refresh tool adapters in every session |

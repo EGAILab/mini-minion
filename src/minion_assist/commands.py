@@ -69,6 +69,8 @@ class CommandContext:
     mcp_manager: object = None        # McpClientManager instance (optional, for /mcp-reload)
     skills: dict | None = None        # dict[str, SkillInfo] loaded at startup
     short_term: object = None         # ShortTermMemory instance (for /session)
+    db: object = None                 # SessionDB instance (optional, for /delete-session's
+                                       # cross-store cleanup — MEM-GAP-003)
 
 
 @dataclass
@@ -1096,7 +1098,55 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
             display_name = ctx.short_term.get_name(agent_id, target_id)
             ctx.short_term.delete_session(agent_id, target_id)
             hint = f"[{display_name}]" if display_name else target_id[:8]
-            return CommandResult(handled=True, message=f"Deleted session {hint}.")
+
+            # Cross-store cleanup (MEM-GAP-003): the JSONL file above was
+            # always this session's only source of truth for the local/basic
+            # profile, but a PostgreSQL-mirrored session also has messages,
+            # capture/commitment jobs, proposals, and commitments living in
+            # SessionDB — none of which the JSONL delete above touches.
+            # ctx.db is only set when a database is actually configured, so
+            # this whole block is a no-op in the local/basic profile.
+            pg_note = ""
+            if ctx.db is not None:
+                try:
+                    pg_result = ctx.db.delete_session(agent_id, target_id)
+                except Exception as exc:
+                    # Surface this loudly rather than silently claiming a
+                    # complete deletion — the JSONL file is already gone, but
+                    # PostgreSQL records may still exist and be searchable.
+                    pg_note = (
+                        f" WARNING: database cleanup failed ({exc}) — "
+                        "PostgreSQL records for this session may still exist."
+                    )
+                else:
+                    if pg_result is not None:
+                        proposal_ids = pg_result.get("proposal_ids") or []
+                        forget_note = ""
+                        if proposal_ids:
+                            # Only SessionDB knows which proposal ids it just
+                            # deleted; only the matching agent's MemoryService
+                            # can clean up their indexed chunks, draft
+                            # previews, and knowledge-graph evidence
+                            # citations (a separate class/connection).
+                            agent_session = ctx.sessions.get(agent_id)
+                            memory = getattr(agent_session, "memory", None)
+                            if memory is not None:
+                                try:
+                                    memory.forget_proposals(proposal_ids)
+                                except Exception as exc:
+                                    forget_note = (
+                                        f" (evidence cleanup for {len(proposal_ids)} "
+                                        f"proposal(s) failed: {exc})"
+                                    )
+                        pg_note = (
+                            f" Also removed {pg_result['messages']} database message(s) "
+                            f"and {len(proposal_ids)} proposal(s).{forget_note}"
+                        )
+                    # pg_result is None: this session_id was never mirrored to
+                    # PostgreSQL for this agent (e.g. it predates the database
+                    # being configured) — nothing more to clean up, not an error.
+
+            return CommandResult(handled=True, message=f"Deleted session {hint}.{pg_note}")
 
     # --- Plugin commands ---
     # Check plugin-registered commands after all built-ins.  Plugins can shadow

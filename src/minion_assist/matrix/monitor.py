@@ -46,6 +46,7 @@ async def monitor_matrix(
     skills: dict | None = None,
     short_term: object = None,
     session_factories: dict | None = None,
+    db: object = None,
 ) -> None:
     """Run the Matrix sync loop until ``stop_event`` is set.
 
@@ -66,6 +67,8 @@ async def monitor_matrix(
                       fresh ``AgentSession`` for that agent given a session_id
                       (MEM-GAP-001) — see ``minion.py``'s
                       ``matrix_session_factories``.
+        db:           Optional ``SessionDB`` instance — enables
+                      ``/delete-session``'s cross-store cleanup (MEM-GAP-003).
     """
     # All database files live under workspace/matrix/ so they're easy to find
     # and back up alongside other workspace data.
@@ -108,6 +111,7 @@ async def monitor_matrix(
         skills=skills,
         short_term=short_term,
         session_factories=session_factories,
+        db=db,
     )
 
     try:
