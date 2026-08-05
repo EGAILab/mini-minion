@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from .agents.session import AgentSession
     from .config import HeartbeatConfig
     from .session.db import SessionDB
+    from .worker_health import WorkerHealth
 
 
 class HeartbeatScheduler:
@@ -73,6 +74,8 @@ class HeartbeatScheduler:
             Phase 6, slice C). ``None`` (the default) skips commitment
             delivery entirely, same as every other database-optional path
             in this project.
+        health: Optional :class:`~minion_assist.worker_health.WorkerHealth`
+            (MEM-GAP-016) — see other schedulers' matching parameter.
     """
 
     def __init__(
@@ -82,12 +85,14 @@ class HeartbeatScheduler:
         matrix_outbound: object = None,
         matrix_loop: object = None,
         db: "SessionDB | None" = None,
+        health: "WorkerHealth | None" = None,
     ) -> None:
         self._config = config
         self._sessions = sessions
         self._outbound = matrix_outbound
         self._loop = matrix_loop
         self._db = db
+        self._health = health
         self._timer: threading.Timer | None = None
         self._stopped = False
 
@@ -109,10 +114,16 @@ class HeartbeatScheduler:
         """Run one heartbeat turn then reschedule."""
         if self._stopped:
             return
+        if self._health is not None:
+            self._health.record_poll()
         try:
             self._run_heartbeat()
+            if self._health is not None:
+                self._health.record_success()
         except Exception as exc:
             print(f"[heartbeat] Error during turn: {exc}", file=sys.stderr)
+            if self._health is not None:
+                self._health.record_failure(f"{type(exc).__name__}: {exc}")
         finally:
             # Always reschedule (even after an error) so the loop continues.
             if not self._stopped:

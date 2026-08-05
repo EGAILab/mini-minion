@@ -108,6 +108,7 @@ from .skills import discover_skills, format_skills_prompt
 from .spawn_registry import count_active_children, get_spawn_depth
 from .tools import ToolRegistry, default_registry
 from .tools.spawn_subagent import SpawnSubagentTool, _make_subagent_registry
+from .worker_health import WorkerHealth
 from .workspace import agent_workspace_root, ensure_workspace
 
 
@@ -587,6 +588,12 @@ def main() -> None:
     # session_id/history, instead of every Matrix room sharing the one
     # AgentSession in `sessions`.
     matrix_session_factories: dict[str, "Callable[[str], AgentSession]"] = {}
+    # Populated below, one entry per background worker/scheduler actually
+    # constructed (MEM-GAP-016) — lets /status deep report live liveness
+    # (last poll/success/error) for each one. Never populated for a worker
+    # that wasn't constructed (e.g. no database configured), so its absence
+    # from this dict already means "not running," no separate flag needed.
+    worker_health: dict[str, WorkerHealth] = {}
     for agent_id, cfg in agents_cfg.items():
         # Per-agent workspace root: resolved before building the memory service
         # and calling default_registry() so both point at the same directory
@@ -830,8 +837,10 @@ def main() -> None:
         # capture_worker.py's module docstring for why this stays gated
         # out of normal per-turn search/injection.
         _index_proposal = _memory_index.reindex_proposal if _memory_index is not None else None
+        worker_health["capture_worker"] = WorkerHealth("capture_worker")
         _capture_worker = CaptureWorker(
-            _db, lambda aid: _providers_by_agent[aid], index_proposal=_index_proposal
+            _db, lambda aid: _providers_by_agent[aid], index_proposal=_index_proposal,
+            health=worker_health["capture_worker"],
         )
         _capture_worker.start()
 
@@ -847,9 +856,11 @@ def main() -> None:
     _commitment_worker = None
     if _db is not None and commitments_cfg.enabled:
         from .memory.commitment_worker import CommitmentWorker  # noqa: PLC0415
+        worker_health["commitment_worker"] = WorkerHealth("commitment_worker")
         _commitment_worker = CommitmentWorker(
             _db, lambda aid: _providers_by_agent[aid],
             min_due_seconds=float(heartbeat_cfg.interval_seconds),
+            health=worker_health["commitment_worker"],
         )
         _commitment_worker.start()
 
@@ -863,7 +874,10 @@ def main() -> None:
     if _memory_index is not None:
         try:
             from .memory.watcher import MemoryIndexWatcher  # noqa: PLC0415
-            _memory_watcher = MemoryIndexWatcher(_memory_index, _agent_files_repos)
+            worker_health["memory_watcher"] = WorkerHealth("memory_watcher")
+            _memory_watcher = MemoryIndexWatcher(
+                _memory_index, _agent_files_repos, health=worker_health["memory_watcher"]
+            )
             _memory_watcher.start()
         except Exception as _watcher_exc:
             print(
@@ -871,6 +885,7 @@ def main() -> None:
                 "On-disk edits made outside the app won't be reindexed until next startup."
             )
             _memory_watcher = None
+            worker_health.pop("memory_watcher", None)
 
     if channels_cfg.matrix is not None:
         from .matrix.channel import MatrixChannel  # noqa: PLC0415 — optional dependency
@@ -884,6 +899,7 @@ def main() -> None:
             short_term=short_term,
             session_factories=matrix_session_factories,
             db=_db,
+            worker_health=worker_health,
         )
         print("[matrix] Listener started.")
 
@@ -895,12 +911,14 @@ def main() -> None:
         from .heartbeat import HeartbeatScheduler  # noqa: PLC0415
         _matrix_outbound = getattr(_matrix_channel, "_outbound", None) if _matrix_channel else None
         _matrix_loop = getattr(_matrix_channel, "_loop", None) if _matrix_channel else None
+        worker_health["heartbeat"] = WorkerHealth("heartbeat")
         _heartbeat = HeartbeatScheduler(
             config=heartbeat_cfg,
             sessions=sessions,
             matrix_outbound=_matrix_outbound,
             matrix_loop=_matrix_loop,
             db=_db,
+            health=worker_health["heartbeat"],
         )
         _heartbeat.start()  # type: ignore[attr-defined]
         print(f"[heartbeat] Scheduler started (interval: {heartbeat_cfg.interval_seconds}s).")
@@ -920,12 +938,14 @@ def main() -> None:
             from .dreaming import DreamingScheduler  # noqa: PLC0415
             _dream_matrix_outbound = getattr(_matrix_channel, "_outbound", None) if _matrix_channel else None
             _dream_matrix_loop = getattr(_matrix_channel, "_loop", None) if _matrix_channel else None
+            worker_health["dreaming"] = WorkerHealth("dreaming")
             _dreaming = DreamingScheduler(
                 cfg=dreaming_cfg,
                 dream_session_factory=_dream_session_factory,
                 workspace_dir=_dream_workspace_dir,
                 matrix_outbound=_dream_matrix_outbound,
                 matrix_loop=_dream_matrix_loop,
+                health=worker_health["dreaming"],
             )
             _dreaming.start()  # type: ignore[attr-defined]
             print(
@@ -968,8 +988,10 @@ def main() -> None:
                 _providers_by_agent[memory_consolidation_cfg.agent_id],
                 agent_id=memory_consolidation_cfg.agent_id,
             )
+            worker_health["memory_consolidation"] = WorkerHealth("memory_consolidation")
             _memory_consolidation = MemoryConsolidationScheduler(
-                memory_consolidation_cfg, _db, _memory_index, _consolidator
+                memory_consolidation_cfg, _db, _memory_index, _consolidator,
+                health=worker_health["memory_consolidation"],
             )
             _memory_consolidation.start()  # type: ignore[attr-defined]
             print(
@@ -1004,10 +1026,12 @@ def main() -> None:
         else:
             from .memory.digest_scheduler import KnowledgeDigestScheduler  # noqa: PLC0415
 
+            worker_health["knowledge_digest"] = WorkerHealth("knowledge_digest")
             _knowledge_digest = KnowledgeDigestScheduler(
                 knowledge_digest_cfg,
                 _memory_index,
                 _agent_files_repos[knowledge_digest_cfg.agent_id],
+                health=worker_health["knowledge_digest"],
             )
             _knowledge_digest.start()  # type: ignore[attr-defined]
             print(
@@ -1243,6 +1267,7 @@ def main() -> None:
                         skills=skills,
                         short_term=short_term,
                         db=_db,
+                        worker_health=worker_health,
                     )
                     result = dispatch_command(ctx)
                     if result.handled:

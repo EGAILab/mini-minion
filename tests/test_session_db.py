@@ -1257,3 +1257,100 @@ def test_delete_session_is_a_harmless_no_op_the_second_time(db, session_id):
 
     assert first is not None
     assert second is None
+
+
+# ---------------------------------------------------------------------------
+# queue_lag_summary (MEM-GAP-016)
+#
+# Uses a fresh, unique agent_id per test (not "main") since this method
+# aggregates across every session for an agent, and "main" may carry real
+# pending jobs from actual usage of this shared dev database. Cleaned up
+# manually since the file's autouse fixture only scopes to the `session_id`
+# fixture value, not an arbitrary agent_id.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def lag_agent_id():
+    return f"test-lag-{uuid.uuid4()}"
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_lag_agent(db, lag_agent_id):
+    yield
+    conn = db._conn()
+    conn.execute("DELETE FROM memory_capture_jobs WHERE agent_id = %s", (lag_agent_id,))
+    conn.execute("DELETE FROM memory_commitment_jobs WHERE agent_id = %s", (lag_agent_id,))
+
+
+def test_queue_lag_summary_is_zero_for_an_agent_with_no_jobs(db, lag_agent_id):
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary == {
+        "capture": {"pending_count": 0, "oldest_pending_age_s": None},
+        "commitment": {"pending_count": 0, "oldest_pending_age_s": None},
+    }
+
+
+def test_queue_lag_summary_counts_pending_capture_jobs(db, session_id, lag_agent_id):
+    db.enqueue_capture_job(lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}")
+
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary["capture"]["pending_count"] == 1
+    assert summary["capture"]["oldest_pending_age_s"] >= 0
+
+
+def test_queue_lag_summary_counts_pending_commitment_jobs(db, session_id, lag_agent_id):
+    db.enqueue_commitment_job(
+        lag_agent_id, session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
+    )
+
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary["commitment"]["pending_count"] == 1
+    assert summary["commitment"]["oldest_pending_age_s"] >= 0
+
+
+def test_queue_lag_summary_excludes_claimed_jobs(db, session_id, lag_agent_id):
+    db.enqueue_capture_job(lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.claim_next_capture_job()  # moves state 'pending' -> 'running'
+
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary["capture"]["pending_count"] == 0
+
+
+def test_queue_lag_summary_excludes_completed_jobs(db, session_id, lag_agent_id):
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    db.claim_next_capture_job()
+    db.complete_capture_job(job_id, [])
+
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary["capture"]["pending_count"] == 0
+
+
+def test_queue_lag_summary_is_scoped_to_the_given_agent(db, session_id, lag_agent_id):
+    db.enqueue_capture_job(lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}")
+
+    summary = db.queue_lag_summary(f"other-{lag_agent_id}")
+
+    assert summary["capture"]["pending_count"] == 0
+
+
+def test_queue_lag_summary_reports_the_oldest_pending_jobs_age(db, session_id, lag_agent_id):
+    old_job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"old-key-{session_id}"
+    )
+    db._conn().execute(
+        "UPDATE memory_capture_jobs SET created_at = %s WHERE id = %s",
+        (time.time() - 3600.0, old_job_id),
+    )
+    db.enqueue_capture_job(lag_agent_id, session_id, 3, 4, idempotency_key=f"new-key-{session_id}")
+
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary["capture"]["pending_count"] == 2
+    assert summary["capture"]["oldest_pending_age_s"] >= 3600.0

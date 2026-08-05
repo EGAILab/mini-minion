@@ -48,6 +48,7 @@ class MatrixChannel:
         self._short_term: object = None
         self._session_factories: dict | None = None
         self._db: object = None
+        self._worker_health: dict | None = None
 
     def start(
         self,
@@ -59,6 +60,7 @@ class MatrixChannel:
         short_term: object = None,
         session_factories: dict | None = None,
         db: object = None,
+        worker_health: dict | None = None,
     ) -> None:
         """Start the Matrix listener in a background daemon thread.
 
@@ -76,6 +78,8 @@ class MatrixChannel:
                 single entry per agent.
             db:           Optional ``SessionDB`` instance — enables
                 ``/delete-session``'s cross-store cleanup (MEM-GAP-003).
+            worker_health: Dict mapping worker name → ``WorkerHealth``
+                (MEM-GAP-016) — enables ``/status deep`` from Matrix chat.
         """
         if self._started:
             return
@@ -87,6 +91,7 @@ class MatrixChannel:
         self._short_term = short_term
         self._session_factories = session_factories
         self._db = db
+        self._worker_health = worker_health
         # daemon=True means the thread is killed automatically when the main
         # process exits — no need to call stop() on a clean REPL exit.
         self._thread = threading.Thread(
@@ -147,4 +152,5 @@ class MatrixChannel:
             short_term=self._short_term,
             session_factories=self._session_factories,
             db=self._db,
+            worker_health=self._worker_health,
         )

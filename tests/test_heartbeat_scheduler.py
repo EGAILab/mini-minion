@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from minion_assist.heartbeat import HeartbeatScheduler
+from minion_assist.worker_health import WorkerHealth
 
 
 def _make_config(
@@ -335,3 +336,34 @@ def test_deliver_to_channel_never_uses_the_fixed_notification_room():
         t.join(timeout=2)
 
     assert sent_to == ["!commitment-room:example.org"]
+
+
+# ---------------------------------------------------------------------------
+# WorkerHealth wiring (MEM-GAP-016)
+# ---------------------------------------------------------------------------
+
+def test_tick_records_a_poll_and_success():
+    cfg = _make_config()
+    health = WorkerHealth("heartbeat")
+    scheduler = HeartbeatScheduler(cfg, {"main": _make_session()}, health=health)
+    scheduler.start = lambda: None  # avoid actually scheduling a real timer
+
+    scheduler._tick()
+
+    snap = health.snapshot()
+    assert snap["last_poll_at"] is not None
+    assert snap["last_success_at"] is not None
+
+
+def test_tick_records_failure_when_run_heartbeat_raises(monkeypatch):
+    cfg = _make_config()
+    health = WorkerHealth("heartbeat")
+    scheduler = HeartbeatScheduler(cfg, {"main": _make_session()}, health=health)
+    scheduler.start = lambda: None
+    monkeypatch.setattr(scheduler, "_run_heartbeat", MagicMock(side_effect=RuntimeError("boom")))
+
+    scheduler._tick()
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] == 1
+    assert "boom" in snap["last_error"]

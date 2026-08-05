@@ -19,6 +19,7 @@ from minion_assist.dreaming import (
     _read_recent_diary_entries,
     _seconds_until_next,
 )
+from minion_assist.worker_health import WorkerHealth
 
 
 # ---------------------------------------------------------------------------
@@ -414,3 +415,45 @@ class TestDreamingScheduler:
         scheduler._run_dream_turn()
         message_arg = mock_session.send.call_args.kwargs.get("message", "") or mock_session.send.call_args.args[0]
         assert "Rewrote the kernel." in message_arg
+
+    # -----------------------------------------------------------------
+    # WorkerHealth wiring (MEM-GAP-016)
+    # -----------------------------------------------------------------
+
+    def test_fire_records_a_poll_and_success(self, tmp_path: Path) -> None:
+        mock_session = MagicMock()
+        mock_session.send.return_value = None
+        factory = MagicMock(return_value=mock_session)
+        health = WorkerHealth("dreaming")
+        scheduler = DreamingScheduler(
+            cfg=self._make_cfg(),
+            dream_session_factory=factory,
+            workspace_dir=tmp_path,
+            health=health,
+        )
+        scheduler.start = lambda: None  # avoid actually scheduling a real timer
+
+        scheduler._fire()
+
+        snap = health.snapshot()
+        assert snap["last_poll_at"] is not None
+        assert snap["last_success_at"] is not None
+
+    def test_fire_records_failure_on_error(self, tmp_path: Path) -> None:
+        def bad_factory():
+            raise RuntimeError("Provider down")
+
+        health = WorkerHealth("dreaming")
+        scheduler = DreamingScheduler(
+            cfg=self._make_cfg(),
+            dream_session_factory=bad_factory,
+            workspace_dir=tmp_path,
+            health=health,
+        )
+        scheduler.start = lambda: None
+
+        scheduler._fire()
+
+        snap = health.snapshot()
+        assert snap["consecutive_failures"] == 1
+        assert "Provider down" in snap["last_error"]

@@ -70,6 +70,9 @@ class MatrixMessageHandler:
         db:                  Optional ``SessionDB`` instance — enables
                               ``/delete-session``'s cross-store cleanup
                               (MEM-GAP-003) when a database is configured.
+        worker_health:       Dict mapping worker name → ``WorkerHealth``
+                              (MEM-GAP-016) — enables ``/status deep`` from
+                              Matrix chat.
         exec_approval_handler: Optional exec-approval handler for tool calls.
     """
 
@@ -90,6 +93,7 @@ class MatrixMessageHandler:
         short_term: object = None,
         session_factories: "dict[str, Callable[[str], AgentSession]] | None" = None,
         db: object = None,
+        worker_health: dict | None = None,
     ) -> None:
         self._client = client
         self._config = config
@@ -105,6 +109,7 @@ class MatrixMessageHandler:
         self._skills = skills
         self._short_term = short_term
         self._db = db
+        self._worker_health = worker_health
         self._session_factories = session_factories or {}
         # Lazily built, then reused for the life of this handler — each
         # (agent_id, room_id) gets exactly one long-lived AgentSession
@@ -322,6 +327,7 @@ class MatrixMessageHandler:
                     skills=self._skills,
                     short_term=self._short_term,
                     db=self._db,
+                    worker_health=self._worker_health,
                 )
                 result = dispatch_command(ctx)
                 if result.handled:

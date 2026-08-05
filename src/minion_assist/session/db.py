@@ -1302,6 +1302,52 @@ class SessionDB:
         )
 
     # ------------------------------------------------------------------
+    # Queue health (MEM-GAP-016)
+    # ------------------------------------------------------------------
+
+    def queue_lag_summary(self, agent_id: str) -> dict:
+        """Report how far behind the capture/commitment job queues are for one agent.
+
+        Unlike :class:`~minion_assist.worker_health.WorkerHealth` (in-process
+        liveness, only visible to the same running process), this is a plain
+        SQL aggregate over ``memory_capture_jobs``/``memory_commitment_jobs``
+        — a fact anyone with a database connection can observe, including a
+        separate ``minion-assist memory status --deep`` CLI invocation.
+        "Pending" here means ``state = 'pending'`` (claimed-but-running or
+        already-finished jobs are excluded — a stuck ``'running'`` job is a
+        different, rarer failure mode this doesn't attempt to detect).
+
+        Args:
+            agent_id: Which agent's queues to summarize.
+
+        Returns:
+            dict: ``{"capture": {"pending_count", "oldest_pending_age_s"},
+                "commitment": {"pending_count", "oldest_pending_age_s"}}``.
+                ``oldest_pending_age_s`` is seconds since the oldest pending
+                job was created, or ``None`` if the queue is empty.
+        """
+        conn = self._conn()
+        now = time.time()
+
+        def _lane(table: str) -> dict:
+            row = conn.execute(
+                f"SELECT count(*), MIN(created_at) FROM {table} "
+                "WHERE agent_id = %s AND state = 'pending'",
+                (agent_id,),
+            ).fetchone()
+            pending_count = row[0] or 0
+            oldest_created_at = row[1]
+            oldest_pending_age_s = (
+                now - oldest_created_at if oldest_created_at is not None else None
+            )
+            return {"pending_count": pending_count, "oldest_pending_age_s": oldest_pending_age_s}
+
+        return {
+            "capture": _lane("memory_capture_jobs"),
+            "commitment": _lane("memory_commitment_jobs"),
+        }
+
+    # ------------------------------------------------------------------
     # Commitment lifecycle — Stage One Phase 6, slice C
     # ------------------------------------------------------------------
 

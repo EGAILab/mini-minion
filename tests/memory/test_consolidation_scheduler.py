@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 from minion_assist.config import MemoryConsolidationConfig
 from minion_assist.memory.consolidation_scheduler import MemoryConsolidationScheduler
+from minion_assist.worker_health import WorkerHealth
 
 
 def _make_cfg(**kwargs) -> MemoryConsolidationConfig:
@@ -184,3 +185,74 @@ class TestFire:
         scheduler._fire()
 
         run_pass.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# WorkerHealth wiring (MEM-GAP-016)
+# ---------------------------------------------------------------------------
+
+class TestWorkerHealth:
+    def test_fire_records_a_poll(self, monkeypatch):
+        health = WorkerHealth("memory_consolidation")
+        scheduler = MemoryConsolidationScheduler(_make_cfg(), Mock(), Mock(), Mock(), health=health)
+        monkeypatch.setattr(scheduler, "_run_pass", Mock())
+        monkeypatch.setattr(scheduler, "start", Mock())
+
+        scheduler._fire()
+
+        assert health.snapshot()["last_poll_at"] is not None
+
+    def test_fire_records_failure_on_a_whole_pass_error(self, monkeypatch):
+        health = WorkerHealth("memory_consolidation")
+        scheduler = MemoryConsolidationScheduler(_make_cfg(), Mock(), Mock(), Mock(), health=health)
+        monkeypatch.setattr(scheduler, "_run_pass", Mock(side_effect=RuntimeError("db down")))
+        monkeypatch.setattr(scheduler, "start", Mock())
+
+        scheduler._fire()
+
+        snap = health.snapshot()
+        assert snap["consecutive_failures"] == 1
+        assert "db down" in snap["last_error"]
+
+    def test_run_pass_records_success_per_drafted_proposal(self, monkeypatch):
+        import minion_assist.memory.consolidation as consolidation
+
+        db = Mock()
+        index = Mock()
+        index.list_consolidation_previews.return_value = []
+        consolidator = Mock()
+        monkeypatch.setattr(
+            consolidation, "rank_proposals",
+            lambda db_, index_, agent_id: [_proposal(id=1), _proposal(id=2)],
+        )
+        health = WorkerHealth("memory_consolidation")
+        scheduler = MemoryConsolidationScheduler(
+            _make_cfg(top_n=5), db, index, consolidator, health=health
+        )
+
+        scheduler._run_pass()
+
+        assert health.snapshot()["last_success_at"] is not None
+
+    def test_run_pass_records_failure_for_a_single_proposals_error(self, monkeypatch):
+        import minion_assist.memory.consolidation as consolidation
+
+        db = Mock()
+        index = Mock()
+        index.list_consolidation_previews.return_value = []
+        consolidator = Mock()
+        consolidator.preview.side_effect = RuntimeError("malformed response")
+        monkeypatch.setattr(
+            consolidation, "rank_proposals",
+            lambda db_, index_, agent_id: [_proposal(id=1)],
+        )
+        health = WorkerHealth("memory_consolidation")
+        scheduler = MemoryConsolidationScheduler(
+            _make_cfg(top_n=5), db, index, consolidator, health=health
+        )
+
+        scheduler._run_pass()
+
+        snap = health.snapshot()
+        assert snap["consecutive_failures"] == 1
+        assert "malformed response" in snap["last_error"]

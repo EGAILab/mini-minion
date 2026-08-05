@@ -459,7 +459,7 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/clear` | Alias for `/new` |
 | `/reset` | Alias for `/new` |
 | `/compact` | Force immediate context compaction for all agents |
-| `/status` | Show session metadata (turn counts, last active) for each agent |
+| `/status [deep]` | Show session metadata (turn counts, last active) for each agent. `/status deep` also reports background-worker liveness (capture/commitment workers, memory watcher, schedulers — last poll/success/error, MEM-GAP-016) and, when a database is configured, per-agent capture/commitment queue lag and lexical-index summary. Works from both the REPL and Matrix chat. |
 | `/agents` | List all known agents with turn counts and last-active timestamps |
 | `/session [N\|uuid-prefix]` | List past conversation sessions for the active agent; restore one by index or UUID prefix |
 | `/rename [N] <name>` | Give the current session (or session N from /session) a descriptive name |

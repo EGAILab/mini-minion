@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
     from ..providers.base import LLMProvider
     from ..session.db import SessionDB
+    from ..worker_health import WorkerHealth
 
 _log = logging.getLogger("minion_assist.commitment_worker")
 
@@ -74,6 +75,8 @@ class CommitmentWorker:
             due time must be pushed out from "now" — see
             ``memory/commitments.py``'s module docstring for why this
             should typically be the configured heartbeat interval.
+        health: Optional :class:`~minion_assist.worker_health.WorkerHealth`
+            (MEM-GAP-016) — see ``CaptureWorker``'s matching parameter.
     """
 
     def __init__(
@@ -81,10 +84,12 @@ class CommitmentWorker:
         db: SessionDB,
         provider_for_agent: Callable[[str], LLMProvider],
         min_due_seconds: float = 1800.0,
+        health: "WorkerHealth | None" = None,
     ) -> None:
         self._db = db
         self._provider_for_agent = provider_for_agent
         self._min_due_seconds = min_due_seconds
+        self._health = health
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -120,6 +125,8 @@ class CommitmentWorker:
             bool: ``True`` if a job was claimed (whether it succeeded or
                 failed), ``False`` if the queue had nothing due.
         """
+        if self._health is not None:
+            self._health.record_poll()
         job = self._db.claim_next_commitment_job()
         if job is None:
             return False
@@ -148,10 +155,14 @@ class CommitmentWorker:
                 time.time(), self._min_due_seconds,
             )
             self._db.complete_commitment_job(job["id"], candidates)
+            if self._health is not None:
+                self._health.record_success()
         except Exception as exc:
             _log.debug("Commitment job %s failed: %s: %s", job["id"], type(exc).__name__, exc)
             backoff = _BACKOFF_BASE_SECONDS * (2 ** job["attempts"])
             self._db.fail_commitment_job(
                 job["id"], f"{type(exc).__name__}: {exc}", backoff, max_attempts=_MAX_ATTEMPTS
             )
+            if self._health is not None:
+                self._health.record_failure(f"{type(exc).__name__}: {exc}")
         return True

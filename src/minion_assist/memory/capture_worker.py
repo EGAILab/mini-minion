@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 
     from ..providers.base import LLMProvider
     from ..session.db import SessionDB
+    from ..worker_health import WorkerHealth
 
 _log = logging.getLogger("minion_assist.capture_worker")
 
@@ -99,6 +100,11 @@ class CaptureWorker:
             exists. Passed in rather than imported directly, matching
             ``provider_for_agent``'s own reasoning — this module stays
             free of a direct dependency on ``postgres_index.py``.
+        health: Optional :class:`~minion_assist.worker_health.WorkerHealth`
+            (MEM-GAP-016) — if given, every poll/success/failure is
+            recorded on it so a same-process caller (e.g. the REPL's
+            ``/status deep``) can tell whether this worker is actually
+            alive and draining the queue, not just constructed.
     """
 
     def __init__(
@@ -106,10 +112,12 @@ class CaptureWorker:
         db: SessionDB,
         provider_for_agent: Callable[[str], LLMProvider],
         index_proposal: Callable[[str, int, str], None] | None = None,
+        health: "WorkerHealth | None" = None,
     ) -> None:
         self._db = db
         self._provider_for_agent = provider_for_agent
         self._index_proposal = index_proposal
+        self._health = health
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -148,6 +156,8 @@ class CaptureWorker:
             bool: ``True`` if a job was claimed (whether it succeeded or
                 failed), ``False`` if the queue had nothing due.
         """
+        if self._health is not None:
+            self._health.record_poll()
         job = self._db.claim_next_capture_job()
         if job is None:
             return False
@@ -178,10 +188,14 @@ class CaptureWorker:
                             "Indexing proposal %s failed: %s: %s",
                             proposal["id"], type(exc).__name__, exc,
                         )
+            if self._health is not None:
+                self._health.record_success()
         except Exception as exc:
             _log.debug("Capture job %s failed: %s: %s", job["id"], type(exc).__name__, exc)
             backoff = _BACKOFF_BASE_SECONDS * (2 ** job["attempts"])
             self._db.fail_capture_job(
                 job["id"], f"{type(exc).__name__}: {exc}", backoff, max_attempts=_MAX_ATTEMPTS
             )
+            if self._health is not None:
+                self._health.record_failure(f"{type(exc).__name__}: {exc}")
         return True

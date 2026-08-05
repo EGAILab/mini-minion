@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from minion_assist.memory.commitment_worker import CommitmentWorker
 from minion_assist.providers.base import LLMResponse
+from minion_assist.worker_health import WorkerHealth
 
 
 def _job(**overrides) -> dict:
@@ -197,3 +198,54 @@ def test_stop_without_start_does_not_raise():
     db = Mock()
     worker = CommitmentWorker(db, provider_for_agent=lambda agent_id: _provider_returning([]))
     worker.stop(timeout=1.0)  # no thread was ever started
+
+
+# ---------------------------------------------------------------------------
+# WorkerHealth wiring (MEM-GAP-016)
+# ---------------------------------------------------------------------------
+
+def test_process_one_records_a_poll_even_when_queue_is_empty():
+    db = Mock()
+    db.claim_next_commitment_job = Mock(return_value=None)
+    health = WorkerHealth("commitment_worker")
+    worker = CommitmentWorker(
+        db, provider_for_agent=lambda agent_id: _provider_returning([]), health=health
+    )
+
+    worker._process_one()
+
+    assert health.snapshot()["last_poll_at"] is not None
+
+
+def test_process_one_records_success_on_a_completed_job():
+    db = Mock()
+    db.claim_next_commitment_job = Mock(return_value=_job())
+    db.get_messages_in_range = Mock(return_value=[])
+    db.list_pending_commitments_for_scope = Mock(return_value=[])
+    health = WorkerHealth("commitment_worker")
+    worker = CommitmentWorker(
+        db, provider_for_agent=lambda agent_id: _provider_returning([]), health=health
+    )
+
+    worker._process_one()
+
+    snap = health.snapshot()
+    assert snap["last_success_at"] is not None
+    assert snap["consecutive_failures"] == 0
+
+
+def test_process_one_records_failure_on_provider_exception():
+    db = Mock()
+    db.claim_next_commitment_job = Mock(return_value=_job(attempts=0))
+    db.get_messages_in_range = Mock(return_value=[])
+    db.list_pending_commitments_for_scope = Mock(return_value=[])
+    provider = Mock()
+    provider.chat = Mock(side_effect=RuntimeError("provider unavailable"))
+    health = WorkerHealth("commitment_worker")
+    worker = CommitmentWorker(db, provider_for_agent=lambda agent_id: provider, health=health)
+
+    worker._process_one()
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] == 1
+    assert "provider unavailable" in snap["last_error"]

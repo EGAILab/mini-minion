@@ -13,6 +13,7 @@ from unittest.mock import Mock
 
 from minion_assist.memory.capture_worker import CaptureWorker
 from minion_assist.providers.base import LLMResponse
+from minion_assist.worker_health import WorkerHealth
 
 
 def _job(**overrides) -> dict:
@@ -250,3 +251,66 @@ def test_stop_without_start_does_not_raise():
     db = Mock()
     worker = CaptureWorker(db, provider_for_agent=lambda agent_id: _provider_returning("NOTHING"))
     worker.stop(timeout=1.0)  # no thread was ever started
+
+
+# ---------------------------------------------------------------------------
+# WorkerHealth wiring (MEM-GAP-016)
+# ---------------------------------------------------------------------------
+
+def test_process_one_without_health_configured_does_not_raise():
+    db = Mock()
+    db.claim_next_capture_job = Mock(return_value=None)
+    worker = CaptureWorker(db, provider_for_agent=lambda agent_id: _provider_returning("NOTHING"))
+
+    assert worker._process_one() is False  # health=None is the default; must not raise
+
+
+def test_process_one_records_a_poll_even_when_queue_is_empty():
+    db = Mock()
+    db.claim_next_capture_job = Mock(return_value=None)
+    health = WorkerHealth("capture_worker")
+    worker = CaptureWorker(
+        db, provider_for_agent=lambda agent_id: _provider_returning("NOTHING"), health=health
+    )
+
+    worker._process_one()
+
+    assert health.snapshot()["last_poll_at"] is not None
+
+
+def test_process_one_records_success_on_a_completed_job():
+    db = Mock()
+    db.claim_next_capture_job = Mock(return_value=_job())
+    db.get_messages_in_range = Mock(return_value=[
+        {"id": 10, "role": "user", "content": "hi", "tool_name": None, "timestamp": 1.0},
+    ])
+    db.complete_capture_job = Mock(return_value=[])
+    health = WorkerHealth("capture_worker")
+    worker = CaptureWorker(
+        db, provider_for_agent=lambda agent_id: _provider_returning("NOTHING"), health=health
+    )
+
+    worker._process_one()
+
+    snap = health.snapshot()
+    assert snap["last_success_at"] is not None
+    assert snap["consecutive_failures"] == 0
+
+
+def test_process_one_records_failure_on_provider_exception():
+    db = Mock()
+    db.claim_next_capture_job = Mock(return_value=_job(attempts=0))
+    db.get_messages_in_range = Mock(return_value=[
+        {"id": 10, "role": "user", "content": "hi", "tool_name": None, "timestamp": 1.0},
+    ])
+    provider = Mock()
+    provider.chat = Mock(side_effect=RuntimeError("provider unavailable"))
+    health = WorkerHealth("capture_worker")
+    worker = CaptureWorker(db, provider_for_agent=lambda agent_id: provider, health=health)
+
+    worker._process_one()
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] == 1
+    assert "provider unavailable" in snap["last_error"]
+    assert snap["last_success_at"] is None

@@ -9,12 +9,14 @@ optional ``watchdog`` package is installed) real file-event delivery.
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import Mock
 
 import pytest
 
 from minion_assist.memory.watcher import _DEBOUNCE_SECONDS, MemoryIndexWatcher
+from minion_assist.worker_health import WorkerHealth
 
 try:
     import watchdog  # noqa: F401
@@ -105,6 +107,49 @@ def test_reconcile_is_a_no_op_for_an_unknown_agent(tmp_path):
     watcher._reconcile("unknown-agent")  # must not raise
 
     index.reconcile_agent.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# WorkerHealth wiring (MEM-GAP-016)
+# ---------------------------------------------------------------------------
+
+def test_reconcile_records_success(tmp_path):
+    index = Mock()
+    health = WorkerHealth("memory_watcher")
+    watcher = MemoryIndexWatcher(index, {"main": _repo(tmp_path)}, health=health)
+
+    watcher._reconcile("main")
+
+    snap = health.snapshot()
+    assert snap["last_success_at"] is not None
+    assert snap["consecutive_failures"] == 0
+
+
+def test_reconcile_records_failure_on_index_exception(tmp_path):
+    index = Mock()
+    index.reconcile_agent.side_effect = RuntimeError("db unavailable")
+    health = WorkerHealth("memory_watcher")
+    watcher = MemoryIndexWatcher(index, {"main": _repo(tmp_path)}, health=health)
+
+    watcher._reconcile("main")
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] == 1
+    assert "db unavailable" in snap["last_error"]
+
+
+def test_debounce_loop_records_a_poll_each_iteration(tmp_path):
+    index = Mock()
+    health = WorkerHealth("memory_watcher")
+    watcher = MemoryIndexWatcher(index, {"main": _repo(tmp_path)}, health=health)
+
+    t = threading.Thread(target=watcher._debounce_loop, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    watcher._stop_event.set()
+    t.join(timeout=2.0)
+
+    assert health.snapshot()["last_poll_at"] is not None
 
 
 # ---------------------------------------------------------------------------

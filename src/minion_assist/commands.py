@@ -36,6 +36,7 @@ Route-aware targeting:
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -71,6 +72,9 @@ class CommandContext:
     short_term: object = None         # ShortTermMemory instance (for /session)
     db: object = None                 # SessionDB instance (optional, for /delete-session's
                                        # cross-store cleanup — MEM-GAP-003)
+    worker_health: dict | None = None # dict[str, WorkerHealth] — one entry per background
+                                       # worker/scheduler actually running (for /status deep,
+                                       # MEM-GAP-016)
 
 
 @dataclass
@@ -111,6 +115,7 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec(
         name="/status",
         description="Show active agent, model, and history information.",
+        arg_hint="[deep]",
     ),
     CommandSpec(
         name="/agents",
@@ -352,6 +357,113 @@ def parse_command(text: str) -> tuple[str, str] | None:
     return command, args
 
 
+# Canonical set of background workers/schedulers minion.py may construct
+# (MEM-GAP-016) — listed explicitly (not just "whatever's in worker_health")
+# so /status deep can show "not running" for a worker that isn't
+# configured, rather than silently omitting it.
+_KNOWN_WORKER_NAMES = (
+    "capture_worker",
+    "commitment_worker",
+    "memory_watcher",
+    "memory_consolidation",
+    "knowledge_digest",
+    "dreaming",
+    "heartbeat",
+)
+
+
+def _format_duration(age: float | None) -> str:
+    """Render a duration in seconds (e.g. 'time since X') as a short string, or 'never'."""
+    if age is None:
+        return "never"
+    age = max(0.0, age)
+    if age < 60:
+        return f"{int(age)}s"
+    if age < 3600:
+        return f"{int(age / 60)}m"
+    if age < 86400:
+        return f"{int(age / 3600)}h"
+    return f"{int(age / 86400)}d"
+
+
+def _format_age(ts: float | None, now: float) -> str:
+    """Render a past epoch-seconds timestamp as a short relative age, or 'never'."""
+    if ts is None:
+        return "never"
+    return f"{_format_duration(now - ts)} ago"
+
+
+def _format_deep_status(ctx: CommandContext) -> list[str]:
+    """Build the extra lines ``/status deep`` appends (MEM-GAP-016).
+
+    Two independent sources, kept clearly labeled since they answer
+    different questions:
+
+    - Worker health (:class:`~minion_assist.worker_health.WorkerHealth`)
+      is in-process-only liveness — only meaningful for *this* running
+      process, never persisted.
+    - Queue lag (:meth:`~minion_assist.session.db.SessionDB.queue_lag_summary`)
+      and index summary (:meth:`~minion_assist.memory.service.MemoryService.deep_status`)
+      are plain database facts, visible from any process with a connection
+      (including the separate ``minion-assist memory status --deep`` CLI).
+    """
+    now = time.time()
+    lines: list[str] = ["  Workers:"]
+    worker_health = ctx.worker_health or {}
+    for name in _KNOWN_WORKER_NAMES:
+        health = worker_health.get(name)
+        if health is None:
+            lines.append(f"    {name}: not running")
+            continue
+        snap = health.snapshot()
+        failures = snap["consecutive_failures"]
+        status = f"{failures} consecutive failure(s)" if failures else "ok"
+        error_note = f"  last_error={snap['last_error']!r}" if snap["last_error"] else ""
+        lines.append(
+            f"    {name}: {status}  "
+            f"last_poll={_format_age(snap['last_poll_at'], now)}  "
+            f"last_success={_format_age(snap['last_success_at'], now)}"
+            f"{error_note}"
+        )
+
+    if ctx.db is None:
+        lines.append("  Database: not configured — no queue lag / index data available.")
+        return lines
+
+    lines.append("  Queues and index (per agent):")
+    for aid in ctx.agents_cfg:
+        try:
+            lag = ctx.db.queue_lag_summary(aid)
+        except Exception as exc:
+            lines.append(f"    [{aid}] queue lag unavailable: {exc}")
+            continue
+        capture = lag["capture"]
+        commitment = lag["commitment"]
+        lines.append(
+            f"    [{aid}] capture_pending={capture['pending_count']}"
+            f" (oldest {_format_duration(capture['oldest_pending_age_s'])})"
+            f"  commitment_pending={commitment['pending_count']}"
+            f" (oldest {_format_duration(commitment['oldest_pending_age_s'])})"
+        )
+        session = ctx.sessions.get(aid)
+        memory = getattr(session, "memory", None)
+        if memory is not None:
+            try:
+                index_status = memory.deep_status()
+            except Exception as exc:
+                lines.append(f"      index status unavailable: {exc}")
+                continue
+            if index_status is None:
+                lines.append("      index: not configured")
+            else:
+                lines.append(
+                    f"      index: {index_status['total_chunks']} chunks, "
+                    f"{index_status['file_count']} files, "
+                    f"last_indexed={_format_age(index_status['last_indexed_at'], now)}"
+                )
+    return lines
+
+
 def _format_history(messages: list[dict], max_content: int = 600) -> str:
     """Render a message list as a readable conversation transcript.
 
@@ -476,6 +588,8 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                     f"  [{aid}]{prefix}  model={cfg.model.id}  history={hist_len} messages"
                 )
             lines.append(f"  Streaming: {'on' if _streaming_cfg.chat_mode else 'off'}")
+            if ctx.args.strip().lower() == "deep":
+                lines.extend(_format_deep_status(ctx))
             return CommandResult(handled=True, message="\n".join(lines))
 
         # --- /agents ---

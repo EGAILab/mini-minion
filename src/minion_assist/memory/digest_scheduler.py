@@ -40,6 +40,7 @@ from .knowledge import compile_digest
 
 if TYPE_CHECKING:
     from ..config import KnowledgeDigestConfig
+    from ..worker_health import WorkerHealth
     from .files import MemoryFileRepository
     from .postgres_index import PostgresMemoryIndex
 
@@ -55,6 +56,9 @@ class KnowledgeDigestScheduler:
             for ``cfg.agent_id`` — already bound to that agent's workspace
             root, so :meth:`~minion_assist.memory.files.MemoryFileRepository.write_digest`
             writes to the right place.
+        health: Optional :class:`~minion_assist.worker_health.WorkerHealth`
+            (MEM-GAP-016) — see ``MemoryConsolidationScheduler``'s matching
+            parameter.
     """
 
     def __init__(
@@ -62,10 +66,12 @@ class KnowledgeDigestScheduler:
         cfg: KnowledgeDigestConfig,
         index: PostgresMemoryIndex,
         files: MemoryFileRepository,
+        health: "WorkerHealth | None" = None,
     ) -> None:
         self._cfg = cfg
         self._index = index
         self._files = files
+        self._health = health
         self._timer: threading.Timer | None = None
         self._stopped = False
 
@@ -87,10 +93,14 @@ class KnowledgeDigestScheduler:
         """Timer callback: run one pass then reschedule for tomorrow."""
         if self._stopped:
             return
+        if self._health is not None:
+            self._health.record_poll()
         try:
             self._run_pass()
         except Exception as exc:
             print(f"[knowledge-digest] Error during pass: {exc}", file=sys.stderr)
+            if self._health is not None:
+                self._health.record_failure(f"{type(exc).__name__}: {exc}")
         finally:
             # Always reschedule so the loop continues even after errors.
             if not self._stopped:
@@ -101,3 +111,5 @@ class KnowledgeDigestScheduler:
         claims = self._index.list_claims(self._cfg.agent_id, status="supported")
         digest = compile_digest(claims, max_chars=self._cfg.max_chars)
         self._files.write_digest(digest)
+        if self._health is not None:
+            self._health.record_success()

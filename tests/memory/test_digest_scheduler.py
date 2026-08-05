@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 from minion_assist.config import KnowledgeDigestConfig
 from minion_assist.memory.digest_scheduler import KnowledgeDigestScheduler
+from minion_assist.worker_health import WorkerHealth
 
 
 def _make_cfg(**kwargs) -> KnowledgeDigestConfig:
@@ -132,3 +133,42 @@ class TestFire:
         scheduler._fire()
 
         run_pass.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# WorkerHealth wiring (MEM-GAP-016)
+# ---------------------------------------------------------------------------
+
+class TestWorkerHealth:
+    def test_fire_records_a_poll(self, monkeypatch):
+        health = WorkerHealth("knowledge_digest")
+        scheduler = KnowledgeDigestScheduler(_make_cfg(), Mock(), Mock(), health=health)
+        monkeypatch.setattr(scheduler, "_run_pass", Mock())
+        monkeypatch.setattr(scheduler, "start", Mock())
+
+        scheduler._fire()
+
+        assert health.snapshot()["last_poll_at"] is not None
+
+    def test_fire_records_failure_on_error(self, monkeypatch):
+        health = WorkerHealth("knowledge_digest")
+        scheduler = KnowledgeDigestScheduler(_make_cfg(), Mock(), Mock(), health=health)
+        monkeypatch.setattr(scheduler, "_run_pass", Mock(side_effect=RuntimeError("boom")))
+        monkeypatch.setattr(scheduler, "start", Mock())
+
+        scheduler._fire()
+
+        snap = health.snapshot()
+        assert snap["consecutive_failures"] == 1
+        assert "boom" in snap["last_error"]
+
+    def test_run_pass_records_success(self):
+        index = Mock()
+        index.list_claims.return_value = []
+        files = Mock()
+        health = WorkerHealth("knowledge_digest")
+        scheduler = KnowledgeDigestScheduler(_make_cfg(), index, files, health=health)
+
+        scheduler._run_pass()
+
+        assert health.snapshot()["last_success_at"] is not None

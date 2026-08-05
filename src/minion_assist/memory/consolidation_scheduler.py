@@ -50,6 +50,7 @@ from ..dreaming import _seconds_until_next
 if TYPE_CHECKING:
     from ..config import MemoryConsolidationConfig
     from ..session.db import SessionDB
+    from ..worker_health import WorkerHealth
     from .consolidation import MemoryConsolidator
     from .postgres_index import PostgresMemoryIndex
 
@@ -65,6 +66,10 @@ class MemoryConsolidationScheduler:
             :class:`~minion_assist.memory.consolidation.MemoryConsolidator`
             to draft with — already bound to ``cfg.agent_id`` (see that
             class's docstring for why one instance is single-agent).
+        health: Optional :class:`~minion_assist.worker_health.WorkerHealth`
+            (MEM-GAP-016) — a "poll" is recorded each time the timer fires;
+            "success"/"failure" are recorded per proposal drafted (or once
+            for a whole-pass failure, e.g. a database error).
     """
 
     def __init__(
@@ -73,11 +78,13 @@ class MemoryConsolidationScheduler:
         db: SessionDB,
         index: PostgresMemoryIndex,
         consolidator: MemoryConsolidator,
+        health: "WorkerHealth | None" = None,
     ) -> None:
         self._cfg = cfg
         self._db = db
         self._index = index
         self._consolidator = consolidator
+        self._health = health
         self._timer: threading.Timer | None = None
         self._stopped = False
 
@@ -99,10 +106,14 @@ class MemoryConsolidationScheduler:
         """Timer callback: run one pass then reschedule for tomorrow."""
         if self._stopped:
             return
+        if self._health is not None:
+            self._health.record_poll()
         try:
             self._run_pass()
         except Exception as exc:
             print(f"[memory-consolidation] Error during pass: {exc}", file=sys.stderr)
+            if self._health is not None:
+                self._health.record_failure(f"{type(exc).__name__}: {exc}")
         finally:
             # Always reschedule so the loop continues even after errors.
             if not self._stopped:
@@ -131,9 +142,13 @@ class MemoryConsolidationScheduler:
             try:
                 self._consolidator.preview(proposal["id"])
                 drafted += 1
+                if self._health is not None:
+                    self._health.record_success()
             except Exception as exc:
                 print(
                     f"[memory-consolidation] Failed to draft preview for proposal "
                     f"#{proposal['id']}: {type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
+                if self._health is not None:
+                    self._health.record_failure(f"{type(exc).__name__}: {exc}")

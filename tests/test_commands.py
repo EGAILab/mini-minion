@@ -1,5 +1,7 @@
 """Tests for commands.py — slash command parsing and dispatch."""
 
+import time
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +30,11 @@ def _make_session(history_len: int = 0, compact_result: bool = True) -> MagicMoc
     session.history = [{"role": "user", "content": f"msg{i}"} for i in range(history_len)]
     session.reset = MagicMock()
     session.compact_now = MagicMock(return_value=compact_result)
+    # Matches AgentSession.memory's real default (None when unconfigured) —
+    # without this, a bare MagicMock auto-creates a truthy child mock for
+    # any attribute access, which would silently pass /status deep's
+    # `memory is not None` check with fake data.
+    session.memory = None
     return session
 
 
@@ -57,6 +64,8 @@ def _make_ctx(
     target: str = "main",
     sessions: dict | None = None,
     agents_cfg: dict | None = None,
+    db: object = None,
+    worker_health: dict | None = None,
 ) -> CommandContext:
     """Build a CommandContext with sensible defaults for testing."""
     if sessions is None:
@@ -70,6 +79,8 @@ def _make_ctx(
         target_agent_id=target,
         sessions=sessions,
         agents_cfg=agents_cfg,
+        db=db,
+        worker_health=worker_health,
     )
 
 
@@ -369,6 +380,111 @@ def test_dispatch_status_shows_streaming_on():
         mock_streaming.chat_mode = True
         result = dispatch_command(_make_ctx("/status"))
     assert "on" in result.message
+
+
+# ---------------------------------------------------------------------------
+# dispatch_command — /status deep (MEM-GAP-016)
+# ---------------------------------------------------------------------------
+
+def test_dispatch_status_bare_does_not_include_worker_section():
+    from minion_assist.worker_health import WorkerHealth
+
+    health = {"capture_worker": WorkerHealth("capture_worker")}
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", worker_health=health))
+    assert "Workers:" not in result.message
+
+
+def test_dispatch_status_deep_lists_every_known_worker():
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep"))
+    assert "capture_worker: not running" in result.message
+    assert "heartbeat: not running" in result.message
+    assert "dreaming: not running" in result.message
+
+
+def test_dispatch_status_deep_reports_a_running_workers_health():
+    from minion_assist.worker_health import WorkerHealth
+
+    health = WorkerHealth("capture_worker")
+    health.record_poll()
+    health.record_success()
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(
+            _make_ctx("/status", args="deep", worker_health={"capture_worker": health})
+        )
+    assert "capture_worker: ok" in result.message
+    assert "last_poll=" in result.message
+    assert "last_success=" in result.message
+
+
+def test_dispatch_status_deep_reports_consecutive_failures():
+    from minion_assist.worker_health import WorkerHealth
+
+    health = WorkerHealth("capture_worker")
+    health.record_failure("connection refused")
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(
+            _make_ctx("/status", args="deep", worker_health={"capture_worker": health})
+        )
+    assert "1 consecutive failure(s)" in result.message
+    assert "connection refused" in result.message
+
+
+def test_dispatch_status_deep_without_a_database_says_so():
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep"))
+    assert "Database: not configured" in result.message
+
+
+def test_dispatch_status_deep_reports_queue_lag_from_the_database():
+    db = MagicMock()
+    db.queue_lag_summary.return_value = {
+        "capture": {"pending_count": 3, "oldest_pending_age_s": 120.0},
+        "commitment": {"pending_count": 0, "oldest_pending_age_s": None},
+    }
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    db.queue_lag_summary.assert_called_once_with("main")
+    assert "capture_pending=3" in result.message
+    assert "commitment_pending=0" in result.message
+
+
+def test_dispatch_status_deep_reports_index_summary_from_the_agents_memory():
+    session = _make_session()
+    session.memory = MagicMock()
+    session.memory.deep_status.return_value = {
+        "total_chunks": 42, "file_count": 7, "last_indexed_at": time.time() - 30,
+    }
+    db = MagicMock()
+    db.queue_lag_summary.return_value = {
+        "capture": {"pending_count": 0, "oldest_pending_age_s": None},
+        "commitment": {"pending_count": 0, "oldest_pending_age_s": None},
+    }
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(
+            _make_ctx("/status", args="deep", sessions={"main": session}, db=db)
+        )
+    assert "42 chunks" in result.message
+    assert "7 files" in result.message
+
+
+def test_dispatch_status_deep_survives_a_queue_lag_query_failure():
+    db = MagicMock()
+    db.queue_lag_summary.side_effect = Exception("connection lost")
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    assert result.handled
+    assert "queue lag unavailable" in result.message
+    assert "connection lost" in result.message
 
 
 # ---------------------------------------------------------------------------

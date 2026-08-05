@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .agents.session import AgentSession
+    from .worker_health import WorkerHealth
     from .config import DreamingConfig
 
 
@@ -285,6 +286,8 @@ class DreamingScheduler:
                                a post-dream notification.  ``None`` → print to terminal.
         matrix_loop:           The asyncio event loop ``matrix_outbound`` runs on.
                                Required when ``matrix_outbound`` is not ``None``.
+        health:                Optional :class:`~minion_assist.worker_health.WorkerHealth`
+                               (MEM-GAP-016) — see other schedulers' matching parameter.
     """
 
     def __init__(
@@ -294,12 +297,14 @@ class DreamingScheduler:
         workspace_dir: Path,
         matrix_outbound: object = None,
         matrix_loop: object = None,
+        health: "WorkerHealth | None" = None,
     ) -> None:
         self._cfg = cfg
         self._factory = dream_session_factory
         self._workspace_dir = workspace_dir
         self._outbound = matrix_outbound
         self._loop = matrix_loop
+        self._health = health
         self._timer: threading.Timer | None = None
         self._stopped = False
 
@@ -321,10 +326,16 @@ class DreamingScheduler:
         """Timer callback: run the dream turn then reschedule for tomorrow."""
         if self._stopped:
             return
+        if self._health is not None:
+            self._health.record_poll()
         try:
             self._run_dream_turn()
+            if self._health is not None:
+                self._health.record_success()
         except Exception as exc:
             print(f"[dreaming] Error during dream turn: {exc}", file=sys.stderr)
+            if self._health is not None:
+                self._health.record_failure(f"{type(exc).__name__}: {exc}")
         finally:
             # Always reschedule so the loop continues even after errors.
             if not self._stopped:

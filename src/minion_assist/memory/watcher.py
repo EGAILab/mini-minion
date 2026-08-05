@@ -53,6 +53,7 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..worker_health import WorkerHealth
     from .files import MemoryFileRepository
     from .postgres_index import PostgresMemoryIndex
 
@@ -80,15 +81,22 @@ class MemoryIndexWatcher:
             workspace root should be watched. One ``watchdog`` observer
             covers all of them; each agent's own repository supplies both
             the directory to watch and the listing to reconcile against.
+        health: Optional :class:`~minion_assist.worker_health.WorkerHealth`
+            (MEM-GAP-016) — see ``CaptureWorker``'s matching parameter.
+            A "poll" is recorded once per debounce-loop iteration (whether
+            or not any agent was actually due); "success"/"failure" are
+            recorded per agent reconcile.
     """
 
     def __init__(
         self,
         index: PostgresMemoryIndex,
         agents: dict[str, MemoryFileRepository],
+        health: "WorkerHealth | None" = None,
     ) -> None:
         self._index = index
         self._agents = agents
+        self._health = health
         self._observer = None
         self._stop_event = threading.Event()
         self._debounce_thread: threading.Thread | None = None
@@ -156,6 +164,8 @@ class MemoryIndexWatcher:
     def _debounce_loop(self) -> None:
         """Poll for agents whose debounce window has elapsed and reconcile them."""
         while not self._stop_event.is_set():
+            if self._health is not None:
+                self._health.record_poll()
             for agent_id in self._due_agents(time.monotonic()):
                 self._reconcile(agent_id)
             self._stop_event.wait(_POLL_INTERVAL_SECONDS)
@@ -172,7 +182,11 @@ class MemoryIndexWatcher:
             return
         try:
             self._index.reconcile_agent(agent_id, repo.list_indexable_files())
+            if self._health is not None:
+                self._health.record_success()
         except Exception as exc:
             _log.debug(
                 "Watcher reconcile failed for agent %s: %s: %s", agent_id, type(exc).__name__, exc
             )
+            if self._health is not None:
+                self._health.record_failure(f"{type(exc).__name__}: {exc}")
