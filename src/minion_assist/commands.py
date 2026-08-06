@@ -439,6 +439,13 @@ def _format_deep_status(ctx: CommandContext) -> list[str]:
     for agent_id in ctx.agents_cfg:
         name = f"session_writes:{agent_id}"
         lines.append(_format_worker_line(name, worker_health.get(name), now))
+    # Per-agent degraded-mode search health (MEM-GAP-008) — same reasoning:
+    # only present for an agent whose MemoryService actually has an index
+    # to fall back from, so absence already means "no index configured,"
+    # not "unhealthy."
+    for agent_id in ctx.agents_cfg:
+        name = f"memory_search:{agent_id}"
+        lines.append(_format_worker_line(name, worker_health.get(name), now))
 
     if ctx.db is None:
         lines.append("  Database: not configured — no queue lag / index data available.")

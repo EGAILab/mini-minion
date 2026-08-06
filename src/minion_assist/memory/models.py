@@ -38,11 +38,13 @@ class MemoryHit:
             linear scan tags ``"topic"``/``"import"``/``"daily"``; the
             lexical index (Stage One Phase 3, slice C) tags
             ``"durable"``/``"daily"``/``"import"`` — ``"durable"`` covers
-            both topic notes *and* root ``MEMORY.md``, which the linear
-            scan never returns at all (see ``memory/files.py``'s
-            ``list_indexable_files``). This naming difference is a
-            deliberate, documented consequence of using a richer corpus,
-            not an inconsistency to paper over.
+            both topic notes *and* root ``MEMORY.md``, and so does the
+            linear scan's ``"topic"`` tag (MEM-GAP-008: root ``MEMORY.md``
+            is now also a linear-scan candidate, tagged ``"topic"`` to
+            match this same corpus grouping — see ``memory/files.py``'s
+            ``MemoryFileRepository.search()``). The tag *string* still
+            differs between the two paths; only the corpus each one covers
+            is now the same.
         rel_path: Path relative to the agent's workspace root, e.g.
             ``"memory/topics/project-goals.md"``. ``None`` for a linear-scan
             hit (Phase 1 never tracked this).
@@ -57,9 +59,12 @@ class MemoryHit:
         boundary: Stage One Phase 6, slice A — a formatted, advisory
             ``[Boundary: ...]`` annotation (see ``memory/boundaries.py``'s
             ``format_boundary_prefix``) when this hit's source note
-            carries action-boundary frontmatter, else ``None``. Only ever
-            set on an indexed-path hit (linear-scan/degraded-mode hits
-            never carry this — see ``MemoryService._apply_boundaries``).
+            carries action-boundary frontmatter, else ``None``. Set on an
+            indexed-path hit by ``MemoryService._apply_boundaries``, and
+            on a linear-scan hit directly by
+            ``MemoryFileRepository.search()`` (MEM-GAP-008) — both paths
+            parse the same frontmatter, so a note outside its boundary
+            window is excluded identically either way.
     """
 
     key: str

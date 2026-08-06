@@ -626,7 +626,16 @@ def main() -> None:
         # dedicated or shared workspace directory configured.
         _agent_files_repo = MemoryFileRepository(_agent_bootstrap_root)
         _agent_files_repos[agent_id] = _agent_files_repo
-        memory_service = MemoryService(_agent_files_repo, index=_memory_index, agent_id=agent_id)
+        # Degraded-mode search visibility (MEM-GAP-008) — only meaningful
+        # when an index exists to fall back *from*; a file-only deployment
+        # has no "index search failed" event to ever record.
+        _memory_search_health = None
+        if _memory_index is not None:
+            _memory_search_health = WorkerHealth(f"memory_search:{agent_id}")
+            worker_health[f"memory_search:{agent_id}"] = _memory_search_health
+        memory_service = MemoryService(
+            _agent_files_repo, index=_memory_index, agent_id=agent_id, health=_memory_search_health,
+        )
         if _memory_index is not None:
             # Startup catch-up: reconcile by content hash rather than
             # unconditionally reindexing, so an unchanged file since the

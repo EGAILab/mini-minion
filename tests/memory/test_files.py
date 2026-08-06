@@ -357,6 +357,105 @@ def test_search_exclude_sources_does_not_let_an_excluded_hit_crowd_out_max_resul
 
 
 # ---------------------------------------------------------------------------
+# search — MEM-GAP-008: root MEMORY.md and boundary parity with the indexed path
+# ---------------------------------------------------------------------------
+
+def test_search_finds_root_memory_md_and_tags_it_topic(tmp_path):
+    (tmp_path / "MEMORY.md").write_text("The user prefers dark mode.", encoding="utf-8")
+    repo = MemoryFileRepository(tmp_path)
+
+    [hit] = repo.search("dark mode")
+
+    assert hit.key == "MEMORY"
+    assert hit.source == "topic"
+
+
+def test_search_exclude_sources_topic_also_omits_root_memory_md(tmp_path):
+    (tmp_path / "MEMORY.md").write_text("The user prefers dark mode.", encoding="utf-8")
+    repo = MemoryFileRepository(tmp_path)
+
+    assert repo.search("dark mode", exclude_sources=frozenset({"topic"})) == []
+
+
+def test_search_root_memory_md_absent_is_not_an_error(tmp_path):
+    # No MEMORY.md file at all — must not raise, just contribute no candidate.
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember("note", "matching keyword")
+
+    [hit] = repo.search("matching")
+
+    assert hit.key == "note"
+
+
+def test_search_excludes_a_note_outside_its_boundary_window(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember(
+        "future-plan",
+        "---\nsafe_after: 2999-01-01\n---\nSome content mentioning goals.",
+    )
+
+    assert repo.search("goals") == []
+
+
+def test_search_excludes_an_expired_note(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember(
+        "old-plan",
+        "---\nexpires_at: 2000-01-01\n---\nSome content mentioning goals.",
+    )
+
+    assert repo.search("goals") == []
+
+
+def test_search_includes_an_active_boundary_note_with_annotation(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember(
+        "active-plan",
+        "---\nowner: main\n---\nSome content mentioning goals.",
+    )
+
+    [hit] = repo.search("goals")
+
+    assert hit.boundary is not None
+    assert "Owner: main" in hit.boundary
+
+
+def test_search_strips_frontmatter_from_returned_content(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember(
+        "active-plan",
+        "---\nowner: main\n---\nSome content mentioning goals.",
+    )
+
+    [hit] = repo.search("goals")
+
+    assert "owner: main" not in hit.content
+    assert "---" not in hit.content
+    assert "Some content mentioning goals." in hit.content
+
+
+def test_search_does_not_match_against_frontmatter_text(tmp_path):
+    # A term that only appears inside the frontmatter block (not the body)
+    # must not produce a match — matching is against the stripped body.
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember(
+        "some-note",
+        "---\napplies_when: deploying to production\n---\nUnrelated body text.",
+    )
+
+    assert repo.search("deploying") == []
+
+
+def test_search_a_note_without_frontmatter_has_no_boundary(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    repo.remember("plain-note", "Some content mentioning goals.")
+
+    [hit] = repo.search("goals")
+
+    assert hit.boundary is None
+
+
+# ---------------------------------------------------------------------------
 # resolve_path
 # ---------------------------------------------------------------------------
 

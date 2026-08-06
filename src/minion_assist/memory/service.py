@@ -76,6 +76,7 @@ from .models import (
 )
 
 if TYPE_CHECKING:
+    from ..worker_health import WorkerHealth
     from .postgres_index import PostgresMemoryIndex
 
 _log = logging.getLogger("minion_assist.memory_service")
@@ -86,8 +87,8 @@ _SEARCH_MAX_RESULTS = 20
 # Maps a lexical-index corpus name to the linear scan's equivalent `source`
 # tag, so search()'s corpus filter still narrows results in degraded mode
 # (no index configured, or the index search just failed). "durable" is the
-# only one that actually differs — the linear scan calls topic notes
-# "topic", never "durable" (and never returns MEMORY.md at all).
+# only one that actually differs — the linear scan calls topic notes (and,
+# since MEM-GAP-008, root MEMORY.md too) "topic", never "durable".
 _CORPUS_TO_LEGACY_SOURCE = {"durable": "topic", "daily": "daily", "import": "import"}
 
 
@@ -106,6 +107,14 @@ class MemoryService:
         agent_id: Required whenever ``index`` is given — the partition key
             :class:`PostgresMemoryIndex` uses to keep agents' chunks apart.
             Ignored if ``index`` is ``None``.
+        health: Optional :class:`~minion_assist.worker_health.WorkerHealth`
+            (MEM-GAP-008/016) — if given, every :meth:`search` attempt
+            against the index records a poll, and its outcome records a
+            success or failure, so a same-process caller (e.g. the REPL's
+            ``/status deep``) can tell whether searches are currently
+            falling back to the degraded linear scan, not just that a
+            fallback happened once in the logs. Never touched when
+            ``index`` is ``None`` — there is no index attempt to record.
     """
 
     def __init__(
@@ -114,10 +123,12 @@ class MemoryService:
         *,
         index: PostgresMemoryIndex | None = None,
         agent_id: str | None = None,
+        health: "WorkerHealth | None" = None,
     ) -> None:
         self._files = files
         self._index = index
         self._agent_id = agent_id
+        self._health = health
 
     @property
     def root(self) -> Path:
@@ -323,6 +334,8 @@ class MemoryService:
                 ``end_line``/``score``; linear-scan hits leave those unset.
         """
         if self._index is not None and self._agent_id is not None:
+            if self._health is not None:
+                self._health.record_poll()
             try:
                 rows = self._index.hybrid_search(
                     self._agent_id, query, corpus=corpus, max_results=max_results
@@ -339,13 +352,18 @@ class MemoryService:
                     )
                     for r in rows
                 ]
-                return self._apply_boundaries(hits)
+                result = self._apply_boundaries(hits)
+                if self._health is not None:
+                    self._health.record_success()
+                return result
             except Exception as exc:
                 _log.warning(
                     "Hybrid index search failed for agent %s, falling back to linear scan: "
                     "%s: %s",
                     self._agent_id, type(exc).__name__, exc,
                 )
+                if self._health is not None:
+                    self._health.record_failure(f"{type(exc).__name__}: {exc}")
 
         # MEM-GAP-004: quarantined imports must not enter a corpus-agnostic
         # search's results (the automatic per-turn injection path, and a

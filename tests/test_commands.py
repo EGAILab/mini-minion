@@ -415,6 +415,28 @@ def test_dispatch_status_deep_lists_a_session_writes_row_per_configured_agent():
     assert "session_writes:researcher: not running" in result.message
 
 
+def test_dispatch_status_deep_lists_a_memory_search_row_per_configured_agent():
+    agents_cfg = _make_agents_cfg(include_route=True)  # main + researcher
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", agents_cfg=agents_cfg))
+    assert "memory_search:main: not running" in result.message
+    assert "memory_search:researcher: not running" in result.message
+
+
+def test_dispatch_status_deep_reports_a_running_memory_search_health():
+    from minion_assist.worker_health import WorkerHealth
+
+    health = WorkerHealth("memory_search:main")
+    health.record_success()
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(
+            _make_ctx("/status", args="deep", worker_health={"memory_search:main": health})
+        )
+    assert "memory_search:main: ok" in result.message
+
+
 def test_dispatch_status_deep_reports_a_running_session_writes_health():
     from minion_assist.worker_health import WorkerHealth
 

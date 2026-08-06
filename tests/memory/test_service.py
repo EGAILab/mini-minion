@@ -273,15 +273,44 @@ def test_search_treats_a_boundary_lookup_failure_as_no_boundary(indexed_service)
     assert hit.boundary is None
 
 
-def test_search_never_looks_up_boundaries_in_degraded_mode(service):
-    # `service` (no index configured) exercises the linear-scan fallback --
-    # boundary metadata lives only in Postgres, so there's nothing to look
-    # up here; this documents that as intentional rather than a gap.
+def test_search_has_no_boundary_for_a_note_without_frontmatter_in_degraded_mode(service):
+    # `service` (no index configured) exercises the linear-scan fallback.
+    # A note with no boundary frontmatter at all naturally has none to find.
     service.remember("project-goals", "Some content mentioning goals.")
 
     results = service.search("goals")
 
     assert all(h.boundary is None for h in results)
+
+
+def test_search_applies_boundaries_in_degraded_mode(service):
+    # MEM-GAP-008: boundary frontmatter is parsed locally by
+    # MemoryFileRepository.search() itself (memory/boundaries.py has no
+    # PostgreSQL dependency), so degraded/no-index mode enforces the same
+    # boundary window as the indexed path — not a gap anymore.
+    service.remember(
+        "future-plan",
+        "---\nsafe_after: 2999-01-01\n---\nSome content mentioning goals.",
+    )
+
+    results = service.search("goals")
+
+    assert results == []  # not yet safe to surface
+
+
+def test_search_annotates_an_active_boundary_note_in_degraded_mode(service):
+    service.remember(
+        "active-plan",
+        "---\nowner: main\n---\nSome content mentioning goals.",
+    )
+
+    results = service.search("goals")
+
+    assert len(results) == 1
+    assert "Owner: main" in results[0].boundary
+    # The raw frontmatter block must never leak into displayed content.
+    assert "owner: main" not in results[0].content
+    assert "---" not in results[0].content
 
 
 def test_search_passes_corpus_through_to_the_index(indexed_service):
@@ -304,6 +333,66 @@ def test_search_falls_back_to_linear_scan_when_index_search_raises(indexed_servi
 
     assert hit.key == "project-goals"
     assert hit.rel_path is None  # a plain linear-scan MemoryHit, not an index one
+
+
+# ---------------------------------------------------------------------------
+# search — degraded-mode visibility via WorkerHealth (MEM-GAP-008)
+# ---------------------------------------------------------------------------
+
+def test_search_records_health_success_on_a_working_index(tmp_path):
+    from minion_assist.worker_health import WorkerHealth
+
+    mock_index = Mock()
+    mock_index.hybrid_search.return_value = []
+    mock_index.get_boundary.return_value = None
+    health = WorkerHealth("memory_search:main")
+    svc = MemoryService(
+        MemoryFileRepository(tmp_path), index=mock_index, agent_id="main", health=health,
+    )
+
+    svc.search("query")
+
+    snap = health.snapshot()
+    assert snap["last_poll_at"] is not None
+    assert snap["last_success_at"] is not None
+    assert snap["consecutive_failures"] == 0
+
+
+def test_search_records_health_failure_when_index_search_raises(tmp_path):
+    from minion_assist.worker_health import WorkerHealth
+
+    mock_index = Mock()
+    mock_index.hybrid_search.side_effect = RuntimeError("connection lost")
+    health = WorkerHealth("memory_search:main")
+    svc = MemoryService(
+        MemoryFileRepository(tmp_path), index=mock_index, agent_id="main", health=health,
+    )
+
+    svc.search("query")  # falls back to linear scan, must not raise
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] == 1
+    assert "connection lost" in snap["last_error"]
+    assert snap["last_success_at"] is None
+
+
+def test_search_without_health_configured_does_not_raise(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.hybrid_search.return_value = []
+
+    svc.search("query")  # health=None is the default; must not raise
+
+
+def test_search_never_touches_health_without_an_index(tmp_path):
+    # No index configured at all — nothing to poll/succeed/fail against.
+    health = Mock()
+    svc = MemoryService(MemoryFileRepository(tmp_path), health=health)
+
+    svc.search("query")
+
+    health.record_poll.assert_not_called()
+    health.record_success.assert_not_called()
+    health.record_failure.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

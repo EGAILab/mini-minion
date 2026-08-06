@@ -27,7 +27,11 @@ independently of the tools that use it.
 Search behavior is intentionally unchanged from ``LongTermMemory.search()``
 in this slice — same term-frequency-with-recency-tiebreak scoring, same
 ``_SEARCH_MAX_RESULTS`` cap. Phase 1's goal is one canonical service with
-existing behavior, not better retrieval (that's Phase 3+).
+existing behavior, not better retrieval (that's Phase 3+). MEM-GAP-008
+later brought this method's *eligibility* (not ranking) into parity with
+the indexed path: root ``MEMORY.md`` is now a candidate, and boundary
+frontmatter (``memory/boundaries.py``) is parsed/enforced here too — see
+:meth:`~MemoryFileRepository.search`'s own docstring.
 
 Talks to
 --------
@@ -60,9 +64,11 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 
+from .boundaries import format_boundary_prefix, is_boundary_active, parse_frontmatter
 from .models import MemoryExcerpt, MemoryHit, MemoryLocator
 
 # Mirrors LongTermMemory._SEARCH_MAX_RESULTS — same cap, same reasoning:
@@ -384,7 +390,7 @@ class MemoryFileRepository:
         *,
         exclude_sources: frozenset[str] = frozenset(),
     ) -> list[MemoryHit]:
-        """Search topic notes, imported notes, and daily notes, ranked by term frequency.
+        """Search root MEMORY.md, topic notes, imported notes, and daily notes, ranked by term frequency.
 
         Scoring is unchanged from ``LongTermMemory.search()``: notes matching
         more distinct query terms (3+ characters, case-insensitive) rank
@@ -392,6 +398,22 @@ class MemoryFileRepository:
         This slice intentionally keeps the same recall characteristics as
         today — see ``tests/fixtures/memory_corpus/README.md`` for the
         recorded baseline this will eventually be compared against.
+
+        Eligibility parity with the indexed path (MEM-GAP-008): root
+        ``MEMORY.md`` is included as a candidate (tagged ``"topic"``,
+        matching ``memory/service.py``'s
+        ``_CORPUS_TO_LEGACY_SOURCE["durable"]`` — the indexed path's
+        "durable" corpus covers both). Every candidate's boundary
+        frontmatter (``memory/boundaries.py``) is parsed and enforced here
+        too: matching and the returned content use the
+        frontmatter-stripped body (never the raw ``---...---`` block), a
+        note outside its ``[safe_after, expires_at]`` window is excluded
+        entirely, and an active note's advisory annotation is attached via
+        ``MemoryHit.boundary`` — the same policy
+        ``MemoryService._apply_boundaries`` applies to indexed hits,
+        computed locally here with no PostgreSQL dependency (so this stays
+        correct even during the PG outage that triggers this fallback in
+        the first place).
 
         Args:
             query: One or more keywords, space-separated.
@@ -404,10 +426,13 @@ class MemoryFileRepository:
                 notes never reach automatic per-turn recall in the
                 degraded/local-fallback path (they're still reachable via an
                 explicit ``corpus="import"`` search — see its docstring).
+                ``"topic"`` also excludes ``MEMORY.md``, since it shares
+                that tag.
 
         Returns:
-            list[MemoryHit]: Best matches first, each tagged with its source
-                ("topic", "import", or "daily").
+            list[MemoryHit]: Best matches first, each tagged with its
+                source ("topic", "import", or "daily"). Never includes a
+                note currently outside its boundary window.
         """
         terms = [t.lower() for t in query.split() if len(t) >= 3]
         if not terms:
@@ -415,6 +440,9 @@ class MemoryFileRepository:
 
         candidates: list[tuple[str, Path]] = []
         if "topic" not in exclude_sources:
+            memory_md = self._root / "MEMORY.md"
+            if memory_md.exists():
+                candidates.append(("topic", memory_md))
             candidates.extend(("topic", p) for p in self._topics_dir.glob("*.md"))
         if "import" not in exclude_sources:
             candidates.extend(("import", p) for p in self._imports_dir.glob("*.md"))
@@ -424,16 +452,22 @@ class MemoryFileRepository:
         if "daily" not in exclude_sources:
             candidates.extend(("daily", p) for p in self._memory_dir.glob("*.md"))
 
-        scored: list[tuple[float, str, str, str]] = []  # (score, key, content, source)
+        now = time.time()
+        # (score, key, body, source, boundary)
+        scored: list[tuple[float, str, str, str, str | None]] = []
         for source, p in candidates:
             try:
-                content = p.read_text(encoding="utf-8")
+                raw_content = p.read_text(encoding="utf-8")
             except OSError:
                 continue
 
-            content_lower = content.lower()
+            metadata, body, _line_offset = parse_frontmatter(raw_content)
+            if not is_boundary_active(metadata, now):
+                continue
+
+            body_lower = body.lower()
             stem_lower = p.stem.lower()
-            match_count = sum(1 for t in terms if t in content_lower or t in stem_lower)
+            match_count = sum(1 for t in terms if t in body_lower or t in stem_lower)
             if match_count == 0:
                 continue
 
@@ -442,12 +476,13 @@ class MemoryFileRepository:
             except OSError:
                 recency = 0.0
 
-            scored.append((match_count + recency, p.stem, content, source))
+            boundary = format_boundary_prefix(metadata) or None
+            scored.append((match_count + recency, p.stem, body, source, boundary))
 
         scored.sort(key=lambda x: (-x[0], x[1]))
         return [
-            MemoryHit(key=key, content=content, source=source)
-            for _, key, content, source in scored[:max_results]
+            MemoryHit(key=key, content=body, source=source, boundary=boundary)
+            for _, key, body, source, boundary in scored[:max_results]
         ]
 
     # -----------------------------------------------------------------
