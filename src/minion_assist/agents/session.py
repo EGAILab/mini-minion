@@ -673,6 +673,10 @@ class AgentSession:
         # PostgreSQL ids of mirrored user/assistant messages this turn — used to
         # enqueue a durable capture job's source range (Stage One Phase 2, slice C).
         _mirrored_ua_ids: list[int] = []
+        # rel_paths of this turn's memory hits actually included in the prompt —
+        # computed at prompt-build time below, but mark_injected() itself isn't
+        # called until run_turn() succeeds (MEM-GAP-012) — see that call site.
+        _injected_rel_paths: list[str] = []
 
         # Phase 5: workspace attestation — verify the workspace dir is still present.
         # Raises WorkspaceVanishedError immediately so the provider is never called
@@ -729,11 +733,14 @@ class AgentSession:
             )
             if mem_block:
                 system += f"\n\n{mem_block}"
-                # Recall telemetry (Stage One Phase 5, slice A): mark which
-                # of this turn's surfaced results were actually injected.
+                # Recall telemetry (Stage One Phase 5, slice A): which of this
+                # turn's surfaced results were actually injected into the
+                # prompt. Recorded here, but mark_injected() itself is called
+                # later, only once run_turn() actually succeeds (MEM-GAP-012)
+                # — see that call site for why marking it here, before the
+                # provider is even called, would count a failed/never-run
+                # turn as a successful "used this memory" signal.
                 _injected_rel_paths = [h.rel_path for h in _injected_hits if h.rel_path]
-                if _injected_rel_paths:
-                    self._memory.mark_injected(_injected_rel_paths, message)
                 if on_event:
                     on_event(MemoryInjected(
                         keys=tuple(h.key for h in _injected_hits),
@@ -876,6 +883,18 @@ class AgentSession:
                 max_tool_rounds=self._agent.max_tool_rounds,
                 log_dir=self._log_dir,
             )
+
+            # Recall telemetry (MEM-GAP-012): only now, after run_turn() has
+            # actually returned without raising, do we count this turn's
+            # injected memory as successfully used — not at prompt-build
+            # time (before this call even ran). A provider exception or a
+            # tool-loop crash below never reaches this line, so a failed
+            # turn's surfaced notes never get credited with a "used"
+            # signal — consolidation.py's ranking weights injected_count
+            # 5x, so this previously let repeated failures inflate a
+            # note's apparent salience.
+            if self._memory is not None and _injected_rel_paths:
+                self._memory.mark_injected(_injected_rel_paths, message)
 
             # Replay new messages back into full history when using a window slice.
             if max_history_turns is not None:

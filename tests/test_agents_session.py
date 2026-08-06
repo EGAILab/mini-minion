@@ -662,6 +662,44 @@ def test_send_marks_injected_recall_telemetry_on_the_index(tmp_path):
     assert call_args[1] == ["memory/topics/python-facts.md"]
 
 
+def test_send_does_not_mark_injected_when_the_provider_call_fails(tmp_path):
+    # MEM-GAP-012: a failed turn must not count its surfaced memory as
+    # successfully "used" — mark_injected() must only fire once run_turn()
+    # has actually returned, not at prompt-build time.
+    mock_index = Mock()
+    mock_index.hybrid_search.return_value = [{
+        "id": 1, "rel_path": "memory/topics/python-facts.md", "source_kind": "durable",
+        "chunk_index": 0, "heading_path": "", "content": "User is a Python expert.",
+        "start_line": 1, "end_line": 1, "score": 0.9,
+    }]
+    mock_index.get_boundary.return_value = None
+    memory = MemoryService(MemoryFileRepository(tmp_path), index=mock_index, agent_id="main")
+    provider = Mock()
+    provider.chat = Mock(side_effect=RuntimeError("provider unavailable"))
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    session = AgentSession(
+        agent_id="main",
+        session_id="test-session",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        memory=memory,
+    )
+
+    try:
+        session.send("Tell me about Python")
+    except RuntimeError:
+        pass
+
+    mock_index.mark_injected.assert_not_called()
+
+
 def test_context_generation_starts_at_zero(tmp_path):
     session = _make_session(tmp_path)
     assert session._context_generation == 0
