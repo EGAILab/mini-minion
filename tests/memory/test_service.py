@@ -667,6 +667,74 @@ def test_remember_reindexes_the_written_file(indexed_service):
     )
 
 
+# ---------------------------------------------------------------------------
+# Revision history for explicit writes (MEM-GAP-020)
+# ---------------------------------------------------------------------------
+
+def test_remember_records_a_revision_of_the_prior_content(indexed_service):
+    svc, mock_index = indexed_service
+    svc.remember("project-goals", "Ship it this quarter.")
+    mock_index.reset_mock()
+
+    svc.remember("project-goals", "Delayed to next quarter.")
+
+    mock_index.record_topic_revision.assert_called_once_with(
+        "main", "project-goals", None, "Ship it this quarter."
+    )
+
+
+def test_remember_records_empty_prior_content_for_a_brand_new_note(indexed_service):
+    svc, mock_index = indexed_service
+
+    svc.remember("brand-new", "First content.")
+
+    mock_index.record_topic_revision.assert_called_once_with("main", "brand-new", None, "")
+
+
+def test_delete_records_a_revision_of_the_deleted_content(indexed_service):
+    svc, mock_index = indexed_service
+    svc.remember("project-goals", "Ship it this quarter.")
+    mock_index.reset_mock()
+
+    svc.delete("project-goals")
+
+    mock_index.record_topic_revision.assert_called_once_with(
+        "main", "project-goals", None, "Ship it this quarter."
+    )
+
+
+def test_delete_of_nonexistent_key_does_not_record_a_revision(indexed_service):
+    svc, mock_index = indexed_service
+
+    svc.delete("never-existed")
+
+    mock_index.record_topic_revision.assert_not_called()
+
+
+def test_remember_without_an_index_never_records_a_revision(service):
+    # No index configured — nothing to record into, and it must not raise.
+    service.remember("project-goals", "content")  # must not raise
+
+
+def test_revision_recording_failure_never_raises_out_of_remember(indexed_service):
+    svc, mock_index = indexed_service
+    mock_index.record_topic_revision.side_effect = RuntimeError("db unavailable")
+
+    svc.remember("project-goals", "content")  # must not raise
+
+    assert svc.load("project-goals") == "content"  # the actual write still succeeded
+
+
+def test_revision_recording_failure_never_raises_out_of_delete(indexed_service):
+    svc, mock_index = indexed_service
+    svc.remember("project-goals", "content")
+    mock_index.record_topic_revision.side_effect = RuntimeError("db unavailable")
+
+    deleted = svc.delete("project-goals")  # must not raise
+
+    assert deleted is True  # the actual deletion still succeeded
+
+
 def test_remember_import_reindexes_as_the_import_corpus(indexed_service):
     svc, mock_index = indexed_service
     svc.remember_import("_auto_extracted", "fact one")

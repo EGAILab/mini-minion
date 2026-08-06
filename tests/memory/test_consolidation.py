@@ -822,6 +822,67 @@ def test_rollback_raises_for_a_topic_with_no_revision_history(files):
 
 
 # ---------------------------------------------------------------------------
+# rollback — explicit-write revisions (MEM-GAP-020, proposal_id=None)
+# ---------------------------------------------------------------------------
+# MemoryService.remember()/delete() record a revision the same way
+# approve() does, but with proposal_id=None (no proposal triggered an
+# explicit write) — these prove rollback() handles that shape without
+# assuming a proposal always exists.
+
+def test_rollback_restores_content_from_an_explicit_write_revision(files):
+    files.remember("project-goals", "Delayed to next quarter.")
+    db = _FakeDB([])
+    index = _FakeIndex(hits=[])
+    index.record_topic_revision("main", "project-goals", None, "Ship it this quarter.")
+    consolidator = MemoryConsolidator(db, index, files, None, agent_id="main")
+
+    result = consolidator.rollback("project-goals")
+
+    assert files.load("project-goals") == "Ship it this quarter."
+    assert result["proposal_id"] is None
+
+
+def test_rollback_deletes_a_brand_new_topic_from_an_explicit_write_revision(files):
+    files.remember("dark-mode", "User prefers dark mode.")
+    db = _FakeDB([])
+    index = _FakeIndex(hits=[])
+    index.record_topic_revision("main", "dark-mode", None, "")  # "" = didn't exist before
+    consolidator = MemoryConsolidator(db, index, files, None, agent_id="main")
+
+    consolidator.rollback("dark-mode")
+
+    assert files.load("dark-mode") is None
+
+
+def test_rollback_never_touches_proposal_status_for_an_explicit_write_revision(files):
+    # _FakeDB.set_proposal_status(None, ...) would KeyError if rollback()
+    # ever called it for a proposal_id=None revision — this proves it's
+    # skipped, not just that it happens not to be reached.
+    files.remember("project-goals", "Delayed to next quarter.")
+    db = _FakeDB([])
+    index = _FakeIndex(hits=[])
+    index.record_topic_revision("main", "project-goals", None, "Ship it this quarter.")
+    consolidator = MemoryConsolidator(db, index, files, None, agent_id="main")
+
+    consolidator.rollback("project-goals")  # must not raise
+
+
+def test_rollback_consumes_an_explicit_write_revision_so_a_second_rollback_steps_further(files):
+    files.remember("project-goals", "Third draft.")
+    db = _FakeDB([])
+    index = _FakeIndex(hits=[])
+    index.record_topic_revision("main", "project-goals", None, "First draft.")
+    index.record_topic_revision("main", "project-goals", None, "Second draft.")
+    consolidator = MemoryConsolidator(db, index, files, None, agent_id="main")
+
+    consolidator.rollback("project-goals")
+    assert files.load("project-goals") == "Second draft."
+
+    consolidator.rollback("project-goals")
+    assert files.load("project-goals") == "First draft."
+
+
+# ---------------------------------------------------------------------------
 # is_preview_stale
 # ---------------------------------------------------------------------------
 

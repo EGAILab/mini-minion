@@ -572,12 +572,31 @@ def _migration_001_baseline(conn) -> None:
     )
 
 
+def _migration_002_nullable_revision_proposal_id(conn) -> None:
+    """Allow ``memory_topic_revisions.proposal_id`` to be ``NULL`` (MEM-GAP-020).
+
+    Before this migration, every revision row required a real
+    ``memory_proposals.id`` — meaning only a consolidation ``approve()``
+    apply could ever be recorded, never a plain explicit
+    ``MemoryService.remember()``/``delete()`` call (``save_memory``,
+    ``SaveMemoryTool``, or a direct ``note`` overwrite). ``NULL`` now means
+    "this revision was an explicit write, not a consolidation apply" — see
+    ``MemoryService.remember()``/``delete()`` (which pass
+    ``proposal_id=None``) and ``MemoryConsolidator.rollback()`` (which
+    skips its proposal-restoring step when ``revision["proposal_id"]`` is
+    ``None``), giving both write paths the same rollback/undo mechanism
+    rather than a second, parallel one.
+    """
+    conn.execute("ALTER TABLE memory_topic_revisions ALTER COLUMN proposal_id DROP NOT NULL")
+
+
 # Every migration PostgresMemoryIndex knows about, in the order they were
 # introduced. Append new migrations here — never edit an existing entry's
 # `apply` function once it has shipped (see _migration_001_baseline's
 # docstring).
 _MEMORY_INDEX_MIGRATIONS = [
     Migration(1, "baseline", _migration_001_baseline),
+    Migration(2, "nullable_revision_proposal_id", _migration_002_nullable_revision_proposal_id),
 ]
 
 
@@ -2378,18 +2397,21 @@ class PostgresMemoryIndex:
     # ------------------------------------------------------------------
 
     def record_topic_revision(
-        self, agent_id: str, target_key: str, proposal_id: int, prior_content: str
+        self, agent_id: str, target_key: str, proposal_id: int | None, prior_content: str
     ) -> int:
-        """Snapshot a topic note's content right before an apply overwrites it.
+        """Snapshot a topic note's content right before a write overwrites/deletes it.
 
         Args:
             agent_id: The agent the topic note belongs to.
             target_key: The topic note's key.
             proposal_id: Which proposal's approval triggered this apply —
                 lets :meth:`~minion_assist.memory.consolidation.MemoryConsolidator.rollback`
-                restore the proposal to ``"pending"`` too.
+                restore the proposal to ``"pending"`` too. ``None``
+                (MEM-GAP-020) for an explicit ``MemoryService.remember()``/
+                ``delete()`` write, which has no proposal to restore —
+                ``rollback()`` skips that step for these rows.
             prior_content: The note's full content immediately before the
-                apply (``""`` if the topic didn't exist yet — a brand new
+                write (``""`` if the topic didn't exist yet — a brand new
                 topic, not a revision).
 
         Returns:
@@ -2411,9 +2433,10 @@ class PostgresMemoryIndex:
 
         Returns:
             dict | None: ``{"id", "agent_id", "target_key", "proposal_id",
-                "prior_content", "created_at"}``, or ``None`` if this topic
-                has no revision history (never applied, or already fully
-                rolled back).
+                "prior_content", "created_at"}`` — ``proposal_id`` is
+                ``None`` for an explicit-write revision (MEM-GAP-020) — or
+                ``None`` if this topic has no revision history (never
+                written, or already fully rolled back).
         """
         row = self._conn().execute(
             """

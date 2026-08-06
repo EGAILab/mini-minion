@@ -168,6 +168,27 @@ class MemoryService:
                 rel_path, self._agent_id, type(exc).__name__, exc,
             )
 
+    def _record_revision(self, key: str, prior_content: str) -> None:
+        """Snapshot a topic note's content right before an explicit write overwrites/deletes it (MEM-GAP-020).
+
+        ``proposal_id=None`` — this is an explicit ``remember()``/
+        ``delete()`` call, not a consolidation apply (see
+        ``PostgresMemoryIndex.record_topic_revision``'s docstring for what
+        that means for ``MemoryConsolidator.rollback()``). Same best-effort,
+        no-op-without-an-index, never-blocks-the-write posture as
+        :meth:`_sync_index` — a failed/skipped revision snapshot must never
+        turn a successful memory write into a failed one.
+        """
+        if self._index is None or self._agent_id is None:
+            return
+        try:
+            self._index.record_topic_revision(self._agent_id, key, None, prior_content)
+        except Exception as exc:
+            _log.debug(
+                "Revision snapshot failed for %s (%s): %s: %s",
+                key, self._agent_id, type(exc).__name__, exc,
+            )
+
     # -----------------------------------------------------------------
     # Explicit notes
     # -----------------------------------------------------------------
@@ -175,11 +196,20 @@ class MemoryService:
     def remember(self, key: str, content: str) -> None:
         """Save an explicit note under ``key``, overwriting any existing note.
 
+        Snapshots the note's prior content (``""`` if it didn't exist yet)
+        as a revision before overwriting (MEM-GAP-020) — recoverable via
+        ``MemoryConsolidator.rollback(key)``/``minion-assist memory
+        consolidate rollback``, the same undo mechanism a consolidation
+        apply already uses. Best-effort: only happens when a database
+        index is configured, and never blocks the write itself.
+
         Args:
             key: Note identifier, e.g. ``"project-goals"``.
             content: Markdown text to store.
         """
+        prior_content = self._files.load(key) or ""
         path = self._files.remember(key, content)
+        self._record_revision(key, prior_content)
         self._sync_index("durable", path, content)
 
     def load(self, key: str) -> str | None:
@@ -187,9 +217,16 @@ class MemoryService:
         return self._files.load(key)
 
     def delete(self, key: str) -> bool:
-        """Delete an explicit note. Returns ``True`` if a file was removed."""
+        """Delete an explicit note. Returns ``True`` if a file was removed.
+
+        Snapshots the deleted content as a revision first (MEM-GAP-020) —
+        see :meth:`remember`'s docstring; the same
+        ``MemoryConsolidator.rollback(key)`` restores it.
+        """
+        prior_content = self._files.load(key)
         removed = self._files.delete(key)
         if removed:
+            self._record_revision(key, prior_content or "")
             self._sync_index("durable", self._files.topic_path(key), None)
         return removed
 

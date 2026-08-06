@@ -1884,6 +1884,17 @@ def test_record_and_fetch_a_topic_revision(index, agent_id):
     assert revision["prior_content"] == "Existing goal: ship v1."
 
 
+def test_record_a_topic_revision_with_no_proposal(index, agent_id):
+    # MEM-GAP-020: an explicit MemoryService.remember()/delete() write has
+    # no proposal to attribute the revision to.
+    index.record_topic_revision(agent_id, "project-goals", None, "Prior content.")
+
+    revision = index.latest_topic_revision(agent_id, "project-goals")
+
+    assert revision["proposal_id"] is None
+    assert revision["prior_content"] == "Prior content."
+
+
 def test_latest_topic_revision_returns_the_most_recent_one(index, agent_id):
     index.record_topic_revision(agent_id, "project-goals", 1, "First prior content.")
     index.record_topic_revision(agent_id, "project-goals", 2, "Second prior content.")

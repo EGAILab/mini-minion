@@ -683,25 +683,32 @@ class MemoryConsolidator:
         self._db.set_proposal_status(proposal_id, "rejected", reason=reason)
 
     def rollback(self, target_key: str) -> dict:
-        """Undo the most recent ``approve()`` for one topic note.
+        """Undo the most recent write to one topic note — a consolidation ``approve()``
+        apply, or a plain explicit ``MemoryService.remember()``/``delete()`` (MEM-GAP-020).
 
-        Restores the note's exact pre-apply content (or deletes the file
-        entirely if it didn't exist before that apply — i.e. the apply
-        created a brand new topic), reindexes accordingly, restores the
-        associated proposal to ``"pending"`` and re-indexes its raw claim
-        chunk (removed by ``approve()``), and consumes the revision row —
-        a second rollback steps back one apply further, not the same one
-        again.
+        Restores the note's exact pre-write content (or deletes the file
+        entirely if it didn't exist before that write — i.e. the write
+        created a brand new topic), reindexes accordingly, and consumes
+        the revision row — a second rollback steps back one write further,
+        not the same one again. For a consolidation-apply revision only
+        (``proposal_id`` set), also restores the associated proposal to
+        ``"pending"`` and re-indexes its raw claim chunk (removed by
+        ``approve()``); an explicit-write revision has no proposal to
+        restore, so that step is skipped for those.
 
         Args:
             target_key: Which topic note to roll back.
 
         Returns:
-            dict: ``{"target_key", "proposal_id", "restored_content"}``.
+            dict: ``{"target_key", "proposal_id", "restored_content"}`` —
+                ``proposal_id`` is ``None`` when the undone write was an
+                explicit ``remember()``/``delete()``, not a consolidation
+                apply.
 
         Raises:
             ValueError: If this topic has no revision history to roll
-                back (never applied, or already fully rolled back).
+                back (never written through a tracked path, or already
+                fully rolled back).
         """
         revision = self._index.latest_topic_revision(self._agent_id, target_key)
         if revision is None:
@@ -709,7 +716,7 @@ class MemoryConsolidator:
 
         rel_path = self._files.topic_path(target_key).relative_to(self._files.root).as_posix()
         if revision["prior_content"] == "":
-            # "" means the apply this undoes created the note from
+            # "" means the write this undoes created the note from
             # scratch — there is nothing to restore it to, so the file
             # goes away entirely rather than becoming an empty note.
             self._files.delete(target_key)
@@ -718,12 +725,13 @@ class MemoryConsolidator:
             self._files.remember(target_key, revision["prior_content"])
             self._index.reindex_file(self._agent_id, rel_path, "durable", revision["prior_content"])
 
-        self._db.set_proposal_status(revision["proposal_id"], "pending")
-        proposal = self._db.get_proposal(revision["proposal_id"])
-        if proposal is not None:
-            self._index.reindex_proposal(
-                self._agent_id, revision["proposal_id"], proposal["claim_text"]
-            )
+        if revision["proposal_id"] is not None:
+            self._db.set_proposal_status(revision["proposal_id"], "pending")
+            proposal = self._db.get_proposal(revision["proposal_id"])
+            if proposal is not None:
+                self._index.reindex_proposal(
+                    self._agent_id, revision["proposal_id"], proposal["claim_text"]
+                )
         self._index.delete_topic_revision(revision["id"])
 
         return {
