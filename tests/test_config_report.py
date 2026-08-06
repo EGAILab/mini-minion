@@ -18,7 +18,14 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from minion_assist.config_report import _redact_url, _render, format_config_report, main
+from minion_assist.config_report import (
+    _collect_secrets,
+    _redact_url,
+    _render,
+    collect_secret_values,
+    format_config_report,
+    main,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -212,3 +219,88 @@ def test_main_returns_2_and_does_not_raise_when_config_loading_fails(monkeypatch
     captured = capsys.readouterr()
     assert exit_code == 2
     assert "Failed to load configuration" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# _collect_secrets / collect_secret_values (MEM-GAP-017)
+# ---------------------------------------------------------------------------
+
+def test_collect_secrets_gathers_a_whole_sensitive_field():
+    out: set[str] = set()
+    _collect_secrets(_Inner("prod", "sk-real-secret-value"), field_name=None, out=out)
+    assert out == {"sk-real-secret-value"}
+
+
+def test_collect_secrets_skips_an_empty_sensitive_field():
+    out: set[str] = set()
+    _collect_secrets(_Inner("prod", ""), field_name=None, out=out)
+    assert out == set()
+
+
+def test_collect_secrets_recurses_into_a_nested_dataclass():
+    outer = _Outer(label="x", inner=_Inner("prod", "nested-secret"))
+    out: set[str] = set()
+    _collect_secrets(outer, field_name=None, out=out)
+    assert out == {"nested-secret"}
+
+
+def test_collect_secrets_gathers_every_value_in_an_env_dict():
+    out: set[str] = set()
+    _collect_secrets({"API_KEY": "env-secret", "DEBUG": "true"}, field_name="env", out=out)
+    assert out == {"env-secret", "true"}
+
+
+def test_collect_secrets_extracts_a_url_credential_only():
+    out: set[str] = set()
+    _collect_secrets("postgresql://user:pw@localhost:5433/db", field_name="url", out=out)
+    assert out == {"user:pw"}
+
+
+def test_collect_secrets_ignores_a_url_without_credentials():
+    out: set[str] = set()
+    _collect_secrets("postgresql://localhost:5433/db", field_name="url", out=out)
+    assert out == set()
+
+
+def test_collect_secrets_gathers_from_a_list_of_dataclasses():
+    servers = (_Inner("a", "secret-a"), _Inner("b", "secret-b"))
+    out: set[str] = set()
+    _collect_secrets(servers, field_name="servers", out=out)
+    assert out == {"secret-a", "secret-b"}
+
+
+def test_collect_secrets_ignores_plain_scalars_and_none():
+    out: set[str] = set()
+    _collect_secrets(42, field_name="tool_timeout", out=out)
+    _collect_secrets(None, field_name="route_prefix", out=out)
+    assert out == set()
+
+
+def test_collect_secret_values_finds_a_real_provider_api_key(monkeypatch):
+    import minion_assist.config as _cfg
+    from minion_assist.config import AgentModelConfig, ModelConfig, ProviderConfig
+
+    fake_agents = {
+        "main": AgentModelConfig(
+            provider=ProviderConfig(
+                name="fake", base_url="http://example.org", api_key="FAKE-SECRET-VALUE-12345",
+                api="openai-completions",
+            ),
+            model=ModelConfig(id="fake-model", context_window=1000, max_output_tokens=100),
+            route_prefix=None,
+        )
+    }
+    monkeypatch.setattr(_cfg, "agents", fake_agents)
+
+    assert "FAKE-SECRET-VALUE-12345" in collect_secret_values()
+
+
+def test_collect_secret_values_finds_a_real_database_url_credential(monkeypatch):
+    import minion_assist.config as _cfg
+    from minion_assist.config import DatabaseConfig
+
+    monkeypatch.setattr(
+        _cfg, "database", DatabaseConfig(url="postgresql://realuser:realpass@dbhost:5432/prod")
+    )
+
+    assert "realuser:realpass" in collect_secret_values()

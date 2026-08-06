@@ -7,17 +7,33 @@ from pathlib import Path
 
 import pytest
 
+import minion_assist.llm_logger as llm_logger
 from minion_assist.llm_logger import (
     _TOOL_RESULT_TRUNCATE,
     _TURN_SNIPPET,
     _log_file,
     _now,
+    _redact,
     log_request,
     log_response,
     log_tool_call,
     log_tool_result,
     log_turn_start,
 )
+
+
+@pytest.fixture
+def known_secrets():
+    """Force _get_secret_values() to a fixed, known set for deterministic redaction tests.
+
+    Bypasses the real (lazily-computed-from-live-config) cache entirely —
+    redaction correctness shouldn't depend on what secrets happen to be
+    configured in the test environment. Restored to "not yet computed"
+    afterward so other tests still exercise the real lazy-computation path.
+    """
+    llm_logger._secret_values = frozenset({"sk-real-secret-value", "hunter2"})
+    yield
+    llm_logger._secret_values = None
 
 
 # ---------------------------------------------------------------------------
@@ -345,3 +361,91 @@ def test_full_agent_loop_sequence(tmp_path):
     assert content.index("[TURN]") < content.index("[DEBUG]")
     assert content.index("[TOOL_CALL]") > content.index("Generated prediction:")
     assert content.index("[TOOL_RESULT]") > content.index("[TOOL_CALL]")
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction (MEM-GAP-017)
+# ---------------------------------------------------------------------------
+
+def test_redact_masks_a_known_secret(known_secrets):
+    assert _redact("the key is sk-real-secret-value here") == "the key is ***REDACTED*** here"
+
+
+def test_redact_masks_every_occurrence(known_secrets):
+    text = "sk-real-secret-value appears twice: sk-real-secret-value"
+    assert _redact(text) == "***REDACTED*** appears twice: ***REDACTED***"
+
+
+def test_redact_masks_multiple_distinct_secrets(known_secrets):
+    text = "key=sk-real-secret-value pass=hunter2"
+    assert _redact(text) == "key=***REDACTED*** pass=***REDACTED***"
+
+
+def test_redact_leaves_unrelated_text_unchanged(known_secrets):
+    text = "nothing sensitive here"
+    assert _redact(text) == text
+
+
+def test_redact_with_no_known_secrets_is_a_no_op(monkeypatch):
+    monkeypatch.setattr(llm_logger, "_secret_values", frozenset())
+    assert _redact("anything at all") == "anything at all"
+
+
+def test_log_request_redacts_a_known_secret_from_the_body(tmp_path, known_secrets):
+    log_request(tmp_path, "http://x/chat", {"system": "key: sk-real-secret-value"})
+    content = _read_log(tmp_path)
+    assert "sk-real-secret-value" not in content
+    assert "***REDACTED***" in content
+
+
+def test_log_response_redacts_a_known_secret_from_the_body(tmp_path, known_secrets):
+    log_response(tmp_path, "m", {"echo": "hunter2"})
+    content = _read_log(tmp_path)
+    assert "hunter2" not in content
+    assert "***REDACTED***" in content
+
+
+def test_log_turn_start_redacts_a_known_secret(tmp_path, known_secrets):
+    log_turn_start(tmp_path, "Ada", "my key is sk-real-secret-value")
+    content = _read_log(tmp_path)
+    assert "sk-real-secret-value" not in content
+
+
+def test_log_tool_call_redacts_a_known_secret_from_arguments(tmp_path, known_secrets):
+    log_tool_call(tmp_path, "Ada", "bash", {"command": "echo hunter2"})
+    content = _read_log(tmp_path)
+    assert "hunter2" not in content
+
+
+def test_log_tool_result_redacts_a_known_secret(tmp_path, known_secrets):
+    log_tool_result(tmp_path, "Ada", "read", "found sk-real-secret-value in file")
+    content = _read_log(tmp_path)
+    assert "sk-real-secret-value" not in content
+
+
+def test_get_secret_values_caches_after_first_call(monkeypatch):
+    """The real (non-fixture) lazy path — computed once, not per call."""
+    monkeypatch.setattr(llm_logger, "_secret_values", None)
+    calls = []
+
+    def _fake_collect():
+        calls.append(1)
+        return frozenset({"x"})
+
+    monkeypatch.setattr("minion_assist.config_report.collect_secret_values", _fake_collect)
+
+    llm_logger._get_secret_values()
+    llm_logger._get_secret_values()
+
+    assert len(calls) == 1  # computed once, reused on the second call
+
+
+def test_get_secret_values_fails_open_when_config_is_unavailable(monkeypatch):
+    monkeypatch.setattr(llm_logger, "_secret_values", None)
+
+    def _boom():
+        raise RuntimeError("config.json is broken")
+
+    monkeypatch.setattr("minion_assist.config_report.collect_secret_values", _boom)
+
+    assert llm_logger._get_secret_values() == frozenset()  # never raises

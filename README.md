@@ -311,7 +311,7 @@ Example structure (see `config.example.json` for the full template):
 | `heartbeat.*` | *(Optional, disabled by default)* Periodic proactive check-in — `enabled`/`interval_seconds`/`prompt`/`agent_id`/`notification_room_id`. See "Heartbeat & Proactive Features". |
 | `dreaming.*` | *(Optional, disabled by default)* Nightly session-reflection scheduler — `enabled`/`hour`/`minute`/`timezone`/`lookback_days`/`agent_id`. |
 | `multi_agent.*` | *(Optional)* Subagent spawn limits — `max_spawn_depth`/`max_children_per_agent`/`default_subagent_timeout_seconds`. See "Multi-Agent Workspace". |
-| `logging.llm_requests` | *(Optional, default `true`)* Log full provider request/response payloads to `workspace/logs/`. May include recalled memory content in the payload — leave `false` unless actively debugging (MEM-GAP-017). |
+| `logging.llm_requests` | *(Optional, default `true`)* Log full provider request/response payloads to `workspace/logs/`. May include recalled memory content in the payload — leave `false` unless actively debugging. Known secrets are always redacted from these logs regardless of this setting — see "Secret redaction in logs" (MEM-GAP-017). |
 | `codex.*` | *(Optional)* Only relevant for an agent whose provider uses `"api": "codex"` — `allow_all_commands`/`auth_refresh_interval_seconds`. |
 
 **Full config surface every run.** `config.example.json` documents every section above (MEM-GAP-019) — copy it as a starting point rather than reconstructing the surface from this table or from source.
@@ -323,6 +323,12 @@ minion-assist config
 ```
 
 Prints every resolved `config.json` section — what minion-assist actually understood after validation, not just what you wrote — with every credential (`api_key`, Matrix `access_token`/`password`, `database.url`'s inline `user:pass@`, MCP server `env`/`headers` values) masked as `***` rather than omitted, so you can confirm a secret *is* configured without ever exposing its value. Runs before any REPL/session/provider setup — the same non-interactive dispatch `minion-assist memory ...` already uses (see `config_report.py`). Exits `2` with the underlying `ConfigError` message if `config.json` itself fails to load/validate.
+
+### Secret redaction in logs (MEM-GAP-017)
+
+`logging.llm_requests` (default `true`) logs the *entire* provider request/response body verbatim to `workspace/logs/*.log` — including whatever memory content got injected into the system prompt (`<relevant_memories>`, `MEMORY.md`, `USER.md`). Kept on by default deliberately (useful for debugging), but every entry `llm_logger.py` writes — requests, responses, turn markers, tool calls, tool results — is passed through a redaction pass first that masks exact occurrences of every currently-configured credential: every provider's `api_key`, Matrix's `access_token`/`password`, and a configured `database.url`'s inline `user:pass@` portion (host/port/db name stay visible — useful for debugging, not secret). Masked as a fixed `***REDACTED***` marker wherever found, however many times it appears.
+
+This is **known-value** redaction, not pattern-guessing: `config_report.py`'s `collect_secret_values()` (the same field-name-based walk `minion-assist config`'s redaction already uses, reused rather than duplicated) gathers every real secret actually configured through `config.json`/`.env`, computed once per process and cached (config is immutable after startup). It catches a real configured secret wherever it turns up — including a case the gap analysis specifically calls out, a user's own memory note that happens to paste a real key — but can't recognize an arbitrary string as sensitive without already knowing it's one; a key that was never configured through minion-assist (e.g. hardcoded in a script the agent reads) wouldn't be caught. Redaction failures fail open (never block a log write) — consistent with `llm_logger.py`'s existing "a disk error never crashes the LLM call" posture.
 
 ### `.env`
 

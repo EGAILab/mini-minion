@@ -138,7 +138,7 @@
     "agent_id": "main"
   },
   "logging": {
-    "_comment": "llm_requests=true logs full provider request/response payloads to workspace/logs/ — may include recalled memory content (MEM-GAP-017); leave false unless actively debugging.",
+    "_comment": "llm_requests=true logs full provider request/response payloads to workspace/logs/ — may include recalled memory content. Known secrets (provider API keys, Matrix token, database URL credential) are always redacted from these logs regardless of this setting (MEM-GAP-017), but leave false unless actively debugging to avoid logging memory content unnecessarily.",
     "llm_requests": false
   },
   "codex": {

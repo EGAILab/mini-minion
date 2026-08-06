@@ -150,9 +150,25 @@ def format_config_report() -> str:
         str: Multi-line report, one top-level section per block, secrets
             masked per :data:`_REDACT_WHOLE_FIELD`/:data:`_REDACT_DICT_VALUES`.
     """
+    lines: list[str] = []
+    for name, value in _config_sections():
+        lines.append(f"{name}:")
+        lines.extend(_render(value, field_name=None, indent=1))
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _config_sections() -> list[tuple[str, object]]:
+    """Every top-level resolved ``config.json`` section, name-labeled.
+
+    Shared by :func:`format_config_report` and :func:`collect_secret_values`
+    (MEM-GAP-017) so both walk the exact same section list — a new config
+    section added to one automatically appears in the other, with no
+    separate list to remember to update.
+    """
     from . import config as _cfg  # noqa: PLC0415
 
-    sections: list[tuple[str, object]] = [
+    return [
         ("agents", _cfg.agents),
         ("workspace", _cfg.workspace),
         ("streaming", _cfg.streaming),
@@ -175,12 +191,69 @@ def format_config_report() -> str:
         ("voice", _cfg.voice),
     ]
 
-    lines: list[str] = []
-    for name, value in sections:
-        lines.append(f"{name}:")
-        lines.extend(_render(value, field_name=None, indent=1))
-        lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+
+def _collect_secrets(value: object, *, field_name: str | None, out: set[str]) -> None:
+    """Recursively gather every known-sensitive value out of a resolved config value into ``out``.
+
+    Same traversal shape as :func:`_render`, but collects raw values
+    instead of building display text — see :func:`collect_secret_values`.
+    """
+    if field_name in _REDACT_WHOLE_FIELD:
+        if isinstance(value, str) and value:
+            out.add(value)
+        return
+    if value is None:
+        return
+    if dataclasses.is_dataclass(value):
+        for f in dataclasses.fields(value):
+            _collect_secrets(getattr(value, f.name), field_name=f.name, out=out)
+        return
+    if isinstance(value, dict):
+        if field_name in _REDACT_DICT_VALUES:
+            for v in value.values():
+                if isinstance(v, str) and v:
+                    out.add(v)
+            return
+        for v in value.values():
+            _collect_secrets(v, field_name=None, out=out)
+        return
+    if isinstance(value, (list, tuple)):
+        for v in value:
+            _collect_secrets(v, field_name=None, out=out)
+        return
+    if field_name == "url" and isinstance(value, str):
+        # A connection string's inline user:pass@ credential, not the whole
+        # URL (host/port/db name aren't secret and are useful in a log).
+        match = re.search(r"://([^@/\s]+)@", value)
+        if match:
+            out.add(match.group(1))
+
+
+def collect_secret_values() -> frozenset[str]:
+    """Every currently-configured secret value, across every resolved config section (MEM-GAP-017).
+
+    Used to redact known credentials from LLM request/response logs
+    (``llm_logger.py``) — masks exact occurrences of a real, currently-
+    configured secret wherever it appears in logged text (a provider
+    ``api_key``, Matrix's ``access_token``/``password``, a database URL's
+    inline credential, an MCP server's ``env``/``headers`` values),
+    complementing rather than replacing careful defaults. This is
+    deliberately *known-value* matching, not pattern-guessing: a secret
+    that was never configured through ``config.json``/``.env`` (e.g. a key
+    a user pasted directly into a memory note) can't be recognized as a
+    secret without already knowing it's one — see the module docstring's
+    "Why redact rather than just not print secrets at all?" note for the
+    same reasoning applied to :func:`format_config_report`.
+
+    Returns:
+        frozenset[str]: Every non-empty secret value found. Cached by the
+            caller (``llm_logger.py`` computes this once, not per log
+            call) since config is immutable after process startup.
+    """
+    out: set[str] = set()
+    for _name, value in _config_sections():
+        _collect_secrets(value, field_name=None, out=out)
+    return frozenset(out)
 
 
 def main(argv: list[str]) -> int:
