@@ -1,10 +1,23 @@
 """Tests for tool workspace-root sandboxing and bash confirmation callable."""
 
+import platform
+import sys
+
 from minion_assist.tools.bash import BashTool
 from minion_assist.tools.glob import GlobTool
 from minion_assist.tools.policy import PermissionPolicy
 from minion_assist.tools.read import ReadTool
 from minion_assist.tools.write import WriteTool
+
+_IS_WINDOWS = platform.system() == "Windows"
+
+# Bare `python` is unreliable in tests: on Windows it can resolve to the
+# Microsoft Store app-execution-alias stub (when no python.org/registered
+# install is on PATH ahead of it), which silently no-ops instead of running
+# real Python. sys.executable is always the interpreter actually running
+# these tests. `&` is PowerShell's call operator, needed to invoke a quoted
+# path as a command rather than treat it as a string.
+_PYTHON = f'& "{sys.executable}"' if _IS_WINDOWS else f'"{sys.executable}"'
 
 # ---------------------------------------------------------------------------
 # ReadTool — path containment
@@ -220,7 +233,7 @@ def test_bash_confirm_receives_command_string():
 def test_bash_tool_cwd_is_used(tmp_path):
     """BashTool cwd= starts the subprocess in the specified directory."""
     tool = BashTool(confirm=None, cwd=tmp_path)
-    result = tool.execute(command='python -c "import os; print(os.getcwd())"')
+    result = tool.execute(command=f'{_PYTHON} -c "import os; print(os.getcwd())"')
     # Normalize separators for cross-platform comparison.
     assert str(tmp_path).lower().replace("\\", "/") in result.lower().replace("\\", "/")
 

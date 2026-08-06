@@ -1,10 +1,19 @@
 """Tests for BashTool."""
 
 import platform
+import sys
 
 from minion_assist.tools.bash import BashTool
 
 _IS_WINDOWS = platform.system() == "Windows"
+
+# Bare `python` is unreliable in tests: on Windows it can resolve to the
+# Microsoft Store app-execution-alias stub (when no python.org/registered
+# install is on PATH ahead of it), which silently no-ops instead of running
+# real Python. sys.executable is always the interpreter actually running
+# these tests. `&` is PowerShell's call operator, needed to invoke a quoted
+# path as a command rather than treat it as a string.
+_PYTHON = f'& "{sys.executable}"' if _IS_WINDOWS else f'"{sys.executable}"'
 
 
 def test_bash_runs_command():
@@ -38,13 +47,13 @@ def test_bash_captures_stderr():
 
 def test_bash_timeout():
     tool = BashTool(confirm=None)
-    result = tool.execute(command='python -c "import time; time.sleep(5)"', timeout=1)
+    result = tool.execute(command=f'{_PYTHON} -c "import time; time.sleep(5)"', timeout=1)
     assert "timed out" in result.lower()
 
 
 def test_bash_no_output():
     tool = BashTool(confirm=None)
-    result = tool.execute(command='python -c "pass"')
+    result = tool.execute(command=f'{_PYTHON} -c "pass"')
     assert result == "(no output)"
 
 
