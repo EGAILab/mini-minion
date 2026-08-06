@@ -50,7 +50,7 @@ from .web_fetch import WebFetchTool
 from .web_search import WebSearchTool
 
 
-def _make_subagent_registry(root: Path | None = None) -> ToolRegistry:
+def _make_subagent_registry(root: Path | None = None, memory_root: Path | None = None) -> ToolRegistry:
     """Build a minimal read-only tool registry for subagent sessions.
 
     Subagents receive: ReadTool, GlobTool, GrepTool, WebSearchTool, WebFetchTool.
@@ -60,14 +60,19 @@ def _make_subagent_registry(root: Path | None = None) -> ToolRegistry:
     Args:
         root: Optional workspace root for path-boundary checks.  ``None``
             disables the workspace boundary.
+        memory_root: The subagent's own workspace directory (AGENTS.md,
+            TOOLS.md, etc. — see :data:`bootstrap._SUBAGENT_BOOTSTRAP_FILES`),
+            allowed as an additional read-only root alongside ``root``.
+            ``None`` leaves ``ReadTool`` scoped to ``root`` only.
 
     Returns:
         ToolRegistry: A populated registry with read-only tools registered.
     """
     policy = PermissionPolicy.default(workspace=root)
+    extra_roots = (memory_root.resolve(),) if memory_root is not None else ()
     registry = ToolRegistry()
     for tool in [
-        ReadTool(root, policy=policy),
+        ReadTool(root, policy=policy, extra_roots=extra_roots),
         GlobTool(root, policy=policy),
         GrepTool(policy),
         WebSearchTool(policy=policy),

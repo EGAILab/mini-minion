@@ -78,6 +78,7 @@ def default_registry(
     ask_user_fn: "Callable[[str], str] | None" = None,
     write_confirm: "Callable[[str], bool] | None" = None,
     db: object | None = None,
+    memory_root: Path | None = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` with all standard tools registered.
 
@@ -87,6 +88,13 @@ def default_registry(
                       backend.
         root:         Workspace root path. File tools reject paths outside this
                       boundary.  Pass ``None`` to disable path restriction.
+        memory_root:  The agent's own workspace directory (SOUL.md, USER.md,
+                      IDENTITY.md, MEMORY.md, memory/YYYY-MM-DD.md — typically
+                      ``~/.minion-assist/workspaces/<agent_id>``). These files
+                      live outside ``root`` (the project/tool sandbox), so
+                      ``read`` additionally allows this directory — read-only,
+                      write/edit/bash boundaries are unaffected.  ``None``
+                      (default) leaves ``read`` scoped to ``root`` only.
         bash_confirm: Optional callable passed to :class:`BashTool`.  Called
                       with the command string before execution; returns ``True``
                       to proceed.  ``None`` runs without asking (headless).
@@ -124,6 +132,7 @@ def default_registry(
     # This ensures EditTool/GrepTool/WebFetchTool always have a workspace
     # boundary even when minion.py doesn't pass an explicit policy object.
     _policy = policy or PermissionPolicy.default(workspace=root)
+    _memory_extra_roots = (memory_root.resolve(),) if memory_root is not None else ()
 
     registry = ToolRegistry()
 
@@ -135,7 +144,7 @@ def default_registry(
     # Legacy tools (read/write/glob) now accept an optional policy so their
     # path safety checks stay in sync with the centralised PermissionPolicy.
     for tool in [
-        ReadTool(root, policy=_policy),
+        ReadTool(root, policy=_policy, extra_roots=_memory_extra_roots),
         WriteTool(root, policy=_policy, confirm=write_confirm),
         GlobTool(root, policy=_policy),
         # BashTool: policy handles SSRF + read_only_mode; approval_fn provides the

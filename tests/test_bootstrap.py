@@ -156,6 +156,22 @@ def test_build_context_files_applies_per_file_limit(tmp_path):
     assert agents_ctx.injected_chars < 100
 
 
+def test_build_context_files_truncated_content_still_names_bare_filename(tmp_path):
+    """The inline truncation marker intentionally keeps the bare filename
+    (not the absolute path, which has unbounded length) — the absolute path
+    is available from the section header instead (see
+    test_render_project_context_header_includes_absolute_path) and from the
+    truncation warning (see test_truncation_warning_lists_absolute_path_of_truncated_file)."""
+    _write_file(tmp_path, "AGENTS.md", "A" * 100)
+
+    files = load_bootstrap_files(tmp_path)
+    ctx_files = build_bootstrap_context_files(files, max_chars=20, total_max_chars=60_000)
+
+    agents_ctx = next(f for f in ctx_files if f.path.name == "AGENTS.md")
+    assert "read AGENTS.md for full content" in agents_ctx.content
+    assert str(tmp_path) not in agents_ctx.content
+
+
 def test_build_context_files_full_content_when_within_limit(tmp_path):
     """Content within max_chars is injected without truncation."""
     _write_file(tmp_path, "SOUL.md", "Short soul.")
@@ -246,6 +262,23 @@ def test_render_project_context_empty_list():
     assert render_project_context([]) == ""
 
 
+def test_render_project_context_header_includes_absolute_path(tmp_path):
+    """The section header must include the file's absolute path, not just its
+    bare name — a bare name (e.g. "SOUL.md") resolves relative to whatever cwd
+    a shell/read tool happens to use, which is not reliably this file's actual
+    location (see the Codex-provider bug where the model tried `Get-Content
+    SOUL.md` relative to the wrong cwd and failed)."""
+    _write_file(tmp_path, "SOUL.md", "soul content")
+
+    files = load_bootstrap_files(tmp_path)
+    ctx_files = build_bootstrap_context_files(files, max_chars=20_000, total_max_chars=60_000)
+    rendered = render_project_context(ctx_files)
+
+    expected_path = str((tmp_path / "SOUL.md").resolve())
+    assert expected_path in rendered
+    assert f"## SOUL.md ({expected_path})" in rendered
+
+
 # ---------------------------------------------------------------------------
 # render_bootstrap_pending_context
 # ---------------------------------------------------------------------------
@@ -288,6 +321,30 @@ def test_truncation_warning_emitted_when_truncated():
     )
     warning = render_truncation_warning([ctx_file], mode="always")
     assert "[Bootstrap truncation warning]" in warning
+
+
+def test_truncation_warning_lists_absolute_path_of_truncated_file():
+    """The warning must name the truncated file's absolute path so the model
+    can actually read it, rather than a bare name it would resolve against
+    the wrong cwd."""
+    ctx_file = ContextFile(
+        path=Path("/abs/workspace/AGENTS.md"),
+        content="...",
+        truncated=True,
+        raw_chars=100,
+        injected_chars=40,
+    )
+    warning = render_truncation_warning([ctx_file], mode="always")
+    assert str(Path("/abs/workspace/AGENTS.md")) in warning
+
+
+def test_truncation_warning_omits_untruncated_files_from_path_list():
+    """Only truncated files' paths are listed, not every injected file."""
+    truncated = ContextFile(path=Path("/abs/AGENTS.md"), content="...", truncated=True)
+    intact = ContextFile(path=Path("/abs/SOUL.md"), content="full", truncated=False)
+    warning = render_truncation_warning([truncated, intact], mode="always")
+    assert str(Path("/abs/AGENTS.md")) in warning
+    assert str(Path("/abs/SOUL.md")) not in warning
 
 
 def test_truncation_warning_suppressed_when_mode_off():

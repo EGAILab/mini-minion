@@ -88,6 +88,57 @@ def test_default_registry_root_enforced_in_glob(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# memory_root parameter — widens `read` (only) to the agent's own workspace
+# directory, e.g. SOUL.md/USER.md/memory/YYYY-MM-DD.md that live outside `root`
+# ---------------------------------------------------------------------------
+
+
+def test_default_registry_memory_root_allows_read_outside_project_root(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    memory_root = tmp_path / "workspace" / "main"
+    memory_root.mkdir(parents=True)
+    soul = memory_root / "SOUL.md"
+    soul.write_text("soul content")
+
+    reg = default_registry(root=root, memory_root=memory_root)
+    result = reg.execute("read", {"path": str(soul)})
+
+    assert "soul content" in result
+
+
+def test_default_registry_no_memory_root_still_rejects_workspace_dir(tmp_path):
+    """Without memory_root, the workspace directory is treated like any other
+    out-of-root path (regression guard for the widening above)."""
+    root = tmp_path / "project"
+    root.mkdir()
+    memory_root = tmp_path / "workspace" / "main"
+    memory_root.mkdir(parents=True)
+    soul = memory_root / "SOUL.md"
+    soul.write_text("soul content")
+
+    reg = default_registry(root=root)
+    result = reg.execute("read", {"path": str(soul)})
+
+    assert "outside the workspace root" in result
+
+
+def test_default_registry_memory_root_does_not_widen_write(tmp_path):
+    """memory_root only widens `read` — write must still be rejected outside root."""
+    root = tmp_path / "project"
+    root.mkdir()
+    memory_root = tmp_path / "workspace" / "main"
+    memory_root.mkdir(parents=True)
+    target = memory_root / "SOUL.md"
+
+    reg = default_registry(root=root, memory_root=memory_root)
+    result = reg.execute("write", {"path": str(target), "content": "hijacked"})
+
+    assert "outside the workspace root" in result
+    assert not target.exists()
+
+
+# ---------------------------------------------------------------------------
 # bash_confirm parameter — verify it is threaded to BashTool
 # ---------------------------------------------------------------------------
 

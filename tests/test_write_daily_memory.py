@@ -72,3 +72,12 @@ def test_schema_has_content_parameter(tmp_path):
     params = tool.schema.parameters
     assert "content" in params["properties"]
     assert "content" in params["required"]
+
+
+def test_schema_description_includes_absolute_memory_dir(tmp_path):
+    """The description must give the absolute memory directory, not just the
+    relative pattern — a relative path resolves against whatever cwd a
+    shell/read tool happens to use, which is not reliably this directory."""
+    tool = _tool(tmp_path)
+    expected_dir = str((tmp_path / "memory").resolve())
+    assert expected_dir in tool.schema.description

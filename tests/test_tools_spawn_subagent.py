@@ -250,3 +250,31 @@ class TestMakeSubagentRegistry:
     def test_with_root_path(self, tmp_path):
         registry = _make_subagent_registry(root=tmp_path)
         assert "read" in registry._tools
+
+    def test_memory_root_allows_read_outside_project_root(self, tmp_path):
+        """memory_root widens `read` to the subagent's own workspace dir
+        (e.g. AGENTS.md/TOOLS.md), which lives outside `root`."""
+        root = tmp_path / "project"
+        root.mkdir()
+        memory_root = tmp_path / "workspace" / "researcher"
+        memory_root.mkdir(parents=True)
+        agents_md = memory_root / "AGENTS.md"
+        agents_md.write_text("agent rules")
+
+        registry = _make_subagent_registry(root=root, memory_root=memory_root)
+        result = registry.execute("read", {"path": str(agents_md)})
+
+        assert "agent rules" in result
+
+    def test_no_memory_root_still_rejects_workspace_dir(self, tmp_path):
+        root = tmp_path / "project"
+        root.mkdir()
+        memory_root = tmp_path / "workspace" / "researcher"
+        memory_root.mkdir(parents=True)
+        agents_md = memory_root / "AGENTS.md"
+        agents_md.write_text("agent rules")
+
+        registry = _make_subagent_registry(root=root)
+        result = registry.execute("read", {"path": str(agents_md)})
+
+        assert "outside the workspace root" in result

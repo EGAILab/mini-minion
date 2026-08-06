@@ -2,6 +2,7 @@
 
 from minion_assist.tools.bash import BashTool
 from minion_assist.tools.glob import GlobTool
+from minion_assist.tools.policy import PermissionPolicy
 from minion_assist.tools.read import ReadTool
 from minion_assist.tools.write import WriteTool
 
@@ -51,6 +52,60 @@ def test_read_rejects_traversal_escape(tmp_path):
     result = ReadTool(root).execute(path=str(traversal))
 
     assert "outside the workspace root" in result
+
+
+# ---------------------------------------------------------------------------
+# ReadTool — extra_roots (agent's own workspace dir, e.g. SOUL.md/memory files
+# that live outside the project sandbox `root`)
+# ---------------------------------------------------------------------------
+
+
+def test_read_allows_path_under_extra_root_legacy_branch(tmp_path):
+    """Without a policy (legacy inline check), extra_roots still widens access."""
+    root = tmp_path / "project"
+    root.mkdir()
+    workspace = tmp_path / "workspace" / "main"
+    workspace.mkdir(parents=True)
+    soul = workspace / "SOUL.md"
+    soul.write_text("soul content", encoding="utf-8")
+
+    result = ReadTool(root, extra_roots=(workspace,)).execute(path=str(soul))
+
+    assert "1: soul content" in result
+
+
+def test_read_still_rejects_path_outside_root_and_extra_roots(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    workspace = tmp_path / "workspace" / "main"
+    workspace.mkdir(parents=True)
+    outside = tmp_path / "secrets.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    result = ReadTool(root, extra_roots=(workspace,)).execute(path=str(outside))
+
+    assert "outside the workspace root" in result
+
+
+def test_read_allows_path_under_extra_root_with_policy(tmp_path):
+    """With a policy injected, extra_roots is forwarded to policy.check_path()."""
+    root = tmp_path / "project"
+    root.mkdir()
+    workspace = tmp_path / "workspace" / "main"
+    workspace.mkdir(parents=True)
+    soul = workspace / "SOUL.md"
+    soul.write_text("soul content", encoding="utf-8")
+    policy = PermissionPolicy(workspace=root)
+
+    result = ReadTool(root, policy=policy, extra_roots=(workspace,)).execute(path=str(soul))
+
+    assert "1: soul content" in result
+
+
+def test_write_tool_has_no_extra_roots_parameter():
+    """WriteTool must not accept extra_roots — widening is read-only, by design."""
+    import inspect
+    assert "extra_roots" not in inspect.signature(WriteTool.__init__).parameters
 
 
 # ---------------------------------------------------------------------------

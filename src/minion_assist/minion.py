@@ -489,9 +489,15 @@ def main() -> None:
             if child_workspace is not None:
                 ensure_workspace(child_workspace)
 
+            # Bootstrap root: same fallback bootstrap.py itself uses (see
+            # child_boot_root below) — computed here too so ReadTool can be
+            # given read access to it (AGENTS.md/TOOLS.md live here, outside
+            # the project tool sandbox `_tool_root`).
+            child_boot_root = child_workspace or _bootstrap_root
+
             # Read-only tool registry built BEFORE the provider so Codex
             # receives it at construction (same as openclaw's startup tool build).
-            child_tools = _make_subagent_registry(root=_tool_root)
+            child_tools = _make_subagent_registry(root=_tool_root, memory_root=child_boot_root)
 
             child_provider = create_provider(
                 api=child_model_cfg.provider.api,
@@ -504,7 +510,7 @@ def main() -> None:
             )
 
             # Bootstrap context for subagent: filtered to AGENTS.md + TOOLS.md only.
-            child_boot_root = child_workspace or _bootstrap_root
+            # (child_boot_root computed earlier, alongside child_tools.)
             child_bootstrap_context = (
                 (
                     lambda root=child_boot_root: build_bootstrap_prompt_block(
@@ -625,6 +631,7 @@ def main() -> None:
         tools = default_registry(
             memory=memory_service,
             root=_tool_root,
+            memory_root=_agent_bootstrap_root,
             bash_confirm=_console_confirm,
             bash_approval=_console_approve,
             skills=skills,

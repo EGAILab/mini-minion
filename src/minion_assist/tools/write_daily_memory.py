@@ -61,10 +61,17 @@ class WriteDailyMemoryTool(Tool):
     @property
     def schema(self) -> ToolSchema:
         """Describe this tool to the LLM."""
+        # Absolute path, not just the relative pattern — a relative path
+        # resolves against whatever cwd a shell/read tool happens to use,
+        # which is not reliably this directory (see the Codex-provider bug
+        # where the model tried `Get-Content memory\2026-08-06.md` relative
+        # to the wrong cwd and failed).
+        memory_dir = self._memory.root / "memory"
         return ToolSchema(
             name="write_daily_memory",
             description=(
-                "Append a note to today's daily memory file (memory/YYYY-MM-DD.md). "
+                f"Append a note to today's daily memory file (memory/YYYY-MM-DD.md, "
+                f"absolute location: {memory_dir}). "
                 "Use this to log events, decisions, or context you want to remember "
                 "in future sessions. The entry is timestamped automatically. "
                 "For significant long-term learnings, also update MEMORY.md directly "

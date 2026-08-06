@@ -50,6 +50,14 @@ def test_load_returns_none_for_missing_note(service):
     assert service.load("does-not-exist") is None
 
 
+# ---------------------------------------------------------------------------
+# root — exposes the underlying repository's workspace root
+# ---------------------------------------------------------------------------
+
+def test_root_returns_repository_root(tmp_path, service):
+    assert service.root == tmp_path.resolve()
+
+
 def test_delete_removes_existing_note(service):
     service.remember("note", "content")
     assert service.delete("note") is True

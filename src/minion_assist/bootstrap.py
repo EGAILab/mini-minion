@@ -214,6 +214,14 @@ def _truncate_content(raw_content: str, limit: int, name: str) -> str:
     This is intentional — the marker is metadata, not content, and the
     slight overshoot is negligible relative to default limits.
 
+    Deliberately uses the bare filename, not the absolute path: an absolute
+    path's length is unbounded (deep nested directories), so embedding it
+    here could itself blow past ``limit`` for a small budget, working against
+    the very truncation this function exists to do. The absolute path is
+    available anyway, from the ``## name (path)`` section header directly
+    above this content (:func:`render_project_context`) and from
+    :func:`render_truncation_warning` when this file was truncated.
+
     Example marker::
 
         [...truncated, read AGENTS.md for full content...]
@@ -380,7 +388,11 @@ def render_project_context(files: list[ContextFile]) -> str:
         return ""
     parts = ["# Project Context"]
     for ctx_file in files:
-        parts.append(f"## {ctx_file.path.name}\n{ctx_file.content}")
+        # The absolute path (not just the bare filename) lets the model read
+        # the file itself via a shell/read tool if it wants more than this
+        # embedded excerpt — a bare name resolves relative to whatever cwd
+        # that tool happens to use, which is not reliably this file's location.
+        parts.append(f"## {ctx_file.path.name} ({ctx_file.path})\n{ctx_file.content}")
     return "\n\n".join(parts)
 
 
@@ -443,11 +455,16 @@ def render_truncation_warning(files: list[ContextFile], mode: str) -> str:
             return ""
         _truncation_warned = True
 
+    # Absolute paths, not bare names — a bare name resolves relative to
+    # whatever cwd the model's shell/read tool happens to use, which is not
+    # reliably where these files actually live.
+    truncated_paths = "\n".join(f"- {f.path}" for f in files if f.truncated)
     return (
         "[Bootstrap truncation warning]\n"
         "Some workspace bootstrap files were truncated before injection.\n"
         "Treat Project Context as partial and read the relevant files directly "
-        "if details seem missing."
+        "if details seem missing:\n"
+        f"{truncated_paths}"
     )
 
 

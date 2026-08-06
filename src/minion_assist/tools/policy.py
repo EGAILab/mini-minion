@@ -95,7 +95,7 @@ class PermissionPolicy:
             reason=reason,
         ))
 
-    def check_path(self, path: Path) -> str | None:
+    def check_path(self, path: Path, extra_roots: tuple[Path, ...] = ()) -> str | None:
         """Check a file path against the policy.
 
         Returns None when the path is allowed, or an error string to return
@@ -103,10 +103,17 @@ class PermissionPolicy:
 
         Checks (in order):
         1. Sensitive credential paths (SSH keys, AWS config, etc.) — always denied.
-        2. Workspace boundary — denied when ``workspace`` is set and path escapes it.
+        2. Workspace boundary — denied when ``workspace`` is set and path escapes
+           it AND every root in ``extra_roots``.
 
         Args:
             path: The file path to validate. Need not exist yet.
+            extra_roots: Additional allowed roots checked as an OR alternative
+                to ``workspace`` — e.g. ReadTool passes the agent's own
+                workspace directory (SOUL.md/USER.md/memory files) here so
+                read-only lookups succeed without widening the boundary used
+                for writes (``check_write`` never passes this). Each root
+                must already be resolved by the caller.
 
         Returns:
             None if the path is allowed, or an error message string.
@@ -119,6 +126,8 @@ class PermissionPolicy:
             self._record_deny("file", str(path)[:120], "sensitive credential path")
             return error
         if self.workspace is not None and not _within(path, self.workspace):
+            if any(_within(path, extra_root) for extra_root in extra_roots):
+                return None
             error = f"Error: '{path}' is outside the workspace root '{self.workspace}'"
             self._record_deny("file", str(path)[:120], "outside workspace boundary")
             return error

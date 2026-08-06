@@ -763,6 +763,10 @@ When `~/.minion-assist/workspaces/{agent_id}/` exists, it is used for that agent
 
 **Subagent bootstrap filtering:** Subagents only receive `AGENTS.md` + `TOOLS.md` from the workspace. `SOUL.md`, `IDENTITY.md`, and `USER.md` define the root agent's character and are withheld from subagents.
 
+### Reading bootstrap/memory files with the `read` tool
+
+Bootstrap files (`SOUL.md`, `USER.md`, `IDENTITY.md`, `MEMORY.md`) and daily memory notes (`memory/YYYY-MM-DD.md`) live under the agent's workspace directory, which is separate from the project directory the `read`/`write`/`edit`/`bash` tools are otherwise sandboxed to. The `read` tool is additionally allowed into the agent's own workspace directory (read-only — `write`/`edit`/`bash` are unaffected), so the model can look these files up directly instead of guessing a relative path against the wrong working directory. The Project Context block injected into the system prompt (see above) also labels each file with its absolute path for the same reason.
+
 ### Workspace attestation (Phase 5)
 
 When an agent has a `workspace_root`, minion-assist checks that the directory and its `.workspace-marker` file still exist at the start of every turn. If the workspace was accidentally deleted, `WorkspaceVanishedError` is raised with a clear message instead of propagating a confusing provider error.

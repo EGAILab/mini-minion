@@ -56,13 +56,25 @@ class ReadTool(Tool):
     listing, or an error message.
     """
 
-    def __init__(self, root: Path | None = None, *, policy: PermissionPolicy | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        policy: PermissionPolicy | None = None,
+        extra_roots: tuple[Path, ...] = (),
+    ) -> None:
         # root=None means unrestricted; set to the project directory at startup.
         self._root = root.resolve() if root else None
         # When a policy is provided, check_path() replaces the inline checks below.
         # policy=None keeps the legacy _within + _is_sensitive behaviour so callers
         # that pass only root continue to work without changes.
         self._policy = policy
+        # Additional allowed roots checked as an OR alternative to `root`/the
+        # policy's workspace — e.g. the agent's own workspace directory, so
+        # SOUL.md/USER.md/IDENTITY.md/memory files can be read even though
+        # they live outside the project's tool sandbox (`root`).  Read-only:
+        # WriteTool/EditTool intentionally do not accept this parameter.
+        self._extra_roots = tuple(r.resolve() for r in extra_roots)
 
     @property
     def schema(self) -> ToolSchema:
@@ -108,7 +120,7 @@ class ReadTool(Tool):
         """
         path = pathlib.Path(str(kwargs["path"]))
         if self._policy is not None:
-            error = self._policy.check_path(path)
+            error = self._policy.check_path(path, extra_roots=self._extra_roots)
             if error:
                 return error
         else:
@@ -120,7 +132,8 @@ class ReadTool(Tool):
                     "Access to credential files and secret directories is not permitted."
                 )
             if self._root and not _within(path, self._root):
-                return f"Error: '{path}' is outside the workspace root '{self._root}'"
+                if not any(_within(path, extra_root) for extra_root in self._extra_roots):
+                    return f"Error: '{path}' is outside the workspace root '{self._root}'"
 
         # Clamp offset and limit to at least 1 to avoid nonsensical values.
         offset = max(1, int(kwargs.get("offset") or 1))

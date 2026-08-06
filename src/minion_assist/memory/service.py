@@ -119,6 +119,18 @@ class MemoryService:
         self._index = index
         self._agent_id = agent_id
 
+    @property
+    def root(self) -> Path:
+        """The agent's workspace root this service's files live under.
+
+        Exposed so tool descriptions (e.g. WriteDailyMemoryTool) can tell the
+        model the absolute location of ``memory/YYYY-MM-DD.md``, rather than
+        just the relative pattern — a relative path resolves against whatever
+        cwd the model's shell/read tool happens to use, not reliably this
+        directory.
+        """
+        return self._files.root
+
     def _sync_index(self, source_kind: str, path: Path, content: str | None) -> None:
         """Update the lexical index for one file, if one is configured.
 

@@ -116,9 +116,9 @@ def test_write_daily_memory_appends_multiple_entries(tmp_path):
     assert "second note" in content
 
 
-def test_write_daily_memory_schema():
+def test_write_daily_memory_schema(tmp_path):
     """WriteDailyMemoryTool.schema has the expected name and required 'content' parameter."""
-    mem = MemoryService.__new__(MemoryService)
+    mem = _service(tmp_path)
     tool = WriteDailyMemoryTool(mem)
     schema = tool.schema
     assert schema.name == "write_daily_memory"
