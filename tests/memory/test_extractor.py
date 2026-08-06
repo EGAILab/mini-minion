@@ -110,6 +110,68 @@ def test_worker_swallows_provider_exceptions(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# WorkerHealth wiring (MEM-GAP-013)
+# ---------------------------------------------------------------------------
+
+def test_worker_without_health_configured_does_not_raise(tmp_path):
+    service = _service(tmp_path)
+    provider = _provider_returning("A fact.")
+
+    _worker(service, provider, _EXCHANGE)  # health=None is the default; must not raise
+
+
+def test_worker_records_a_poll_and_success(tmp_path):
+    from minion_assist.worker_health import WorkerHealth
+
+    service = _service(tmp_path)
+    provider = _provider_returning("A fact.")
+    health = WorkerHealth("memory_extractor:main")
+
+    _worker(service, provider, _EXCHANGE, health)
+
+    snap = health.snapshot()
+    assert snap["last_poll_at"] is not None
+    assert snap["last_success_at"] is not None
+    assert snap["consecutive_failures"] == 0
+
+
+def test_worker_records_failure_on_provider_exception(tmp_path):
+    from minion_assist.worker_health import WorkerHealth
+
+    service = _service(tmp_path)
+    provider = Mock()
+    provider.chat = Mock(side_effect=RuntimeError("boom"))
+    health = WorkerHealth("memory_extractor:main")
+
+    _worker(service, provider, _EXCHANGE, health)
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] == 1
+    assert "boom" in snap["last_error"]
+    assert snap["last_success_at"] is None
+
+
+def test_extract_and_save_async_passes_health_through_to_the_worker(tmp_path):
+    """Thread-based, so poll this briefly rather than asserting instantly."""
+    import time as _time
+
+    from minion_assist.memory.extractor import extract_and_save_async
+    from minion_assist.worker_health import WorkerHealth
+
+    service = _service(tmp_path)
+    provider = _provider_returning("A fact.")
+    health = WorkerHealth("memory_extractor:main")
+
+    extract_and_save_async(service, provider, _EXCHANGE, health=health)
+
+    for _ in range(50):
+        if health.snapshot()["last_success_at"] is not None:
+            break
+        _time.sleep(0.02)
+    assert health.snapshot()["last_success_at"] is not None
+
+
+# ---------------------------------------------------------------------------
 # extract_facts (Stage One Phase 2, slice C — the shared primitive)
 # ---------------------------------------------------------------------------
 # Unlike _worker, extract_facts() does NOT catch provider exceptions — the

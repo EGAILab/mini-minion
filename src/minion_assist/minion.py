@@ -733,6 +733,14 @@ def main() -> None:
         if _db is not None:
             _session_health = WorkerHealth(f"session_writes:{agent_id}")
             worker_health[f"session_writes:{agent_id}"] = _session_health
+        # MEM-GAP-013: the inverse gate — the degraded-mode daemon-thread
+        # extractor (memory/extractor.py) only ever runs when there is NO
+        # database (see AgentSession._send_locked's else branch), so this
+        # tracker only makes sense in that case.
+        _extraction_health = None
+        if _db is None:
+            _extraction_health = WorkerHealth(f"memory_extractor:{agent_id}")
+            worker_health[f"memory_extractor:{agent_id}"] = _extraction_health
         sessions[agent_id] = AgentSession(
             agent_id=agent_id,
             session_id=_session_id,
@@ -755,6 +763,7 @@ def main() -> None:
             db=_db,
             model_id=cfg.model.id,
             health=_session_health,
+            extraction_health=_extraction_health,
         )
         # Tracked so the durable capture worker (Stage One Phase 2, slice C)
         # can look up the right provider per job — it isn't tied to one agent.
@@ -779,6 +788,7 @@ def main() -> None:
             _bootstrap_context=_agent_bootstrap_context,
             _workspace_root=_agent_workspace,
             _health=_session_health,
+            _extraction_health=_extraction_health,
         ) -> AgentSession:
             return AgentSession(
                 agent_id=_agent_id,
@@ -801,6 +811,7 @@ def main() -> None:
                 db=_db,
                 model_id=_cfg.model.id,
                 health=_health,
+                extraction_health=_extraction_health,
             )
 
         matrix_session_factories[agent_id] = _matrix_session_factory

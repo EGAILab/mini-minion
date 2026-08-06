@@ -463,6 +463,16 @@ class AgentSession:
             for this agent's PostgreSQL mirror and capture/commitment job
             enqueue attempts inside ``send()``. ``None`` (the default) simply
             skips recording — behavior is otherwise unchanged.
+        extraction_health (WorkerHealth | None): Optional liveness tracker
+            (MEM-GAP-013) for the degraded-mode daemon-thread extractor
+            (``memory/extractor.py``'s ``extract_and_save_async``) — the
+            fallback fact-extraction path used when no database is
+            configured. Separate from ``health`` above: that one is only
+            ever constructed *with* a database (MEM-GAP-007's mirror/job
+            tracking has nothing to track without one), while this one is
+            only relevant *without* one — the two are mutually exclusive in
+            practice, never both set. ``None`` (the default) simply skips
+            recording.
     """
 
     def __init__(
@@ -489,6 +499,7 @@ class AgentSession:
         db: object | None = None,
         model_id: str = "",
         health: WorkerHealth | None = None,
+        extraction_health: WorkerHealth | None = None,
     ) -> None:
         self._agent_id = agent_id
         self._session_id = session_id
@@ -537,6 +548,10 @@ class AgentSession:
         # (e.g. /status deep) can see when these have started silently
         # failing, instead of a bare "except Exception: pass" hiding it.
         self._health = health
+        # Optional liveness tracker (MEM-GAP-013) for the degraded-mode
+        # daemon-thread extractor — see the Args docstring above for why
+        # this is a separate tracker from self._health, not the same one.
+        self._extraction_health = extraction_health
 
         # Compute injection limits proportionally from the model's context window.
         # This ensures every budget scales automatically when the model is switched.
@@ -1020,7 +1035,9 @@ class AgentSession:
                         m for m in self._history[-6:]
                         if m.get("role") in ("user", "assistant") and m.get("content")
                     ]
-                    extract_and_save_async(self._memory, self._provider, _last[-2:])
+                    extract_and_save_async(
+                        self._memory, self._provider, _last[-2:], health=self._extraction_health
+                    )
 
             # Trigger commitment extraction from the last exchange (Stage One
             # Phase 6, slice B). Independent of the memory-extraction flag

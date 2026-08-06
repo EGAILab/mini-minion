@@ -1119,6 +1119,37 @@ def test_enable_memory_extraction_true_allows_extraction(tmp_path):
     assert extraction_calls
 
 
+def test_degraded_extraction_passes_extraction_health_through(tmp_path):
+    """MEM-GAP-013: extraction_health flows from AgentSession into the daemon-thread call."""
+    from minion_assist.worker_health import WorkerHealth
+
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    health = WorkerHealth("memory_extractor:main")
+
+    session = AgentSession(
+        agent_id="main",
+        session_id="test-session",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=_mock_provider(),
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        memory=memory,
+        enable_memory_extraction=True,
+        extraction_health=health,
+    )
+
+    with patch("minion_assist.memory.extractor.extract_and_save_async") as mock_extract:
+        session.send("hello")
+
+    assert mock_extract.call_args.kwargs["health"] is health
+
+
 # ---------------------------------------------------------------------------
 # Reseed context injection
 # ---------------------------------------------------------------------------

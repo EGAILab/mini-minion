@@ -34,7 +34,26 @@ Design (this module's degraded path only)
   incremental and cheap.
 - Caps at 3 facts per turn and 50 total entries in the rolling file.
 - Fails silently — extraction is best-effort; a failure here must never
-  affect the conversation in any way.
+  affect the conversation in any way. Silent to the conversation, not
+  necessarily to an operator — see MEM-GAP-013 below.
+
+Visibility (MEM-GAP-013)
+----------------------------
+Before this, a failure here (or the process exiting before the thread
+finished — ``daemon=True`` means it's simply killed mid-extraction, with
+no trace) was genuinely invisible: logged at ``DEBUG`` only, no health
+tracking of any kind, unlike every database-backed worker in this
+codebase (``WorkerHealth``, MEM-GAP-007/016). Full *recoverability* would
+need a durable local queue — real over-engineering for what's meant to be
+a lightweight fallback path that mostly isn't the active path at all (most
+deployments configure a database, making the durable ``CaptureWorker``
+path in ``capture_worker.py`` the one that actually runs) — so this adds
+the same optional ``WorkerHealth`` recording every other worker already
+has instead: :func:`extract_and_save_async`/:func:`_worker` take an
+optional ``health`` parameter, recorded the same poll/success/failure way
+``CaptureWorker._process_one`` already does. ``agents/session.py`` passes
+its own ``extraction_health`` (constructed by ``minion.py`` only when
+*no* database is configured — the only time this path is ever taken).
 
 Talks to
 --------
@@ -46,6 +65,8 @@ Talks to
 - ``agents/session.py``   — calls :func:`extract_and_save_async` when no
                             database is configured, or enqueues a durable
                             capture job (via ``session/db.py``) otherwise.
+- ``worker_health.py``    — :class:`WorkerHealth`, this module's optional
+                            liveness tracker (MEM-GAP-013).
 """
 
 from __future__ import annotations
@@ -57,6 +78,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..memory.service import MemoryService
     from ..providers.base import LLMProvider
+    from ..worker_health import WorkerHealth
 
 _log = logging.getLogger("minion_assist.extractor")
 
@@ -126,6 +148,7 @@ def extract_and_save_async(
     memory: MemoryService,
     provider: LLMProvider,
     last_exchange: list[dict],
+    health: "WorkerHealth | None" = None,
 ) -> None:
     """Trigger background memory extraction. Returns immediately.
 
@@ -139,13 +162,18 @@ def extract_and_save_async(
         provider:      The agent's LLM provider (same one used for the turn).
         last_exchange: The last 1–2 messages (ideally last user + last assistant).
                        Extraction is skipped if fewer than 2 messages are provided.
+        health: Optional :class:`~minion_assist.worker_health.WorkerHealth`
+            (MEM-GAP-013) — if given, the background thread records a poll
+            and its outcome, so a same-process caller (e.g. ``/status
+            deep``) can see this degraded-mode path is actually running
+            and succeeding, not just silently swallowing failures.
     """
     if len(last_exchange) < 2:
         return
     exchange = last_exchange[-2:]
     threading.Thread(
         target=_worker,
-        args=(memory, provider, exchange),
+        args=(memory, provider, exchange, health),
         daemon=True,
         name="memory-extractor",
     ).start()
@@ -155,14 +183,21 @@ def _worker(
     memory: MemoryService,
     provider: LLMProvider,
     exchange: list[dict],
+    health: "WorkerHealth | None" = None,
 ) -> None:
     """Worker — runs in a background thread.  Never raises."""
+    if health is not None:
+        health.record_poll()
     try:
         facts = extract_facts(provider, exchange)
         if facts:
             _append(memory, facts)
+        if health is not None:
+            health.record_success()
     except Exception as exc:
         _log.debug("Memory extraction failed: %s: %s", type(exc).__name__, exc)
+        if health is not None:
+            health.record_failure(f"{type(exc).__name__}: {exc}")
 
 
 def _append(memory: MemoryService, facts: list[str]) -> None:

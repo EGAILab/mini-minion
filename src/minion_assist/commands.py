@@ -446,6 +446,13 @@ def _format_deep_status(ctx: CommandContext) -> list[str]:
     for agent_id in ctx.agents_cfg:
         name = f"memory_search:{agent_id}"
         lines.append(_format_worker_line(name, worker_health.get(name), now))
+    # Per-agent degraded-mode extraction health (MEM-GAP-013) — inverse of
+    # the two above: only present for an agent with NO database configured
+    # (the only time the daemon-thread extractor in memory/extractor.py
+    # ever runs at all).
+    for agent_id in ctx.agents_cfg:
+        name = f"memory_extractor:{agent_id}"
+        lines.append(_format_worker_line(name, worker_health.get(name), now))
 
     if ctx.db is None:
         lines.append("  Database: not configured — no queue lag / index data available.")
