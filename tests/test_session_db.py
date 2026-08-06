@@ -279,6 +279,7 @@ def test_get_messages_in_range_excludes_outside_range(db, session_id):
 # ---------------------------------------------------------------------------
 
 def test_enqueue_capture_job_returns_job_id(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_capture_job(
         "main", session_id, source_from_message_id=1, source_to_message_id=2,
         idempotency_key=f"key-{session_id}",
@@ -287,6 +288,7 @@ def test_enqueue_capture_job_returns_job_id(db, session_id):
 
 
 def test_enqueue_capture_job_idempotent(db, session_id):
+    db.upsert_session(session_id, "main")
     key = f"key-{session_id}"
     first = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=key)
     second = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=key)
@@ -296,6 +298,7 @@ def test_enqueue_capture_job_idempotent(db, session_id):
 
 
 def test_claim_next_capture_job_returns_a_pending_job(db, session_id):
+    db.upsert_session(session_id, "main")
     db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
 
     job = db.claim_next_capture_job()
@@ -309,6 +312,7 @@ def test_claim_next_capture_job_returns_a_pending_job(db, session_id):
 
 
 def test_claim_next_capture_job_does_not_reclaim_running_job(db, session_id):
+    db.upsert_session(session_id, "main")
     db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     first_claim = db.claim_next_capture_job()
 
@@ -319,6 +323,7 @@ def test_claim_next_capture_job_does_not_reclaim_running_job(db, session_id):
 
 
 def test_complete_capture_job_records_proposals_and_marks_done(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
 
@@ -337,6 +342,7 @@ def test_complete_capture_job_records_proposals_and_marks_done(db, session_id):
 
 
 def test_complete_capture_job_with_no_proposals_still_marks_done(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
 
@@ -352,6 +358,7 @@ def test_complete_capture_job_returns_new_proposal_ids_and_text(db, session_id):
     # Stage One Phase 5, slice B: CaptureWorker needs each new proposal's id
     # and claim text (without a second query) to index it as searchable
     # right after this call returns.
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
 
@@ -372,6 +379,7 @@ def test_complete_capture_job_returns_new_proposal_ids_and_text(db, session_id):
 
 
 def test_complete_capture_job_with_no_proposals_returns_empty_list(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
 
@@ -381,6 +389,7 @@ def test_complete_capture_job_with_no_proposals_returns_empty_list(db, session_i
 
 
 def test_list_pending_proposals_returns_only_pending_ones(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
     new_proposals = db.complete_capture_job(
@@ -398,6 +407,7 @@ def test_list_pending_proposals_returns_only_pending_ones(db, session_id):
 
 
 def test_list_pending_proposals_scopes_to_the_given_agent(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
     db.complete_capture_job(job_id, ["A fact about main."])
@@ -406,6 +416,7 @@ def test_list_pending_proposals_scopes_to_the_given_agent(db, session_id):
 
 
 def test_get_proposal_returns_the_matching_row(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
     new_proposals = db.complete_capture_job(job_id, ["User prefers dark mode."])
@@ -422,6 +433,7 @@ def test_get_proposal_returns_none_for_an_unknown_id(db):
 
 
 def test_set_proposal_status_updates_status_and_reason(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
     new_proposals = db.complete_capture_job(job_id, ["User prefers dark mode."])
@@ -434,6 +446,7 @@ def test_set_proposal_status_updates_status_and_reason(db, session_id):
 
 
 def test_set_proposal_status_clears_a_stale_reason_on_a_later_transition(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
     new_proposals = db.complete_capture_job(job_id, ["User prefers dark mode."])
@@ -450,6 +463,7 @@ def test_new_proposal_defaults_to_pending_status(db, session_id):
     # Stage One Phase 5, slice B: the status column (used by Phase 5 slice
     # D's consolidation review) defaults to "pending" for every existing
     # and newly-created proposal.
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
     db.complete_capture_job(job_id, ["User prefers dark mode."])
@@ -461,6 +475,7 @@ def test_new_proposal_defaults_to_pending_status(db, session_id):
 
 
 def test_fail_capture_job_reschedules_with_backoff(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
 
@@ -477,6 +492,7 @@ def test_fail_capture_job_reschedules_with_backoff(db, session_id):
 
 
 def test_fail_capture_job_gives_up_after_max_attempts(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
 
     for _ in range(3):
@@ -491,6 +507,7 @@ def test_fail_capture_job_gives_up_after_max_attempts(db, session_id):
 
 
 def test_failed_job_is_reclaimable_after_backoff_expires(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
     db.fail_capture_job(job_id, "boom", backoff_seconds=-1.0, max_attempts=5)  # already due
@@ -507,6 +524,7 @@ def test_failed_job_is_reclaimable_after_backoff_expires(db, session_id):
 # ---------------------------------------------------------------------------
 
 def test_list_message_ids_returns_every_id_ascending(db, session_id):
+    db.upsert_session(session_id, "main")
     id1 = db.add_message(session_id, "user", "hi")
     id2 = db.add_message(session_id, "assistant", "hello")
 
@@ -518,6 +536,7 @@ def test_list_message_ids_is_empty_for_a_session_with_no_messages(db, session_id
 
 
 def test_list_capture_job_ranges_returns_every_enqueued_range(db, session_id):
+    db.upsert_session(session_id, "main")
     db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-a-{session_id}")
     db.enqueue_capture_job("main", session_id, 5, 6, idempotency_key=f"key-b-{session_id}")
 
@@ -527,6 +546,7 @@ def test_list_capture_job_ranges_returns_every_enqueued_range(db, session_id):
 
 
 def test_list_capture_job_ranges_includes_failed_jobs(db, session_id):
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
     db.fail_capture_job(job_id, "boom", backoff_seconds=999.0, max_attempts=1)  # marks 'failed'
@@ -566,6 +586,7 @@ def _candidate(**overrides) -> dict:
 
 
 def test_enqueue_commitment_job_returns_job_id(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -573,6 +594,7 @@ def test_enqueue_commitment_job_returns_job_id(db, session_id):
 
 
 def test_enqueue_commitment_job_idempotent(db, session_id):
+    db.upsert_session(session_id, "main")
     key = f"commit-key-{session_id}"
     first = db.enqueue_commitment_job("main", session_id, "cli", 1, 2, idempotency_key=key)
     second = db.enqueue_commitment_job("main", session_id, "cli", 1, 2, idempotency_key=key)
@@ -582,6 +604,7 @@ def test_enqueue_commitment_job_idempotent(db, session_id):
 
 
 def test_claim_next_commitment_job_returns_a_pending_job(db, session_id):
+    db.upsert_session(session_id, "main")
     db.enqueue_commitment_job(
         "main", session_id, "!room:example.org", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -601,6 +624,7 @@ def test_claim_next_commitment_job_returns_none_when_queue_empty(db):
 
 
 def test_claim_next_commitment_job_does_not_reclaim_a_running_job(db, session_id):
+    db.upsert_session(session_id, "main")
     db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -613,6 +637,7 @@ def test_claim_next_commitment_job_does_not_reclaim_a_running_job(db, session_id
 
 
 def test_complete_commitment_job_inserts_a_new_commitment(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -640,6 +665,7 @@ def test_complete_commitment_job_inserts_a_new_commitment(db, session_id):
 
 
 def test_complete_commitment_job_marks_the_job_done(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -654,6 +680,7 @@ def test_complete_commitment_job_marks_the_job_done(db, session_id):
 
 
 def test_complete_commitment_job_with_no_candidates_returns_empty_list(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -665,6 +692,7 @@ def test_complete_commitment_job_with_no_candidates_returns_empty_list(db, sessi
 def test_complete_commitment_job_upserts_a_matching_dedupe_key_instead_of_duplicating(
     db, session_id
 ):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -696,6 +724,7 @@ def test_complete_commitment_job_upserts_a_matching_dedupe_key_instead_of_duplic
 
 
 def test_complete_commitment_job_does_not_upsert_against_a_non_pending_commitment(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -715,6 +744,7 @@ def test_complete_commitment_job_does_not_upsert_against_a_non_pending_commitmen
 
 
 def test_complete_commitment_job_scopes_dedupe_to_the_same_channel(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "room-a", 1, 2, idempotency_key=f"commit-key-a-{session_id}"
     )
@@ -731,6 +761,7 @@ def test_complete_commitment_job_scopes_dedupe_to_the_same_channel(db, session_i
 
 
 def test_fail_commitment_job_reschedules_with_backoff(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -749,6 +780,7 @@ def test_fail_commitment_job_reschedules_with_backoff(db, session_id):
 
 
 def test_fail_commitment_job_gives_up_after_max_attempts(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -763,6 +795,7 @@ def test_fail_commitment_job_gives_up_after_max_attempts(db, session_id):
 
 
 def test_list_pending_commitments_for_scope_returns_pending_only(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -780,6 +813,7 @@ def test_list_pending_commitments_for_scope_returns_pending_only(db, session_id)
 
 
 def test_list_pending_commitments_for_scope_scoped_to_channel(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "room-a", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -790,6 +824,7 @@ def test_list_pending_commitments_for_scope_scoped_to_channel(db, session_id):
 
 
 def test_list_pending_commitments_for_scope_respects_limit(db, session_id):
+    db.upsert_session(session_id, "main")
     job_id = db.enqueue_commitment_job(
         "main", session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -809,6 +844,7 @@ def test_list_pending_commitments_for_scope_respects_limit(db, session_id):
 
 def _create_commitment(db, session_id, agent_id="main", channel="cli", **overrides) -> dict:
     """Create a real commitment row via the enqueue/claim/complete flow and return it in full."""
+    db.upsert_session(session_id, agent_id)  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_commitment_job(
         agent_id, session_id, channel, 1, 2,
         idempotency_key=f"commit-key-{session_id}-{overrides.get('dedupe_key', 'x')}",
@@ -1229,6 +1265,7 @@ def test_delete_session_removes_commitments(db, session_id):
 
 def test_delete_session_removes_proposals_and_returns_their_ids(db, session_id):
     db.upsert_session(session_id, "main")
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()
     new_proposals = db.complete_capture_job(
@@ -1317,6 +1354,7 @@ def test_queue_lag_summary_is_zero_for_an_agent_with_no_jobs(db, lag_agent_id):
 
 
 def test_queue_lag_summary_counts_pending_capture_jobs(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
     db.enqueue_capture_job(lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}")
 
     summary = db.queue_lag_summary(lag_agent_id)
@@ -1326,6 +1364,7 @@ def test_queue_lag_summary_counts_pending_capture_jobs(db, session_id, lag_agent
 
 
 def test_queue_lag_summary_counts_pending_commitment_jobs(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
     db.enqueue_commitment_job(
         lag_agent_id, session_id, "cli", 1, 2, idempotency_key=f"commit-key-{session_id}"
     )
@@ -1337,7 +1376,11 @@ def test_queue_lag_summary_counts_pending_commitment_jobs(db, session_id, lag_ag
 
 
 def test_queue_lag_summary_counts_pending_message_embedding_jobs(db, session_id, lag_agent_id):
-    db.enqueue_message_embedding_job(lag_agent_id, session_id, 1, idempotency_key=f"emb-{session_id}")
+    db.upsert_session(session_id, lag_agent_id)
+    message_id = db.add_message(session_id, "user", "hello")
+    db.enqueue_message_embedding_job(
+        lag_agent_id, session_id, message_id, idempotency_key=f"emb-{session_id}"
+    )
 
     summary = db.queue_lag_summary(lag_agent_id)
 
@@ -1346,6 +1389,7 @@ def test_queue_lag_summary_counts_pending_message_embedding_jobs(db, session_id,
 
 
 def test_queue_lag_summary_excludes_claimed_jobs(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
     db.enqueue_capture_job(lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}")
     db.claim_next_capture_job()  # moves state 'pending' -> 'running'
 
@@ -1355,6 +1399,7 @@ def test_queue_lag_summary_excludes_claimed_jobs(db, session_id, lag_agent_id):
 
 
 def test_queue_lag_summary_excludes_completed_jobs(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
     job_id = db.enqueue_capture_job(
         lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
     )
@@ -1367,6 +1412,7 @@ def test_queue_lag_summary_excludes_completed_jobs(db, session_id, lag_agent_id)
 
 
 def test_queue_lag_summary_is_scoped_to_the_given_agent(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
     db.enqueue_capture_job(lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}")
 
     summary = db.queue_lag_summary(f"other-{lag_agent_id}")
@@ -1375,6 +1421,7 @@ def test_queue_lag_summary_is_scoped_to_the_given_agent(db, session_id, lag_agen
 
 
 def test_queue_lag_summary_reports_the_oldest_pending_jobs_age(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
     old_job_id = db.enqueue_capture_job(
         lag_agent_id, session_id, 1, 2, idempotency_key=f"old-key-{session_id}"
     )
@@ -1836,3 +1883,253 @@ def test_delete_session_removes_message_embeddings(db_with_vector, session_id):
         "SELECT count(*) FROM message_embeddings WHERE message_id = %s", (message_id,)
     ).fetchone()
     assert row[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Referential integrity — foreign keys and CHECK constraints (MEM-GAP-011)
+#
+# These exercise the constraints directly via raw SQL (bypassing
+# delete_session()'s own manual cascade, and inserting invalid values
+# directly) specifically to prove the *database* now enforces these
+# invariants structurally — not just that the application's own code
+# already behaves correctly, which the rest of this file already covers.
+# ---------------------------------------------------------------------------
+
+def test_deleting_a_session_row_directly_cascades_to_messages(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.add_message(session_id, "user", "hello")
+
+    db._conn().execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM messages WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_deleting_a_session_row_directly_cascades_to_message_mirrors(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    db._conn().execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM message_mirrors WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_deleting_a_message_row_directly_cascades_to_message_mirrors(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.mirror_message(session_id, "e1", "user", "hello")
+
+    db._conn().execute("DELETE FROM messages WHERE id = %s", (message_id,))
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM message_mirrors WHERE message_id = %s", (message_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_deleting_a_session_row_directly_cascades_to_capture_jobs(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+
+    db._conn().execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM memory_capture_jobs WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_deleting_a_capture_job_directly_cascades_to_proposals(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    db.complete_capture_job(job_id, ["a claim"])
+
+    db._conn().execute("DELETE FROM memory_capture_jobs WHERE id = %s", (job_id,))
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM memory_proposals WHERE job_id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_deleting_a_session_row_directly_cascades_to_commitment_jobs(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"key-{session_id}"
+    )
+
+    db._conn().execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM memory_commitment_jobs WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_deleting_a_session_row_directly_cascades_to_commitments(db, session_id):
+    db.upsert_session(session_id, "main")
+    _create_commitment(db, session_id)
+
+    db._conn().execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM commitments WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_deleting_a_commitment_job_directly_cascades_to_commitments(db, session_id):
+    db.upsert_session(session_id, "main")
+    commitment = _create_commitment(db, session_id)
+    source_job_id = db._conn().execute(
+        "SELECT source_job_id FROM commitments WHERE id = %s", (commitment["id"],)
+    ).fetchone()[0]
+
+    db._conn().execute("DELETE FROM memory_commitment_jobs WHERE id = %s", (source_job_id,))
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM commitments WHERE id = %s", (commitment["id"],)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_deleting_a_session_row_directly_cascades_to_message_embedding_jobs(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.mirror_message(session_id, "e1", "user", "hello")
+    db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"emb-{session_id}"
+    )
+
+    db._conn().execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM message_embedding_jobs WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+def test_deleting_a_message_row_directly_cascades_to_message_embeddings(db_with_vector, session_id):
+    db_with_vector.upsert_session(session_id, "main")
+    message_id = db_with_vector.mirror_message(session_id, "e1", "user", "hello")
+    db_with_vector.complete_message_embedding_job(
+        db_with_vector.enqueue_message_embedding_job(
+            "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+        ),
+        message_id, "test-endpoint::test-model", [0.1, 0.2, 0.3],
+    )
+
+    db_with_vector._conn().execute("DELETE FROM messages WHERE id = %s", (message_id,))
+
+    row = db_with_vector._conn().execute(
+        "SELECT count(*) FROM message_embeddings WHERE message_id = %s", (message_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
+# --- CHECK constraints on enumerated state/status columns ---
+
+def _assert_check_violation(db, sql: str, params: tuple) -> None:
+    import psycopg
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        db._conn().execute(sql, params)
+
+
+def test_memory_capture_jobs_rejects_an_unrecognized_state(db, session_id):
+    _assert_check_violation(
+        db,
+        """
+        INSERT INTO memory_capture_jobs
+            (agent_id, session_id, source_from_message_id, source_to_message_id,
+             idempotency_key, state, attempts, run_after, created_at, updated_at)
+        VALUES ('main', %s, 1, 2, %s, 'bogus', 0, 0, 0, 0)
+        """,
+        (session_id, f"key-{session_id}"),
+    )
+
+
+def test_memory_commitment_jobs_rejects_an_unrecognized_state(db, session_id):
+    _assert_check_violation(
+        db,
+        """
+        INSERT INTO memory_commitment_jobs
+            (agent_id, session_id, channel, source_from_message_id, source_to_message_id,
+             idempotency_key, state, attempts, run_after, created_at, updated_at)
+        VALUES ('main', %s, 'cli', 1, 2, %s, 'bogus', 0, 0, 0, 0)
+        """,
+        (session_id, f"key-{session_id}"),
+    )
+
+
+def test_message_embedding_jobs_rejects_an_unrecognized_state(db, session_id):
+    _assert_check_violation(
+        db,
+        """
+        INSERT INTO message_embedding_jobs
+            (agent_id, session_id, message_id, idempotency_key, state,
+             attempts, run_after, created_at, updated_at)
+        VALUES ('main', %s, 1, %s, 'bogus', 0, 0, 0, 0)
+        """,
+        (session_id, f"key-{session_id}"),
+    )
+
+
+def test_memory_proposals_rejects_an_unrecognized_status(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    _assert_check_violation(
+        db,
+        "INSERT INTO memory_proposals (job_id, agent_id, claim_text, created_at, status) "
+        "VALUES (%s, 'main', 'x', 0, 'bogus')",
+        (job_id,),
+    )
+
+
+def test_commitments_rejects_an_unrecognized_status(db, session_id):
+    _assert_check_violation(
+        db,
+        """
+        INSERT INTO commitments
+            (agent_id, session_id, channel, kind, sensitivity, source, status, reason,
+             suggested_text, dedupe_key, confidence, due_earliest, due_latest,
+             source_job_id, created_at, updated_at)
+        VALUES ('main', %s, 'cli', 'k', 's', 'src', 'bogus', 'r', 't', 'd', 0.5, 0, 0, 1, 0, 0)
+        """,
+        (session_id,),
+    )
+
+
+def test_memory_proposals_accepts_every_documented_status(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.upsert_session(session_id, "main")  # MEM-GAP-011: FK now requires a real session row
+    job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
+    for status in ("pending", "promoted", "rejected", "superseded"):
+        db._conn().execute(
+            "INSERT INTO memory_proposals (job_id, agent_id, claim_text, created_at, status) "
+            "VALUES (%s, 'main', %s, 0, %s)",
+            (job_id, f"claim-{status}", status),
+        )  # must not raise for any of these
+
+
+def test_commitments_accepts_every_documented_status(db, session_id):
+    db.upsert_session(session_id, "main")
+    job_id = db.enqueue_commitment_job(
+        "main", session_id, "cli", 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    for status in ("pending", "sent", "dismissed", "expired"):
+        db._conn().execute(
+            """
+            INSERT INTO commitments
+                (agent_id, session_id, channel, kind, sensitivity, source, status, reason,
+                 suggested_text, dedupe_key, confidence, due_earliest, due_latest,
+                 source_job_id, created_at, updated_at)
+            VALUES ('main', %s, 'cli', 'k', 's', 'src', %s, 'r', 't', %s, 0.5, 0, 0, %s, 0, 0)
+            """,
+            (session_id, status, f"dedupe-{status}", job_id),
+        )  # must not raise for any of these

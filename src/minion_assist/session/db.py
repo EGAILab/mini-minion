@@ -415,6 +415,151 @@ def _migration_003_message_embedding_jobs(conn) -> None:
     """)
 
 
+def _add_constraint_if_missing(conn, table: str, name: str, definition: str) -> None:
+    """Run ``ALTER TABLE {table} ADD CONSTRAINT {name} {definition}``, tolerating "already exists".
+
+    PostgreSQL has no ``ADD CONSTRAINT IF NOT EXISTS`` syntax (verified
+    directly against this project's PostgreSQL 16 instance — it raises a
+    plain ``SyntaxError``), unlike ``CREATE TABLE``/``CREATE INDEX``. This
+    is the same try/except-tolerates-"already there" shape
+    ``_migration_001_baseline`` already uses for the pgvector extension, so
+    that re-running this migration's body (e.g. after a crash mid-migration,
+    before the ledger row was written — see ``schema_migrations.py``) is
+    always safe.
+    """
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD CONSTRAINT {name} {definition}")
+    except Exception:
+        pass
+
+
+def _migration_004_referential_integrity(conn) -> None:
+    """Foreign keys and enumerated-state CHECK constraints (MEM-GAP-011).
+
+    Before this migration, every cross-table reference in this schema
+    (``messages.session_id``, ``memory_capture_jobs.session_id``, etc.) was
+    a plain unconstrained column — a session row could be deleted while its
+    messages/jobs/mirrors survived, or an application bug could write an
+    unrecognized ``state``/``status`` string with nothing to catch it. Every
+    relationship added here stays *within* ``SessionDB``'s own tables
+    (never reaching into ``memory/postgres_index.py``'s ``kb_claims``/
+    ``memory_consolidation_previews`` etc.) — see the module docstring's
+    referential-integrity note for why cross-module FKs and the
+    ``kb_claims`` relationship table's intentionally-dangling references
+    stay out of scope here.
+
+    Order matters: known-orphaned rows (there should be none in a healthy
+    deployment; a real one was found and is exactly what this cleans up —
+    see the MEM-GAP-011 changelog entry) are deleted *before* adding each
+    FK, since ``VALIDATE CONSTRAINT`` fails outright if any existing row
+    violates it. ``NOT VALID`` on ``ADD CONSTRAINT`` means the constraint
+    is enforced for all *new* writes immediately without an initial table
+    scan; the separate ``VALIDATE CONSTRAINT`` step then confirms every
+    existing row already satisfies it (a lighter lock than a plain
+    ``ADD CONSTRAINT`` would take, since it doesn't need to block
+    concurrent writes for the scan's duration).
+
+    Every FK here is ``ON DELETE CASCADE`` — matching, and now structurally
+    guaranteeing, ``SessionDB.delete_session()``'s existing manual
+    same-order cleanup (MEM-GAP-003): deleting a session's row now cascades
+    to its messages/mirrors/jobs/proposals/commitments even if application
+    code ever fails to delete them explicitly first.
+    """
+    # --- Orphan cleanup (must run before the FKs below, or VALIDATE fails) ---
+    conn.execute(
+        "DELETE FROM message_mirrors mm WHERE NOT EXISTS "
+        "(SELECT 1 FROM sessions s WHERE s.id = mm.session_id)"
+    )
+    conn.execute(
+        "DELETE FROM message_mirrors mm WHERE NOT EXISTS "
+        "(SELECT 1 FROM messages m WHERE m.id = mm.message_id)"
+    )
+    conn.execute(
+        "DELETE FROM messages m WHERE NOT EXISTS "
+        "(SELECT 1 FROM sessions s WHERE s.id = m.session_id)"
+    )
+    conn.execute(
+        "DELETE FROM message_embedding_jobs j WHERE NOT EXISTS "
+        "(SELECT 1 FROM sessions s WHERE s.id = j.session_id)"
+    )
+    conn.execute(
+        "DELETE FROM message_embedding_jobs j WHERE NOT EXISTS "
+        "(SELECT 1 FROM messages m WHERE m.id = j.message_id)"
+    )
+    conn.execute(
+        "DELETE FROM memory_capture_jobs j WHERE NOT EXISTS "
+        "(SELECT 1 FROM sessions s WHERE s.id = j.session_id)"
+    )
+    conn.execute(
+        "DELETE FROM memory_proposals p WHERE NOT EXISTS "
+        "(SELECT 1 FROM memory_capture_jobs j WHERE j.id = p.job_id)"
+    )
+    conn.execute(
+        "DELETE FROM memory_commitment_jobs j WHERE NOT EXISTS "
+        "(SELECT 1 FROM sessions s WHERE s.id = j.session_id)"
+    )
+    conn.execute(
+        "DELETE FROM commitments c WHERE NOT EXISTS "
+        "(SELECT 1 FROM sessions s WHERE s.id = c.session_id)"
+    )
+    conn.execute(
+        "DELETE FROM commitments c WHERE NOT EXISTS "
+        "(SELECT 1 FROM memory_commitment_jobs j WHERE j.id = c.source_job_id)"
+    )
+
+    # --- Foreign keys (NOT VALID, then validated) ---
+    _fk_specs = [
+        ("messages", "fk_messages_session",
+         "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE NOT VALID"),
+        ("message_mirrors", "fk_message_mirrors_session",
+         "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE NOT VALID"),
+        ("message_mirrors", "fk_message_mirrors_message",
+         "FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE NOT VALID"),
+        ("message_embedding_jobs", "fk_message_embedding_jobs_session",
+         "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE NOT VALID"),
+        ("message_embedding_jobs", "fk_message_embedding_jobs_message",
+         "FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE NOT VALID"),
+        ("memory_capture_jobs", "fk_memory_capture_jobs_session",
+         "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE NOT VALID"),
+        ("memory_proposals", "fk_memory_proposals_job",
+         "FOREIGN KEY (job_id) REFERENCES memory_capture_jobs(id) ON DELETE CASCADE NOT VALID"),
+        ("memory_commitment_jobs", "fk_memory_commitment_jobs_session",
+         "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE NOT VALID"),
+        ("commitments", "fk_commitments_session",
+         "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE NOT VALID"),
+        ("commitments", "fk_commitments_job",
+         "FOREIGN KEY (source_job_id) REFERENCES memory_commitment_jobs(id) ON DELETE CASCADE NOT VALID"),
+    ]
+    for table, name, definition in _fk_specs:
+        _add_constraint_if_missing(conn, table, name, definition)
+    for table, name, _ in _fk_specs:
+        conn.execute(f"ALTER TABLE {table} VALIDATE CONSTRAINT {name}")
+
+    # --- Enumerated state/status CHECK constraints ---
+    # Vocabularies confirmed against actual code (grep for every literal
+    # assignment), not guessed — 'superseded' is included for
+    # memory_proposals.status despite no current code path writing it: the
+    # module docstring documents it as a legal value assigned by a future
+    # MemoryConsolidator operation, and a CHECK constraint should never be
+    # stricter than what's already documented as intended.
+    _check_specs = [
+        ("memory_capture_jobs", "chk_memory_capture_jobs_state",
+         "CHECK (state IN ('pending', 'running', 'done', 'failed')) NOT VALID"),
+        ("memory_commitment_jobs", "chk_memory_commitment_jobs_state",
+         "CHECK (state IN ('pending', 'running', 'done', 'failed')) NOT VALID"),
+        ("message_embedding_jobs", "chk_message_embedding_jobs_state",
+         "CHECK (state IN ('pending', 'running', 'done', 'failed')) NOT VALID"),
+        ("memory_proposals", "chk_memory_proposals_status",
+         "CHECK (status IN ('pending', 'promoted', 'rejected', 'superseded')) NOT VALID"),
+        ("commitments", "chk_commitments_status",
+         "CHECK (status IN ('pending', 'sent', 'dismissed', 'expired')) NOT VALID"),
+    ]
+    for table, name, definition in _check_specs:
+        _add_constraint_if_missing(conn, table, name, definition)
+    for table, name, _ in _check_specs:
+        conn.execute(f"ALTER TABLE {table} VALIDATE CONSTRAINT {name}")
+
+
 # Every migration SessionDB knows about, in the order they were introduced.
 # Append new migrations here — never edit an existing entry's `apply`
 # function once it has shipped (see _migration_001_baseline's docstring).
@@ -422,6 +567,7 @@ _SESSION_DB_MIGRATIONS = [
     Migration(1, "baseline", _migration_001_baseline),
     Migration(2, "drop_legacy_message_embeddings", _migration_002_drop_legacy_message_embeddings),
     Migration(3, "message_embedding_jobs", _migration_003_message_embedding_jobs),
+    Migration(4, "referential_integrity", _migration_004_referential_integrity),
 ]
 
 
@@ -556,6 +702,19 @@ class SessionDB:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS message_embeddings_hnsw "
                 "ON message_embeddings USING hnsw (embedding vector_cosine_ops)"
+            )
+            # MEM-GAP-011: same referential-integrity reasoning as the
+            # checksummed migration below, applied here since this table
+            # lives outside that ledger (dimension-parameterized, can't be
+            # frozen source). Idempotent via _add_constraint_if_missing —
+            # this whole block re-runs on every _ensure_schema() call, not
+            # just once.
+            _add_constraint_if_missing(
+                conn, "message_embeddings", "fk_message_embeddings_message",
+                "FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE NOT VALID",
+            )
+            conn.execute(
+                "ALTER TABLE message_embeddings VALIDATE CONSTRAINT fk_message_embeddings_message"
             )
 
     # ------------------------------------------------------------------
