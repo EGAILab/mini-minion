@@ -35,11 +35,31 @@ Talks to
   :class:`MemoryExcerpt` are this module's return types.
 - ``memory/migration.py`` — Phase 0's migration populates the directories
   this class reads from.
+
+Concurrency (MEM-GAP-007/009)
+-------------------------------
+Every writer that can touch this agent's files (an interactive turn,
+``CaptureWorker``, ``MemoryConsolidationScheduler``, ``KnowledgeDigestScheduler``,
+...) is a thread inside the *same* process, not a separate process — this
+deployment doesn't run separate worker processes. ``_atomic_write_text``'s
+own temp-file-then-rename swap already makes a *reader* never see a
+half-written file; what it doesn't protect against on its own is two
+*writers* targeting the same path concurrently (the read-modify-write in
+:meth:`~MemoryFileRepository.append_daily` could lose an update, and two
+overwrites could interleave unpredictably). Each write method acquires
+this path's lock (:meth:`~MemoryFileRepository._lock_for`) for its full
+read-modify-write sequence, which fully closes that race for this
+deployment's actual (single-process, multi-thread) concurrency model — see
+``session/db.py``'s module docstring for the same reasoning applied to
+PostgreSQL writes. A per-*instance* lock dict, not a global one: two
+different agents' repositories never touch the same file (separate
+workspace roots), so they never need to share locks.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 from datetime import date, datetime
 from pathlib import Path
 
@@ -93,6 +113,28 @@ class MemoryFileRepository:
         self._imports_dir = self._memory_dir / "imports"
         for d in (self._memory_dir, self._topics_dir, self._imports_dir):
             d.mkdir(parents=True, exist_ok=True)
+        # One lock per target file path, created lazily on first use — see
+        # the module docstring's "Concurrency" section for why this (not a
+        # global lock, not OS-level file locking) is the right scope for
+        # this deployment's actual concurrency model.
+        self._write_locks: dict[Path, threading.Lock] = {}
+        self._write_locks_guard = threading.Lock()
+
+    def _lock_for(self, path: Path) -> threading.Lock:
+        """Return the write lock for ``path``, creating it on first use.
+
+        Every writer targeting the same ``path`` waits on the exact same
+        ``Lock`` object, serializing their read-modify-write sequences —
+        see the module docstring. ``_write_locks_guard`` only protects the
+        lazy-creation step itself (a classic double-checked-locking
+        pattern), not the caller's actual file operation.
+        """
+        with self._write_locks_guard:
+            lock = self._write_locks.get(path)
+            if lock is None:
+                lock = threading.Lock()
+                self._write_locks[path] = lock
+            return lock
 
     @property
     def root(self) -> Path:
@@ -129,7 +171,8 @@ class MemoryFileRepository:
                 re-deriving the sanitized filename itself.
         """
         path = self.topic_path(key)
-        _atomic_write_text(path, content)
+        with self._lock_for(path):
+            _atomic_write_text(path, content)
         return path
 
     def load(self, key: str) -> str | None:
@@ -154,10 +197,11 @@ class MemoryFileRepository:
             bool: ``True`` if a file was deleted, ``False`` if it didn't exist.
         """
         path = self.topic_path(key)
-        if path.exists():
-            path.unlink()
-            return True
-        return False
+        with self._lock_for(path):
+            if path.exists():
+                path.unlink()
+                return True
+            return False
 
     def list_keys(self) -> list[str]:
         """Return every topic note's key, sorted alphabetically."""
@@ -205,7 +249,8 @@ class MemoryFileRepository:
             Path: The file that was written.
         """
         path = self._root / "KNOWLEDGE_DIGEST.md"
-        _atomic_write_text(path, content)
+        with self._lock_for(path):
+            _atomic_write_text(path, content)
         return path
 
     # -----------------------------------------------------------------
@@ -243,7 +288,8 @@ class MemoryFileRepository:
                 value for why.
         """
         path = self.import_path(key)
-        _atomic_write_text(path, content)
+        with self._lock_for(path):
+            _atomic_write_text(path, content)
         return path
 
     def load_import(self, key: str) -> str | None:
@@ -272,10 +318,11 @@ class MemoryFileRepository:
             bool: ``True`` if a file was deleted, ``False`` if it didn't exist.
         """
         path = self.import_path(key)
-        if path.exists():
-            path.unlink()
-            return True
-        return False
+        with self._lock_for(path):
+            if path.exists():
+                path.unlink()
+                return True
+            return False
 
     # -----------------------------------------------------------------
     # Daily notes (memory/YYYY-MM-DD.md) — the one merged daily-note path
@@ -306,16 +353,24 @@ class MemoryFileRepository:
         day = when or date.today()
         path = self._memory_dir / f"{day.isoformat()}.md"
 
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        stamp = datetime.now().strftime("%H:%M")
-        entry = f"- {stamp}: {text}"
+        # The whole read-modify-write sequence must hold this path's lock,
+        # not just the final write — this is the one method in this class
+        # where the *read* result feeds the write, so two concurrent
+        # appends (e.g. an interactive turn and MemoryConsolidationScheduler
+        # both writing today's note) could otherwise both read the same
+        # "before" content and one append would silently overwrite the
+        # other's (MEM-GAP-009).
+        with self._lock_for(path):
+            existing = path.read_text(encoding="utf-8") if path.exists() else ""
+            stamp = datetime.now().strftime("%H:%M")
+            entry = f"- {stamp}: {text}"
 
-        if existing.strip():
-            new_content = existing.rstrip("\n") + "\n" + entry + "\n"
-        else:
-            new_content = f"## {day.isoformat()}\n\n{entry}\n"
+            if existing.strip():
+                new_content = existing.rstrip("\n") + "\n" + entry + "\n"
+            else:
+                new_content = f"## {day.isoformat()}\n\n{entry}\n"
 
-        _atomic_write_text(path, new_content)
+            _atomic_write_text(path, new_content)
         return path
 
     # -----------------------------------------------------------------

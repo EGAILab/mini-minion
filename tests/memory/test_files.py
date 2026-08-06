@@ -6,6 +6,7 @@ side effects outside the test's own temp directory.
 
 from __future__ import annotations
 
+import threading
 from datetime import date
 
 import pytest
@@ -490,3 +491,78 @@ def test_list_indexable_files_excludes_dreams_and_user_and_missing_memory_md(tmp
 def test_list_indexable_files_returns_empty_list_for_a_fresh_repository(tmp_path):
     repo = MemoryFileRepository(tmp_path)
     assert repo.list_indexable_files() == []
+
+
+# ---------------------------------------------------------------------------
+# Concurrency (MEM-GAP-009)
+# ---------------------------------------------------------------------------
+
+def test_lock_for_returns_the_same_lock_object_for_the_same_path(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    path = repo.topic_path("project-goals")
+
+    first = repo._lock_for(path)
+    second = repo._lock_for(path)
+
+    assert first is second
+
+
+def test_lock_for_returns_different_locks_for_different_paths(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+
+    a = repo._lock_for(repo.topic_path("a"))
+    b = repo._lock_for(repo.topic_path("b"))
+
+    assert a is not b
+
+
+def test_concurrent_append_daily_loses_no_entries(tmp_path):
+    """20 threads each append one entry to the same daily note concurrently.
+
+    Before the per-path lock, append_daily()'s read-modify-write was not
+    atomic with respect to other writers to the same file — two threads
+    could both read the same "before" content and one append would
+    silently overwrite the other's. With the lock, every entry must
+    survive regardless of interleaving.
+    """
+    repo = MemoryFileRepository(tmp_path)
+    day = date(2026, 7, 20)
+    thread_count = 20
+    barrier = threading.Barrier(thread_count)
+
+    def _append(i: int) -> None:
+        barrier.wait()  # maximize actual concurrent overlap
+        repo.append_daily(f"entry-{i}", when=day)
+
+    threads = [threading.Thread(target=_append, args=(i,)) for i in range(thread_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    content = repo._memory_dir / "2026-07-20.md"
+    text = content.read_text(encoding="utf-8")
+    for i in range(thread_count):
+        assert f"entry-{i}" in text
+    # One bullet line per entry, no lost/merged/corrupted lines.
+    bullet_lines = [ln for ln in text.splitlines() if ln.startswith("- ")]
+    assert len(bullet_lines) == thread_count
+
+
+def test_concurrent_remember_to_different_keys_does_not_interfere(tmp_path):
+    repo = MemoryFileRepository(tmp_path)
+    thread_count = 10
+    barrier = threading.Barrier(thread_count)
+
+    def _remember(i: int) -> None:
+        barrier.wait()
+        repo.remember(f"topic-{i}", f"content-{i}")
+
+    threads = [threading.Thread(target=_remember, args=(i,)) for i in range(thread_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for i in range(thread_count):
+        assert repo.load(f"topic-{i}") == f"content-{i}"

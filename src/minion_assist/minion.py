@@ -96,6 +96,7 @@ from .config import knowledge_digest as knowledge_digest_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
 from .config import memory_consolidation as memory_consolidation_cfg
+from .config import memory_reconciliation as memory_reconciliation_cfg
 from .config import multi_agent as multi_agent_cfg
 from .plugins import load_plugins
 from .config import streaming, voice as voice_cfg, workspace
@@ -697,6 +698,19 @@ def main() -> None:
             idle_minutes=cfg.session_idle_minutes,
             reseed_max_chars=_reseed_max_chars,
         )
+        # One WorkerHealth per agent (MEM-GAP-007/016), shared by this
+        # agent's default REPL session and every Matrix room-scoped session
+        # built for it below (_matrix_session_factory) — /status deep wants
+        # one "is this agent's mirroring/enqueueing healthy" row per agent,
+        # not one per room. Only created when a database is configured —
+        # without one, AgentSession never attempts a mirror/enqueue at all
+        # (see _send_locked's `if self._db is not None` guards), so there
+        # is nothing meaningful to track; matches every other worker's
+        # "absent from worker_health means not running" convention.
+        _session_health = None
+        if _db is not None:
+            _session_health = WorkerHealth(f"session_writes:{agent_id}")
+            worker_health[f"session_writes:{agent_id}"] = _session_health
         sessions[agent_id] = AgentSession(
             agent_id=agent_id,
             session_id=_session_id,
@@ -718,6 +732,7 @@ def main() -> None:
             log_dir=_log_dir,
             db=_db,
             model_id=cfg.model.id,
+            health=_session_health,
         )
         # Tracked so the durable capture worker (Stage One Phase 2, slice C)
         # can look up the right provider per job — it isn't tied to one agent.
@@ -741,6 +756,7 @@ def main() -> None:
             _memory_service=memory_service,
             _bootstrap_context=_agent_bootstrap_context,
             _workspace_root=_agent_workspace,
+            _health=_session_health,
         ) -> AgentSession:
             return AgentSession(
                 agent_id=_agent_id,
@@ -762,6 +778,7 @@ def main() -> None:
                 log_dir=_log_dir,
                 db=_db,
                 model_id=_cfg.model.id,
+                health=_health,
             )
 
         matrix_session_factories[agent_id] = _matrix_session_factory
@@ -893,6 +910,27 @@ def main() -> None:
             )
             _memory_watcher = None
             worker_health.pop("memory_watcher", None)
+
+    # --- Memory reconciliation scheduler (optional — only when a database
+    # is configured) ---
+    # MEM-GAP-007: heals gaps a transient PostgreSQL write failure can
+    # leave behind (an un-mirrored turn, a never-enqueued capture/
+    # commitment job) — see memory/reconciliation_scheduler.py's module
+    # docstring. No separate "enabled" flag, same as CaptureWorker/
+    # MemoryIndexWatcher above: data-integrity plumbing, not an opt-in
+    # feature.
+    _memory_reconciliation = None
+    if _db is not None:
+        from .memory.reconciliation_scheduler import ReconciliationScheduler  # noqa: PLC0415
+        worker_health["memory_reconciliation"] = WorkerHealth("memory_reconciliation")
+        _memory_reconciliation = ReconciliationScheduler(
+            memory_reconciliation_cfg,
+            _db,
+            list(agents_cfg.keys()),
+            short_term,
+            health=worker_health["memory_reconciliation"],
+        )
+        _memory_reconciliation.start()
 
     if channels_cfg.matrix is not None:
         from .matrix.channel import MatrixChannel  # noqa: PLC0415 — optional dependency
@@ -1083,6 +1121,8 @@ def main() -> None:
             _commitment_worker.stop()
         if _memory_watcher is not None:
             _memory_watcher.stop()
+        if _memory_reconciliation is not None:
+            _memory_reconciliation.stop()
         sys.exit(0)
 
     if hasattr(signal, "SIGTERM"):
@@ -1171,6 +1211,8 @@ def main() -> None:
                 _commitment_worker.stop()
             if _memory_watcher is not None:
                 _memory_watcher.stop()
+            if _memory_reconciliation is not None:
+                _memory_reconciliation.stop()
         return
 
     # --- REPL loop ---
@@ -1330,6 +1372,8 @@ def main() -> None:
             _commitment_worker.stop()
         if _memory_watcher is not None:
             _memory_watcher.stop()
+        if _memory_reconciliation is not None:
+            _memory_reconciliation.stop()
 
 
 if __name__ == "__main__":

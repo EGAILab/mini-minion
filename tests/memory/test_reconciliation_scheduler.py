@@ -1,0 +1,220 @@
+"""Tests for memory/reconciliation_scheduler.py: ReconciliationScheduler (MEM-GAP-007)."""
+
+from __future__ import annotations
+
+import time
+from unittest.mock import Mock
+
+from minion_assist.config import MemoryReconciliationConfig
+from minion_assist.memory.reconciliation_scheduler import ReconciliationScheduler
+from minion_assist.worker_health import WorkerHealth
+
+
+def _make_cfg(**kwargs) -> MemoryReconciliationConfig:
+    defaults = dict(interval_seconds=300, quiet_seconds=60)
+    defaults.update(kwargs)
+    return MemoryReconciliationConfig(**defaults)
+
+
+def _session_info(session_id: str, last_active: float | None) -> dict:
+    return {"id": session_id, "agent_id": "main", "title": None,
+            "started_at": 0.0, "last_active": last_active, "turn_count": 1}
+
+
+# ---------------------------------------------------------------------------
+# start / stop lifecycle
+# ---------------------------------------------------------------------------
+
+def test_start_creates_a_daemon_timer():
+    scheduler = ReconciliationScheduler(_make_cfg(), Mock(), ["main"], Mock())
+    scheduler.start()
+    assert scheduler._timer is not None
+    assert scheduler._timer.daemon is True
+    scheduler.stop()
+
+
+def test_stop_cancels_the_timer():
+    scheduler = ReconciliationScheduler(_make_cfg(), Mock(), ["main"], Mock())
+    scheduler.start()
+    scheduler.stop()
+    assert scheduler._stopped is True
+
+
+# ---------------------------------------------------------------------------
+# _run_pass — mirror reconciliation
+# ---------------------------------------------------------------------------
+
+def test_run_pass_calls_reconcile_all_sessions_with_every_configured_agent():
+    db = Mock()
+    db.list_session_ids_for_agent.return_value = []
+    short_term = Mock()
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main", "researcher"], short_term)
+
+    scheduler._run_pass()
+
+    db.reconcile_all_sessions.assert_called_once_with(short_term, ["main", "researcher"])
+
+
+# ---------------------------------------------------------------------------
+# _run_pass — job-coverage catch-up
+# ---------------------------------------------------------------------------
+
+def test_run_pass_skips_a_session_within_the_quiet_period():
+    db = Mock()
+    now = time.time()
+    db.list_session_ids_for_agent.return_value = ["s1"]
+    db.get_sessions_by_ids.return_value = {"s1": _session_info("s1", now)}  # active right now
+    scheduler = ReconciliationScheduler(_make_cfg(quiet_seconds=60), db, ["main"], Mock())
+
+    scheduler._run_pass()
+
+    db.find_uncovered_capture_range.assert_not_called()
+    db.find_uncovered_commitment_range.assert_not_called()
+
+
+def test_run_pass_reconciles_a_session_past_the_quiet_period():
+    db = Mock()
+    old = time.time() - 3600
+    db.list_session_ids_for_agent.return_value = ["s1"]
+    db.get_sessions_by_ids.return_value = {"s1": _session_info("s1", old)}
+    db.find_uncovered_capture_range.return_value = None
+    db.find_uncovered_commitment_range.return_value = None
+    scheduler = ReconciliationScheduler(_make_cfg(quiet_seconds=60), db, ["main"], Mock())
+
+    scheduler._run_pass()
+
+    db.find_uncovered_capture_range.assert_called_once_with("main", "s1")
+    db.find_uncovered_commitment_range.assert_called_once_with("main", "s1")
+
+
+def test_run_pass_reconciles_a_session_that_has_never_been_active():
+    """last_active=None (shouldn't happen in practice, but must not crash/skip wrongly)."""
+    db = Mock()
+    db.list_session_ids_for_agent.return_value = ["s1"]
+    db.get_sessions_by_ids.return_value = {"s1": _session_info("s1", None)}
+    db.find_uncovered_capture_range.return_value = None
+    db.find_uncovered_commitment_range.return_value = None
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._run_pass()  # must not raise
+
+    db.find_uncovered_capture_range.assert_called_once_with("main", "s1")
+
+
+def test_run_pass_skips_agents_with_no_sessions():
+    db = Mock()
+    db.list_session_ids_for_agent.return_value = []
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._run_pass()  # must not raise
+
+    db.get_sessions_by_ids.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _catch_up_capture / _catch_up_commitment
+# ---------------------------------------------------------------------------
+
+def test_catch_up_capture_enqueues_a_job_for_the_gap():
+    db = Mock()
+    db.find_uncovered_capture_range.return_value = (10, 12)
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._catch_up_capture("main", "sess-1")
+
+    db.enqueue_capture_job.assert_called_once()
+    call_args = db.enqueue_capture_job.call_args.args
+    assert call_args[0] == "main"
+    assert call_args[1] == "sess-1"
+    assert call_args[2] == 10
+    assert call_args[3] == 12
+    assert "reconcile" in call_args[4]  # idempotency key
+
+
+def test_catch_up_capture_does_nothing_when_fully_covered():
+    db = Mock()
+    db.find_uncovered_capture_range.return_value = None
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._catch_up_capture("main", "sess-1")
+
+    db.enqueue_capture_job.assert_not_called()
+
+
+def test_catch_up_commitment_enqueues_a_job_for_the_gap_with_the_right_channel():
+    db = Mock()
+    db.find_uncovered_commitment_range.return_value = ("!room:example.org", 10, 12)
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._catch_up_commitment("main", "sess-1")
+
+    db.enqueue_commitment_job.assert_called_once()
+    call_args = db.enqueue_commitment_job.call_args.args
+    assert call_args[0] == "main"
+    assert call_args[1] == "sess-1"
+    assert call_args[2] == "!room:example.org"
+    assert call_args[3] == 10
+    assert call_args[4] == 12
+    assert "reconcile" in call_args[5]  # idempotency key
+
+
+def test_catch_up_commitment_does_nothing_when_fully_covered():
+    db = Mock()
+    db.find_uncovered_commitment_range.return_value = None
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._catch_up_commitment("main", "sess-1")
+
+    db.enqueue_commitment_job.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _fire / WorkerHealth wiring (MEM-GAP-016)
+# ---------------------------------------------------------------------------
+
+def test_fire_records_a_poll_and_success(monkeypatch):
+    health = WorkerHealth("memory_reconciliation")
+    scheduler = ReconciliationScheduler(_make_cfg(), Mock(), ["main"], Mock(), health=health)
+    monkeypatch.setattr(scheduler, "_run_pass", Mock())
+    monkeypatch.setattr(scheduler, "start", Mock())
+
+    scheduler._fire()
+
+    snap = health.snapshot()
+    assert snap["last_poll_at"] is not None
+    assert snap["last_success_at"] is not None
+
+
+def test_fire_records_failure_on_error(monkeypatch):
+    health = WorkerHealth("memory_reconciliation")
+    scheduler = ReconciliationScheduler(_make_cfg(), Mock(), ["main"], Mock(), health=health)
+    monkeypatch.setattr(scheduler, "_run_pass", Mock(side_effect=RuntimeError("db down")))
+    monkeypatch.setattr(scheduler, "start", Mock())
+
+    scheduler._fire()  # must not raise
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] == 1
+    assert "db down" in snap["last_error"]
+
+
+def test_fire_reschedules_even_after_an_error(monkeypatch):
+    scheduler = ReconciliationScheduler(_make_cfg(), Mock(), ["main"], Mock())
+    monkeypatch.setattr(scheduler, "_run_pass", Mock(side_effect=RuntimeError("boom")))
+    restart_called = Mock()
+    monkeypatch.setattr(scheduler, "start", restart_called)
+
+    scheduler._fire()
+
+    restart_called.assert_called_once()
+
+
+def test_fire_does_nothing_once_stopped(monkeypatch):
+    scheduler = ReconciliationScheduler(_make_cfg(), Mock(), ["main"], Mock())
+    scheduler._stopped = True
+    run_pass = Mock()
+    monkeypatch.setattr(scheduler, "_run_pass", run_pass)
+
+    scheduler._fire()
+
+    run_pass.assert_not_called()

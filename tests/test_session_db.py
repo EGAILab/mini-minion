@@ -1354,3 +1354,133 @@ def test_queue_lag_summary_reports_the_oldest_pending_jobs_age(db, session_id, l
 
     assert summary["capture"]["pending_count"] == 2
     assert summary["capture"]["oldest_pending_age_s"] >= 3600.0
+
+
+# ---------------------------------------------------------------------------
+# find_uncovered_capture_range / find_uncovered_commitment_range (MEM-GAP-007)
+# ---------------------------------------------------------------------------
+
+def test_find_uncovered_capture_range_none_without_any_messages(db, session_id):
+    db.upsert_session(session_id, "main")
+
+    assert db.find_uncovered_capture_range("main", session_id) is None
+
+
+def test_find_uncovered_capture_range_returns_none_for_an_unowned_session(db, session_id):
+    db.upsert_session(session_id, "researcher")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    assert db.find_uncovered_capture_range("main", session_id) is None
+
+
+def test_find_uncovered_capture_range_returns_the_full_range_with_no_prior_job(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "hello")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
+
+    assert db.find_uncovered_capture_range("main", session_id) == (id1, id2)
+
+
+def test_find_uncovered_capture_range_none_when_fully_covered(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "hello")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
+    db.enqueue_capture_job(
+        "main", session_id, id1, id2, idempotency_key=f"key-{session_id}"
+    )
+
+    assert db.find_uncovered_capture_range("main", session_id) is None
+
+
+def test_find_uncovered_capture_range_returns_only_the_gap_after_the_last_job(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first turn")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "first reply")
+    db.enqueue_capture_job(
+        "main", session_id, id1, id2, idempotency_key=f"key1-{session_id}"
+    )
+    id3 = db.mirror_message(session_id, "e3", "user", "second turn")
+    id4 = db.mirror_message(session_id, "e4", "assistant", "second reply")
+
+    assert db.find_uncovered_capture_range("main", session_id) == (id3, id4)
+
+
+def test_find_uncovered_capture_range_treats_a_failed_job_as_still_covering(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "hello")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
+    job_id = db.enqueue_capture_job(
+        "main", session_id, id1, id2, idempotency_key=f"key-{session_id}"
+    )
+    db.claim_next_capture_job()
+    db.fail_capture_job(job_id, "boom", backoff_seconds=999.0, max_attempts=1)
+
+    # Still "covered" -- a failed extraction attempt is not an unenqueued gap.
+    assert db.find_uncovered_capture_range("main", session_id) is None
+
+
+def test_find_uncovered_capture_range_excludes_tool_and_empty_messages(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "hello")
+    db.mirror_message(session_id, "e2", "tool", "tool output", tool_name="bash")
+    id3 = db.mirror_message(session_id, "e3", "assistant", "hi there")
+
+    assert db.find_uncovered_capture_range("main", session_id) == (id1, id3)
+
+
+def test_find_uncovered_commitment_range_none_without_any_prior_job(db, session_id):
+    # A session with zero commitment jobs ever is left alone -- most likely
+    # means commitments were disabled, not a missed enqueue (see docstring).
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    assert db.find_uncovered_commitment_range("main", session_id) is None
+
+
+def test_find_uncovered_commitment_range_returns_none_for_an_unowned_session(db, session_id):
+    db.upsert_session(session_id, "researcher")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    assert db.find_uncovered_commitment_range("main", session_id) is None
+
+
+def test_find_uncovered_commitment_range_returns_the_gap_after_the_last_job(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first turn")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "first reply")
+    db.enqueue_commitment_job(
+        "main", session_id, "cli", id1, id2, idempotency_key=f"key1-{session_id}"
+    )
+    id3 = db.mirror_message(session_id, "e3", "user", "second turn")
+    id4 = db.mirror_message(session_id, "e4", "assistant", "second reply")
+
+    assert db.find_uncovered_commitment_range("main", session_id) == ("cli", id3, id4)
+
+
+def test_find_uncovered_commitment_range_uses_the_most_recently_covered_jobs_channel(
+    db, session_id
+):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first turn")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "first reply")
+    db.enqueue_commitment_job(
+        "main", session_id, "!room:example.org", id1, id2, idempotency_key=f"key1-{session_id}"
+    )
+    id3 = db.mirror_message(session_id, "e3", "user", "second turn")
+    id4 = db.mirror_message(session_id, "e4", "assistant", "second reply")
+
+    channel, from_id, to_id = db.find_uncovered_commitment_range("main", session_id)
+
+    assert channel == "!room:example.org"
+    assert (from_id, to_id) == (id3, id4)
+
+
+def test_find_uncovered_commitment_range_none_when_fully_covered(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "hello")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
+    db.enqueue_commitment_job(
+        "main", session_id, "cli", id1, id2, idempotency_key=f"key-{session_id}"
+    )
+
+    assert db.find_uncovered_commitment_range("main", session_id) is None

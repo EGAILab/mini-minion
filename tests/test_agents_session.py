@@ -21,6 +21,7 @@ from minion_assist.messages import EVENT_ID_KEY
 from minion_assist.providers.base import LLMResponse
 from minion_assist.session import SessionStore
 from minion_assist.tools import ToolRegistry
+from minion_assist.worker_health import WorkerHealth
 
 
 # ---------------------------------------------------------------------------
@@ -1141,7 +1142,7 @@ def test_date_does_not_lead_system_prompt(tmp_path):
 # PostgreSQL mirroring (Stage One Phase 2, slice A)
 # ---------------------------------------------------------------------------
 
-def _make_session_with_mock_db(tmp_path, mock_db, enable_commitments=False):
+def _make_session_with_mock_db(tmp_path, mock_db, enable_commitments=False, health=None):
     """Build an AgentSession wired to a mock SessionDB, for mirroring tests."""
     short_term = ShortTermMemory(tmp_path / "sessions")
     session_store = SessionStore(tmp_path / "sessions.json")
@@ -1158,6 +1159,7 @@ def _make_session_with_mock_db(tmp_path, mock_db, enable_commitments=False):
         session_store=session_store,
         db=mock_db,
         enable_commitments=enable_commitments,
+        health=health,
     )
 
 
@@ -1220,6 +1222,112 @@ def test_second_turn_does_not_reassign_event_ids_from_first_turn(tmp_path):
     ids_after_second = {m[EVENT_ID_KEY] for m in session.history}
 
     assert ids_after_first.issubset(ids_after_second)
+
+
+# ---------------------------------------------------------------------------
+# WorkerHealth wiring for mirror/enqueue failures (MEM-GAP-007)
+# ---------------------------------------------------------------------------
+
+def _make_session_with_mock_db_and_memory(tmp_path, mock_db, health=None):
+    """Like _make_session_with_mock_db, but with a real MemoryService so
+    capture-job enqueueing (gated on self._memory is not None) actually fires."""
+    memory = MemoryService(MemoryFileRepository(tmp_path / "workspace"))
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    return AgentSession(
+        agent_id="main",
+        session_id="test-session",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=_mock_provider(),
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        db=mock_db,
+        memory=memory,
+        health=health,
+    )
+
+
+def test_successful_mirror_records_health_success(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=1)
+    health = WorkerHealth("session_writes:main")
+    session = _make_session_with_mock_db(tmp_path, mock_db, health=health)
+
+    session.send("hello")
+
+    snap = health.snapshot()
+    assert snap["last_success_at"] is not None
+    assert snap["consecutive_failures"] == 0
+
+
+def test_mirror_failure_is_recorded_but_does_not_break_the_turn(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=RuntimeError("connection refused"))
+    health = WorkerHealth("session_writes:main")
+    session = _make_session_with_mock_db(tmp_path, mock_db, health=health)
+
+    result = session.send("hello")  # must not raise
+
+    assert result  # the turn still completed and returned a response
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] >= 1
+    assert "connection refused" in snap["last_error"]
+
+
+def test_mirror_failure_without_health_configured_still_does_not_raise(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=RuntimeError("boom"))
+    session = _make_session_with_mock_db(tmp_path, mock_db)  # health=None (default)
+
+    session.send("hello")  # must not raise — matches pre-MEM-GAP-007 behavior
+
+
+def test_capture_job_enqueue_failure_is_recorded(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=[1, 2])
+    mock_db.enqueue_capture_job = Mock(side_effect=RuntimeError("db unavailable"))
+    health = WorkerHealth("session_writes:main")
+    session = _make_session_with_mock_db_and_memory(tmp_path, mock_db, health=health)
+
+    session.send("hello")  # must not raise
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] >= 1
+    assert "db unavailable" in snap["last_error"]
+
+
+def test_commitment_job_enqueue_failure_is_recorded(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=[1, 2])
+    mock_db.enqueue_commitment_job = Mock(side_effect=RuntimeError("db unavailable"))
+    health = WorkerHealth("session_writes:main")
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    session = AgentSession(
+        agent_id="main",
+        session_id="test-session",
+        agent=AgentConfig(name="Ada", soul="You are Ada."),
+        provider=_mock_provider(),
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        db=mock_db,
+        enable_commitments=True,
+        health=health,
+    )
+
+    session.send("hello")  # must not raise
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] >= 1
+    assert "db unavailable" in snap["last_error"]
 
 
 # ---------------------------------------------------------------------------

@@ -360,11 +360,15 @@ def parse_command(text: str) -> tuple[str, str] | None:
 # Canonical set of background workers/schedulers minion.py may construct
 # (MEM-GAP-016) — listed explicitly (not just "whatever's in worker_health")
 # so /status deep can show "not running" for a worker that isn't
-# configured, rather than silently omitting it.
+# configured, rather than silently omitting it. Excludes the per-agent
+# "session_writes:{agent_id}" entries (MEM-GAP-007), which are derived from
+# ctx.agents_cfg instead, since the exact keys depend on which agents are
+# configured.
 _KNOWN_WORKER_NAMES = (
     "capture_worker",
     "commitment_worker",
     "memory_watcher",
+    "memory_reconciliation",
     "memory_consolidation",
     "knowledge_digest",
     "dreaming",
@@ -393,6 +397,22 @@ def _format_age(ts: float | None, now: float) -> str:
     return f"{_format_duration(now - ts)} ago"
 
 
+def _format_worker_line(name: str, health: object, now: float) -> str:
+    """Format one /status deep worker row — 'not running' if health is None."""
+    if health is None:
+        return f"    {name}: not running"
+    snap = health.snapshot()
+    failures = snap["consecutive_failures"]
+    status = f"{failures} consecutive failure(s)" if failures else "ok"
+    error_note = f"  last_error={snap['last_error']!r}" if snap["last_error"] else ""
+    return (
+        f"    {name}: {status}  "
+        f"last_poll={_format_age(snap['last_poll_at'], now)}  "
+        f"last_success={_format_age(snap['last_success_at'], now)}"
+        f"{error_note}"
+    )
+
+
 def _format_deep_status(ctx: CommandContext) -> list[str]:
     """Build the extra lines ``/status deep`` appends (MEM-GAP-016).
 
@@ -411,20 +431,13 @@ def _format_deep_status(ctx: CommandContext) -> list[str]:
     lines: list[str] = ["  Workers:"]
     worker_health = ctx.worker_health or {}
     for name in _KNOWN_WORKER_NAMES:
-        health = worker_health.get(name)
-        if health is None:
-            lines.append(f"    {name}: not running")
-            continue
-        snap = health.snapshot()
-        failures = snap["consecutive_failures"]
-        status = f"{failures} consecutive failure(s)" if failures else "ok"
-        error_note = f"  last_error={snap['last_error']!r}" if snap["last_error"] else ""
-        lines.append(
-            f"    {name}: {status}  "
-            f"last_poll={_format_age(snap['last_poll_at'], now)}  "
-            f"last_success={_format_age(snap['last_success_at'], now)}"
-            f"{error_note}"
-        )
+        lines.append(_format_worker_line(name, worker_health.get(name), now))
+    # Per-agent session-write health (MEM-GAP-007) — keys depend on which
+    # agents are configured, so derived from ctx.agents_cfg rather than a
+    # fixed name list.
+    for agent_id in ctx.agents_cfg:
+        name = f"session_writes:{agent_id}"
+        lines.append(_format_worker_line(name, worker_health.get(name), now))
 
     if ctx.db is None:
         lines.append("  Database: not configured — no queue lag / index data available.")

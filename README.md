@@ -459,7 +459,7 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/clear` | Alias for `/new` |
 | `/reset` | Alias for `/new` |
 | `/compact` | Force immediate context compaction for all agents |
-| `/status [deep]` | Show session metadata (turn counts, last active) for each agent. `/status deep` also reports background-worker liveness (capture/commitment workers, memory watcher, schedulers — last poll/success/error, MEM-GAP-016) and, when a database is configured, per-agent capture/commitment queue lag and lexical-index summary. Works from both the REPL and Matrix chat. |
+| `/status [deep]` | Show session metadata (turn counts, last active) for each agent. `/status deep` also reports background-worker liveness (capture/commitment workers, memory watcher, memory reconciliation, schedulers, and one `session_writes:{agent_id}` row per agent for mirror/enqueue health — last poll/success/error, MEM-GAP-007/016) and, when a database is configured, per-agent capture/commitment queue lag and lexical-index summary. Works from both the REPL and Matrix chat. |
 | `/agents` | List all known agents with turn counts and last-active timestamps |
 | `/session [N\|uuid-prefix]` | List past conversation sessions for the active agent; restore one by index or UUID prefix |
 | `/rename [N] <name>` | Give the current session (or session N from /session) a descriptive name |
@@ -1167,6 +1167,35 @@ One deliberate exception: `PostgresMemoryIndex`'s `memory_chunk_embeddings` tabl
 Every message dict carries an internal `_event_id` (`messages.py`'s `EVENT_ID_KEY`/`ensure_event_id()`) — a UUID assigned the first time a database is configured for that message, persisted to JSONL from then on. `SessionDB.mirror_message(session_id, event_id, ...)` checks `message_mirrors` before inserting, so the same message is never mirrored twice. This key is internal-only: `providers/openai_compatible.py`'s message-preparation function strips it before any request reaches the LLM API (the only provider conversion that rebuilds a message via dict-spread; Anthropic's and Codex's converters already extract named fields one at a time and drop it naturally).
 
 Without a configured database, no `_event_id` is assigned at all — there's nothing to mirror, so assigning one would just be unused noise in the JSONL file.
+
+### Reconciliation: self-healing writes and concurrency safety (MEM-GAP-007/009)
+
+Every mirror/enqueue attempt inside `AgentSession._send_locked()` (message mirroring, capture-job enqueue, commitment-job enqueue) is wrapped in a `try`/`except` — a transient PostgreSQL failure (e.g. a momentary connection drop) must never fail the turn itself, since the turn's content is already safely on disk in JSONL. Before this fix, a caught exception there was simply discarded: that turn's mirror or job would never exist, and nothing ever retried it short of a full process restart (`SessionDB.reconcile_all_sessions()` previously only ran once, at startup).
+
+**Now visible.** Each of those four sites optionally records into a `WorkerHealth` (see "Health and diagnostics" below) instead of swallowing silently — `/status deep` shows a `session_writes:{agent_id}` row with `consecutive_failures`/`last_error` if mirroring or enqueueing has started failing.
+
+**Now self-healing.** `ReconciliationScheduler` (`memory/reconciliation_scheduler.py`) runs a periodic background pass — no separate `enabled` flag, it simply starts whenever a database is configured, the same as `CaptureWorker`/`MemoryIndexWatcher`:
+
+1. **Mirror gaps** — re-runs `SessionDB.reconcile_all_sessions()` (unchanged logic, just no longer startup-only): diffs every agent's JSONL against `message_mirrors` and mirrors whatever's missing.
+2. **Job-coverage gaps** — `SessionDB.find_uncovered_capture_range()`/`find_uncovered_commitment_range()` find mirrored messages newer than a session's last enqueued capture/commitment job and enqueue **one coarse catch-up job** for the whole gap, rather than trying to reconstruct exact per-turn boundaries from message content (which turn a given message belongs to isn't reliably re-derivable after the fact once tool calls are mixed in) — simpler and safer, at the cost of coarser batching for whatever gap accumulated (normally zero; only nonzero after a genuine failure). A session whose `last_active` is more recent than `quiet_seconds` is skipped for job-coverage catch-up, so a still-in-progress turn's own normal enqueue isn't raced.
+
+Configured under `"memory_reconciliation"` in `config.json` (all fields optional):
+
+```json
+{
+  "memory_reconciliation": {
+    "interval_seconds": 300,
+    "quiet_seconds": 60
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `interval_seconds` | Seconds between reconciliation passes. Default 300 (5 min), clamped to [60, 3600]. |
+| `quiet_seconds` | Minimum seconds since a session's `last_active` before its job-coverage gap is caught up. Default 60. |
+
+**Concurrent file writes (MEM-GAP-009).** Every writer that can touch an agent's memory files (an interactive turn, `CaptureWorker`, the daily schedulers, ...) is a thread inside the same process — this deployment doesn't run separate worker processes. `MemoryFileRepository` now serializes every write method (`remember`, `remember_import`, `write_digest`, `append_daily`, `delete`, `delete_import`) with a per-target-path `threading.Lock` (`_lock_for()`), so two threads writing the same file can never interleave or lose an update — most importantly for `append_daily()`, whose read-modify-write would otherwise let one writer's read miss another's concurrent write. Scoped per-instance (per-agent), not global, since two agents' repositories never share a file.
 
 ### Durable capture-job queue (Stage One Phase 2, slice C)
 

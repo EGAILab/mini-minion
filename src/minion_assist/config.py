@@ -820,6 +820,40 @@ class MemoryConsolidationConfig:
 
 
 @dataclass(frozen=True)
+class MemoryReconciliationConfig:
+    """Controls the periodic background reconciliation scheduler (MEM-GAP-007).
+
+    Heals two kinds of gap a transient PostgreSQL write failure can leave
+    behind: an ``AgentSession`` turn's message mirror
+    (``SessionDB.reconcile_all_sessions()``, previously only ever run once
+    at startup) and a missed capture/commitment job enqueue
+    (``SessionDB.find_uncovered_capture_range``/``find_uncovered_commitment_range``).
+    Unlike ``heartbeat``/``dreaming``/``memory_consolidation`` above, this
+    has no separate ``enabled`` flag — like ``CaptureWorker`` and
+    ``MemoryIndexWatcher``, it's data-integrity plumbing that simply runs
+    whenever a database is configured, not an opt-in feature.
+
+    Configured in ``config.json`` under the ``"memory_reconciliation"`` key::
+
+        "memory_reconciliation": {
+            "interval_seconds": 300,
+            "quiet_seconds": 60
+        }
+
+    Attributes:
+        interval_seconds (int): Seconds between reconciliation passes.
+            Default 300 (5 minutes). Clamped to [60, 3600] at runtime.
+        quiet_seconds (int): Minimum seconds since a session's
+            ``last_active`` before its capture/commitment coverage gap is
+            caught up — avoids racing a live turn that just hasn't
+            finished enqueueing yet. Default 60.
+    """
+
+    interval_seconds: int = 300
+    quiet_seconds: int = 60
+
+
+@dataclass(frozen=True)
 class CommitmentsConfig:
     """Controls inferred, short-lived commitment extraction (Stage One Phase 6, slice B).
 
@@ -1464,6 +1498,29 @@ def _resolve_memory_consolidation() -> MemoryConsolidationConfig:
 # separate from `dreaming` above (Task 9) even though both use the same
 # daily wall-clock scheduling shape.
 memory_consolidation: MemoryConsolidationConfig = _resolve_memory_consolidation()
+
+
+def _resolve_memory_reconciliation() -> MemoryReconciliationConfig:
+    """Read the ``"memory_reconciliation"`` section from config.json and build a MemoryReconciliationConfig.
+
+    All fields have sensible defaults so the section can be omitted entirely.
+
+    Returns:
+        MemoryReconciliationConfig: Immutable settings; defaults apply when absent.
+    """
+    raw = _raw.get("memory_reconciliation", {})
+    if not isinstance(raw, dict):
+        return MemoryReconciliationConfig()
+    return MemoryReconciliationConfig(
+        interval_seconds=max(60, min(3600, int(raw.get("interval_seconds", 300)))),
+        quiet_seconds=max(0, int(raw.get("quiet_seconds", 60))),
+    )
+
+
+# memory_reconciliation: controls the periodic background reconciliation
+# scheduler (MEM-GAP-007). No separate "enabled" flag -- like CaptureWorker/
+# MemoryIndexWatcher, it simply runs whenever a database is configured.
+memory_reconciliation: MemoryReconciliationConfig = _resolve_memory_reconciliation()
 
 
 def _resolve_commitments() -> CommitmentsConfig:

@@ -98,6 +98,7 @@ from ..messages import (
 from ..providers.base import LLMProvider
 from ..session import SessionStore
 from ..tools import ToolRegistry
+from ..worker_health import WorkerHealth
 from ..workspace import WorkspaceVanishedError, check_workspace
 from .definitions import AgentConfig
 from .events import (
@@ -417,6 +418,10 @@ class AgentSession:
             or its marker file has disappeared, :class:`WorkspaceVanishedError`
             is raised before the provider is called.  ``None`` (the default)
             disables per-turn attestation.
+        health (WorkerHealth | None): Optional liveness tracker (MEM-GAP-007)
+            for this agent's PostgreSQL mirror and capture/commitment job
+            enqueue attempts inside ``send()``. ``None`` (the default) simply
+            skips recording — behavior is otherwise unchanged.
     """
 
     def __init__(
@@ -442,6 +447,7 @@ class AgentSession:
         log_dir: Path | None = None,
         db: object | None = None,
         model_id: str = "",
+        health: WorkerHealth | None = None,
     ) -> None:
         self._agent_id = agent_id
         self._session_id = session_id
@@ -484,6 +490,12 @@ class AgentSession:
         # produces a fresh extraction instead of silently reusing results
         # keyed under the old model.
         self._model_id = model_id
+        # Optional live-liveness tracker (MEM-GAP-016/007) — records
+        # success/failure for this agent's per-turn PostgreSQL mirror and
+        # capture/commitment job enqueue attempts, so a same-process caller
+        # (e.g. /status deep) can see when these have started silently
+        # failing, instead of a bare "except Exception: pass" hiding it.
+        self._health = health
 
         # Compute injection limits proportionally from the model's context window.
         # This ensures every budget scales automatically when the model is switched.
@@ -807,8 +819,18 @@ class AgentSession:
                 )
                 if _uid is not None:
                     _mirrored_ua_ids.append(_uid)
-            except Exception:
-                pass
+                if self._health is not None:
+                    self._health.record_success()
+            except Exception as _mirror_exc:
+                # Never blocks the turn (JSONL already has this message —
+                # see the comment above) — but MEM-GAP-007's whole point is
+                # that this used to vanish silently. ReconciliationScheduler
+                # (session/db.py's reconcile_all_sessions) heals this gap on
+                # its next pass; this just makes the gap visible until then.
+                if self._health is not None:
+                    self._health.record_failure(
+                        f"{type(_mirror_exc).__name__}: {_mirror_exc}"
+                    )
 
         # Snapshot for rollback on mid-turn crash.
         snapshot_len = len(self._history)
@@ -884,8 +906,16 @@ class AgentSession:
                         last_active=_ts,
                         turn_count=_session_info.turn_count,
                     )
-                except Exception:
-                    pass
+                    if self._health is not None:
+                        self._health.record_success()
+                except Exception as _mirror_exc:
+                    # See the user-message mirror comment above — same
+                    # reasoning: never blocks the turn, healed on the next
+                    # ReconciliationScheduler pass, just made visible here.
+                    if self._health is not None:
+                        self._health.record_failure(
+                            f"{type(_mirror_exc).__name__}: {_mirror_exc}"
+                        )
 
             # Trigger memory extraction from the last exchange.
             # Skipped when enable_memory_extraction=False (e.g. expensive models,
@@ -909,8 +939,18 @@ class AgentSession:
                             self._db.enqueue_capture_job(
                                 self._agent_id, self._session_id, _from_id, _to_id, _idem_key,
                             )
-                        except Exception:
-                            pass
+                            if self._health is not None:
+                                self._health.record_success()
+                        except Exception as _enqueue_exc:
+                            # ReconciliationScheduler's coverage-gap catch-up
+                            # (SessionDB.find_uncovered_capture_range) heals
+                            # this on its next pass; this just makes the
+                            # failure visible until then, instead of the
+                            # turn's capture job silently never existing.
+                            if self._health is not None:
+                                self._health.record_failure(
+                                    f"{type(_enqueue_exc).__name__}: {_enqueue_exc}"
+                                )
                 else:
                     # Degraded path: no database configured, so there is no
                     # durable queue to enqueue into. Daemon thread — never
@@ -942,8 +982,16 @@ class AgentSession:
                             self._agent_id, self._session_id, _c_channel,
                             _c_from_id, _c_to_id, _c_idem_key,
                         )
-                    except Exception:
-                        pass
+                        if self._health is not None:
+                            self._health.record_success()
+                    except Exception as _enqueue_exc:
+                        # See the capture-job enqueue comment above — same
+                        # reasoning, healed by ReconciliationScheduler's
+                        # find_uncovered_commitment_range catch-up pass.
+                        if self._health is not None:
+                            self._health.record_failure(
+                                f"{type(_enqueue_exc).__name__}: {_enqueue_exc}"
+                            )
 
             # Emit TurnCompleted — ignored by CLI, consumed by structured log handlers.
             if on_event:

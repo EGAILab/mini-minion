@@ -403,6 +403,29 @@ def test_dispatch_status_deep_lists_every_known_worker():
     assert "capture_worker: not running" in result.message
     assert "heartbeat: not running" in result.message
     assert "dreaming: not running" in result.message
+    assert "memory_reconciliation: not running" in result.message
+
+
+def test_dispatch_status_deep_lists_a_session_writes_row_per_configured_agent():
+    agents_cfg = _make_agents_cfg(include_route=True)  # main + researcher
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", agents_cfg=agents_cfg))
+    assert "session_writes:main: not running" in result.message
+    assert "session_writes:researcher: not running" in result.message
+
+
+def test_dispatch_status_deep_reports_a_running_session_writes_health():
+    from minion_assist.worker_health import WorkerHealth
+
+    health = WorkerHealth("session_writes:main")
+    health.record_success()
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(
+            _make_ctx("/status", args="deep", worker_health={"session_writes:main": health})
+        )
+    assert "session_writes:main: ok" in result.message
 
 
 def test_dispatch_status_deep_reports_a_running_workers_health():

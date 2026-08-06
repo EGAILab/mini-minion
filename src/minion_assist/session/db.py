@@ -1382,6 +1382,120 @@ class SessionDB:
             "commitment": _lane("memory_commitment_jobs"),
         }
 
+    def find_uncovered_capture_range(
+        self, agent_id: str, session_id: str
+    ) -> tuple[int, int] | None:
+        """Return the range of mirrored messages newer than this session's last capture job.
+
+        MEM-GAP-007: ``AgentSession._send_locked()``'s own
+        ``enqueue_capture_job()`` call can fail (e.g. a transient
+        connection drop) and, before this method existed, that turn's
+        capture job would simply never exist — nothing ever retried it.
+        :class:`~minion_assist.memory.reconciliation_scheduler.ReconciliationScheduler`
+        calls this periodically per session and enqueues one catch-up job
+        covering the whole gap when it finds one.
+
+        Deliberately coarser than ``_send_locked()``'s own per-turn range
+        (exactly "the last exchange"): reconstructing exact per-turn
+        boundaries from message content alone (which messages belong to
+        which turn, given tool calls can appear in between) would risk
+        getting the pairing subtly wrong. Returning "everything mirrored
+        since the last job's covered end" is simpler and safe — however
+        many turns accumulated in the gap (normally zero; only nonzero
+        after a genuine enqueue failure) become one catch-up job instead
+        of exactly reconstructed per-turn ones.
+
+        A job counts as "covering" its range regardless of its current
+        ``state`` (pending/running/done/failed) — a failed extraction
+        attempt still means a job was successfully *enqueued* for that
+        range; re-enqueuing here would create a duplicate under a new
+        idempotency key, not retry the original failed attempt.
+
+        Args:
+            agent_id: The agent this session must belong to.
+            session_id: The session to check.
+
+        Returns:
+            tuple[int, int] | None: ``(from_id, to_id)`` for uncovered
+                mirrored user/assistant messages, or ``None`` if
+                ``session_id`` isn't owned by ``agent_id`` or there's
+                nothing to catch up on.
+        """
+        if not self._session_owned_by(session_id, agent_id):
+            return None
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT MAX(source_to_message_id) FROM memory_capture_jobs "
+            "WHERE agent_id = %s AND session_id = %s",
+            (agent_id, session_id),
+        ).fetchone()
+        last_covered = row[0] if row and row[0] is not None else 0
+        row = conn.execute(
+            "SELECT MIN(id), MAX(id) FROM messages "
+            "WHERE session_id = %s AND role IN ('user', 'assistant') "
+            "AND content IS NOT NULL AND id > %s",
+            (session_id, last_covered),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return (row[0], row[1])
+
+    def find_uncovered_commitment_range(
+        self, agent_id: str, session_id: str
+    ) -> tuple[str, int, int] | None:
+        """Return the range of mirrored messages newer than this session's last commitment job.
+
+        Same reasoning and "coarser catch-up, not exact per-turn
+        reconstruction" trade-off as :meth:`find_uncovered_capture_range` —
+        see its docstring.
+
+        Commitment jobs are additionally channel-scoped (a Matrix room id,
+        or ``"cli"``), so this only reconciles a session that has *at
+        least one* prior commitment job to infer the channel from. A
+        session with zero commitment jobs ever most likely means
+        commitments were disabled (``config.json``'s
+        ``commitments.enabled``) when its messages were created, not a
+        missed enqueue — left alone rather than guessing at a channel.
+
+        Args:
+            agent_id: The agent this session must belong to.
+            session_id: The session to check.
+
+        Returns:
+            tuple[str, int, int] | None: ``(channel, from_id, to_id)`` for
+                uncovered mirrored user/assistant messages, using the most
+                recently covered job's channel, or ``None`` if
+                ``session_id`` isn't owned by ``agent_id``, this session
+                has no prior commitment job, or there's nothing to catch
+                up on.
+        """
+        if not self._session_owned_by(session_id, agent_id):
+            return None
+        conn = self._conn()
+        row = conn.execute(
+            """
+            SELECT channel, MAX(source_to_message_id)
+            FROM memory_commitment_jobs
+            WHERE agent_id = %s AND session_id = %s
+            GROUP BY channel
+            ORDER BY MAX(source_to_message_id) DESC
+            LIMIT 1
+            """,
+            (agent_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        channel, last_covered = row[0], row[1] or 0
+        row2 = conn.execute(
+            "SELECT MIN(id), MAX(id) FROM messages "
+            "WHERE session_id = %s AND role IN ('user', 'assistant') "
+            "AND content IS NOT NULL AND id > %s",
+            (session_id, last_covered),
+        ).fetchone()
+        if row2 is None or row2[0] is None:
+            return None
+        return (channel, row2[0], row2[1])
+
     # ------------------------------------------------------------------
     # Commitment lifecycle — Stage One Phase 6, slice C
     # ------------------------------------------------------------------
