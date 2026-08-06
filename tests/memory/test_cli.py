@@ -384,6 +384,108 @@ def test_reindex_filters_by_agent(monkeypatch, tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# retention (MEM-GAP-015)
+# ---------------------------------------------------------------------------
+
+def _mock_db_for_retention(counts: dict | None = None) -> Mock:
+    db = Mock()
+    db.prune_operational_tables.return_value = counts or {
+        "capture_jobs": 0, "commitment_jobs": 0, "message_embedding_jobs": 0,
+    }
+    return db
+
+
+def test_retention_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["retention"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_retention_dry_run_is_default(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "memory_retention", SimpleNamespace(retention_days=30))
+    mock_db = _mock_db_for_retention({"capture_jobs": 2, "commitment_jobs": 0, "message_embedding_jobs": 1})
+    _patch_db(monkeypatch, mock_db)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(["retention"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_db.prune_operational_tables.assert_called_once_with(30, dry_run=True)
+    assert "would be deleted" in out
+    assert "3 row(s)" in out
+    assert "Re-run with --apply" in out
+
+
+def test_retention_apply_deletes_and_reports_counts(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "memory_retention", SimpleNamespace(retention_days=30))
+    mock_db = _mock_db_for_retention({"capture_jobs": 5, "commitment_jobs": 0, "message_embedding_jobs": 0})
+    _patch_db(monkeypatch, mock_db)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(["retention", "--apply"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_db.prune_operational_tables.assert_called_once_with(30, dry_run=False)
+    assert "5 row(s)" in out
+    assert "deleted:" in out
+    assert "Re-run with --apply" not in out
+
+
+def test_retention_days_override(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "memory_retention", SimpleNamespace(retention_days=30))
+    mock_db = _mock_db_for_retention()
+    _patch_db(monkeypatch, mock_db)
+    _patch_index(monkeypatch, None)
+
+    cli.main(["retention", "--days", "7"])
+
+    mock_db.prune_operational_tables.assert_called_once_with(7, dry_run=True)
+
+
+def test_retention_skips_the_index_when_none_configured(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "memory_retention", SimpleNamespace(retention_days=30))
+    mock_db = _mock_db_for_retention({"capture_jobs": 1, "commitment_jobs": 0, "message_embedding_jobs": 0})
+    _patch_db(monkeypatch, mock_db)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(["retention"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "recall_events" not in out
+
+
+def test_retention_merges_index_counts_when_configured(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "memory_retention", SimpleNamespace(retention_days=30))
+    mock_db = _mock_db_for_retention({"capture_jobs": 1, "commitment_jobs": 0, "message_embedding_jobs": 0})
+    _patch_db(monkeypatch, mock_db)
+    mock_index = Mock()
+    mock_index.prune_operational_tables.return_value = {
+        "recall_events": 4, "consolidation_previews": 0, "import_previews": 0,
+    }
+    _patch_index(monkeypatch, mock_index)
+
+    exit_code = cli.main(["retention"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_index.prune_operational_tables.assert_called_once_with(30, dry_run=True)
+    assert "recall_events: 4" in out
+    assert "5 row(s)" in out  # 1 (db) + 4 (index)
+
+
+# ---------------------------------------------------------------------------
 # pin / unpin / pins
 # ---------------------------------------------------------------------------
 

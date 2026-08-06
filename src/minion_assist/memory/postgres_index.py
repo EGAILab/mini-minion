@@ -1455,6 +1455,58 @@ class PostgresMemoryIndex:
             (agent_id, proposal_id),
         )
 
+    def prune_operational_tables(self, retention_days: float, dry_run: bool = False) -> dict:
+        """Delete stale rows from pure operational/telemetry tables (MEM-GAP-015).
+
+        Covers three tables that, before this method existed, never had
+        any cleanup path at all regardless of outcome:
+
+        - ``memory_recall_events`` — recall telemetry (MEM-GAP-012), one
+          row per file surfaced to a prompt.
+        - ``memory_consolidation_previews`` — drafted-but-not-yet-applied
+          consolidation previews. Approving or rejecting a proposal does
+          NOT delete its preview row today (only full session deletion
+          does, via :meth:`remove_consolidation_previews_for_proposal`),
+          so a reviewed preview lingers forever without this.
+        - ``memory_import_previews`` — the same drafted-preview shape for
+          import review; nothing anywhere deletes these after a decision
+          either.
+
+        Deliberately does **not** touch ``memory_topic_revisions``: each
+        row there is a real rollback restore point for an already-applied
+        change (see :meth:`~minion_assist.memory.service.MemoryService.remember`'s
+        revision recording), not disposable telemetry — pruning it would
+        silently remove the ability to roll back an old change. Also does
+        not touch ``memory_proposals`` (the actual extracted claim text)
+        or anything durable (``memory_chunks``/``memory_files``,
+        ``kb_*``) — those stay indefinite by design.
+
+        Args:
+            retention_days: How many days a row may age before deletion.
+            dry_run: When ``True``, counts matching rows via ``SELECT
+                count(*)`` instead of deleting them — same filter, same
+                return shape, nothing removed. Used by
+                ``minion-assist memory retention``'s dry-run report.
+
+        Returns:
+            dict: ``{"recall_events", "consolidation_previews", "import_previews"}``
+                — number of rows deleted (or, in dry-run mode, matching)
+                in each table.
+        """
+        conn = self._conn()
+        cutoff = time.time() - (retention_days * 86400)
+        verb = "SELECT count(*) FROM" if dry_run else "DELETE FROM"
+
+        def _prune(table: str, column: str) -> int:
+            cur = conn.execute(f"{verb} {table} WHERE {column} < %s", (cutoff,))
+            return cur.fetchone()[0] if dry_run else cur.rowcount
+
+        return {
+            "recall_events": _prune("memory_recall_events", "surfaced_at"),
+            "consolidation_previews": _prune("memory_consolidation_previews", "created_at"),
+            "import_previews": _prune("memory_import_previews", "created_at"),
+        }
+
     def rebuild_agent(self, agent_id: str, indexable_files: list[tuple[str, str, str]]) -> int:
         """Rebuild one agent's entire index from a fresh file listing.
 

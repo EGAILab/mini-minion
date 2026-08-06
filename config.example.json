@@ -105,6 +105,14 @@
     "agent_id": "main",
     "max_chars": 8000
   },
+  "memory_retention": {
+    "_comment": "Daily scheduler that prunes stale rows from pure operational/telemetry tables (completed jobs, recall telemetry, review previews) — never messages, memory files, or rollback history. Disabled by default; also runnable on demand via 'minion-assist memory retention [--apply]'.",
+    "enabled": false,
+    "hour": 4,
+    "minute": 45,
+    "timezone": "Australia/Sydney",
+    "retention_days": 30
+  },
   "commitments": {
     "_comment": "Inferred, short-lived commitment (follow-up) extraction and delivery. Requires 'database'; disabled by default.",
     "enabled": false

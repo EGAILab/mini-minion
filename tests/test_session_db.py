@@ -1438,6 +1438,121 @@ def test_queue_lag_summary_reports_the_oldest_pending_jobs_age(db, session_id, l
 
 
 # ---------------------------------------------------------------------------
+# prune_operational_tables (MEM-GAP-015)
+# ---------------------------------------------------------------------------
+
+def _old_done_capture_job(db, session_id, agent_id, days_old: float) -> int:
+    """Create a capture job, complete it, then backdate updated_at."""
+    job_id = db.enqueue_capture_job(
+        agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}-{days_old}"
+    )
+    db.claim_next_capture_job()
+    db.complete_capture_job(job_id, [])
+    db._conn().execute(
+        "UPDATE memory_capture_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - days_old * 86400, job_id),
+    )
+    return job_id
+
+
+def test_prune_operational_tables_deletes_old_done_capture_jobs(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    _old_done_capture_job(db, session_id, lag_agent_id, days_old=40)
+
+    counts = db.prune_operational_tables(30)
+
+    assert counts["capture_jobs"] == 1
+
+
+def test_prune_operational_tables_dry_run_counts_without_deleting(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = _old_done_capture_job(db, session_id, lag_agent_id, days_old=40)
+
+    counts = db.prune_operational_tables(30, dry_run=True)
+
+    assert counts["capture_jobs"] == 1
+    row = db._conn().execute(
+        "SELECT 1 FROM memory_capture_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row is not None  # still there — dry run must not delete
+
+
+def test_prune_operational_tables_never_deletes_a_recent_done_job(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    db.claim_next_capture_job()
+    db.complete_capture_job(job_id, [])  # updated_at is "now" — well within the window
+
+    counts = db.prune_operational_tables(30)
+
+    assert counts["capture_jobs"] == 0
+    row = db._conn().execute(
+        "SELECT 1 FROM memory_capture_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row is not None
+
+
+def test_prune_operational_tables_never_deletes_a_pending_job_regardless_of_age(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    db._conn().execute(
+        "UPDATE memory_capture_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - 365 * 86400, job_id),
+    )
+
+    counts = db.prune_operational_tables(30)
+
+    assert counts["capture_jobs"] == 0
+    row = db._conn().execute(
+        "SELECT 1 FROM memory_capture_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row is not None  # still pending, untouched no matter how old
+
+
+def test_prune_operational_tables_deletes_old_failed_commitment_jobs(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_commitment_job(
+        lag_agent_id, session_id, "cli", 1, 2, idempotency_key=f"commit-{session_id}"
+    )
+    db.claim_next_commitment_job()
+    db.fail_commitment_job(job_id, "boom", 0.0, max_attempts=1)  # -> terminal 'failed'
+    db._conn().execute(
+        "UPDATE memory_commitment_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - 40 * 86400, job_id),
+    )
+
+    counts = db.prune_operational_tables(30)
+
+    assert counts["commitment_jobs"] == 1
+
+
+def test_prune_operational_tables_deletes_old_failed_message_embedding_jobs(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    message_id = db.add_message(session_id, "user", "hello")
+    job_id = db.enqueue_message_embedding_job(
+        lag_agent_id, session_id, message_id, idempotency_key=f"emb-{session_id}"
+    )
+    db.claim_next_message_embedding_job()
+    db.fail_message_embedding_job(job_id, "boom", 0.0, max_attempts=1)  # -> terminal 'failed'
+    db._conn().execute(
+        "UPDATE message_embedding_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - 40 * 86400, job_id),
+    )
+
+    counts = db.prune_operational_tables(30)
+
+    assert counts["message_embedding_jobs"] == 1
+
+
+# ---------------------------------------------------------------------------
 # find_uncovered_capture_range / find_uncovered_commitment_range (MEM-GAP-007)
 # ---------------------------------------------------------------------------
 

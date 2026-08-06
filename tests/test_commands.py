@@ -404,6 +404,7 @@ def test_dispatch_status_deep_lists_every_known_worker():
     assert "heartbeat: not running" in result.message
     assert "dreaming: not running" in result.message
     assert "memory_reconciliation: not running" in result.message
+    assert "memory_retention: not running" in result.message
 
 
 def test_dispatch_status_deep_lists_a_session_writes_row_per_configured_agent():

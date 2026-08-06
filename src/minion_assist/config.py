@@ -936,6 +936,54 @@ class KnowledgeDigestConfig:
 
 
 @dataclass(frozen=True)
+class MemoryRetentionConfig:
+    """Controls the bounded operational-table cleanup scheduler (MEM-GAP-015).
+
+    Mirrors ``KnowledgeDigestConfig``'s daily wall-clock scheduling shape —
+    a fourth, separately-configured daily schedule alongside ``dreaming``,
+    ``memory_consolidation``, and ``knowledge_digest``. Each pass deletes
+    rows past ``retention_days`` from pure operational/telemetry tables
+    only (completed capture/commitment/message-embedding jobs, recall
+    telemetry, consolidation/import review previews) — see
+    ``memory/retention_scheduler.py``'s module docstring for exactly which
+    tables and why. Never touches durable memory (messages, memory files,
+    knowledge-graph claims) or ``memory_topic_revisions`` (the rollback
+    undo-stack, not disposable telemetry) — indefinite retention remains
+    the default for those regardless of this setting.
+
+    Configured in ``config.json`` under the ``"memory_retention"`` key::
+
+        "memory_retention": {
+            "enabled": true,
+            "hour": 4,
+            "minute": 45,
+            "timezone": "Australia/Sydney",
+            "retention_days": 30
+        }
+
+    Attributes:
+        enabled (bool): When ``True`` (default ``False``), the scheduler
+            starts at process startup. Requires a configured database —
+            silently does not start without one (see ``minion.py``).
+        hour (int): Wall-clock hour of day to fire (0-23). Default 4.
+        minute (int): Wall-clock minute to fire (0-59). Default 45 —
+            deliberately offset from ``knowledge_digest``'s 04:30 default
+            so the two schedulers don't contend for the same startup
+            slot when both are enabled.
+        timezone (str): IANA timezone name for scheduling. Default
+            ``"Australia/Sydney"``.
+        retention_days (int): How many days a terminal-state job row or
+            telemetry/preview row may age before it's deleted. Default 30.
+    """
+
+    enabled: bool = False
+    hour: int = 4
+    minute: int = 45
+    timezone: str = "Australia/Sydney"
+    retention_days: int = 30
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     """Controls verbose LLM request/response logging.
 
@@ -1571,6 +1619,36 @@ def _resolve_knowledge_digest() -> KnowledgeDigestConfig:
 # `memory_consolidation`, for the same "keep each independently
 # configurable" reasoning (Task 9).
 knowledge_digest: KnowledgeDigestConfig = _resolve_knowledge_digest()
+
+
+def _resolve_memory_retention() -> MemoryRetentionConfig:
+    """Read the ``"memory_retention"`` section from config.json and build a MemoryRetentionConfig.
+
+    All fields have sensible defaults so the section can be omitted entirely.
+
+    Returns:
+        MemoryRetentionConfig: Immutable settings; defaults apply when absent.
+    """
+    raw = _raw.get("memory_retention", {})
+    if not isinstance(raw, dict):
+        return MemoryRetentionConfig()
+    hour = int(raw.get("hour", 4))
+    minute = int(raw.get("minute", 45))
+    return MemoryRetentionConfig(
+        enabled=bool(raw.get("enabled", False)),
+        hour=max(0, min(23, hour)),
+        minute=max(0, min(59, minute)),
+        timezone=str(raw.get("timezone", "Australia/Sydney")),
+        retention_days=max(1, int(raw.get("retention_days", 30))),
+    )
+
+
+# memory_retention: bounded cleanup of pure operational/telemetry tables
+# (MEM-GAP-015). Disabled by default; enabled via
+# "memory_retention": {"enabled": true} in config.json. A fourth,
+# separately-configured daily schedule alongside `dreaming`,
+# `memory_consolidation`, and `knowledge_digest`.
+memory_retention: MemoryRetentionConfig = _resolve_memory_retention()
 
 
 def _resolve_logging() -> LoggingConfig:

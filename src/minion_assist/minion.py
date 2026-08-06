@@ -93,6 +93,7 @@ from .config import codex_cfg, logging_cfg
 from .config import database as database_cfg
 from .config import embeddings as embeddings_cfg
 from .config import knowledge_digest as knowledge_digest_cfg
+from .config import memory_retention as memory_retention_cfg
 from .config import mcp as mcp_cfg
 from .config import memory as memory_cfg
 from .config import memory_consolidation as memory_consolidation_cfg
@@ -1129,6 +1130,40 @@ def main() -> None:
                 f"[knowledge-digest] Scheduler started "
                 f"(daily at {knowledge_digest_cfg.hour:02d}:{knowledge_digest_cfg.minute:02d} "
                 f"{knowledge_digest_cfg.timezone})."
+            )
+
+    # --- Memory retention scheduler (optional) ---
+    # MEM-GAP-015: a fourth, separately-configured daily schedule (same
+    # reasoning as knowledge_digest above) that prunes stale rows from
+    # pure operational/telemetry tables — see
+    # memory/retention_scheduler.py's module docstring for exactly what.
+    # Requires a database; the lexical index is optional (its half of the
+    # cleanup is simply skipped without one, same as knowledge_digest's
+    # index dependency being mandatory but this one's being optional —
+    # job-table cleanup alone is still useful in a file-only-index setup).
+    _memory_retention: object = None
+    if memory_retention_cfg.enabled:
+        if _db is None:
+            print(
+                "[memory-retention] Warning: no database configured — "
+                "retention scheduler disabled.",
+                file=sys.stderr,
+            )
+        else:
+            from .memory.retention_scheduler import MemoryRetentionScheduler  # noqa: PLC0415
+
+            worker_health["memory_retention"] = WorkerHealth("memory_retention")
+            _memory_retention = MemoryRetentionScheduler(
+                memory_retention_cfg,
+                _db,
+                _memory_index,
+                health=worker_health["memory_retention"],
+            )
+            _memory_retention.start()  # type: ignore[attr-defined]
+            print(
+                f"[memory-retention] Scheduler started "
+                f"(daily at {memory_retention_cfg.hour:02d}:{memory_retention_cfg.minute:02d} "
+                f"{memory_retention_cfg.timezone}, retention_days={memory_retention_cfg.retention_days})."
             )
 
     use_streaming = streaming.chat_mode

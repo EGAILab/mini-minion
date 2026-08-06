@@ -199,6 +199,7 @@ minion-assist/
 │   │   ├── digest_scheduler.py  # Phase 7: KnowledgeDigestScheduler — daily KNOWLEDGE_DIGEST.md recompilation
 │   │   ├── import_review.py     # Phase 7: ImportReviewer — quarantined-import preview/approve/reject
 │   │   ├── forgetting.py        # Phase 7: forget_source() — evidence-source deletion cascade
+│   │   ├── retention_scheduler.py # MemoryRetentionScheduler — daily operational/telemetry-table cleanup (MEM-GAP-015)
 │   │   └── __init__.py
 │   └── session/                 # Session metadata tracking
 │       ├── store.py             # JSON session store (turn counts, timestamps)
@@ -299,6 +300,7 @@ Example structure (see `config.example.json` for the full template):
 | `memory_consolidation.*` | *(Optional, disabled by default)* Automated daily consolidation-preview scheduler (Stage One Phase 5, slice D) — `enabled`/`hour`/`minute`/`timezone`/`agent_id`/`top_n`. See "Consolidation ranking and preview drafting". |
 | `commitments.enabled` | *(Optional, default `false`)* Inferred, short-lived commitment extraction (Stage One Phase 6, slice B). Requires a configured database. See "Commitments — schema and extraction pipeline". |
 | `knowledge_digest.*` | *(Optional, disabled by default)* Automated daily `KNOWLEDGE_DIGEST.md` compilation scheduler (Stage One Phase 7, slice D) — `enabled`/`hour`/`minute`/`timezone`/`agent_id`/`max_chars`. See "Compiled knowledge digest". |
+| `memory_retention.*` | *(Optional, disabled by default)* Daily bounded cleanup of pure operational/telemetry tables — never messages, memory files, or rollback history (MEM-GAP-015) — `enabled`/`hour`/`minute`/`timezone`/`retention_days`. Also runnable on demand via `minion-assist memory retention [--apply]`. See "Operational-table retention". |
 | `database.url` | *(Optional)* PostgreSQL connection string for session history storage and FTS search. Omit to run file-only. Example: `"postgresql://minion:minion@localhost:5433/minion_assist"`. |
 | `extra_plugin_manifests` | *(Optional)* List of additional `plugins.json` file paths to load beyond the two fixed locations (`~/.minion-assist/plugins.json` and `.minion-assist/plugins.json`). Paths support `~` expansion. |
 | `bootstrap.enabled` | *(Optional, default `true`)* Set to `false` to disable workspace bootstrap file injection entirely. |
@@ -484,7 +486,7 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/clear` | Alias for `/new` |
 | `/reset` | Alias for `/new` |
 | `/compact` | Force immediate context compaction for all agents |
-| `/status [deep]` | Show session metadata (turn counts, last active) for each agent. `/status deep` also reports background-worker liveness (capture/commitment/message-embedding workers, memory watcher, memory reconciliation, schedulers, one `session_writes:{agent_id}` row per agent for mirror/enqueue health — MEM-GAP-007/016 — one `memory_search:{agent_id}` row per agent with a configured index for degraded-mode search health — MEM-GAP-008 — and one `memory_extractor:{agent_id}` row per agent *without* a configured database for degraded-mode extraction health — MEM-GAP-013) and, when a database is configured, per-agent capture/commitment/message-embedding queue lag and lexical-index summary. Works from both the REPL and Matrix chat. |
+| `/status [deep]` | Show session metadata (turn counts, last active) for each agent. `/status deep` also reports background-worker liveness (capture/commitment/message-embedding workers, memory watcher, memory reconciliation, memory retention (MEM-GAP-015), schedulers, one `session_writes:{agent_id}` row per agent for mirror/enqueue health — MEM-GAP-007/016 — one `memory_search:{agent_id}` row per agent with a configured index for degraded-mode search health — MEM-GAP-008 — and one `memory_extractor:{agent_id}` row per agent *without* a configured database for degraded-mode extraction health — MEM-GAP-013) and, when a database is configured, per-agent capture/commitment/message-embedding queue lag and lexical-index summary. Works from both the REPL and Matrix chat. |
 | `/agents` | List all known agents with turn counts and last-active timestamps |
 | `/session [N\|uuid-prefix]` | List past conversation sessions for the active agent; restore one by index or UUID prefix |
 | `/rename [N] <name>` | Give the current session (or session N from /session) a descriptive name |
@@ -1177,6 +1179,8 @@ On every startup minion-assist will:
 | `memory_capture_jobs` | Durable fact-extraction queue. Columns: `id` (BIGSERIAL), `agent_id`, `session_id`, `source_from_message_id`, `source_to_message_id`, `idempotency_key` (UNIQUE), `state` (`pending`/`running`/`done`/`failed`), `attempts`, `run_after`, `last_error`, `created_at`, `updated_at`. |
 | `memory_proposals` | Unreviewed extracted claims. Columns: `id` (BIGSERIAL), `job_id`, `agent_id`, `claim_text`, `created_at`. |
 
+Completed/failed rows in the three job-queue tables above (`message_embedding_jobs`, `memory_capture_jobs`, `memory_commitment_jobs`) accumulate indefinitely unless `memory_retention` is configured — see "Operational-table retention" (MEM-GAP-015). `memory_proposals` and every other table above is untouched by that cleanup.
+
 ### Schema migrations (MEM-GAP-010)
 
 Schema evolution is versioned and checksum-verified via `schema_migrations.py`'s `run_migrations()`, not just unconditional `CREATE TABLE IF NOT EXISTS` calls. A `schema_migrations` ledger table (`component`, `version`, `name`, `checksum`, `applied_at`) tracks what's been applied — `SessionDB` and `PostgresMemoryIndex` are independent components (`"session_db"`/`"memory_index"`) sharing one ledger table. Both classes' entire pre-migration schema became a single "baseline" migration (version 1) — every statement in it was already idempotent, so an existing database just gets retroactively marked "at version 1" the first time this version of the code runs against it; nothing breaks and no data migration is needed.
@@ -1639,6 +1643,34 @@ New CLI command — runs the exact same compile-and-write step as the scheduler,
 ```bash
 minion-assist memory knowledge compile --agent main
 minion-assist memory knowledge compile --agent main --max-chars 4000
+```
+
+### Operational-table retention (MEM-GAP-015)
+
+Everything durable in this project — messages, memory files, knowledge-graph claims — retains indefinitely by default, which is the correct, intentional behavior for a single-user deployment. What has no bound is a separate category: pure operational/telemetry tables that accumulate as a side effect of normal operation and, before this feature, never had any cleanup path at all — completed/failed capture, commitment, and message-embedding job rows; `memory_recall_events` (recall telemetry, MEM-GAP-012); and `memory_consolidation_previews`/`memory_import_previews` (drafted-preview rows that, notably, are **not** deleted by a normal approve/reject decision — only full session deletion touches them).
+
+**Scoped narrowly, on purpose.** `SessionDB.prune_operational_tables()` only ever deletes job rows whose `state` is `'done'` or `'failed'` (never `'pending'`/`'running'`, regardless of age) past `retention_days`. `PostgresMemoryIndex.prune_operational_tables()` does the same by `created_at`/`surfaced_at` for its three tables. Neither method touches `memory_topic_revisions` — each row there is a real rollback restore point for an already-applied change (see "Explicit-write revisions" below), not disposable telemetry — nor `memory_proposals` (the extracted claim text itself) nor anything durable. Both methods accept `dry_run=True`, which runs the identical filter as `SELECT count(*)` instead of `DELETE`, so a dry-run report and the real cleanup can never silently diverge in what they count.
+
+**`MemoryRetentionScheduler`** (`memory/retention_scheduler.py`) runs one pass a day, mirroring `KnowledgeDigestScheduler`'s daily wall-clock shape — a fourth, separately-configured schedule alongside `dreaming`, `memory_consolidation`, and `knowledge_digest`. Configured under `"memory_retention"` in `config.json`:
+
+```json
+"memory_retention": {
+    "enabled": true,
+    "hour": 4,
+    "minute": 45,
+    "timezone": "Australia/Sydney",
+    "retention_days": 30
+}
+```
+
+Disabled by default. Requires a configured database; the lexical index is optional — without one, only the job-table half of the cleanup runs.
+
+New CLI command — the same prune logic the scheduler uses, on demand, dry-run by default:
+
+```bash
+minion-assist memory retention                # dry-run report — counts only, deletes nothing
+minion-assist memory retention --apply         # actually deletes the stale rows
+minion-assist memory retention --apply --days 7   # override config.json's retention_days
 ```
 
 ### Import quarantine and review (Stage One Phase 7, slice E)
@@ -2508,6 +2540,12 @@ minion-assist memory status --deep [--agent main]
 # (only reindexes files that actually changed). With --force: crash-safe
 # full rebuild via shadow-table swap. Requires a configured database.
 minion-assist memory reindex [--agent main] [--force]
+
+# Bounded operational/telemetry cleanup (MEM-GAP-015). Without --apply: a
+# dry-run report of how many rows are past the retention window in each
+# covered table. With --apply: actually deletes them. Requires a
+# configured database; --days overrides config.json's memory_retention.
+minion-assist memory retention [--apply] [--days 30]
 ```
 
 `memory/baseline.py` measures the legacy `LongTermMemory.search()` — recall and latency — against the checked-in fixture corpus at `tests/fixtures/memory_corpus/`, so later phases (PostgreSQL lexical index, embeddings) have a real number to compare against rather than an assumption. See `tests/fixtures/memory_corpus/README.md` for the recorded baseline and a known current gap (punctuation-sensitive matching).
@@ -2528,6 +2566,7 @@ Everything from the durable capture-job queue onward is documented in depth unde
 | `digest_scheduler.py` | 7D | `KnowledgeDigestScheduler` — daily `KNOWLEDGE_DIGEST.md` recompilation. |
 | `import_review.py` | 7E | `ImportReviewer` (preview/approve/reject) — see "Import quarantine and review". |
 | `forgetting.py` | 7F | `forget_source()` — see "Forgetting a source". |
+| `retention_scheduler.py` | — | `MemoryRetentionScheduler` — daily bounded cleanup of operational/telemetry tables (MEM-GAP-015), also runnable on demand via `minion-assist memory retention`. |
 
 ---
 

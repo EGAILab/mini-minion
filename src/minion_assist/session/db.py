@@ -1989,6 +1989,49 @@ class SessionDB:
             "message_embedding": _lane("message_embedding_jobs"),
         }
 
+    def prune_operational_tables(self, retention_days: float, dry_run: bool = False) -> dict:
+        """Delete terminal-state job rows older than ``retention_days`` (MEM-GAP-015).
+
+        Only ever deletes rows whose ``state`` is ``'done'`` or ``'failed'``
+        (never ``'pending'``/``'running'``) and whose ``updated_at`` is
+        older than the cutoff — a job still in flight or waiting to be
+        retried is never touched regardless of age. This is pure
+        operational bookkeeping (queue history, not memory content):
+        deleting an old completed/failed job row does not affect the
+        capture/commitment/embedding output it already produced, which
+        lives in ``memory_proposals``/``commitments``/``message_embeddings``
+        respectively and is untouched by this method.
+
+        Args:
+            retention_days: How many days a terminal-state row may age
+                before it's deleted.
+            dry_run: When ``True``, counts matching rows via ``SELECT
+                count(*)`` instead of deleting them — same filter, same
+                return shape, nothing removed. Used by
+                ``minion-assist memory retention``'s dry-run report.
+
+        Returns:
+            dict: ``{"capture_jobs", "commitment_jobs", "message_embedding_jobs"}``
+                — number of rows deleted (or, in dry-run mode, matching)
+                in each table.
+        """
+        conn = self._conn()
+        cutoff = time.time() - (retention_days * 86400)
+        verb = "SELECT count(*) FROM" if dry_run else "DELETE FROM"
+
+        def _prune(table: str) -> int:
+            cur = conn.execute(
+                f"{verb} {table} WHERE state IN ('done', 'failed') AND updated_at < %s",
+                (cutoff,),
+            )
+            return cur.fetchone()[0] if dry_run else cur.rowcount
+
+        return {
+            "capture_jobs": _prune("memory_capture_jobs"),
+            "commitment_jobs": _prune("memory_commitment_jobs"),
+            "message_embedding_jobs": _prune("message_embedding_jobs"),
+        }
+
     def find_uncovered_capture_range(
         self, agent_id: str, session_id: str
     ) -> tuple[int, int] | None:

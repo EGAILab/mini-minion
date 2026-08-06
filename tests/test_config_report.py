@@ -157,7 +157,8 @@ def test_format_config_report_includes_every_known_section():
         "agents:", "workspace:", "streaming:", "compaction:", "mcp:", "memory:",
         "bootstrap:", "channels:", "multi_agent:", "heartbeat:", "dreaming:",
         "memory_consolidation:", "memory_reconciliation:", "commitments:",
-        "knowledge_digest:", "logging:", "codex:", "database:", "embeddings:", "voice:",
+        "knowledge_digest:", "memory_retention:", "logging:", "codex:",
+        "database:", "embeddings:", "voice:",
     ):
         assert section in report
 

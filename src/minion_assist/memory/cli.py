@@ -17,6 +17,9 @@ Currently supported:
 - ``minion-assist memory search QUERY [--agent ID] [--corpus C]`` — keyword search.
 - ``minion-assist memory doctor [--agent ID]``          — status + un-migrated-data check.
 - ``minion-assist memory reindex [--agent ID] [--force]`` — rebuild the lexical index.
+- ``minion-assist memory retention``                    — dry-run report (default).
+- ``minion-assist memory retention --apply``             — prune stale operational/telemetry rows.
+- ``minion-assist memory retention [--days N]``          — override the configured retention window.
 - ``minion-assist memory pin KEY --agent ID``            — pin a topic note.
 - ``minion-assist memory unpin KEY --agent ID``          — unpin a topic note.
 - ``minion-assist memory pins [--agent ID]``             — list pinned notes.
@@ -49,6 +52,11 @@ Talks to
 - ``session/db.py`` — :func:`_build_db` constructs the
   :class:`~minion_assist.session.db.SessionDB` every ``consolidate``
   subcommand needs (proposals live there, not in the lexical index).
+  ``retention`` calls :meth:`~minion_assist.session.db.SessionDB.prune_operational_tables`
+  and, when an index is configured,
+  :meth:`~minion_assist.memory.postgres_index.PostgresMemoryIndex.prune_operational_tables`
+  — the same methods ``memory/retention_scheduler.py``'s daily scheduler
+  calls, exposed here for an on-demand dry-run or manual run (MEM-GAP-015).
 - ``minion.py`` — ``main()`` dispatches ``sys.argv[1] == "memory"`` here
   before falling through to the interactive REPL.
 - ``config.py`` — reads ``workspace``, ``agents``, ``bootstrap``, and
@@ -148,6 +156,28 @@ def _build_parser() -> argparse.ArgumentParser:
             "Crash-safe full rebuild via shadow-table swap (Stage One Phase 3, slice C). "
             "Without this flag, performs a cheaper hash-diff reconciliation instead — only "
             "reindexes files that actually changed."
+        ),
+    )
+
+    retention = sub.add_parser(
+        "retention",
+        help=(
+            "Report or prune stale rows from operational/telemetry tables "
+            "(MEM-GAP-015). Requires a configured database."
+        ),
+    )
+    retention.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete the stale rows. Without this flag, only a dry-run report is printed.",
+    )
+    retention.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help=(
+            "Override retention_days from config.json's memory_retention section "
+            "(falls back to that section's configured value, or its default of 30)."
         ),
     )
 
@@ -705,6 +735,42 @@ def _run_reindex(args: argparse.Namespace) -> int:
                 print(f"{agent_id}: reindexed {touched} file(s).")
             else:
                 print(f"{agent_id}: already up to date.")
+    return 0
+
+
+def _run_retention(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory retention [--apply] [--days N]``.
+
+    Without ``--apply``: a dry-run report — counts rows past the retention
+    window in every covered operational/telemetry table, without deleting
+    anything (:meth:`SessionDB.prune_operational_tables`'s ``dry_run=True``
+    path runs ``SELECT count(*)`` instead of ``DELETE``, same filter).
+    With ``--apply``: actually deletes them. See
+    ``memory/retention_scheduler.py``'s module docstring for exactly which
+    tables this covers and which it deliberately never touches.
+    """
+    from ..config import memory_retention as memory_retention_cfg  # noqa: PLC0415
+
+    db = _build_db()
+    if db is None:
+        print("Error: no database configured (or it's unreachable) — nothing to report.")
+        return 1
+    index = _build_index()
+
+    retention_days = args.days if args.days is not None else memory_retention_cfg.retention_days
+    dry_run = not args.apply
+
+    counts = db.prune_operational_tables(retention_days, dry_run=dry_run)
+    if index is not None:
+        counts.update(index.prune_operational_tables(retention_days, dry_run=dry_run))
+
+    total = sum(counts.values())
+    verb = "would be deleted" if dry_run else "deleted"
+    print(f"{total} row(s) older than {retention_days} day(s) {verb}:")
+    for name, count in counts.items():
+        print(f"  {name}: {count}")
+    if dry_run:
+        print("Re-run with --apply to actually delete these rows.")
     return 0
 
 
@@ -1374,6 +1440,7 @@ _HANDLERS = {
     "search": _run_search,
     "doctor": _run_doctor,
     "reindex": _run_reindex,
+    "retention": _run_retention,
     "pin": _run_pin,
     "unpin": _run_unpin,
     "pins": _run_pins,

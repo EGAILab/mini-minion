@@ -618,3 +618,43 @@ def test_main_wires_health_into_matrix_session_factory_closure(tmp_path):
     # degraded-mode extraction tracker must be None here — not silently
     # wired to the wrong object.
     assert room_session._extraction_health is None
+
+
+# ---------------------------------------------------------------------------
+# MEM-GAP-015: production-wiring coverage for MemoryRetentionScheduler
+# ---------------------------------------------------------------------------
+# Only requires a database (not embeddings), unlike the two tests above —
+# a narrower skip guard than _requires_live_db_and_embeddings.
+
+_requires_live_db = pytest.mark.skipif(
+    not _DB_AVAILABLE_FOR_WIRING, reason="requires a live PostgreSQL instance"
+)
+
+
+@_requires_live_db
+def test_main_wires_memory_retention_scheduler_when_enabled(tmp_path, capsys):
+    """minion.py's real startup path must actually construct and start a
+    MemoryRetentionScheduler and register its WorkerHealth when
+    memory_retention.enabled=True and a database is configured — the same
+    'did minion.py forget to wire it up' check the MEM-GAP-018 round added
+    for the other schedulers, applied to this new one."""
+    import minion_assist.minion as minion_mod
+    from minion_assist.config import MemoryRetentionConfig
+
+    enabled_cfg = MemoryRetentionConfig(
+        enabled=True, hour=4, minute=45, timezone="UTC", retention_days=30
+    )
+
+    with (
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.minion.mcp_cfg", SimpleNamespace(servers=())),
+        patch("minion_assist.minion.channels_cfg", SimpleNamespace(matrix=None)),
+        patch("minion_assist.minion.memory_retention_cfg", enabled_cfg),
+        patch("minion_assist.agents.session.run_turn", Mock()),
+        patch("minion_assist.minion.create_provider", return_value=Mock()),
+        patch("builtins.input", side_effect=iter(["/status deep", "quit"])),
+    ):
+        minion_mod.main()
+
+    out = capsys.readouterr().out
+    assert "memory_retention: not running" not in out

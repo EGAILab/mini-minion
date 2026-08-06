@@ -372,6 +372,7 @@ _KNOWN_WORKER_NAMES = (
     "memory_reconciliation",
     "memory_consolidation",
     "knowledge_digest",
+    "memory_retention",
     "dreaming",
     "heartbeat",
 )

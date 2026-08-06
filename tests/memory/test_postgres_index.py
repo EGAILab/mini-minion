@@ -1868,6 +1868,90 @@ def test_remove_consolidation_previews_for_proposal_is_a_no_op_when_none_exist(i
 
 
 # ---------------------------------------------------------------------------
+# prune_operational_tables (MEM-GAP-015)
+# ---------------------------------------------------------------------------
+
+def _backdate(index, table: str, column: str, agent_id: str, days_old: float) -> None:
+    index._conn().execute(
+        f"UPDATE {table} SET {column} = %s WHERE agent_id = %s",
+        (time.time() - days_old * 86400, agent_id),
+    )
+
+
+def test_prune_operational_tables_deletes_old_recall_events(index, agent_id):
+    index.record_recall(agent_id, "topics/x.md", "hash-1")
+    _backdate(index, "memory_recall_events", "surfaced_at", agent_id, days_old=40)
+
+    counts = index.prune_operational_tables(30)
+
+    assert counts["recall_events"] == 1
+    assert index._conn().execute(
+        "SELECT count(*) FROM memory_recall_events WHERE agent_id = %s", (agent_id,)
+    ).fetchone()[0] == 0
+
+
+def test_prune_operational_tables_never_deletes_a_recent_recall_event(index, agent_id):
+    index.record_recall(agent_id, "topics/x.md", "hash-1")
+
+    counts = index.prune_operational_tables(30)
+
+    assert counts["recall_events"] == 0
+    assert index._conn().execute(
+        "SELECT count(*) FROM memory_recall_events WHERE agent_id = %s", (agent_id,)
+    ).fetchone()[0] == 1
+
+
+def test_prune_operational_tables_dry_run_counts_without_deleting(index, agent_id):
+    index.record_recall(agent_id, "topics/x.md", "hash-1")
+    _backdate(index, "memory_recall_events", "surfaced_at", agent_id, days_old=40)
+
+    counts = index.prune_operational_tables(30, dry_run=True)
+
+    assert counts["recall_events"] == 1
+    assert index._conn().execute(
+        "SELECT count(*) FROM memory_recall_events WHERE agent_id = %s", (agent_id,)
+    ).fetchone()[0] == 1  # still there — dry run must not delete
+
+
+def test_prune_operational_tables_deletes_old_consolidation_previews_regardless_of_review_status(
+    index, agent_id
+):
+    """A reviewed (approved/rejected) preview row is never deleted by the
+    review flow itself (see remove_consolidation_previews_for_proposal's
+    docstring) — this is the only cleanup path for an old one."""
+    index.record_consolidation_preview(
+        agent_id, 1, "new_topic", "dark-mode", "", "Draft.", "Reason."
+    )
+    _backdate(index, "memory_consolidation_previews", "created_at", agent_id, days_old=40)
+
+    counts = index.prune_operational_tables(30)
+
+    assert counts["consolidation_previews"] == 1
+
+
+def test_prune_operational_tables_deletes_old_import_previews(index, agent_id):
+    index.record_import_preview(
+        agent_id, "import-1", "new_topic", "dark-mode", "", "Draft.", "Reason."
+    )
+    _backdate(index, "memory_import_previews", "created_at", agent_id, days_old=40)
+
+    counts = index.prune_operational_tables(30)
+
+    assert counts["import_previews"] == 1
+
+
+def test_prune_operational_tables_never_touches_topic_revisions(index, agent_id):
+    """memory_topic_revisions is a rollback undo-stack, not telemetry — see
+    prune_operational_tables' own docstring for why it's deliberately excluded."""
+    index.record_topic_revision(agent_id, "project-goals", 1, "Existing goal: ship v1.")
+    _backdate(index, "memory_topic_revisions", "created_at", agent_id, days_old=365)
+
+    index.prune_operational_tables(30)
+
+    assert index.latest_topic_revision(agent_id, "project-goals") is not None
+
+
+# ---------------------------------------------------------------------------
 # Topic revisions (Stage One Phase 5, slice D)
 # ---------------------------------------------------------------------------
 

@@ -184,6 +184,7 @@ def _config_sections() -> list[tuple[str, object]]:
         ("memory_reconciliation", _cfg.memory_reconciliation),
         ("commitments", _cfg.commitments),
         ("knowledge_digest", _cfg.knowledge_digest),
+        ("memory_retention", _cfg.memory_retention),
         ("logging", _cfg.logging_cfg),
         ("codex", _cfg.codex_cfg),
         ("database", _cfg.database),
