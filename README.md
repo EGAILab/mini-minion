@@ -2613,6 +2613,22 @@ Codex's own bash/file capabilities (separate from dynamic tools) can be auto-app
 
 `allow_all_commands: true` silently approves all built-in shell and file operations.  When `false` (default), a TUI prompt appears for each request.
 
+### Background token refresh
+
+The `codex app-server` subprocess is launched once and kept running for the life of the bot process, but it only receives the OAuth access token once, at launch. Left alone, the binary's own internal background jobs (e.g. its periodic refresh of the available-models list) start failing with `401 token_expired` once that token expires — visible as recurring `codex_models_manager` errors in the logs — until the bot is restarted.
+
+To avoid needing a restart, minion-assist re-pushes the (auto-refreshed) token into the running subprocess on a timer:
+
+```json
+{
+  "codex": {
+    "auth_refresh_interval_seconds": 300
+  }
+}
+```
+
+Default is 300 seconds (5 minutes), matching the refresh-before-expiry buffer already used when loading the token. Lower this if your deployment sees very short-lived tokens; there's little cost to refreshing more often since each tick is a single JSON-RPC call.
+
 ---
 
 ## Adding a Provider

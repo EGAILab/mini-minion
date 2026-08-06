@@ -1696,7 +1696,8 @@ class CodexConfig:
     Configured in ``config.json`` under ``"codex"``:
 
         "codex": {
-            "allow_all_commands": true
+            "allow_all_commands": true,
+            "auth_refresh_interval_seconds": 300
         }
 
     Attributes:
@@ -1705,8 +1706,17 @@ class CodexConfig:
             are approved automatically without prompting.  When ``False``
             (the default), a TUI prompt is shown for every request so the
             user can approve or deny each command.
+        auth_refresh_interval_seconds (float): How often (in seconds) the
+            OAuth token is re-pushed into the running Codex subprocess in the
+            background.  The subprocess is launched once and kept alive for
+            the life of the bot process, but only receives the access token
+            once at launch — without a periodic refresh, the token expires
+            (~hourly) and the binary's own internal background jobs start
+            failing with 401 token_expired until the bot is restarted.
+            Default 300 (5 minutes).
     """
     allow_all_commands: bool = False
+    auth_refresh_interval_seconds: float = 300.0
 
 
 def _resolve_codex() -> CodexConfig:
@@ -1716,6 +1726,7 @@ def _resolve_codex() -> CodexConfig:
         return CodexConfig()
     return CodexConfig(
         allow_all_commands=bool(raw.get("allow_all_commands", False)),
+        auth_refresh_interval_seconds=float(raw.get("auth_refresh_interval_seconds", 300.0)),
     )
 
 

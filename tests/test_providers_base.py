@@ -52,6 +52,19 @@ def test_create_provider_codex():
     assert isinstance(p, CodexProvider)
 
 
+def test_create_provider_codex_uses_configured_auth_refresh_interval():
+    """create_provider must forward codex_cfg.auth_refresh_interval_seconds
+    so the background token-refresh thread (see providers/codex.py) uses the
+    interval from config.json rather than silently ignoring it."""
+    from unittest.mock import patch
+    from minion_assist.config import CodexConfig
+
+    with patch("minion_assist.providers.codex_cfg", CodexConfig(auth_refresh_interval_seconds=42.0)):
+        p = create_provider(api="codex", base_url="", api_key="", model="gpt-5.5")
+
+    assert p._auth_refresh_interval == 42.0
+
+
 def test_create_provider_openai_responses_falls_through():
     # "openai-responses" is not a special case — falls through to OpenAICompatibleProvider.
     p = create_provider(api="openai-responses", base_url="http://x", api_key="k", model="m")

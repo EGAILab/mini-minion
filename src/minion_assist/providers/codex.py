@@ -9,7 +9,12 @@ Authenticate once with::
     codex-login
 
 Tokens are stored in ``~/.minion-assist/codex-auth.json`` and
-auto-refreshed before each session starts.
+auto-refreshed before each session starts.  Because the subprocess is kept
+running for the life of the bot, the token is also re-injected into it on a
+background timer (see ``CodexProvider._start_auth_refresh_thread``) so a
+long-running bot doesn't need to be restarted when the token expires
+overnight — configurable via ``codex.auth_refresh_interval_seconds`` in
+``config.json``.
 
 The binary defaults to ``codex`` (looked up on PATH).  Override with the
 ``CODEX_BIN`` environment variable.
@@ -444,6 +449,17 @@ class CodexProvider:
         approve_command: Called when Codex requests approval for its own
             built-in shell/file operations.  Receives ``(method, params)``
             and must return ``"approve"`` or ``"deny"``.  ``None`` = auto-deny.
+        auth_refresh_interval: Seconds between background re-injections of the
+            OAuth token into the (long-lived) Codex subprocess.  The binary is
+            started once and kept alive for the life of the bot process, but
+            it only ever receives the access token once (via
+            ``account/login/start``) unless we push a new one to it.  Left
+            unattended, the binary's own internal background jobs (e.g. its
+            periodic "refresh available models" call) start failing with
+            401 token_expired once that token expires — see
+            ``_start_auth_refresh_thread``.  Default 300s (5 min), matching
+            the refresh-before-expiry buffer already used in
+            ``auth/codex_auth.py``.
     """
 
     def __init__(
@@ -454,6 +470,7 @@ class CodexProvider:
         log_dir: Path | None = None,
         registry: "ToolRegistry | None" = None,
         approve_command: Callable[[str, dict], str] | None = None,
+        auth_refresh_interval: float = 300.0,
     ) -> None:
         env_bin = os.environ.get("CODEX_BIN", "").strip()
         self._codex_bin = env_bin or codex_bin
@@ -467,6 +484,11 @@ class CodexProvider:
         self._registry = registry
         # Callback for Codex built-in tool approval (item/commandExecution/requestApproval etc.).
         self._approve_command = approve_command
+        # See _start_auth_refresh_thread — how often we re-push the OAuth
+        # token into the running subprocess so it never goes stale overnight.
+        self._auth_refresh_interval = auth_refresh_interval
+        self._auth_refresh_thread: threading.Thread | None = None
+        self._auth_refresh_stop: threading.Event | None = None
 
     def reset_session(self) -> None:
         """Forget the current Codex thread so the next chat() starts a fresh one.
@@ -506,7 +528,50 @@ class CodexProvider:
                 "capabilities": {"experimentalApi": True},
             }, timeout=30.0)
             self._inject_auth(self._rpc)
+            self._start_auth_refresh_thread(self._rpc)
         return self._rpc
+
+    def _start_auth_refresh_thread(self, rpc: _CodexRpcClient) -> None:
+        """Start a background daemon thread that periodically re-injects auth.
+
+        Why this is needed: the Codex subprocess is launched once and kept
+        alive for the life of the bot process (see ``_get_rpc``), but the
+        OAuth access token is only ever pushed into it once, at launch.  The
+        binary itself runs its own internal background jobs against OpenAI's
+        API (e.g. periodically refreshing its list of available models) using
+        that same token.  Once the token expires — independent of whether
+        minion-assist ever calls ``chat()`` — those internal jobs start
+        failing with 401 token_expired and spam the log every few minutes
+        until the whole bot is restarted.
+
+        Restarting the bot "fixes" it only because a fresh subprocess gets a
+        freshly (auto-)refreshed token via ``load_token()``.  This thread
+        does the same re-injection on a timer, without needing a restart, by
+        repeatedly calling ``_inject_auth`` (which itself calls
+        ``codex_auth.load_token()`` — already auto-refreshing the token via
+        its refresh_token when nearing expiry).
+        """
+        stop_event = threading.Event()
+        self._auth_refresh_stop = stop_event
+        thread = threading.Thread(
+            target=self._auth_refresh_loop,
+            args=(rpc, stop_event),
+            name="codex-auth-refresh",
+            daemon=True,
+        )
+        self._auth_refresh_thread = thread
+        thread.start()
+
+    def _auth_refresh_loop(self, rpc: _CodexRpcClient, stop_event: threading.Event) -> None:
+        """Re-inject auth every ``_auth_refresh_interval`` seconds until stopped.
+
+        ``Event.wait(timeout)`` returns ``True`` only when the event was set,
+        so this doubles as both the sleep and the stop check: a normal tick
+        waits out the full interval and refreshes; a stop request wakes the
+        wait immediately and exits the loop without refreshing.
+        """
+        while not stop_event.wait(self._auth_refresh_interval):
+            self._inject_auth(rpc)
 
     def _inject_auth(self, rpc: _CodexRpcClient) -> None:
         """Pass the stored OAuth token to the Codex binary via account/login/start."""

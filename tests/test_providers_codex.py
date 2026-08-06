@@ -6,6 +6,7 @@ All tests use a stub _CodexRpcClient so no real subprocess is spawned.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -131,6 +132,9 @@ def _make_provider(stub: _StubRpc, model: str = "gpt-5.5") -> CodexProvider:
     p._log_dir = None
     p._registry = None
     p._approve_command = None
+    p._auth_refresh_interval = 300.0
+    p._auth_refresh_thread = None
+    p._auth_refresh_stop = None
     return p
 
 
@@ -535,3 +539,93 @@ def test_reset_session_causes_new_thread_start():
 
     thread_starts = [c for c in stub.calls if c[0] == "thread/start"]
     assert len(thread_starts) == 2, "expected two thread/start calls (one per session)"
+
+
+# ---------------------------------------------------------------------------
+# Background auth-refresh thread (overnight token-expiry fix)
+#
+# The Codex subprocess is launched once and kept alive for the life of the
+# bot process, but only receives the OAuth token once at launch. These tests
+# cover the periodic re-injection thread that keeps that long-lived
+# subprocess's token fresh without needing a bot restart.
+# ---------------------------------------------------------------------------
+
+
+def test_auth_refresh_loop_calls_inject_auth_repeatedly():
+    """Each tick of the loop should re-push auth into the running subprocess."""
+    stub = _StubRpc()
+    p = _make_provider(stub)
+    p._auth_refresh_interval = 0.01  # fast tick so the test doesn't wait long
+
+    calls: list[object] = []
+    p._inject_auth = lambda rpc: calls.append(rpc)
+
+    stop_event = threading.Event()
+    thread = threading.Thread(target=p._auth_refresh_loop, args=(stub, stop_event))
+    thread.start()
+
+    time.sleep(0.05)  # let several ticks fire
+    stop_event.set()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert len(calls) >= 2
+    assert all(c is stub for c in calls)
+
+
+def test_auth_refresh_loop_stops_immediately_on_stop_event():
+    """A stop event set before the interval elapses exits without refreshing."""
+    stub = _StubRpc()
+    p = _make_provider(stub)
+    p._auth_refresh_interval = 5.0  # long interval; the stop event must preempt it
+
+    calls: list[object] = []
+    p._inject_auth = lambda rpc: calls.append(rpc)
+
+    stop_event = threading.Event()
+    stop_event.set()  # already stopped before the loop starts waiting
+
+    thread = threading.Thread(target=p._auth_refresh_loop, args=(stub, stop_event))
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert calls == []
+
+
+def test_get_rpc_starts_auth_refresh_thread():
+    """_get_rpc() must launch the background refresh thread on first call."""
+    stub_client = MagicMock()
+    stub_client.request = MagicMock(return_value={})
+
+    p = object.__new__(CodexProvider)
+    p._codex_bin = "codex"
+    p._model = ""
+    p._turn_timeout = 5.0
+    p._rpc = None
+    p._thread_id = None
+    p._sent_count = 0
+    p._log_dir = None
+    p._registry = None
+    p._approve_command = None
+    p._auth_refresh_interval = 300.0
+    p._auth_refresh_thread = None
+    p._auth_refresh_stop = None
+
+    injected: list[object] = []
+    p._inject_auth = lambda rpc: injected.append(rpc)
+
+    with patch("minion_assist.providers.codex._CodexRpcClient", return_value=stub_client):
+        rpc = p._get_rpc()
+
+    try:
+        assert rpc is stub_client
+        assert injected == [stub_client]
+        assert p._auth_refresh_thread is not None
+        assert p._auth_refresh_thread.is_alive()
+        assert p._auth_refresh_thread.daemon is True
+    finally:
+        # The thread waits on _auth_refresh_interval (300s); wake it now so
+        # it doesn't linger after the test process exits.
+        p._auth_refresh_stop.set()
+        p._auth_refresh_thread.join(timeout=1.0)

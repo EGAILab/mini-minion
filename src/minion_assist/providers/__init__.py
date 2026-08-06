@@ -35,6 +35,7 @@ from .base import LLMProvider, LLMResponse, TokenUsage, ToolCall
 from .codex import CodexProvider
 from .lmstudio import LMStudioProvider
 from .openai_compatible import OpenAICompatibleProvider
+from ..config import codex_cfg
 
 if TYPE_CHECKING:
     from ..tools import ToolRegistry
@@ -96,6 +97,7 @@ def create_provider(
                 log_dir=log_dir,
                 registry=registry,
                 approve_command=approve_command,
+                auth_refresh_interval=codex_cfg.auth_refresh_interval_seconds,
             )
         case _:
             # Default: treat any unknown api value as an OpenAI-compatible endpoint.
