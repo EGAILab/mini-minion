@@ -69,7 +69,82 @@
     }
   },
   "database": {
+    "_comment": "Optional PostgreSQL connection — enables session_search, the memory lexical/vector index, and every durable job queue (capture/commitment/message-embedding). Omit this section entirely to stay in file-only mode.",
     "url": "postgresql://minion:minion@localhost:5433/minion_assist"
+  },
+  "embeddings": {
+    "_comment": "Optional — activates the memory/session semantic-search vector lane on top of the database above. 'provider' must name an entry under models.providers (its baseUrl/api are reused; credentials come from {PROVIDER}_API_KEY in .env, same as a chat provider). 'dimensions' must exactly match the model's real output vector length — omit this whole section to stay lexical-only.",
+    "provider": "lmstudio",
+    "model": "nomic-embed-text-v1.5",
+    "dimensions": 768
+  },
+  "memory": {
+    "_comment": "Controls the per-turn background fact-extraction daemon.",
+    "enable_extraction": true
+  },
+  "memory_reconciliation": {
+    "_comment": "Periodic self-healing pass for transient mirror/job-enqueue failures. Only meaningful with 'database' configured; both fields are optional.",
+    "interval_seconds": 300,
+    "quiet_seconds": 60
+  },
+  "memory_consolidation": {
+    "_comment": "Daily scheduler that reviews/promotes extracted proposals into curated memory. Disabled by default.",
+    "enabled": false,
+    "hour": 4,
+    "minute": 0,
+    "timezone": "Australia/Sydney",
+    "agent_id": "main",
+    "top_n": 5
+  },
+  "knowledge_digest": {
+    "_comment": "Daily scheduler that summarizes recent knowledge-graph claims into KNOWLEDGE_DIGEST.md. Disabled by default.",
+    "enabled": false,
+    "hour": 4,
+    "minute": 30,
+    "timezone": "Australia/Sydney",
+    "agent_id": "main",
+    "max_chars": 8000
+  },
+  "commitments": {
+    "_comment": "Inferred, short-lived commitment (follow-up) extraction and delivery. Requires 'database'; disabled by default.",
+    "enabled": false
+  },
+  "bootstrap": {
+    "_comment": "Workspace-file prompt injection (AGENTS.md, SOUL.md, TOOLS.md, ...). 'path' overrides the auto-detected workspace root; omit to use the default per-agent workspace.",
+    "enabled": true,
+    "max_chars": 20000,
+    "total_max_chars": 60000,
+    "truncation_warning": "always"
+  },
+  "multi_agent": {
+    "_comment": "Limits for agent-spawns-subagent recursion.",
+    "max_spawn_depth": 4,
+    "max_children_per_agent": 5,
+    "default_subagent_timeout_seconds": 120
+  },
+  "heartbeat": {
+    "_comment": "Periodic proactive check-in. Disabled by default; 'notification_room_id' (Matrix room) is optional.",
+    "enabled": false,
+    "interval_seconds": 1800,
+    "agent_id": "main"
+  },
+  "dreaming": {
+    "_comment": "Nightly reflection scheduler that reviews recent sessions. Disabled by default.",
+    "enabled": false,
+    "hour": 3,
+    "minute": 0,
+    "timezone": "Australia/Sydney",
+    "lookback_days": 3,
+    "agent_id": "main"
+  },
+  "logging": {
+    "_comment": "llm_requests=true logs full provider request/response payloads to workspace/logs/ — may include recalled memory content (MEM-GAP-017); leave false unless actively debugging.",
+    "llm_requests": false
+  },
+  "codex": {
+    "_comment": "Only relevant when an agent's provider uses \"api\": \"codex\".",
+    "allow_all_commands": false,
+    "auth_refresh_interval_seconds": 300
   },
   "voice": {
     "enabled": false,

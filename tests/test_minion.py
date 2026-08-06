@@ -487,3 +487,37 @@ def test_main_does_not_dispatch_for_non_memory_args(tmp_path):
     # No SystemExit escaped and no exception — REPL setup ran as usual, already
     # covered by the assertions in _run_main's other callers. This test exists
     # to document that the guard is argv[1]-specific, not a blanket short-circuit.
+
+
+# ---------------------------------------------------------------------------
+# `minion-assist config` CLI dispatch guard (MEM-GAP-019)
+# ---------------------------------------------------------------------------
+# Same shape as the `memory` dispatch guard above — verifies main() hands off
+# to config_report.py before any REPL setup, without re-testing
+# config_report.py's own report content (tests/test_config_report.py's job).
+
+def test_main_dispatches_config_subcommand_before_repl_setup():
+    import minion_assist.minion as minion_mod
+
+    with (
+        patch("sys.argv", ["minion-assist", "config"]),
+        patch("minion_assist.config_report.main", return_value=0) as cli_main_mock,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            minion_mod.main()
+
+    cli_main_mock.assert_called_once_with([])
+    assert exc_info.value.code == 0
+
+
+def test_main_propagates_config_cli_exit_code():
+    import minion_assist.minion as minion_mod
+
+    with (
+        patch("sys.argv", ["minion-assist", "config"]),
+        patch("minion_assist.config_report.main", return_value=2),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            minion_mod.main()
+
+    assert exc_info.value.code == 2

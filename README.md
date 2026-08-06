@@ -91,6 +91,7 @@ minion-assist/
 ├── src/minion_assist/
 │   ├── minion.py                # Entry point — interactive REPL
 │   ├── config.py                # Config loader (config.json + .env)
+│   ├── config_report.py         # `minion-assist config` — effective, secret-redacted config (MEM-GAP-019)
 │   ├── bootstrap.py             # Bootstrap prompt layer — workspace file discovery, budget, truncation, rendering
 │   ├── context.py               # Context window overflow detection and history compaction
 │   ├── cli_input.py             # PromptReader — Up/Down arrow key prompt history via prompt_toolkit
@@ -305,6 +306,23 @@ Example structure (see `config.example.json` for the full template):
 | `bootstrap.max_chars` | *(Optional, default `20000`)* Maximum characters to inject from any single bootstrap file. Larger files are truncated with a head+tail excerpt. |
 | `bootstrap.total_max_chars` | *(Optional, default `60000`)* Maximum total characters across all bootstrap files combined. |
 | `bootstrap.truncation_warning` | *(Optional, default `"always"`)* When to inject a truncation warning: `"always"`, `"once"` (first occurrence only per process), or `"off"`. |
+| `embeddings.*` | *(Optional)* Activates the semantic-search vector lane (MEM-GAP-006). `provider`/`model`/`dimensions` — see "Embeddings and the vector lane". |
+| `memory_reconciliation.*` | *(Optional)* Periodic self-healing pass for transient mirror/job-enqueue failures — `interval_seconds`/`quiet_seconds`. See "Reconciliation: self-healing writes and concurrency safety". |
+| `heartbeat.*` | *(Optional, disabled by default)* Periodic proactive check-in — `enabled`/`interval_seconds`/`prompt`/`agent_id`/`notification_room_id`. See "Heartbeat & Proactive Features". |
+| `dreaming.*` | *(Optional, disabled by default)* Nightly session-reflection scheduler — `enabled`/`hour`/`minute`/`timezone`/`lookback_days`/`agent_id`. |
+| `multi_agent.*` | *(Optional)* Subagent spawn limits — `max_spawn_depth`/`max_children_per_agent`/`default_subagent_timeout_seconds`. See "Multi-Agent Workspace". |
+| `logging.llm_requests` | *(Optional, default `true`)* Log full provider request/response payloads to `workspace/logs/`. May include recalled memory content in the payload — leave `false` unless actively debugging (MEM-GAP-017). |
+| `codex.*` | *(Optional)* Only relevant for an agent whose provider uses `"api": "codex"` — `allow_all_commands`/`auth_refresh_interval_seconds`. |
+
+**Full config surface every run.** `config.example.json` documents every section above (MEM-GAP-019) — copy it as a starting point rather than reconstructing the surface from this table or from source.
+
+### Show effective configuration (`minion-assist config`)
+
+```bash
+minion-assist config
+```
+
+Prints every resolved `config.json` section — what minion-assist actually understood after validation, not just what you wrote — with every credential (`api_key`, Matrix `access_token`/`password`, `database.url`'s inline `user:pass@`, MCP server `env`/`headers` values) masked as `***` rather than omitted, so you can confirm a secret *is* configured without ever exposing its value. Runs before any REPL/session/provider setup — the same non-interactive dispatch `minion-assist memory ...` already uses (see `config_report.py`). Exits `2` with the underlying `ConfigError` message if `config.json` itself fails to load/validate.
 
 ### `.env`
 
