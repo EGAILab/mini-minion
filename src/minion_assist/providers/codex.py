@@ -432,6 +432,15 @@ class CodexProvider:
     Each provider instance maintains one Codex thread across multiple
     ``chat()`` calls so the binary owns conversation continuity.
 
+    Not safe to share across independent conversations: ``_thread_id`` and
+    ``_sent_count`` are single instance-level values, and the notification
+    handler registered per ``chat()`` call does not filter by thread/turn ID.
+    Two concurrent ``chat()`` calls on one shared instance (e.g. two Matrix
+    rooms whose messages happen to be dispatched at the same time) can end
+    up delivering one call's response to the other. Each independent
+    conversation — one per Matrix room, for instance — needs its own
+    ``CodexProvider`` instance (see ``minion.py``'s ``_matrix_session_factory``).
+
     All tools from the optional ``registry`` are registered with Codex as
     dynamic tools under the ``"minion-assist"`` namespace on the first call.
     Codex can then invoke them via ``item/tool/call`` server requests, which

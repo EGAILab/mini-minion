@@ -620,6 +620,57 @@ def test_main_wires_health_into_matrix_session_factory_closure(tmp_path):
     assert room_session._extraction_health is None
 
 
+@_requires_live_db_and_embeddings
+def test_matrix_room_sessions_get_their_own_provider_instance(tmp_path):
+    """Regression test for the cross-talk bug where two Matrix rooms sharing
+    one CodexProvider could receive each other's responses: CodexProvider
+    tracks one shared _thread_id/_sent_count per instance and matrix messages
+    are dispatched via a thread pool (matrix/handler.py's run_in_executor),
+    so two rooms calling provider.chat() concurrently on a shared instance
+    raced. Each Matrix room-scoped session must get a freshly constructed
+    provider instead of reusing the main REPL session's provider."""
+    import minion_assist.minion as minion_mod
+
+    captured_kwargs: dict = {}
+    captured_args: list = []
+
+    class _FakeMatrixChannel:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self, *args, **kwargs):
+            captured_args.extend(args)
+            captured_kwargs.update(kwargs)
+
+        def stop(self, *_args, **_kwargs):
+            pass
+
+    with (
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.minion.mcp_cfg", SimpleNamespace(servers=())),
+        patch("minion_assist.minion.channels_cfg", SimpleNamespace(matrix=SimpleNamespace())),
+        patch("minion_assist.matrix.channel.MatrixChannel", _FakeMatrixChannel),
+        patch("minion_assist.agents.session.run_turn", Mock()),
+        # side_effect=Mock returns a NEW Mock() on every call, unlike
+        # return_value=Mock() (a single shared instance) used by the other
+        # wiring tests here — needed to tell instances apart by identity.
+        patch("minion_assist.minion.create_provider", side_effect=lambda **_kw: Mock()),
+        patch("builtins.input", side_effect=iter(["quit"])),
+    ):
+        minion_mod.main()
+
+    sessions = captured_args[0]
+    factories = captured_kwargs["session_factories"]
+
+    main_repl_provider = sessions["main"].provider
+    room_a_provider = factories["main"]("room-a").provider
+    room_b_provider = factories["main"]("room-b").provider
+
+    assert room_a_provider is not main_repl_provider
+    assert room_b_provider is not main_repl_provider
+    assert room_a_provider is not room_b_provider
+
+
 # ---------------------------------------------------------------------------
 # MEM-GAP-015: production-wiring coverage for MemoryRetentionScheduler
 # ---------------------------------------------------------------------------

@@ -771,17 +771,34 @@ def main() -> None:
         _providers_by_agent[agent_id] = provider
 
         # Matrix room-scoped session factory (MEM-GAP-001). Shares every
-        # per-agent resource with `sessions[agent_id]` above (same provider,
-        # tools, memory, compactor — these are expensive/stateful and meant
-        # to be reused); only session_id/history differ per call, so each
-        # Matrix room gets its own isolated conversation instead of every
-        # room sharing one AgentSession. Default-argument binding prevents
-        # the loop-closure gotcha — same pattern as `_dream_factory` above.
+        # per-agent resource with `sessions[agent_id]` above EXCEPT the
+        # provider (tools, memory, compactor — these are stateless/thread-safe
+        # and meant to be reused); only session_id/history/provider differ per
+        # call, so each Matrix room gets its own isolated conversation instead
+        # of every room sharing one AgentSession.
+        #
+        # The provider must NOT be shared: matrix messages are dispatched via
+        # loop.run_in_executor() (matrix/handler.py), a real thread pool, so
+        # two rooms' messages can call provider.chat() concurrently. Stateless
+        # providers (OpenAI-completions, Anthropic) tolerate that fine — the
+        # full history is sent every call. CodexProvider does not: it tracks
+        # one shared `_thread_id`/`_sent_count` and its notification handler
+        # has no per-call thread/turn filtering, so two concurrent chat() calls
+        # on the same CodexProvider can cross-deliver each other's responses
+        # (one room asking about anime got back a different room's "screenshot
+        # saved" response). Building a fresh provider per room — the same
+        # pattern _make_spawn_fn already uses for subagents — gives each room
+        # its own Codex thread/subprocess (lazily launched on first message)
+        # and sidesteps the shared-state race entirely, at the cost of one
+        # extra Codex subprocess per actively-used room instead of one shared
+        # subprocess for everything.
+        #
+        # Default-argument binding prevents the loop-closure gotcha — same
+        # pattern as `_dream_factory` above.
         def _matrix_session_factory(
             session_id: str,
             _agent_id=agent_id,
             _agent=AGENTS[agent_id],
-            _provider=provider,
             _cfg=cfg,
             _tools=tools,
             _compactor=compactor,
@@ -791,11 +808,20 @@ def main() -> None:
             _health=_session_health,
             _extraction_health=_extraction_health,
         ) -> AgentSession:
+            _room_provider = create_provider(
+                api=_cfg.provider.api,
+                base_url=_cfg.provider.base_url,
+                api_key=_cfg.provider.api_key,
+                model=_cfg.model.id,
+                log_dir=_log_dir,
+                registry=_tools,
+                approve_command=_codex_approve,
+            )
             return AgentSession(
                 agent_id=_agent_id,
                 session_id=session_id,
                 agent=_agent,
-                provider=_provider,
+                provider=_room_provider,
                 max_output_tokens=_cfg.model.max_output_tokens,
                 tools=_tools,
                 compactor=_compactor,

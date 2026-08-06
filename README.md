@@ -726,6 +726,8 @@ Add a `channels.matrix` block to `config.json`:
 
 **Room-scoped sessions:** every `(room_id, agent_id)` pair gets its own persistent `AgentSession` — a room is this deployment's unit of conversation isolation (e.g. a "Movie" room and a "Work" room routed to the same agent never share history), not the Matrix thread feature. The binding is stored in SQLite (`matrix/room_sessions.db`) and survives restarts; a room's first message always starts a fresh session rather than inheriting any other room's history. See [ADR 0006](docs/adr/0006-room-scoped-matrix-sessions.md) for the full rationale.
 
+Each room-scoped session also gets its own freshly constructed LLM provider — not the main REPL session's provider. Matrix messages are handled on a thread pool, so two rooms can call the provider concurrently; a stateless provider (OpenAI-completions, Anthropic) tolerates that fine, but the Codex provider tracks one conversation thread per instance, so sharing it across rooms let one room's response leak into a different room's turn under concurrent messages. One Codex subprocess is lazily started per actively-used room instead of one shared subprocess for every session.
+
 **Markdown formatting:** agent responses are automatically converted from markdown to `org.matrix.custom.html` before sending, so bold, code blocks, lists, and links render natively in Element and other Matrix clients. The `matrix/format.py` module handles conversion (using `markdown-it-py`) and intelligent paragraph chunking.
 
 **Typing indicators:** while the agent is processing a message, a typing notification appears in the Matrix room so users know the bot is working. The indicator is cleared automatically when the reply is sent, even if the agent errors.
