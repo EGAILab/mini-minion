@@ -262,3 +262,61 @@ def test_fire_does_nothing_once_stopped(monkeypatch):
     scheduler._fire()
 
     run_pass.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _fire against a REAL SessionDB failure (MEM-GAP-018)
+# ---------------------------------------------------------------------------
+# The two _fire tests above only prove the wiring works when _run_pass
+# itself is monkeypatched to raise — they never exercise a genuine failure
+# produced by real production code (SessionDB's own connection handling).
+# This test uses a real SessionDB successfully constructed against the dev
+# database, then points its URL at an unreachable port so the *next* real
+# query genuinely fails via psycopg's own driver — not a mocked
+# side_effect — proving WorkerHealth captures an authentic production
+# failure end-to-end. Skipped, not failed, without a reachable dev DB.
+
+import pytest
+
+_DB_URL = "postgresql://minion:minion@localhost:5433/minion_assist"
+
+try:
+    import psycopg as _psycopg
+
+    _test_conn = _psycopg.connect(_DB_URL, connect_timeout=2)
+    _test_conn.close()
+    _DB_AVAILABLE = True
+except Exception:
+    _DB_AVAILABLE = False
+
+_requires_live_db = pytest.mark.skipif(
+    not _DB_AVAILABLE, reason="requires a live PostgreSQL instance"
+)
+
+
+@_requires_live_db
+def test_fire_records_a_genuine_db_connection_failure():
+    from minion_assist.session.db import SessionDB
+
+    real_db = SessionDB(_DB_URL)  # succeeds against the real dev DB
+    # Force the thread-local connection closed, then point the URL at a
+    # port nothing listens on — the next real query inside _run_pass()
+    # (SessionDB.reconcile_all_sessions -> ... -> self._conn()) genuinely
+    # fails to reconnect, raising psycopg's own OperationalError.
+    real_db._conn().close()
+    real_db._url = "postgresql://minion:minion@localhost:1/minion_assist"
+
+    health = WorkerHealth("memory_reconciliation")
+    scheduler = ReconciliationScheduler(
+        _make_cfg(), real_db, ["main"], Mock(), health=health,
+    )
+
+    try:
+        scheduler._fire()  # must not raise — _fire()'s own except must catch it
+    finally:
+        scheduler.stop()  # cancel the timer _fire() reschedules in its finally block
+
+    snap = health.snapshot()
+    assert snap["last_poll_at"] is not None
+    assert snap["consecutive_failures"] == 1
+    assert snap["last_error"]  # a genuine driver error message, not empty

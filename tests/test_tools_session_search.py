@@ -60,3 +60,89 @@ def test_discover_uses_the_agent_id_for_session_metadata_and_bookends():
     db.get_sessions_by_ids.assert_called_once_with(["s1"], "researcher")
     db.get_session_bookends.assert_called_once_with("s1", "researcher", n=2)
     db.get_messages_around.assert_called_once_with("s1", "researcher", 1, window=3)
+
+
+# ---------------------------------------------------------------------------
+# Real-database cross-agent isolation (MEM-GAP-018)
+# ---------------------------------------------------------------------------
+# Everything above proves the tool always *forwards* its own agent_id — but
+# only against a Mock, which can't prove PostgreSQL's WHERE agent_id = ...
+# clause actually blocks the query. These tests drive
+# SessionSearchTool.execute() through a REAL SessionDB with two different
+# agents' data present, proving genuine end-to-end isolation through the
+# actual tool call path (not the DB layer directly, which is already
+# covered by tests/test_session_db.py). Skipped, not failed, without a
+# reachable dev PostgreSQL instance — same convention as test_session_db.py.
+
+import uuid
+
+import pytest
+
+_DB_URL = "postgresql://minion:minion@localhost:5433/minion_assist"
+
+try:
+    import psycopg as _psycopg
+
+    _test_conn = _psycopg.connect(_DB_URL, connect_timeout=2)
+    _test_conn.close()
+    _DB_AVAILABLE = True
+except Exception:
+    _DB_AVAILABLE = False
+
+_requires_live_db = pytest.mark.skipif(
+    not _DB_AVAILABLE, reason="requires a live PostgreSQL instance"
+)
+
+
+@pytest.fixture
+def _real_db():
+    from minion_assist.session.db import SessionDB
+    return SessionDB(_DB_URL)
+
+
+def _cleanup_sessions(real_db, *session_ids: str) -> None:
+    conn = real_db._conn()
+    for sid in session_ids:
+        conn.execute("DELETE FROM message_mirrors WHERE session_id = %s", (sid,))
+        conn.execute("DELETE FROM messages WHERE session_id = %s", (sid,))
+        conn.execute("DELETE FROM sessions WHERE id = %s", (sid,))
+
+
+@_requires_live_db
+def test_discover_never_surfaces_another_agents_session_through_real_db(_real_db):
+    marker = f"zzqisolationmarker{uuid.uuid4().hex[:8]}"
+    owner_session = f"test-{uuid.uuid4()}"
+    other_session = f"test-{uuid.uuid4()}"
+    try:
+        _real_db.upsert_session(owner_session, "main")
+        _real_db.upsert_session(other_session, "researcher")
+        _real_db.mirror_message(owner_session, "e1", "user", f"my note about {marker}")
+        _real_db.mirror_message(other_session, "e2", "user", f"other agent note about {marker}")
+
+        owner_tool = SessionSearchTool(_real_db, "main")
+        result = owner_tool.execute(mode="DISCOVER", query=marker)
+
+        assert owner_session[:8] in result
+        assert other_session[:8] not in result
+        assert "[researcher]" not in result
+    finally:
+        _cleanup_sessions(_real_db, owner_session, other_session)
+
+
+@_requires_live_db
+def test_browse_never_lists_another_agents_sessions_through_real_db(_real_db):
+    owner_session = f"test-{uuid.uuid4()}"
+    other_session = f"test-{uuid.uuid4()}"
+    try:
+        _real_db.upsert_session(owner_session, "main")
+        _real_db.upsert_session(other_session, "researcher")
+        _real_db.mirror_message(owner_session, "e1", "user", "hello")
+        _real_db.mirror_message(other_session, "e2", "user", "hello")
+
+        owner_tool = SessionSearchTool(_real_db, "main")
+        result = owner_tool.execute(mode="BROWSE")
+
+        assert owner_session[:8] in result
+        assert other_session[:8] not in result
+    finally:
+        _cleanup_sessions(_real_db, owner_session, other_session)

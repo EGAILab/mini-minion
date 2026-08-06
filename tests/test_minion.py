@@ -521,3 +521,100 @@ def test_main_propagates_config_cli_exit_code():
             minion_mod.main()
 
     assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# MEM-GAP-018: production-wiring coverage for WorkerHealth / MessageEmbeddingWorker
+# ---------------------------------------------------------------------------
+# Every WorkerHealth/MessageEmbeddingWorker unit test elsewhere in the suite
+# exercises the class directly — none of them prove minion.py's real startup
+# path actually constructs and threads these into the real AgentSession/
+# worker call sites. That's exactly the "forgot to wire it up" failure mode
+# already self-caught once this session (MEM-GAP-007's `health=` kwarg was
+# initially missing from the AgentSession(...) construction). These two
+# tests run minion.py's real main() against the real dev config.json
+# (database + embeddings), so they only pass when the wiring genuinely
+# exists — not when it's mocked away. Skipped, not failed, when the dev
+# database isn't reachable, matching tests/test_session_db.py's convention.
+
+from minion_assist.config import database as _database_cfg
+from minion_assist.config import embeddings as _embeddings_cfg
+
+try:
+    import psycopg as _psycopg_wiring
+
+    _wiring_conn = _psycopg_wiring.connect(_database_cfg.url, connect_timeout=2)
+    _wiring_conn.close()
+    _DB_AVAILABLE_FOR_WIRING = bool(_database_cfg.url)
+except Exception:
+    _DB_AVAILABLE_FOR_WIRING = False
+
+_requires_live_db_and_embeddings = pytest.mark.skipif(
+    not (_DB_AVAILABLE_FOR_WIRING and _embeddings_cfg is not None),
+    reason="requires a live PostgreSQL instance and an 'embeddings' section in config.json",
+)
+
+
+@_requires_live_db_and_embeddings
+def test_main_wires_message_embedding_worker_and_per_agent_health(tmp_path, capsys):
+    """`/status deep`, driven through the real REPL command path, must show
+    MessageEmbeddingWorker and the 'main' agent's memory_search/
+    session_writes health as actually running (not 'not running', which is
+    what a dropped construction/wiring line would silently produce) — and
+    must show memory_extractor as 'not running', since that tracker only
+    ever applies to the no-database branch (MEM-GAP-013's inverse gate)."""
+    _run_main(tmp_path, ["/status deep", "quit"])
+
+    out = capsys.readouterr().out
+    assert "message_embedding_worker: not running" not in out
+    assert "session_writes:main: not running" not in out
+    assert "memory_search:main: not running" not in out
+    # Inverse gate (MEM-GAP-013): a database IS configured here, so the
+    # degraded-mode extractor tracker must be absent, not present.
+    assert "memory_extractor:main: not running" in out
+
+
+@_requires_live_db_and_embeddings
+def test_main_wires_health_into_matrix_session_factory_closure(tmp_path):
+    """The Matrix room-scoped AgentSession factory closure (MEM-GAP-001)
+    must carry the exact same WorkerHealth instances as the agent's main
+    REPL session. This closure duplicates the health=/extraction_health=
+    kwargs a few lines below the main AgentSession(...) construction in
+    minion.py — precisely the kind of second call site a future edit could
+    silently forget to update."""
+    import minion_assist.minion as minion_mod
+
+    captured_kwargs: dict = {}
+
+    class _FakeMatrixChannel:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self, *_args, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        def stop(self, *_args, **_kwargs):
+            pass
+
+    with (
+        patch("minion_assist.minion.workspace", tmp_path),
+        patch("minion_assist.minion.mcp_cfg", SimpleNamespace(servers=())),
+        patch("minion_assist.minion.channels_cfg", SimpleNamespace(matrix=SimpleNamespace())),
+        patch("minion_assist.matrix.channel.MatrixChannel", _FakeMatrixChannel),
+        patch("minion_assist.agents.session.run_turn", Mock()),
+        patch("minion_assist.minion.create_provider", return_value=Mock()),
+        patch("builtins.input", side_effect=iter(["quit"])),
+    ):
+        minion_mod.main()
+
+    factories = captured_kwargs["session_factories"]
+    worker_health = captured_kwargs["worker_health"]
+
+    room_session = factories["main"]("fake-room-session-id")
+
+    assert room_session._health is not None
+    assert room_session._health is worker_health.get("session_writes:main")
+    # A database is configured for "main" in this environment, so the
+    # degraded-mode extraction tracker must be None here — not silently
+    # wired to the wrong object.
+    assert room_session._extraction_health is None
