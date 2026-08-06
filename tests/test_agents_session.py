@@ -612,6 +612,66 @@ def test_build_prompt_section_stops_once_the_budget_is_exhausted(tmp_path):
     assert tokens <= 40
 
 
+def test_build_prompt_section_returned_token_count_matches_the_actual_text(tmp_path):
+    # MEM-GAP-014: the returned token_count must be the fully rendered
+    # block's own cost (wrapper tags + join newlines included), not just
+    # the sum of each hit's individually-estimated cost.
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert.")
+
+    text, _injected_hits, tokens = build_prompt_section(memory, "Python", max_tokens=1000)
+
+    from minion_assist.context import _estimate_tokens as _real_estimate
+    assert tokens == _real_estimate({"content": text})
+
+
+def test_build_prompt_section_never_exceeds_budget_after_accounting_for_wrapper_tags(tmp_path):
+    # A budget sized to fit the per-hit running total exactly, but too
+    # small once the wrapper tags/newlines the old accounting ignored are
+    # included, must still trim rather than return an over-budget block.
+    memory = Mock()
+    memory.search.return_value = [
+        MemoryHit(key=f"note-{i}", content="x" * 40, source="topic") for i in range(3)
+    ]
+
+    from minion_assist.context import _estimate_tokens as _real_estimate
+
+    for budget in range(5, 60):
+        text, injected_hits, tokens = build_prompt_section(memory, "query", max_tokens=budget)
+        if text:
+            assert _real_estimate({"content": text}) <= budget
+            assert tokens == _real_estimate({"content": text})
+
+
+def test_build_prompt_section_suppresses_a_duplicate_snippet(tmp_path):
+    # MEM-GAP-014: two hits with identical content must not both consume
+    # budget for the same information.
+    memory = Mock()
+    memory.search.return_value = [
+        MemoryHit(key="note-a", content="The user prefers dark mode.", source="topic"),
+        MemoryHit(key="note-b", content="The user prefers dark mode.", source="topic"),
+        MemoryHit(key="note-c", content="The user is a Python expert.", source="topic"),
+    ]
+
+    text, injected_hits, _tokens = build_prompt_section(memory, "query", max_tokens=1000)
+
+    keys = [h.key for h in injected_hits]
+    assert keys == ["note-a", "note-c"]
+    assert text.count("The user prefers dark mode.") == 1
+
+
+def test_build_prompt_section_does_not_suppress_distinct_content(tmp_path):
+    memory = Mock()
+    memory.search.return_value = [
+        MemoryHit(key="note-a", content="First distinct note.", source="topic"),
+        MemoryHit(key="note-b", content="Second distinct note.", source="topic"),
+    ]
+
+    _text, injected_hits, _tokens = build_prompt_section(memory, "query", max_tokens=1000)
+
+    assert [h.key for h in injected_hits] == ["note-a", "note-b"]
+
+
 # ---------------------------------------------------------------------------
 # MemoryInjected event and context-generation tracking (Stage One Phase 4, slice D)
 # ---------------------------------------------------------------------------

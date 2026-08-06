@@ -77,6 +77,7 @@ Talks to
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import uuid
@@ -109,6 +110,8 @@ from .events import (
     TurnCompleted,
 )
 from .runner import run_turn
+
+_log = logging.getLogger("minion_assist.agent_session")
 
 # This limit is now computed per-instance from the model's context window
 # inside AgentSession.__init__ so it scales automatically when the model is
@@ -321,8 +324,10 @@ def build_prompt_section(
         memory: The memory backend to search.
         message: The user's message — the search query.
         max_tokens: Token budget for the injected block, including its
-            header. Estimated the same way ``context.py`` estimates
-            message tokens, not counted exactly.
+            header, wrapper tags, and every line's join newlines — the
+            returned ``token_count`` never exceeds this (MEM-GAP-014).
+            Estimated the same way ``context.py`` estimates message
+            tokens, not counted exactly.
 
     Returns:
         tuple[str, tuple[MemoryHit, ...], int]: ``(text, injected_hits,
@@ -334,7 +339,8 @@ def build_prompt_section(
             ``.rel_path`` for
             :meth:`~minion_assist.memory.service.MemoryService.mark_injected`
             (Stage One Phase 5, slice A's recall telemetry). ``token_count``
-            is the block's estimated cost (0 if empty).
+            is ``text``'s own estimated cost (0 if empty), not just the sum
+            of each included hit's individual cost.
     """
     results = memory.search(message, max_results=5)
     if not results:
@@ -346,10 +352,21 @@ def build_prompt_section(
     )
     lines = [header]
     injected: list[MemoryHit] = []
+    # Exact-snippet dedup within this one call (MEM-GAP-014) — distinct from
+    # the cross-turn non-suppression this function's docstring already
+    # describes (a prior turn's injection is never visible to the model on
+    # a later turn, so there's nothing to suppress *across* calls). This is
+    # about two hits in the *same* results list rendering identical text
+    # (e.g. the same content chunked/surfaced twice) and both wasting
+    # budget on the same information.
+    seen_snippets: set[str] = set()
     tokens_used = _estimate_tokens({"content": header})
 
     for hit in results:
         snippet = hit.content.strip()[:400]
+        if snippet in seen_snippets:
+            _log.debug("build_prompt_section: dropping %r, duplicate of an already-included snippet", hit.key)
+            continue
         citation = f" ({hit.rel_path}:{hit.start_line}-{hit.end_line})" if hit.rel_path else ""
         # Stage One Phase 6, slice A: a boundary-bearing note gets its
         # advisory annotation rendered right alongside its content, every
@@ -360,16 +377,40 @@ def build_prompt_section(
         entry = f"[{hit.source}] {hit.key}{citation}: {snippet}{boundary_suffix}"
         entry_tokens = _estimate_tokens({"content": entry})
         if tokens_used + entry_tokens > max_tokens:
+            _log.debug(
+                "build_prompt_section: dropping %r, over budget (%d + %d > %d)",
+                hit.key, tokens_used, entry_tokens, max_tokens,
+            )
             break
         lines.append(entry)
         injected.append(hit)
+        seen_snippets.add(snippet)
         tokens_used += entry_tokens
 
     if not injected:
         return "", (), 0
 
     text = "<relevant_memories>\n" + "\n".join(lines) + "\n</relevant_memories>"
-    return text, tuple(injected), tokens_used
+    actual_tokens = _estimate_tokens({"content": text})
+
+    # The per-hit running total above never counted the wrapper tags or the
+    # newlines joining lines together, so the fully assembled block can
+    # cost slightly more than it suggested. Trim from the end (lowest-
+    # ranked first) until the *actual* rendered text fits — a hard
+    # postcondition, not an approximation (MEM-GAP-014: "budget the fully
+    # rendered block").
+    while actual_tokens > max_tokens and injected:
+        _dropped = injected.pop()
+        lines.pop()
+        _log.debug(
+            "build_prompt_section: trimming %r, rendered block still over budget (%d > %d)",
+            _dropped.key, actual_tokens, max_tokens,
+        )
+        if not injected:
+            return "", (), 0
+        text = "<relevant_memories>\n" + "\n".join(lines) + "\n</relevant_memories>"
+        actual_tokens = _estimate_tokens({"content": text})
+    return text, tuple(injected), actual_tokens
 
 
 class AgentSession:
