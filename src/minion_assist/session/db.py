@@ -8,7 +8,17 @@ Schema (created automatically on first connect):
   sessions(id, agent_id, source, started_at, last_active, turn_count, title, parent_id)
   messages(id BIGSERIAL, session_id, role, content, tool_name, timestamp,
            search_vector tsvector GENERATED ALWAYS AS ...)
-  message_embeddings(message_id, embedding vector(N))  — only when pgvector available
+  message_embeddings(message_id, model_identity, embedding vector(N)) —
+           only when pgvector AND an embedding provider are configured
+           (MEM-GAP-006). Keyed by (message_id, model_identity) so a
+           model/dimension change adds new rows under a new identity
+           rather than requiring a destructive migration — same shape as
+           memory/postgres_index.py's memory_chunk_embeddings.
+  message_embedding_jobs(id, agent_id, session_id, message_id,
+           idempotency_key, state, attempts, run_after, last_error,
+           created_at, updated_at) — durable embedding queue, one job per
+           message (MEM-GAP-006), structurally identical to
+           memory_capture_jobs/memory_commitment_jobs
   message_mirrors(session_id, event_id, message_id, mirrored_at) — idempotency
            ledger for mirroring (Stage One Phase 2, slice A)
   memory_capture_jobs(id, agent_id, session_id, source_from_message_id,
@@ -83,15 +93,48 @@ session's own ``AgentSession.send()``, which is serialized by
 ``AgentSession._lock`` — but would need a real transaction (or an
 ``INSERT ... ON CONFLICT`` upsert) if two processes ever mirrored the same
 session concurrently.
+
+Durable message-embedding jobs (MEM-GAP-006)
+------------------------------------------------
+Same durable-queue shape as capture/commitment jobs above, but one job per
+message rather than one job per exchange range: ``agents/session.py``
+enqueues a ``message_embedding_jobs`` row for each newly-mirrored
+user/assistant message (only when ``config.embeddings`` is configured — see
+``config.py``'s ``EmbeddingConfig``). A single
+:class:`~minion_assist.memory.message_embedding_worker.MessageEmbeddingWorker`
+polls for due jobs, embeds the message's content via the configured
+:class:`~minion_assist.providers.embeddings.EmbeddingProvider`, and stores
+the vector in ``message_embeddings`` keyed by ``(message_id, model_identity)``
+— never per-turn synchronous embedding, for the same "don't block the turn on
+a network call" reason ``memory/extractor.py``'s capture pipeline uses a
+worker instead of an inline call.
+
+Per-message rather than per-range idempotency key
+(``"{agent}:{message_id}:{model_identity}"``): re-enqueuing the same message
+under the same embedding model/endpoint is a no-op; switching models (a new
+``model_identity``) produces a new key and a fresh embedding, without
+disturbing any embedding already stored under the old identity — the same
+multi-model-coexistence design ``memory_chunk_embeddings`` uses, which is
+what makes changing the configured embedding model or its dimensions safe
+rather than requiring a destructive migration.
+
+Retrieval: :meth:`hybrid_search_messages` reciprocal-rank-fuses this vector
+lane with :meth:`search_messages`'s existing FTS lexical lane (reusing
+``memory/postgres_index.py``'s ``_reciprocal_rank_fusion``), and degrades to
+FTS-only automatically when no embedding provider is configured — see
+``tools/session_search.py``'s ``SessionSearchTool``.
 """
 from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..messages import EVENT_ID_KEY, ensure_event_id
 from ..schema_migrations import Migration, run_migrations
+
+if TYPE_CHECKING:
+    from ..providers.embeddings import EmbeddingProvider
 
 # Thread-local connection cache — one psycopg connection per OS thread.
 _local = threading.local()
@@ -315,11 +358,70 @@ def _migration_001_baseline(conn) -> None:
     """)
 
 
+def _migration_002_drop_legacy_message_embeddings(conn) -> None:
+    """Drop the dead, hard-coded ``vector(1536)`` ``message_embeddings`` table (MEM-GAP-006).
+
+    That table was created by ``_migration_001_baseline`` but never had a
+    writer or reader anywhere in the codebase — the gap analysis confirmed
+    this directly (``repository search finds no production writer/read
+    lane``). Safe to drop unconditionally: there is no real data to lose.
+    ``_ensure_schema()`` recreates it right after migrations run, this time
+    parameterized by the configured embedding model's actual dimensions and
+    keyed by ``(message_id, model_identity)`` — the same
+    dimension-parameterized, self-contained-outside-the-ledger shape
+    ``memory/postgres_index.py``'s ``memory_chunk_embeddings`` already uses,
+    for the same reason: a ``vector(N)`` column's width can't be a bind
+    parameter, so it can't live inside a migration whose whole point is
+    frozen, checksummed source.
+
+    Runs exactly once per database (recorded in the ``schema_migrations``
+    ledger like any other migration) — a fresh database that never had the
+    old table simply drops nothing, harmlessly.
+    """
+    conn.execute("DROP TABLE IF EXISTS message_embeddings")
+
+
+def _migration_003_message_embedding_jobs(conn) -> None:
+    """Durable one-job-per-message embedding queue (MEM-GAP-006).
+
+    Structurally identical to ``memory_capture_jobs``/``memory_commitment_jobs``
+    (same claim/complete/fail lifecycle via ``FOR UPDATE SKIP LOCKED``), but
+    ``message_id`` instead of a ``(source_from, source_to)`` range — each job
+    embeds exactly one message, so there is no range to express. See the
+    module docstring's "Durable message-embedding jobs" section.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_embedding_jobs (
+            id               BIGSERIAL PRIMARY KEY,
+            agent_id         TEXT NOT NULL,
+            session_id       TEXT NOT NULL,
+            message_id       BIGINT NOT NULL,
+            idempotency_key  TEXT NOT NULL UNIQUE,
+            state            TEXT NOT NULL DEFAULT 'pending',
+            attempts         INTEGER NOT NULL DEFAULT 0,
+            run_after        DOUBLE PRECISION NOT NULL,
+            last_error       TEXT,
+            created_at       DOUBLE PRECISION NOT NULL,
+            updated_at       DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS message_embedding_jobs_pending_idx
+        ON message_embedding_jobs (state, run_after)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS message_embedding_jobs_session_idx
+        ON message_embedding_jobs (agent_id, session_id)
+    """)
+
+
 # Every migration SessionDB knows about, in the order they were introduced.
 # Append new migrations here — never edit an existing entry's `apply`
 # function once it has shipped (see _migration_001_baseline's docstring).
 _SESSION_DB_MIGRATIONS = [
     Migration(1, "baseline", _migration_001_baseline),
+    Migration(2, "drop_legacy_message_embeddings", _migration_002_drop_legacy_message_embeddings),
+    Migration(3, "message_embedding_jobs", _migration_003_message_embedding_jobs),
 ]
 
 
@@ -343,13 +445,32 @@ class SessionDB:
 
     Args:
         url: libpq connection string, e.g. ``postgresql://user:pw@host/db``.
+        embedding_dimensions: The configured embedding model's vector length
+            (``config.embeddings.dimensions``), or ``None`` if no embedding
+            backend is configured. Same reasoning as
+            ``PostgresMemoryIndex.__init__`` — a pgvector column's width is
+            fixed at ``CREATE TABLE`` time, so this must be known up front.
+            When ``None`` (the default), ``message_embeddings`` is never
+            created and the session vector lane simply doesn't exist.
+        embedding_provider: The :class:`~minion_assist.providers.embeddings.EmbeddingProvider`
+            :meth:`hybrid_search_messages` calls to embed a query. ``None``
+            (the default) means the vector lane stays empty even if
+            ``embedding_dimensions`` created the table — search degrades to
+            FTS-only, exactly as if no embedding backend were configured.
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(
+        self,
+        url: str,
+        embedding_dimensions: int | None = None,
+        embedding_provider: "EmbeddingProvider | None" = None,
+    ) -> None:
         import psycopg  # noqa: PLC0415
         self._url = url
         self._psycopg = psycopg
         self._has_vector = False
+        self._embedding_dimensions = embedding_dimensions
+        self._embedding_provider = embedding_provider
         self._ensure_schema()
 
     # ------------------------------------------------------------------
@@ -357,26 +478,85 @@ class SessionDB:
     # ------------------------------------------------------------------
 
     def _conn(self):
-        """Return a thread-local autocommit connection, creating it if needed."""
+        """Return a thread-local autocommit connection, creating it if needed.
+
+        Registers pgvector's psycopg adapter on every new connection when
+        ``self._has_vector`` is set — without it, a ``vector`` column
+        round-trips as a raw string instead of a usable list of floats. Same
+        pattern as ``PostgresMemoryIndex._conn()``.
+        """
         conn = getattr(_local, "conn", None)
         if conn is None or conn.closed:
             conn = self._psycopg.connect(self._url, autocommit=True)
+            if self._has_vector:
+                from pgvector.psycopg import register_vector  # noqa: PLC0415
+
+                register_vector(conn)
             _local.conn = conn
         return conn
+
+    @property
+    def has_vector_lane(self) -> bool:
+        """``True`` if pgvector is available AND an embedding model is configured.
+
+        Mirrors ``PostgresMemoryIndex.has_vector_lane`` — used by callers
+        (the message-embedding enqueue site, the worker, the vector search
+        lane) to no-op cleanly rather than each re-deriving this condition.
+        """
+        return self._has_vector and bool(self._embedding_dimensions)
+
+    @property
+    def embedding_model_identity(self) -> str | None:
+        """The configured embedding provider's identity string, or ``None`` if unconfigured.
+
+        Exposes :attr:`EmbeddingProvider.model_identity` without callers
+        (``agents/session.py``'s enqueue site, ``ReconciliationScheduler``)
+        needing to reach into ``self._embedding_provider`` directly — used
+        to build a message-embedding job's idempotency key.
+        """
+        return self._embedding_provider.model_identity if self._embedding_provider else None
 
     def _ensure_schema(self) -> None:
         conn = self._conn()
         # pgvector extension (optional — silently skipped if not available).
         # Kept here rather than inside a migration: this mutates self, which
         # a migration function (checksummed, self-less by design — see
-        # schema_migrations.py) has no access to.
+        # schema_migrations.py) has no access to. Registered on *this*
+        # connection immediately since _conn() only registers it for
+        # connections created *after* self._has_vector becomes True.
         try:
             conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             self._has_vector = True
+            from pgvector.psycopg import register_vector  # noqa: PLC0415
+
+            register_vector(conn)
         except Exception:
             pass
 
         run_migrations(conn, "session_db", _SESSION_DB_MIGRATIONS)
+
+        # message_embeddings — created only when pgvector is available AND
+        # an embedding backend is configured (MEM-GAP-006). Parameterized by
+        # the configured model's dimensions; kept outside the checksummed
+        # migration ledger for the same reason memory_chunk_embeddings is —
+        # see _migration_002_drop_legacy_message_embeddings's docstring.
+        # Keyed by (message_id, model_identity), NOT message_id alone: a
+        # model/dimension change adds new rows under a new identity instead
+        # of requiring a destructive migration.
+        if self._has_vector and self._embedding_dimensions:
+            dims = int(self._embedding_dimensions)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS message_embeddings (
+                    message_id     BIGINT NOT NULL,
+                    model_identity TEXT NOT NULL,
+                    embedding      vector({dims}) NOT NULL,
+                    PRIMARY KEY (message_id, model_identity)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS message_embeddings_hnsw "
+                "ON message_embeddings USING hnsw (embedding vector_cosine_ops)"
+            )
 
     # ------------------------------------------------------------------
     # Session operations
@@ -489,8 +669,8 @@ class SessionDB:
         message id, no ``session_id`` column of its own), ``message_mirrors``,
         ``messages``, this session's ``memory_proposals`` (via their
         ``memory_capture_jobs``), ``memory_capture_jobs``,
-        ``memory_commitment_jobs``, ``commitments``, and finally the
-        ``sessions`` row itself.
+        ``memory_commitment_jobs``, ``message_embedding_jobs``,
+        ``commitments``, and finally the ``sessions`` row itself.
 
         Deliberately does **not** touch anything outside this database, and
         does **not** touch any durable memory note a *promoted* proposal's
@@ -529,10 +709,11 @@ class SessionDB:
                 "SELECT id FROM messages WHERE session_id = %s", (session_id,)
             ).fetchall()
         ]
-        if message_ids and self._has_vector:
+        if message_ids and self.has_vector_lane:
             conn.execute(
                 "DELETE FROM message_embeddings WHERE message_id = ANY(%s)", (message_ids,)
             )
+        conn.execute("DELETE FROM message_embedding_jobs WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM message_mirrors WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM messages WHERE session_id = %s", (session_id,))
 
@@ -673,6 +854,98 @@ class SessionDB:
             }
             for r in rows
         ]
+
+    def _vector_search_messages(self, query: str, agent_id: str, limit: int) -> list[dict]:
+        """Cosine-similarity ranking against cached message embeddings (MEM-GAP-006).
+
+        Mirrors ``PostgresMemoryIndex._vector_lane``'s shape and error
+        handling: returns an empty lane (never raises) if no embedding
+        provider is configured, or if embedding the query itself fails —
+        the vector lane is optional by design, same as the memory index's.
+        Scoped by ``agent_id`` through the same ``sessions`` join
+        :meth:`search_messages` uses, so this can never surface another
+        agent's message content (MEM-GAP-002).
+        """
+        if self._embedding_provider is None or not self.has_vector_lane:
+            return []
+        try:
+            [query_vector] = self._embedding_provider.embed([query])
+        except Exception:
+            return []
+
+        # %s::vector explicit casts: without them, psycopg sends a bare
+        # Python list as a plain float8[] array and pgvector's <=> operator
+        # has no overload for vector <=> float8[] — same reasoning as
+        # PostgresMemoryIndex._vector_lane's identical cast.
+        rows = self._conn().execute(
+            """
+            SELECT m.id, m.session_id, m.role, m.content, m.tool_name, m.timestamp,
+                   1 - (me.embedding <=> %s::vector) AS similarity
+            FROM messages m
+            JOIN message_embeddings me ON me.message_id = m.id AND me.model_identity = %s
+            JOIN sessions s ON s.id = m.session_id
+            WHERE s.agent_id = %s
+            ORDER BY me.embedding <=> %s::vector
+            LIMIT %s
+            """,
+            (query_vector, self._embedding_provider.model_identity, agent_id, query_vector, limit),
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "session_id": r[1], "role": r[2],
+                "content": r[3], "tool_name": r[4], "timestamp": r[5],
+                "snippet": None, "rank": float(r[6]),
+            }
+            for r in rows
+        ]
+
+    def hybrid_search_messages(self, query: str, agent_id: str, limit: int = 10) -> list[dict]:
+        """Lexical + vector fused session-message search (MEM-GAP-006).
+
+        Reciprocal-rank-fuses :meth:`search_messages`'s FTS lane with
+        :meth:`_vector_search_messages`'s cosine-similarity lane, reusing
+        ``memory/postgres_index.py``'s ``_reciprocal_rank_fusion`` — the
+        same fusion algorithm ``PostgresMemoryIndex.hybrid_search`` uses for
+        memory files, applied here to session messages instead. Degrades to
+        FTS-only automatically when no embedding provider is configured
+        (the vector lane returns ``[]``), so callers
+        (``tools/session_search.py``) never need to branch on whether
+        embeddings are available.
+
+        Args:
+            query: The search text — used verbatim for both lanes (FTS
+                ``websearch_to_tsquery`` syntax and the embedding call).
+            agent_id: Scopes both lanes (MEM-GAP-002).
+            limit: Result count per lane before fusion, and of the final
+                fused list.
+
+        Returns:
+            list[dict]: Same shape as :meth:`search_messages`'s rows
+                (``id``, ``session_id``, ``role``, ``content``, ``tool_name``,
+                ``timestamp``, ``snippet``, ``rank``), ordered by fused
+                score descending. ``rank`` is the fused RRF score, not
+                either lane's original rank/similarity.
+        """
+        lexical_hits = self.search_messages(query, agent_id, limit=limit)
+        vector_hits = self._vector_search_messages(query, agent_id, limit)
+        if not vector_hits:
+            return lexical_hits
+
+        from ..memory.postgres_index import _reciprocal_rank_fusion  # noqa: PLC0415
+
+        # Lexical lane listed first: when both lanes agree on a message,
+        # _reciprocal_rank_fusion's rows.setdefault() keeps the lexical
+        # lane's dict (real ts_headline snippet) over the vector lane's
+        # (snippet=None) — same lane ordering PostgresMemoryIndex.hybrid_search
+        # uses so richer-field lanes win ties.
+        scores, rows = _reciprocal_rank_fusion([lexical_hits, vector_hits])
+        ranked_ids = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+        fused = []
+        for message_id, score in ranked_ids:
+            row = dict(rows[message_id])
+            row["rank"] = score
+            fused.append(row)
+        return fused
 
     def _session_owned_by(self, session_id: str, agent_id: str) -> bool:
         """Return ``True`` if ``session_id`` exists and belongs to ``agent_id``.
@@ -1337,6 +1610,179 @@ class SessionDB:
         )
 
     # ------------------------------------------------------------------
+    # Message-embedding job queue (MEM-GAP-006)
+    # ------------------------------------------------------------------
+    # Same claim/complete/fail lifecycle as the capture/commitment queues
+    # above (FOR UPDATE SKIP LOCKED, exponential backoff, ON CONFLICT DO
+    # NOTHING idempotency), but one job embeds exactly one message rather
+    # than extracting from a range — see the module docstring's "Durable
+    # message-embedding jobs" section.
+
+    def enqueue_message_embedding_job(
+        self, agent_id: str, session_id: str, message_id: int, idempotency_key: str,
+    ) -> int | None:
+        """Enqueue a message-embedding job, idempotently.
+
+        Args:
+            agent_id: The agent this message belongs to.
+            session_id: The session this message belongs to.
+            message_id: The message to embed.
+            idempotency_key: Typically ``"{agent}:{message_id}:{model_identity}"``
+                — enqueuing the same message under the same embedding
+                model/endpoint twice is a no-op, not a duplicate job.
+
+        Returns:
+            int | None: The new job's id, or ``None`` if a job with this
+                ``idempotency_key`` already exists.
+        """
+        now = time.time()
+        row = self._conn().execute(
+            """
+            INSERT INTO message_embedding_jobs
+                (agent_id, session_id, message_id, idempotency_key,
+                 state, attempts, run_after, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, 'pending', 0, %s, %s, %s)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id
+            """,
+            (agent_id, session_id, message_id, idempotency_key, now, now, now),
+        ).fetchone()
+        return row[0] if row else None
+
+    def claim_next_message_embedding_job(self) -> dict | None:
+        """Atomically claim one pending, due message-embedding job for processing.
+
+        Identical mechanics to :meth:`claim_next_capture_job` — see its
+        docstring.
+
+        Returns:
+            dict | None: ``{"id", "agent_id", "session_id", "message_id",
+                "attempts"}``, or ``None`` if no job is currently due.
+        """
+        now = time.time()
+        row = self._conn().execute(
+            """
+            UPDATE message_embedding_jobs
+            SET state = 'running', updated_at = %s
+            WHERE id = (
+                SELECT id FROM message_embedding_jobs
+                WHERE state = 'pending' AND run_after <= %s
+                ORDER BY id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, agent_id, session_id, message_id, attempts
+            """,
+            (now, now),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0], "agent_id": row[1], "session_id": row[2],
+            "message_id": row[3], "attempts": row[4],
+        }
+
+    def complete_message_embedding_job(
+        self, job_id: int, message_id: int, model_identity: str, embedding: list[float],
+    ) -> None:
+        """Store the embedded vector and mark a message-embedding job done.
+
+        Upserts into ``message_embeddings`` (``ON CONFLICT ... DO UPDATE``)
+        rather than a plain insert, so retrying a job that partially
+        completed (vector written, job marked done failed before this
+        method returned) is safe to run again.
+
+        Args:
+            job_id: The job to complete.
+            message_id: The message that was embedded — passed separately
+                rather than re-queried, since the caller (the worker) has
+                it already from :meth:`claim_next_message_embedding_job`.
+            model_identity: Identifies which model/endpoint produced this
+                vector (:attr:`EmbeddingProvider.model_identity`).
+            embedding: The embedding vector itself.
+        """
+        now = time.time()
+        conn = self._conn()
+        conn.execute(
+            """
+            INSERT INTO message_embeddings (message_id, model_identity, embedding)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (message_id, model_identity) DO UPDATE SET embedding = EXCLUDED.embedding
+            """,
+            (message_id, model_identity, embedding),
+        )
+        conn.execute(
+            "UPDATE message_embedding_jobs SET state = 'done', updated_at = %s WHERE id = %s",
+            (now, job_id),
+        )
+
+    def fail_message_embedding_job(
+        self, job_id: int, error: str, backoff_seconds: float, max_attempts: int = 5,
+    ) -> None:
+        """Record a failed embedding attempt — retry with backoff, or give up.
+
+        Identical mechanics to :meth:`fail_capture_job` — see its
+        docstring.
+        """
+        now = time.time()
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT attempts FROM message_embedding_jobs WHERE id = %s", (job_id,)
+        ).fetchone()
+        attempts = (row[0] if row else 0) + 1
+        state = "failed" if attempts >= max_attempts else "pending"
+        conn.execute(
+            """
+            UPDATE message_embedding_jobs
+            SET state = %s, attempts = %s, run_after = %s, last_error = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (state, attempts, now + backoff_seconds, error, now, job_id),
+        )
+
+    def find_uncovered_message_ids_for_embedding(
+        self, agent_id: str, session_id: str
+    ) -> list[int]:
+        """Return mirrored user/assistant message ids newer than this session's last embedding job.
+
+        Same "coarse catch-up" purpose as :meth:`find_uncovered_capture_range`
+        (MEM-GAP-007's enqueue-can-fail problem, applied to embedding jobs),
+        but returns an explicit list of message ids rather than a
+        ``(from_id, to_id)`` range tuple: a capture job covers *every*
+        message in a range regardless of role, so a range is enough: an
+        embedding job is one-per-message, and messages with no content
+        (e.g. bare tool calls) or a non-user/assistant role never get a job
+        at all — collapsing to a range and reconstructing member ids from it
+        would incorrectly include those. Returning the exact ids sidesteps
+        that.
+
+        Args:
+            agent_id: The agent this session must belong to.
+            session_id: The session to check.
+
+        Returns:
+            list[int]: Message ids with no embedding job yet, ascending, or
+                ``[]`` if ``session_id`` isn't owned by ``agent_id`` or
+                there's nothing to catch up on.
+        """
+        if not self._session_owned_by(session_id, agent_id):
+            return []
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT MAX(message_id) FROM message_embedding_jobs "
+            "WHERE agent_id = %s AND session_id = %s",
+            (agent_id, session_id),
+        ).fetchone()
+        last_covered = row[0] if row and row[0] is not None else 0
+        rows = conn.execute(
+            "SELECT id FROM messages "
+            "WHERE session_id = %s AND role IN ('user', 'assistant') "
+            "AND content IS NOT NULL AND id > %s ORDER BY id",
+            (session_id, last_covered),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    # ------------------------------------------------------------------
     # Queue health (MEM-GAP-016)
     # ------------------------------------------------------------------
 
@@ -1357,7 +1803,8 @@ class SessionDB:
 
         Returns:
             dict: ``{"capture": {"pending_count", "oldest_pending_age_s"},
-                "commitment": {"pending_count", "oldest_pending_age_s"}}``.
+                "commitment": {"pending_count", "oldest_pending_age_s"},
+                "message_embedding": {"pending_count", "oldest_pending_age_s"}}``.
                 ``oldest_pending_age_s`` is seconds since the oldest pending
                 job was created, or ``None`` if the queue is empty.
         """
@@ -1380,6 +1827,7 @@ class SessionDB:
         return {
             "capture": _lane("memory_capture_jobs"),
             "commitment": _lane("memory_commitment_jobs"),
+            "message_embedding": _lane("message_embedding_jobs"),
         }
 
     def find_uncovered_capture_range(

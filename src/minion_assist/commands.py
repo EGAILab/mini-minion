@@ -367,6 +367,7 @@ def parse_command(text: str) -> tuple[str, str] | None:
 _KNOWN_WORKER_NAMES = (
     "capture_worker",
     "commitment_worker",
+    "message_embedding_worker",
     "memory_watcher",
     "memory_reconciliation",
     "memory_consolidation",
@@ -452,11 +453,14 @@ def _format_deep_status(ctx: CommandContext) -> list[str]:
             continue
         capture = lag["capture"]
         commitment = lag["commitment"]
+        message_embedding = lag["message_embedding"]
         lines.append(
             f"    [{aid}] capture_pending={capture['pending_count']}"
             f" (oldest {_format_duration(capture['oldest_pending_age_s'])})"
             f"  commitment_pending={commitment['pending_count']}"
             f" (oldest {_format_duration(commitment['oldest_pending_age_s'])})"
+            f"  message_embedding_pending={message_embedding['pending_count']}"
+            f" (oldest {_format_duration(message_embedding['oldest_pending_age_s'])})"
         )
         session = ctx.sessions.get(aid)
         memory = getattr(session, "memory", None)

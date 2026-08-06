@@ -470,6 +470,7 @@ def test_dispatch_status_deep_reports_queue_lag_from_the_database():
     db.queue_lag_summary.return_value = {
         "capture": {"pending_count": 3, "oldest_pending_age_s": 120.0},
         "commitment": {"pending_count": 0, "oldest_pending_age_s": None},
+        "message_embedding": {"pending_count": 2, "oldest_pending_age_s": 5.0},
     }
     with patch("minion_assist.config.streaming") as mock_streaming:
         mock_streaming.chat_mode = False
@@ -477,6 +478,7 @@ def test_dispatch_status_deep_reports_queue_lag_from_the_database():
     db.queue_lag_summary.assert_called_once_with("main")
     assert "capture_pending=3" in result.message
     assert "commitment_pending=0" in result.message
+    assert "message_embedding_pending=2" in result.message
 
 
 def test_dispatch_status_deep_reports_index_summary_from_the_agents_memory():
@@ -489,6 +491,7 @@ def test_dispatch_status_deep_reports_index_summary_from_the_agents_memory():
     db.queue_lag_summary.return_value = {
         "capture": {"pending_count": 0, "oldest_pending_age_s": None},
         "commitment": {"pending_count": 0, "oldest_pending_age_s": None},
+        "message_embedding": {"pending_count": 0, "oldest_pending_age_s": None},
     }
     with patch("minion_assist.config.streaming") as mock_streaming:
         mock_streaming.chat_mode = False

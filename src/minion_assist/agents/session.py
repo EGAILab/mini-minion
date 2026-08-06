@@ -993,6 +993,35 @@ class AgentSession:
                                 f"{type(_enqueue_exc).__name__}: {_enqueue_exc}"
                             )
 
+            # Enqueue message-embedding jobs for the turn's new messages
+            # (MEM-GAP-006). Independent of the capture/commitment flags
+            # above — this just makes the raw messages semantically
+            # searchable, unrelated to fact extraction. No-op when no
+            # embedding provider is configured (has_vector_lane is False).
+            # One job per message (unlike capture/commitment's one job per
+            # range) since each message embeds independently.
+            if self._db is not None and self._db.has_vector_lane:
+                _model_identity = self._db.embedding_model_identity
+                for _emb_message_id in _mirrored_ua_ids[-2:]:
+                    _emb_idem_key = (
+                        f"{self._agent_id}:{_emb_message_id}:{_model_identity}"
+                    )
+                    try:
+                        self._db.enqueue_message_embedding_job(
+                            self._agent_id, self._session_id, _emb_message_id, _emb_idem_key,
+                        )
+                        if self._health is not None:
+                            self._health.record_success()
+                    except Exception as _enqueue_exc:
+                        # See the capture-job enqueue comment above — same
+                        # reasoning, healed by ReconciliationScheduler's
+                        # find_uncovered_message_ids_for_embedding catch-up
+                        # pass.
+                        if self._health is not None:
+                            self._health.record_failure(
+                                f"{type(_enqueue_exc).__name__}: {_enqueue_exc}"
+                            )
+
             # Emit TurnCompleted — ignored by CLI, consumed by structured log handlers.
             if on_event:
                 _tool_calls_made = sum(

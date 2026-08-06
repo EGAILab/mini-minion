@@ -141,7 +141,7 @@ minion-assist/
 │   │   ├── todo.py              # TodoWriteTool, TodoReadTool — session-scoped todo list
 │   │   ├── memory.py            # SaveMemoryTool, SearchMemoryTool
 │   │   ├── write_daily_memory.py # WriteDailyMemoryTool — daily log append
-│   │   ├── session_search.py    # SessionSearchTool — FTS search across this agent's own past sessions (requires PostgreSQL)
+│   │   ├── session_search.py    # SessionSearchTool — lexical + vector fused search across this agent's own past sessions (requires PostgreSQL; MEM-GAP-006)
 │   │   ├── browser.py           # BrowserTool — Playwright browser automation (start/navigate/evaluate/screenshot/pick/cookies/stop)
 │   │   ├── mcp.py               # McpToolAdapter, McpStatusTool, ListMcpResourcesTool, ReadMcpResourceTool, ListMcpPromptsTool, GetMcpPromptTool
 │   │   ├── skill.py             # SkillTool — load skill instructions on demand
@@ -193,6 +193,7 @@ minion-assist/
 │   │   ├── boundaries.py        # Phase 6: action-boundary frontmatter parsing (owner/applies_when/expires_at/…)
 │   │   ├── commitments.py       # Phase 6: inferred, short-lived commitment extraction
 │   │   ├── commitment_worker.py # Phase 6: durable commitment-extraction queue worker (needs db)
+│   │   ├── message_embedding_worker.py # MessageEmbeddingWorker — durable session-message embedding queue worker (needs db + embeddings; MEM-GAP-006)
 │   │   ├── knowledge.py         # Phase 7: claim marker parsing/rendering + compile_digest()
 │   │   ├── digest_scheduler.py  # Phase 7: KnowledgeDigestScheduler — daily KNOWLEDGE_DIGEST.md recompilation
 │   │   ├── import_review.py     # Phase 7: ImportReviewer — quarantined-import preview/approve/reject
@@ -459,7 +460,7 @@ The REPL recognises slash commands that start with `/`. Type `/help` to print th
 | `/clear` | Alias for `/new` |
 | `/reset` | Alias for `/new` |
 | `/compact` | Force immediate context compaction for all agents |
-| `/status [deep]` | Show session metadata (turn counts, last active) for each agent. `/status deep` also reports background-worker liveness (capture/commitment workers, memory watcher, memory reconciliation, schedulers, and one `session_writes:{agent_id}` row per agent for mirror/enqueue health — last poll/success/error, MEM-GAP-007/016) and, when a database is configured, per-agent capture/commitment queue lag and lexical-index summary. Works from both the REPL and Matrix chat. |
+| `/status [deep]` | Show session metadata (turn counts, last active) for each agent. `/status deep` also reports background-worker liveness (capture/commitment/message-embedding workers, memory watcher, memory reconciliation, schedulers, and one `session_writes:{agent_id}` row per agent for mirror/enqueue health — last poll/success/error, MEM-GAP-007/016) and, when a database is configured, per-agent capture/commitment/message-embedding queue lag and lexical-index summary. Works from both the REPL and Matrix chat. |
 | `/agents` | List all known agents with turn counts and last-active timestamps |
 | `/session [N\|uuid-prefix]` | List past conversation sessions for the active agent; restore one by index or UUID prefix |
 | `/rename [N] <name>` | Give the current session (or session N from /session) a descriptive name |
@@ -1105,7 +1106,7 @@ All ML packages (`silero_vad`, `torch`, `nemo`, `transformers`, `kokoro`, `piper
 
 ## PostgreSQL Session Store
 
-minion-assist can mirror every conversation message into a PostgreSQL database, enabling full-text search across an agent's own historical sessions via the `session_search` tool (strictly agent-scoped — see "session_search Tool Modes" below).  The file-based JSONL store always remains active — PostgreSQL is an additive layer, not a replacement.
+minion-assist can mirror every conversation message into a PostgreSQL database, enabling full-text search — fused with semantic (vector) search when an embedding provider is configured (MEM-GAP-006, see "Embeddings and the vector lane") — across an agent's own historical sessions via the `session_search` tool (strictly agent-scoped — see "session_search Tool Modes" below).  The file-based JSONL store always remains active — PostgreSQL is an additive layer, not a replacement.
 
 ### Setup
 
@@ -1138,6 +1139,7 @@ On every startup minion-assist will:
 3. Register the `session_search` tool in every agent's tool registry.
 4. Dual-write every new message to both JSONL and PostgreSQL, idempotently (see below).
 5. Start one `CaptureWorker` background thread that services the durable capture-job queue for every agent (see below).
+6. When an `"embeddings"` provider is also configured, start one `MessageEmbeddingWorker` background thread that services the durable message-embedding queue for every agent (MEM-GAP-006, see "Embeddings and the vector lane").
 
 ### Schema
 
@@ -1145,7 +1147,8 @@ On every startup minion-assist will:
 |---|---|
 | `sessions` | One row per session: `id`, `agent_id`, `source`, `started_at`, `last_active`, `turn_count`, `title`, `parent_id` |
 | `messages` | Every message with a `tsvector` generated column for FTS, GIN-indexed. Columns: `id` (BIGSERIAL), `session_id`, `role`, `content`, `tool_name`, `timestamp`, `search_vector` |
-| `message_embeddings` | Optional — created only when the `vector` extension (pgvector) is available. Holds `vector(1536)` embeddings for future semantic search. |
+| `message_embeddings` | Optional — created only when pgvector is available **and** an `"embeddings"` provider is configured (MEM-GAP-006). `PRIMARY KEY (message_id, model_identity)` — a model/dimension change adds new rows under a new `model_identity` rather than requiring a destructive migration, same shape as `memory_chunk_embeddings` below. Vector width (`vector(N)`) parameterized by `embeddings.dimensions`. |
+| `message_embedding_jobs` | Durable one-job-per-message embedding queue (MEM-GAP-006), structurally identical to `memory_capture_jobs` below but `message_id` instead of a source range. Columns: `id` (BIGSERIAL), `agent_id`, `session_id`, `message_id`, `idempotency_key` (UNIQUE, `"{agent}:{message_id}:{model_identity}"`), `state`, `attempts`, `run_after`, `last_error`, `created_at`, `updated_at`. |
 | `message_mirrors` | Idempotency ledger, `PRIMARY KEY (session_id, event_id)`. Every mirror attempt is keyed by a message's stable `event_id` (see below) — mirroring the same message twice is a no-op, not a duplicate row. |
 | `memory_capture_jobs` | Durable fact-extraction queue. Columns: `id` (BIGSERIAL), `agent_id`, `session_id`, `source_from_message_id`, `source_to_message_id`, `idempotency_key` (UNIQUE), `state` (`pending`/`running`/`done`/`failed`), `attempts`, `run_after`, `last_error`, `created_at`, `updated_at`. |
 | `memory_proposals` | Unreviewed extracted claims. Columns: `id` (BIGSERIAL), `job_id`, `agent_id`, `claim_text`, `created_at`. |
@@ -1160,7 +1163,7 @@ Every applied migration's actual source code is hashed (via `inspect.getsource`)
 
 Both are deliberate — an unverifiable schema is exactly the failure mode this exists to prevent, not something to warn about and continue past. Going forward, any *new* schema change is added as a new, higher-numbered `Migration` in `_SESSION_DB_MIGRATIONS`/`_MEMORY_INDEX_MIGRATIONS`, never an edit to the baseline.
 
-One deliberate exception: `PostgresMemoryIndex`'s `memory_chunk_embeddings` table (vector width parameterized by the configured embedding model's dimensions, plus its own self-healing old-primary-key-detection logic) stays outside the checksummed ledger — its shape depends on runtime config, not fixed schema history. Safely changing an existing deployment's embedding dimensions remains a known open gap (MEM-GAP-006).
+One deliberate exception: `PostgresMemoryIndex`'s `memory_chunk_embeddings` table and `SessionDB`'s `message_embeddings` table (both vector width parameterized by the configured embedding model's dimensions) stay outside the checksummed ledger — their shape depends on runtime config, not fixed schema history. Both are keyed by `(content_hash|message_id, model_identity)` rather than row id alone, so a model or dimension *change* is handled by adding new rows under a new `model_identity` — not by altering the existing `vector(N)` column. What remains unhandled is a `vector(N)` column that already exists at one width being asked to hold a *different* width's vectors (PostgreSQL has no `ALTER COLUMN` for this): the first process to create either table fixes its width for that table's lifetime; a later config change to different `dimensions` silently no-ops on `CREATE TABLE IF NOT EXISTS` rather than resizing it. Recreating the table (drop + let `_ensure_schema()` rebuild it) after a dimensions change is a manual step for now.
 
 ### Idempotent mirroring (Stage One Phase 2, slice A)
 
@@ -1170,14 +1173,15 @@ Without a configured database, no `_event_id` is assigned at all — there's not
 
 ### Reconciliation: self-healing writes and concurrency safety (MEM-GAP-007/009)
 
-Every mirror/enqueue attempt inside `AgentSession._send_locked()` (message mirroring, capture-job enqueue, commitment-job enqueue) is wrapped in a `try`/`except` — a transient PostgreSQL failure (e.g. a momentary connection drop) must never fail the turn itself, since the turn's content is already safely on disk in JSONL. Before this fix, a caught exception there was simply discarded: that turn's mirror or job would never exist, and nothing ever retried it short of a full process restart (`SessionDB.reconcile_all_sessions()` previously only ran once, at startup).
+Every mirror/enqueue attempt inside `AgentSession._send_locked()` (message mirroring, capture-job enqueue, commitment-job enqueue, message-embedding-job enqueue — MEM-GAP-006) is wrapped in a `try`/`except` — a transient PostgreSQL failure (e.g. a momentary connection drop) must never fail the turn itself, since the turn's content is already safely on disk in JSONL. Before this fix, a caught exception there was simply discarded: that turn's mirror or job would never exist, and nothing ever retried it short of a full process restart (`SessionDB.reconcile_all_sessions()` previously only ran once, at startup).
 
-**Now visible.** Each of those four sites optionally records into a `WorkerHealth` (see "Health and diagnostics" below) instead of swallowing silently — `/status deep` shows a `session_writes:{agent_id}` row with `consecutive_failures`/`last_error` if mirroring or enqueueing has started failing.
+**Now visible.** Each of those sites optionally records into a `WorkerHealth` (see "Health and diagnostics" below) instead of swallowing silently — `/status deep` shows a `session_writes:{agent_id}` row with `consecutive_failures`/`last_error` if mirroring or enqueueing has started failing.
 
 **Now self-healing.** `ReconciliationScheduler` (`memory/reconciliation_scheduler.py`) runs a periodic background pass — no separate `enabled` flag, it simply starts whenever a database is configured, the same as `CaptureWorker`/`MemoryIndexWatcher`:
 
 1. **Mirror gaps** — re-runs `SessionDB.reconcile_all_sessions()` (unchanged logic, just no longer startup-only): diffs every agent's JSONL against `message_mirrors` and mirrors whatever's missing.
 2. **Job-coverage gaps** — `SessionDB.find_uncovered_capture_range()`/`find_uncovered_commitment_range()` find mirrored messages newer than a session's last enqueued capture/commitment job and enqueue **one coarse catch-up job** for the whole gap, rather than trying to reconstruct exact per-turn boundaries from message content (which turn a given message belongs to isn't reliably re-derivable after the fact once tool calls are mixed in) — simpler and safer, at the cost of coarser batching for whatever gap accumulated (normally zero; only nonzero after a genuine failure). A session whose `last_active` is more recent than `quiet_seconds` is skipped for job-coverage catch-up, so a still-in-progress turn's own normal enqueue isn't raced.
+3. **Message-embedding gaps (MEM-GAP-006)** — `SessionDB.find_uncovered_message_ids_for_embedding()` finds mirrored messages newer than a session's last enqueued embedding job and enqueues **one job per missing message id** — unlike capture/commitment's coarse range, an embedding job is already one-per-message, so there's no coarser unit to batch into. No-op when no embedding provider is configured. Skipped entirely under the same `quiet_seconds` guard as the job-coverage gaps above.
 
 Configured under `"memory_reconciliation"` in `config.json` (all fields optional):
 
@@ -1243,7 +1247,7 @@ Without a configured database, none of the above run: `_memory_index`/`_memory_w
 
 ### Search, citations, and crash-safe reindex (Stage One Phase 3, slice C)
 
-`MemoryService.search()` now uses the lexical index when one is configured — a strictly larger corpus than the Phase 1 linear scan, since the index also covers root `MEMORY.md` (the linear scan never returns it at all). Each hit is a `MemoryHit` as before, now optionally carrying `rel_path`/`start_line`/`end_line`/`score` when it came from the index (`None` for a linear-scan hit). Pass `corpus="durable"|"daily"|"import"` to restrict results to one part of the memory root; `"proposal"` also works (Phase 5 slice B). A plain `corpus=None` search — used both for automatic per-turn injection and a bare `search_memory` call — excludes both `"proposal"` and `"import"` chunks by default (MEM-GAP-004): unreviewed capture-job proposals and quarantined imports never enter automatic recall unless a caller explicitly asks for that corpus, since neither has been reviewed and imports in particular can carry externally-sourced text. This applies to the no-index linear-scan fallback too (`MemoryFileRepository.search()`'s `exclude_sources` parameter). The plan's fourth corpus, "sessions", is deliberately not offered here since it's already the separate `session_search` tool's job.
+`MemoryService.search()` now uses the lexical index when one is configured — a strictly larger corpus than the Phase 1 linear scan, since the index also covers root `MEMORY.md` (the linear scan never returns it at all). Each hit is a `MemoryHit` as before, now optionally carrying `rel_path`/`start_line`/`end_line`/`score` when it came from the index (`None` for a linear-scan hit). Pass `corpus="durable"|"daily"|"import"` to restrict results to one part of the memory root; `"proposal"` also works (Phase 5 slice B). A plain `corpus=None` search — used both for automatic per-turn injection and a bare `search_memory` call — excludes both `"proposal"` and `"import"` chunks by default (MEM-GAP-004): unreviewed capture-job proposals and quarantined imports never enter automatic recall unless a caller explicitly asks for that corpus, since neither has been reviewed and imports in particular can carry externally-sourced text. This applies to the no-index linear-scan fallback too (`MemoryFileRepository.search()`'s `exclude_sources` parameter). The plan's fourth corpus, "sessions", is deliberately not offered here since it's already the separate `session_search` tool's job (lexical + vector fused since MEM-GAP-006 — see "Session semantic search" above).
 
 **Fallback behavior:** without a configured database, or if an index search call raises (e.g. a transient connection drop), `search()` falls back to the Phase 1 linear scan rather than failing the caller — a turn's `<relevant_memories>` injection must never break over a database hiccup. This fallback is not silent: a failed index search is logged at `WARNING`, and `deep_status()`/`memory status --deep` surface ongoing index health so a persistently broken index isn't invisible.
 
@@ -1278,9 +1282,21 @@ An optional `"embeddings"` section in `config.json` enables a semantic-search la
 
 | Table | Description |
 |---|---|
-| `memory_chunk_embeddings` | Embedding cache, `PRIMARY KEY (content_hash, model_identity)` — content-addressed, *not* tied to a `memory_chunks` row id (see below for why). Columns: `model_identity` (e.g. `"http://host/v1::nomic-embed-text-v1.5"` — lets a model/endpoint change be detected rather than silently mixing vectors from different embedding spaces), `embedding` (`vector(N)`, `N` from `embeddings.dimensions`). Only created when pgvector is available **and** an embedding backend is configured — both conditions, unlike `message_embeddings` above which only needs pgvector. |
+| `memory_chunk_embeddings` | Embedding cache, `PRIMARY KEY (content_hash, model_identity)` — content-addressed, *not* tied to a `memory_chunks` row id (see below for why). Columns: `model_identity` (e.g. `"http://host/v1::nomic-embed-text-v1.5"` — lets a model/endpoint change be detected rather than silently mixing vectors from different embedding spaces), `embedding` (`vector(N)`, `N` from `embeddings.dimensions`). Only created when pgvector is available **and** an embedding backend is configured. `SessionDB`'s `message_embeddings` (see "Session semantic search" below) is the same shape, one layer down, for session messages instead of memory-file chunks. |
 
 `PostgresMemoryIndex.has_vector_lane` reports whether both conditions hold. `cache_embedding()`/`get_cached_embedding()` are the storage primitives, keyed by `(content_hash, model_identity)` rather than a `memory_chunks` row id — `reindex_file()` deletes and reinserts every chunk of a file on every call (even when only one paragraph changed), so a row-id-keyed cache could never actually hit. `memory_chunks.chunk_hash` already stores the same hash per row, so the vector lane joins through that column instead of needing its own row reference — and since identical chunk text embeds identically regardless of which agent's note it came from, a cache hit is shared across agents for free. (An earlier, row-id-keyed version of this table shipped briefly before this design — `_ensure_schema()` detects and self-heals it on first connect if found, so nothing manual is needed on a machine that already ran that code.) A cache miss (no vector lane, or this exact `(content_hash, model_identity)` pair never embedded) always returns `None` rather than raising, so a caller can treat "compute a fresh embedding" as the uniform fallback.
+
+### Session semantic search (MEM-GAP-006)
+
+The same `"embeddings"` config above also activates a second, independent vector lane: semantic search over conversation history (`session_search`'s DISCOVER mode), not just memory files. Before this, `SessionDB` created a `message_embeddings` table with a hard-coded `vector(1536)` column but nothing ever wrote to or read from it — full-text search was the only way to find an old conversation, so a paraphrased recall ("that thing about the deploy last month" vs. the original wording) simply returned nothing.
+
+**Write path.** After each turn, `AgentSession._send_locked()` enqueues one `message_embedding_jobs` row per newly-mirrored user/assistant message — independent of the capture/commitment flags, since this just makes raw messages searchable, unrelated to fact extraction. No-op when no embedding provider is configured. One `MessageEmbeddingWorker` (`memory/message_embedding_worker.py`), started once at process startup, polls this queue the same way `CaptureWorker` polls `memory_capture_jobs` (`FOR UPDATE SKIP LOCKED` claim, exponential backoff on failure, `_MAX_ATTEMPTS = 5`) and stores each result in `message_embeddings`, keyed by `(message_id, model_identity)`.
+
+Deliberately a worker, not an inline call in `_send_locked()`: embedding is a network round trip, and the whole reason `memory_capture_jobs`/`CaptureWorker` exists instead of a synchronous per-turn extraction call is to never block a turn on one — the same reasoning applies here.
+
+**Read path.** `SessionDB.hybrid_search_messages(query, agent_id, limit)` reciprocal-rank-fuses `search_messages()`'s existing FTS lexical lane with a new cosine-similarity vector lane (`_vector_search_messages()`), reusing `memory/postgres_index.py`'s `_reciprocal_rank_fusion` — the same fusion algorithm `PostgresMemoryIndex.hybrid_search()` uses for memory files, applied here to session messages. Degrades to FTS-only automatically when no embedding provider is configured (the vector lane returns `[]`), so `SessionSearchTool`'s DISCOVER mode calls this unconditionally with no branch needed. Both lanes stay scoped by `agent_id` through the same `sessions` join `search_messages()` already used (MEM-GAP-002) — the vector lane can never surface another agent's message content.
+
+**Resumable.** `ReconciliationScheduler`'s third catch-up pass (see "Reconciliation" above) finds any mirrored message with no embedding job yet and enqueues one — so a transient enqueue failure heals itself on the next reconciliation pass instead of that message staying permanently unsearchable.
 
 ### Pinning (Stage One Phase 4, slice B)
 
@@ -1645,7 +1661,7 @@ simply returns nothing for it, the same as a session_id that doesn't exist.
 
 | Mode | Description |
 |---|---|
-| `DISCOVER` | FTS query across this agent's own sessions. Returns ranked matches with a snippet, ±3 message context window, and session bookends (first/last messages). Supports AND (default), OR, `"quoted phrase"`, `-exclude`, `prefix*`. |
+| `DISCOVER` | Lexical + vector fused query across this agent's own sessions (MEM-GAP-006) — semantic (paraphrase) matches on top of FTS when an embedding provider is configured; FTS-only otherwise. Returns ranked matches with a snippet, ±3 message context window, and session bookends (first/last messages). FTS lane supports AND (default), OR, `"quoted phrase"`, `-exclude`, `prefix*`. |
 | `SCROLL` | Read messages around a specific message ID in one of this agent's own sessions. Accepts `anchor_message_id` (0 = end of session) and `window` (default 5, max 20). |
 | `BROWSE` | List this agent's own 20 most recent sessions with title, turn count, age, and first-message preview. |
 
@@ -1655,7 +1671,7 @@ When using `docker-compose.yml`, PostgreSQL data is persisted to `../data/` (rel
 
 ### Graceful degradation
 
-If the database is unavailable at startup, minion-assist prints a warning and continues in file-only mode — `session_search` is not registered and `CaptureWorker` is never started. Fact extraction still happens via the original per-turn daemon thread (`extract_and_save_async`). No existing functionality is affected.
+If the database is unavailable at startup, minion-assist prints a warning and continues in file-only mode — `session_search` is not registered and `CaptureWorker`/`MessageEmbeddingWorker` are never started. Fact extraction still happens via the original per-turn daemon thread (`extract_and_save_async`). No existing functionality is affected.
 
 ---
 
@@ -2056,7 +2072,7 @@ registry.unregister_prefix("mcp__playwright__")            # remove all tools fo
 | `GitStatusTool` | `git_status` | Show git working-tree status (`git status --short --branch`): branch name, staged, modified, and untracked files. `is_read_only=True`. |
 | `GitDiffTool` | `git_diff` | Show a unified diff of changes. Optional `staged=true` for staged changes; optional `path` to limit to a file. `is_read_only=True`. |
 | `GitCommitTool` | `git_commit` | Stage files (optional `files` list) and create a git commit with the given `message`. Calls the `bash_confirm` callback before executing, same as `BashTool`. |
-| `SessionSearchTool` | `session_search` | Search, scroll, or browse past conversation sessions stored in PostgreSQL, scoped to the calling agent's own sessions only (MEM-GAP-002). Three modes: **DISCOVER** (FTS across this agent's own sessions — supports quoted phrases, `-exclude`, `prefix*`), **SCROLL** (paginate within one of this agent's own sessions by message ID), **BROWSE** (list this agent's own recent sessions). Only registered when a `database.url` is configured *and* an `agent_id` is known. `is_read_only=True`. |
+| `SessionSearchTool` | `session_search` | Search, scroll, or browse past conversation sessions stored in PostgreSQL, scoped to the calling agent's own sessions only (MEM-GAP-002). Three modes: **DISCOVER** (lexical + vector fused across this agent's own sessions — FTS supports quoted phrases, `-exclude`, `prefix*`; also finds paraphrased matches when an embedding provider is configured, MEM-GAP-006), **SCROLL** (paginate within one of this agent's own sessions by message ID), **BROWSE** (list this agent's own recent sessions). Only registered when a `database.url` is configured *and* an `agent_id` is known. `is_read_only=True`. |
 | `McpStatusTool` | `mcp_status` | List all configured MCP servers and their connection status. |
 | `ListMcpResourcesTool` | `list_mcp_resources` | List resources available on a connected MCP server. |
 | `ReadMcpResourceTool` | `read_mcp_resource` | Read a specific resource from a connected MCP server. Output capped at 8 000 chars. |

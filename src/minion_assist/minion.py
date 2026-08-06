@@ -363,12 +363,37 @@ def main() -> None:
             state_str = "OK" if status.state == "connected" else f"FAILED: {status.detail}"
             print(f"  MCP [{status.name}]: {state_str}")
 
+    # --- Embedding provider (optional — shared by SessionDB and PostgresMemoryIndex) ---
+    # Stage One Phase 4, slice A / MEM-GAP-006: pgvector's column width is
+    # fixed at table-creation time, so the configured model's dimensions (if
+    # any) must be known up front. embeddings_cfg is None when the
+    # "embeddings" config.json section is absent — every vector lane then
+    # simply never gets created.
+    _embedding_dims = embeddings_cfg.dimensions if embeddings_cfg else None
+    # Constructed once here (not inside SessionDB/PostgresMemoryIndex) so
+    # both stay free of a direct config.py dependency, and so there's only
+    # one OpenAI client/connection pool for embeddings per process — same
+    # reasoning CaptureWorker's injected provider_for_agent callable follows.
+    _embedding_provider = None
+    if embeddings_cfg is not None:
+        from .providers.embeddings import EmbeddingProvider  # noqa: PLC0415
+        _embedding_provider = EmbeddingProvider(
+            base_url=embeddings_cfg.provider.base_url,
+            api_key=embeddings_cfg.provider.api_key,
+            model=embeddings_cfg.model,
+            dimensions=embeddings_cfg.dimensions,
+        )
+
     # --- PostgreSQL session store (optional) ---
     _db = None
     if database_cfg.url:
         try:
             from .session.db import SessionDB  # noqa: PLC0415
-            _db = SessionDB(database_cfg.url)
+            _db = SessionDB(
+                database_cfg.url,
+                embedding_dimensions=_embedding_dims,
+                embedding_provider=_embedding_provider,
+            )
             print(f"Database connected: {database_cfg.url.split('@')[-1]}")
             # Reconcile every session's JSONL against message_mirrors — mirrors
             # exactly what's missing (including a partial mirror left by a prior
@@ -388,25 +413,6 @@ def main() -> None:
     if _db is not None:
         try:
             from .memory.postgres_index import PostgresMemoryIndex  # noqa: PLC0415
-            # Stage One Phase 4, slice A: pgvector's column width is fixed at
-            # table-creation time, so the configured model's dimensions (if
-            # any) must be known up front. embeddings_cfg is None when the
-            # "embeddings" config.json section is absent — the vector lane
-            # then simply never gets created.
-            _embedding_dims = embeddings_cfg.dimensions if embeddings_cfg else None
-            # Stage One Phase 4, slice C: constructed once here (not inside
-            # PostgresMemoryIndex) so the index stays free of a direct
-            # config.py dependency — same reasoning CaptureWorker's injected
-            # provider_for_agent callable follows.
-            _embedding_provider = None
-            if embeddings_cfg is not None:
-                from .providers.embeddings import EmbeddingProvider  # noqa: PLC0415
-                _embedding_provider = EmbeddingProvider(
-                    base_url=embeddings_cfg.provider.base_url,
-                    api_key=embeddings_cfg.provider.api_key,
-                    model=embeddings_cfg.model,
-                    dimensions=embeddings_cfg.dimensions,
-                )
             _memory_index = PostgresMemoryIndex(
                 database_cfg.url,
                 embedding_dimensions=_embedding_dims,
@@ -888,6 +894,19 @@ def main() -> None:
         )
         _commitment_worker.start()
 
+    # --- Durable message-embedding worker (optional — only when a database
+    # AND an embedding provider are both configured) ---
+    # MEM-GAP-006. One worker for the whole process, same shape as
+    # _capture_worker/_commitment_worker above.
+    _message_embedding_worker = None
+    if _db is not None and _embedding_provider is not None:
+        from .memory.message_embedding_worker import MessageEmbeddingWorker  # noqa: PLC0415
+        worker_health["message_embedding_worker"] = WorkerHealth("message_embedding_worker")
+        _message_embedding_worker = MessageEmbeddingWorker(
+            _db, _embedding_provider, health=worker_health["message_embedding_worker"],
+        )
+        _message_embedding_worker.start()
+
     # --- Memory index watcher (optional — only when a database is configured) ---
     # Stage One Phase 3, slice B: catches on-disk edits made outside the app
     # (e.g. hand-editing MEMORY.md in a text editor). Write-path sync already
@@ -1119,6 +1138,8 @@ def main() -> None:
             _capture_worker.stop()
         if _commitment_worker is not None:
             _commitment_worker.stop()
+        if _message_embedding_worker is not None:
+            _message_embedding_worker.stop()
         if _memory_watcher is not None:
             _memory_watcher.stop()
         if _memory_reconciliation is not None:
@@ -1209,6 +1230,8 @@ def main() -> None:
                 _capture_worker.stop()
             if _commitment_worker is not None:
                 _commitment_worker.stop()
+            if _message_embedding_worker is not None:
+                _message_embedding_worker.stop()
             if _memory_watcher is not None:
                 _memory_watcher.stop()
             if _memory_reconciliation is not None:
@@ -1370,6 +1393,8 @@ def main() -> None:
             _capture_worker.stop()
         if _commitment_worker is not None:
             _commitment_worker.stop()
+        if _message_embedding_worker is not None:
+            _message_embedding_worker.stop()
         if _memory_watcher is not None:
             _memory_watcher.stop()
         if _memory_reconciliation is not None:

@@ -19,15 +19,18 @@ Two kinds of gap, two mechanisms
    unchanged: it diffs every agent's JSONL session files (the always-durable
    source of truth) against ``message_mirrors`` and mirrors whatever's
    missing. Cheap and exact — no new logic needed here.
-2. **Job-coverage gaps** — capture/commitment jobs have no equivalent
-   "diff against a source of truth" (an enqueue intent isn't itself
-   persisted anywhere durable before the attempt). Instead,
+2. **Job-coverage gaps** — capture/commitment/message-embedding jobs have no
+   equivalent "diff against a source of truth" (an enqueue intent isn't
+   itself persisted anywhere durable before the attempt). Instead,
    :meth:`~minion_assist.session.db.SessionDB.find_uncovered_capture_range`/
-   :meth:`~minion_assist.session.db.SessionDB.find_uncovered_commitment_range`
+   :meth:`~minion_assist.session.db.SessionDB.find_uncovered_commitment_range`/
+   :meth:`~minion_assist.session.db.SessionDB.find_uncovered_message_ids_for_embedding`
    look for mirrored messages newer than a session's last enqueued job and
-   enqueue one coarse catch-up job for the whole gap — see those methods'
-   docstrings for why "coarse catch-up" rather than exact per-turn
-   reconstruction.
+   enqueue catch-up jobs for the gap — see those methods' docstrings for why
+   "coarse catch-up" rather than exact per-turn reconstruction (capture/
+   commitment), and why the embedding gap-finder returns exact message ids
+   instead of a range (MEM-GAP-006: one job per message, unlike capture/
+   commitment's one job per range).
 
 Quiet-period guard
 -------------------
@@ -44,10 +47,12 @@ Talks to
 - ``session/db.py`` — :meth:`SessionDB.reconcile_all_sessions`,
   :meth:`SessionDB.find_uncovered_capture_range`,
   :meth:`SessionDB.find_uncovered_commitment_range`,
+  :meth:`SessionDB.find_uncovered_message_ids_for_embedding`,
   :meth:`SessionDB.list_session_ids_for_agent`, :meth:`SessionDB.get_sessions_by_ids`,
-  :meth:`SessionDB.enqueue_capture_job`, :meth:`SessionDB.enqueue_commitment_job`.
+  :meth:`SessionDB.enqueue_capture_job`, :meth:`SessionDB.enqueue_commitment_job`,
+  :meth:`SessionDB.enqueue_message_embedding_job`.
 - ``memory/extractor.py`` / ``memory/commitments.py`` — the prompt-version
-  constants embedded in a catch-up job's idempotency key.
+  constants embedded in a capture/commitment catch-up job's idempotency key.
 - ``minion.py`` — constructs and starts one instance per process, only
   when a database is configured, passing every configured agent id.
 """
@@ -145,6 +150,7 @@ class ReconciliationScheduler:
                     continue  # possibly still mid-turn -- don't race a live enqueue
                 self._catch_up_capture(agent_id, session_id)
                 self._catch_up_commitment(agent_id, session_id)
+                self._catch_up_message_embedding(agent_id, session_id)
 
     def _catch_up_capture(self, agent_id: str, session_id: str) -> None:
         gap = self._db.find_uncovered_capture_range(agent_id, session_id)
@@ -170,3 +176,20 @@ class ReconciliationScheduler:
         self._db.enqueue_commitment_job(
             agent_id, session_id, channel, from_id, to_id, idem_key
         )
+
+    def _catch_up_message_embedding(self, agent_id: str, session_id: str) -> None:
+        """Enqueue one embedding job per message this session's gap-finder reports missing.
+
+        No-op when no embedding provider is configured
+        (``self._db.has_vector_lane`` is ``False``) — mirrors
+        :meth:`~minion_assist.session.db.SessionDB._vector_search_messages`'s
+        own no-op behavior in that case, rather than needlessly querying for
+        a gap that can never be filled.
+        """
+        if not self._db.has_vector_lane:
+            return
+        model_identity = self._db.embedding_model_identity
+        message_ids = self._db.find_uncovered_message_ids_for_embedding(agent_id, session_id)
+        for message_id in message_ids:
+            idem_key = f"{agent_id}:{message_id}:{model_identity}"
+            self._db.enqueue_message_embedding_job(agent_id, session_id, message_id, idem_key)

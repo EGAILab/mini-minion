@@ -79,6 +79,7 @@ def test_run_pass_reconciles_a_session_past_the_quiet_period():
     db.get_sessions_by_ids.return_value = {"s1": _session_info("s1", old)}
     db.find_uncovered_capture_range.return_value = None
     db.find_uncovered_commitment_range.return_value = None
+    db.has_vector_lane = False
     scheduler = ReconciliationScheduler(_make_cfg(quiet_seconds=60), db, ["main"], Mock())
 
     scheduler._run_pass()
@@ -94,6 +95,7 @@ def test_run_pass_reconciles_a_session_that_has_never_been_active():
     db.get_sessions_by_ids.return_value = {"s1": _session_info("s1", None)}
     db.find_uncovered_capture_range.return_value = None
     db.find_uncovered_commitment_range.return_value = None
+    db.has_vector_lane = False
     scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
 
     scheduler._run_pass()  # must not raise
@@ -166,6 +168,48 @@ def test_catch_up_commitment_does_nothing_when_fully_covered():
     scheduler._catch_up_commitment("main", "sess-1")
 
     db.enqueue_commitment_job.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _catch_up_message_embedding (MEM-GAP-006)
+# ---------------------------------------------------------------------------
+
+def test_catch_up_message_embedding_does_nothing_without_a_vector_lane():
+    db = Mock()
+    db.has_vector_lane = False
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._catch_up_message_embedding("main", "sess-1")
+
+    db.find_uncovered_message_ids_for_embedding.assert_not_called()
+    db.enqueue_message_embedding_job.assert_not_called()
+
+
+def test_catch_up_message_embedding_enqueues_one_job_per_missing_id():
+    db = Mock()
+    db.has_vector_lane = True
+    db.embedding_model_identity = "test-endpoint::test-model"
+    db.find_uncovered_message_ids_for_embedding.return_value = [10, 11]
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._catch_up_message_embedding("main", "sess-1")
+
+    assert db.enqueue_message_embedding_job.call_count == 2
+    first_call, second_call = db.enqueue_message_embedding_job.call_args_list
+    assert first_call.args == ("main", "sess-1", 10, "main:10:test-endpoint::test-model")
+    assert second_call.args == ("main", "sess-1", 11, "main:11:test-endpoint::test-model")
+
+
+def test_catch_up_message_embedding_does_nothing_when_fully_covered():
+    db = Mock()
+    db.has_vector_lane = True
+    db.embedding_model_identity = "test-endpoint::test-model"
+    db.find_uncovered_message_ids_for_embedding.return_value = []
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._catch_up_message_embedding("main", "sess-1")
+
+    db.enqueue_message_embedding_job.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

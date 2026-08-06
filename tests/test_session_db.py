@@ -111,6 +111,16 @@ def _cleanup_after(db, session_id):
     conn.execute(
         "DELETE FROM memory_commitment_jobs WHERE session_id = %s", (session_id,)
     )
+    conn.execute("DELETE FROM message_embedding_jobs WHERE session_id = %s", (session_id,))
+    if db.has_vector_lane:
+        conn.execute(
+            """
+            DELETE FROM message_embeddings WHERE message_id IN (
+                SELECT id FROM messages WHERE session_id = %s
+            )
+            """,
+            (session_id,),
+        )
     conn.execute("DELETE FROM message_mirrors WHERE session_id = %s", (session_id,))
     conn.execute("DELETE FROM messages WHERE session_id = %s", (session_id,))
     conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
@@ -1192,6 +1202,19 @@ def test_delete_session_removes_commitment_jobs(db, session_id):
     assert row[0] == 0
 
 
+def test_delete_session_removes_message_embedding_jobs(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "hello")
+    db.enqueue_message_embedding_job("main", session_id, message_id, idempotency_key=f"emb-{session_id}")
+
+    db.delete_session("main", session_id)
+
+    row = db._conn().execute(
+        "SELECT count(*) FROM message_embedding_jobs WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    assert row[0] == 0
+
+
 def test_delete_session_removes_commitments(db, session_id):
     db.upsert_session(session_id, "main")
     _create_commitment(db, session_id)
@@ -1280,6 +1303,7 @@ def _cleanup_lag_agent(db, lag_agent_id):
     conn = db._conn()
     conn.execute("DELETE FROM memory_capture_jobs WHERE agent_id = %s", (lag_agent_id,))
     conn.execute("DELETE FROM memory_commitment_jobs WHERE agent_id = %s", (lag_agent_id,))
+    conn.execute("DELETE FROM message_embedding_jobs WHERE agent_id = %s", (lag_agent_id,))
 
 
 def test_queue_lag_summary_is_zero_for_an_agent_with_no_jobs(db, lag_agent_id):
@@ -1288,6 +1312,7 @@ def test_queue_lag_summary_is_zero_for_an_agent_with_no_jobs(db, lag_agent_id):
     assert summary == {
         "capture": {"pending_count": 0, "oldest_pending_age_s": None},
         "commitment": {"pending_count": 0, "oldest_pending_age_s": None},
+        "message_embedding": {"pending_count": 0, "oldest_pending_age_s": None},
     }
 
 
@@ -1309,6 +1334,15 @@ def test_queue_lag_summary_counts_pending_commitment_jobs(db, session_id, lag_ag
 
     assert summary["commitment"]["pending_count"] == 1
     assert summary["commitment"]["oldest_pending_age_s"] >= 0
+
+
+def test_queue_lag_summary_counts_pending_message_embedding_jobs(db, session_id, lag_agent_id):
+    db.enqueue_message_embedding_job(lag_agent_id, session_id, 1, idempotency_key=f"emb-{session_id}")
+
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary["message_embedding"]["pending_count"] == 1
+    assert summary["message_embedding"]["oldest_pending_age_s"] >= 0
 
 
 def test_queue_lag_summary_excludes_claimed_jobs(db, session_id, lag_agent_id):
@@ -1484,3 +1518,321 @@ def test_find_uncovered_commitment_range_none_when_fully_covered(db, session_id)
     )
 
     assert db.find_uncovered_commitment_range("main", session_id) is None
+
+
+# ---------------------------------------------------------------------------
+# Message-embedding pipeline (MEM-GAP-006)
+# ---------------------------------------------------------------------------
+# db_with_vector uses a small 3-dim embedding (matching
+# tests/memory/test_postgres_index.py's own vector_index/embedding_index
+# convention for this shared dev database) rather than a real model's real
+# dimensions — only the plumbing is under test here, not embedding quality.
+
+@pytest.fixture
+def mock_embedding_provider():
+    """A fake EmbeddingProvider returning one fixed 3-dim vector per input text."""
+    from unittest.mock import Mock
+
+    provider = Mock()
+    provider.model_identity = "test-endpoint::test-model"
+    provider.embed = Mock(side_effect=lambda texts: [[0.1, 0.2, 0.3] for _ in texts])
+    return provider
+
+
+@pytest.fixture
+def db_with_vector(mock_embedding_provider):
+    """A SessionDB fully wired for embeddings — dimensions + a mock provider."""
+    return SessionDB(
+        _DB_URL, embedding_dimensions=3, embedding_provider=mock_embedding_provider
+    )
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_message_embeddings(db_with_vector, session_id):
+    yield
+    conn = db_with_vector._conn()
+    conn.execute(
+        "DELETE FROM message_embeddings WHERE message_id IN "
+        "(SELECT id FROM messages WHERE session_id = %s)",
+        (session_id,),
+    )
+    conn.execute("DELETE FROM message_embedding_jobs WHERE session_id = %s", (session_id,))
+
+
+def test_has_vector_lane_is_false_without_configured_dimensions(db):
+    assert db.has_vector_lane is False
+
+
+def test_has_vector_lane_is_true_with_configured_dimensions(db_with_vector):
+    assert db_with_vector.has_vector_lane is True
+
+
+def test_embedding_model_identity_is_none_without_a_provider(db):
+    assert db.embedding_model_identity is None
+
+
+def test_embedding_model_identity_reflects_the_configured_provider(db_with_vector):
+    assert db_with_vector.embedding_model_identity == "test-endpoint::test-model"
+
+
+# --- job queue ---
+
+def test_enqueue_message_embedding_job_returns_a_job_id(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "hello")
+
+    job_id = db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+    )
+
+    assert job_id is not None
+
+
+def test_enqueue_message_embedding_job_is_idempotent(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "hello")
+    key = f"key-{session_id}"
+
+    first = db.enqueue_message_embedding_job("main", session_id, message_id, idempotency_key=key)
+    second = db.enqueue_message_embedding_job("main", session_id, message_id, idempotency_key=key)
+
+    assert first is not None
+    assert second is None
+
+
+def test_claim_next_message_embedding_job_returns_the_enqueued_job(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "hello")
+    job_id = db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+    )
+
+    claimed = db.claim_next_message_embedding_job()
+
+    # The queue is global (like capture/commitment jobs) — some other
+    # pending row from the shared dev database could be claimed first, so
+    # only assert on our own job if it happens to be the one claimed.
+    if claimed is not None and claimed["id"] == job_id:
+        assert claimed["agent_id"] == "main"
+        assert claimed["session_id"] == session_id
+        assert claimed["message_id"] == message_id
+        assert claimed["attempts"] == 0
+
+
+def test_complete_message_embedding_job_stores_the_embedding_and_marks_done(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "hello")
+    job_id = db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+    )
+
+    db.complete_message_embedding_job(job_id, message_id, "test-endpoint::test-model", [0.1, 0.2, 0.3])
+
+    row = db._conn().execute(
+        "SELECT state FROM message_embedding_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "done"
+    stored = db._conn().execute(
+        "SELECT model_identity FROM message_embeddings WHERE message_id = %s", (message_id,)
+    ).fetchone()
+    assert stored[0] == "test-endpoint::test-model"
+
+
+def test_complete_message_embedding_job_upserts_on_retry(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "hello")
+    job_id = db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+    )
+
+    db.complete_message_embedding_job(job_id, message_id, "test-endpoint::test-model", [0.1, 0.2, 0.3])
+    db.complete_message_embedding_job(job_id, message_id, "test-endpoint::test-model", [0.4, 0.5, 0.6])
+
+    count = db._conn().execute(
+        "SELECT count(*) FROM message_embeddings WHERE message_id = %s", (message_id,)
+    ).fetchone()[0]
+    assert count == 1  # upsert, not a second row
+
+
+def test_fail_message_embedding_job_retries_with_backoff(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "hello")
+    job_id = db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+    )
+
+    db.fail_message_embedding_job(job_id, "boom", backoff_seconds=60.0, max_attempts=5)
+
+    row = db._conn().execute(
+        "SELECT state, attempts, last_error FROM message_embedding_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "pending"  # still under max_attempts, retried
+    assert row[1] == 1
+    assert row[2] == "boom"
+
+
+def test_fail_message_embedding_job_gives_up_after_max_attempts(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "hello")
+    job_id = db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+    )
+
+    db.fail_message_embedding_job(job_id, "boom", backoff_seconds=0.0, max_attempts=1)
+
+    row = db._conn().execute(
+        "SELECT state FROM message_embedding_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "failed"
+
+
+# --- find_uncovered_message_ids_for_embedding ---
+
+def test_find_uncovered_message_ids_for_embedding_returns_empty_for_an_unowned_session(
+    db, session_id
+):
+    db.upsert_session(session_id, "researcher")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    assert db.find_uncovered_message_ids_for_embedding("main", session_id) == []
+
+
+def test_find_uncovered_message_ids_for_embedding_returns_all_new_messages(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "second")
+
+    assert db.find_uncovered_message_ids_for_embedding("main", session_id) == [id1, id2]
+
+
+def test_find_uncovered_message_ids_for_embedding_excludes_tool_and_empty_messages(
+    db, session_id
+):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "question")
+    db.mirror_message(session_id, "e2", "tool", "raw output", tool_name="read")
+    db.mirror_message(session_id, "e3", "assistant", None)
+
+    assert db.find_uncovered_message_ids_for_embedding("main", session_id) == [id1]
+
+
+def test_find_uncovered_message_ids_for_embedding_excludes_already_queued_ids(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "second")
+    db.enqueue_message_embedding_job("main", session_id, id1, idempotency_key=f"key-{session_id}")
+
+    # Cursor is MAX(message_id) already covered, so only ids after id1 remain.
+    assert db.find_uncovered_message_ids_for_embedding("main", session_id) == [id2]
+
+
+def test_find_uncovered_message_ids_for_embedding_empty_when_fully_covered(db, session_id):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "hello")
+    db.enqueue_message_embedding_job("main", session_id, id1, idempotency_key=f"key-{session_id}")
+
+    assert db.find_uncovered_message_ids_for_embedding("main", session_id) == []
+
+
+# --- vector lane / hybrid search ---
+
+def test_vector_search_messages_empty_without_a_provider(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    assert db._vector_search_messages("hello", "main", limit=5) == []
+
+
+def test_vector_search_messages_finds_a_cached_embedding(db_with_vector, session_id):
+    db_with_vector.upsert_session(session_id, "main")
+    message_id = db_with_vector.mirror_message(session_id, "e1", "user", "a distinctive phrase")
+    db_with_vector.complete_message_embedding_job(
+        db_with_vector.enqueue_message_embedding_job(
+            "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+        ),
+        message_id, "test-endpoint::test-model", [0.1, 0.2, 0.3],
+    )
+
+    results = db_with_vector._vector_search_messages("anything", "main", limit=5)
+
+    assert [r["id"] for r in results] == [message_id]
+
+
+def test_vector_search_messages_is_scoped_to_the_given_agent(db_with_vector, session_id):
+    db_with_vector.upsert_session(session_id, "researcher")
+    message_id = db_with_vector.mirror_message(session_id, "e1", "user", "a distinctive phrase")
+    db_with_vector.complete_message_embedding_job(
+        db_with_vector.enqueue_message_embedding_job(
+            "researcher", session_id, message_id, idempotency_key=f"key-{session_id}"
+        ),
+        message_id, "test-endpoint::test-model", [0.1, 0.2, 0.3],
+    )
+
+    results = db_with_vector._vector_search_messages("anything", "main", limit=5)
+
+    assert results == []
+
+
+def test_hybrid_search_messages_falls_back_to_lexical_without_a_vector_lane(db, session_id):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "a very particular keyword")
+
+    results = db.hybrid_search_messages("particular keyword", "main", limit=5)
+
+    assert len(results) == 1
+    assert results[0]["content"] == "a very particular keyword"
+
+
+def test_hybrid_search_messages_includes_a_vector_only_match(db_with_vector, session_id):
+    db_with_vector.upsert_session(session_id, "main")
+    # No lexical overlap with the query at all — only the vector lane (with
+    # its constant mock vector) can surface this.
+    message_id = db_with_vector.mirror_message(session_id, "e1", "user", "zzz_no_overlap_zzz")
+    db_with_vector.complete_message_embedding_job(
+        db_with_vector.enqueue_message_embedding_job(
+            "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+        ),
+        message_id, "test-endpoint::test-model", [0.1, 0.2, 0.3],
+    )
+
+    results = db_with_vector.hybrid_search_messages("completely different wording", "main", limit=5)
+
+    assert message_id in [r["id"] for r in results]
+
+
+def test_hybrid_search_messages_result_shape_matches_search_messages(db_with_vector, session_id):
+    db_with_vector.upsert_session(session_id, "main")
+    message_id = db_with_vector.mirror_message(session_id, "e1", "user", "shared keyword text")
+    db_with_vector.complete_message_embedding_job(
+        db_with_vector.enqueue_message_embedding_job(
+            "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+        ),
+        message_id, "test-endpoint::test-model", [0.1, 0.2, 0.3],
+    )
+
+    results = db_with_vector.hybrid_search_messages("shared keyword", "main", limit=5)
+
+    assert results
+    row = results[0]
+    for field in ("id", "session_id", "role", "content", "tool_name", "timestamp", "snippet", "rank"):
+        assert field in row
+
+
+# --- delete_session cleanup ---
+
+def test_delete_session_removes_message_embeddings(db_with_vector, session_id):
+    db_with_vector.upsert_session(session_id, "main")
+    message_id = db_with_vector.mirror_message(session_id, "e1", "user", "hello")
+    db_with_vector.complete_message_embedding_job(
+        db_with_vector.enqueue_message_embedding_job(
+            "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+        ),
+        message_id, "test-endpoint::test-model", [0.1, 0.2, 0.3],
+    )
+
+    db_with_vector.delete_session("main", session_id)
+
+    row = db_with_vector._conn().execute(
+        "SELECT count(*) FROM message_embeddings WHERE message_id = %s", (message_id,)
+    ).fetchone()
+    assert row[0] == 0

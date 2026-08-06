@@ -1,7 +1,10 @@
-"""Session history search tool backed by PostgreSQL FTS.
+"""Session history search tool backed by PostgreSQL FTS, fused with vector search when configured.
 
 Three modes:
-  DISCOVER — full-text search across all sessions, returns match + context window + bookends
+  DISCOVER — lexical + vector fused search across all sessions (MEM-GAP-006;
+             vector lane is a no-op without a configured embedding provider,
+             so this is FTS-only in that case), returns match + context
+             window + bookends
   SCROLL   — paginate within a session by anchor message ID
   BROWSE   — list recent sessions chronologically
 """
@@ -38,7 +41,9 @@ class SessionSearchTool(Tool):
             description=(
                 "Search, scroll, or browse past conversation history stored in the database.\n"
                 "DISCOVER: full-text search across ALL sessions — supports AND (default), OR, "
-                'quoted phrase "exact match", minus -exclude, prefix word*.\n'
+                'quoted phrase "exact match", minus -exclude, prefix word*. Also finds '
+                "paraphrased matches (different wording, same meaning) when semantic search "
+                "is configured.\n"
                 "SCROLL: read messages around a specific message ID within one session.\n"
                 "BROWSE: list recent sessions chronologically with titles and previews."
             ),
@@ -92,7 +97,10 @@ class SessionSearchTool(Tool):
         if not query.strip():
             return "Error: 'query' is required for DISCOVER mode."
         try:
-            matches = self._db.search_messages(query, self._agent_id, limit=15)
+            # Lexical + vector fused (MEM-GAP-006) — degrades to FTS-only
+            # automatically when no embedding provider is configured, so no
+            # branch is needed here.
+            matches = self._db.hybrid_search_messages(query, self._agent_id, limit=15)
         except Exception as exc:
             return f"Search error: {exc}"
 

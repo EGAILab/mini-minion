@@ -16,7 +16,7 @@ from minion_assist.tools.session_search import SessionSearchTool
 
 def _tool(agent_id: str = "main") -> tuple[SessionSearchTool, Mock]:
     db = Mock()
-    db.search_messages.return_value = []
+    db.hybrid_search_messages.return_value = []
     db.get_sessions_by_ids.return_value = {}
     db.get_session_bookends.return_value = ([], [])
     db.get_messages_around.return_value = []
@@ -29,7 +29,7 @@ def test_discover_passes_the_owning_agent_id():
 
     tool.execute(mode="DISCOVER", query="hunter2")
 
-    db.search_messages.assert_called_once_with("hunter2", "researcher", limit=15)
+    db.hybrid_search_messages.assert_called_once_with("hunter2", "researcher", limit=15)
 
 
 def test_scroll_passes_the_owning_agent_id():
@@ -50,7 +50,7 @@ def test_browse_passes_the_owning_agent_id():
 
 def test_discover_uses_the_agent_id_for_session_metadata_and_bookends():
     tool, db = _tool("researcher")
-    db.search_messages.return_value = [
+    db.hybrid_search_messages.return_value = [
         {"session_id": "s1", "id": 1, "rank": 0.5, "content": "hi", "snippet": "hi"},
     ]
     db.get_sessions_by_ids.return_value = {"s1": {"title": "t", "agent_id": "researcher"}}

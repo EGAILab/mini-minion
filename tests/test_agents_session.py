@@ -1290,6 +1290,10 @@ def test_capture_job_enqueue_failure_is_recorded(tmp_path):
     mock_db = Mock()
     mock_db.mirror_message = Mock(side_effect=[1, 2])
     mock_db.enqueue_capture_job = Mock(side_effect=RuntimeError("db unavailable"))
+    # No vector lane configured — isolates this assertion to the
+    # capture-job enqueue failure, not the (also-shared-health)
+    # message-embedding enqueue site's own success/failure signal.
+    mock_db.has_vector_lane = False
     health = WorkerHealth("session_writes:main")
     session = _make_session_with_mock_db_and_memory(tmp_path, mock_db, health=health)
 
@@ -1304,6 +1308,10 @@ def test_commitment_job_enqueue_failure_is_recorded(tmp_path):
     mock_db = Mock()
     mock_db.mirror_message = Mock(side_effect=[1, 2])
     mock_db.enqueue_commitment_job = Mock(side_effect=RuntimeError("db unavailable"))
+    # No vector lane configured — isolates this assertion to the
+    # commitment-job enqueue failure, not the (also-shared-health)
+    # message-embedding enqueue site's own success/failure signal.
+    mock_db.has_vector_lane = False
     health = WorkerHealth("session_writes:main")
     short_term = ShortTermMemory(tmp_path / "sessions")
     session_store = SessionStore(tmp_path / "sessions.json")
@@ -1405,3 +1413,56 @@ def test_commitment_job_idempotency_key_includes_the_channel(tmp_path):
     key_b = mock_db.enqueue_commitment_job.call_args.args[5]
 
     assert key_a != key_b
+
+
+# ---------------------------------------------------------------------------
+# Message-embedding job enqueue (MEM-GAP-006)
+# ---------------------------------------------------------------------------
+
+def test_message_embedding_job_enqueued_when_vector_lane_is_configured(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=[1, 2])
+    mock_db.has_vector_lane = True
+    mock_db.embedding_model_identity = "test-endpoint::test-model"
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("hello")
+
+    # One job per newly-mirrored user+assistant message (both ids 1 and 2).
+    assert mock_db.enqueue_message_embedding_job.call_count == 2
+    call_args = [c.args for c in mock_db.enqueue_message_embedding_job.call_args_list]
+    assert call_args[0] == ("main", "test-session", 1, "main:1:test-endpoint::test-model")
+    assert call_args[1] == ("main", "test-session", 2, "main:2:test-endpoint::test-model")
+
+
+def test_message_embedding_job_not_enqueued_without_a_vector_lane(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=[1, 2])
+    mock_db.has_vector_lane = False
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("hello")
+
+    mock_db.enqueue_message_embedding_job.assert_not_called()
+
+
+def test_message_embedding_job_not_enqueued_without_a_database(tmp_path):
+    session = _make_session(tmp_path)  # db=None
+
+    session.send("hello")  # must not raise
+
+
+def test_message_embedding_job_enqueue_failure_is_recorded(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(side_effect=[1, 2])
+    mock_db.has_vector_lane = True
+    mock_db.embedding_model_identity = "test-endpoint::test-model"
+    mock_db.enqueue_message_embedding_job = Mock(side_effect=RuntimeError("db unavailable"))
+    health = WorkerHealth("session_writes:main")
+    session = _make_session_with_mock_db(tmp_path, mock_db, health=health)
+
+    session.send("hello")  # must not raise
+
+    snap = health.snapshot()
+    assert snap["consecutive_failures"] >= 1
+    assert "db unavailable" in snap["last_error"]
