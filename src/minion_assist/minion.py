@@ -409,6 +409,14 @@ def main() -> None:
             _reconciled = _db.reconcile_all_sessions(short_term, list(agents_cfg.keys()))
             if _reconciled:
                 print(f"  Mirrored {_reconciled} messages from JSONL to database.")
+            # R2-GAP-003: recover any job left stuck in 'running' by a prior
+            # process crash, before any worker below starts claiming — see
+            # reclaim_stale_running_jobs()'s docstring for why this is safe
+            # to run unconditionally at startup and only at startup.
+            _reclaimed = _db.reclaim_stale_running_jobs()
+            _reclaimed_total = sum(_reclaimed.values())
+            if _reclaimed_total:
+                print(f"  Reclaimed {_reclaimed_total} stale 'running' job(s) from a prior crash: {_reclaimed}")
         except Exception as _db_exc:
             print(f"[minion-assist] Warning: database unavailable ({_db_exc}). Session search disabled.")
             _db = None

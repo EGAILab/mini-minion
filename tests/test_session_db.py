@@ -1346,10 +1346,14 @@ def _cleanup_lag_agent(db, lag_agent_id):
 def test_queue_lag_summary_is_zero_for_an_agent_with_no_jobs(db, lag_agent_id):
     summary = db.queue_lag_summary(lag_agent_id)
 
+    _empty_lane = {
+        "pending_count": 0, "oldest_pending_age_s": None,
+        "running_count": 0, "oldest_running_age_s": None,
+    }
     assert summary == {
-        "capture": {"pending_count": 0, "oldest_pending_age_s": None},
-        "commitment": {"pending_count": 0, "oldest_pending_age_s": None},
-        "message_embedding": {"pending_count": 0, "oldest_pending_age_s": None},
+        "capture": _empty_lane,
+        "commitment": _empty_lane,
+        "message_embedding": _empty_lane,
     }
 
 
@@ -1550,6 +1554,296 @@ def test_prune_operational_tables_deletes_old_failed_message_embedding_jobs(
     counts = db.prune_operational_tables(30)
 
     assert counts["message_embedding_jobs"] == 1
+
+
+# ---------------------------------------------------------------------------
+# R2-GAP-001: retention must not destroy outputs or erase coverage
+# ---------------------------------------------------------------------------
+#
+# Before this fix, memory_proposals.job_id / commitments.source_job_id were
+# ON DELETE CASCADE against the job tables prune_operational_tables() deletes
+# rows from — pruning an old job silently deleted its already-materialized
+# proposal/commitment too. Separately, find_uncovered_capture_range /
+# find_uncovered_commitment_range / find_uncovered_message_ids_for_embedding
+# derived their "already covered" cursor from MAX(job table column), so
+# pruning also reset reconciliation's notion of what had already been
+# enqueued. These tests prove both are fixed: outputs survive a job being
+# pruned (or deleted directly), and reconciliation still sees the range as
+# covered afterward.
+
+def test_prune_operational_tables_detaches_but_preserves_a_proposal_from_its_pruned_job(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    db.claim_next_capture_job()
+    proposals = db.complete_capture_job(job_id, ["remember this"])
+    proposal_id = proposals[0]["id"]
+    db._conn().execute(
+        "UPDATE memory_capture_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - 40 * 86400, job_id),
+    )
+
+    counts = db.prune_operational_tables(30)
+
+    assert counts["capture_jobs"] == 1
+    row = db._conn().execute(
+        "SELECT job_id, claim_text FROM memory_proposals WHERE id = %s", (proposal_id,)
+    ).fetchone()
+    assert row is not None  # the proposal itself must survive
+    assert row[0] is None  # but its now-deleted job's back-pointer is detached
+    assert row[1] == "remember this"
+
+
+def test_prune_operational_tables_detaches_but_preserves_a_commitment_from_its_pruned_job(
+    db, session_id, lag_agent_id
+):
+    commitment = _create_commitment(db, session_id, agent_id=lag_agent_id)
+    commitment_id = commitment["id"]
+    job_id = db._conn().execute(
+        "SELECT source_job_id FROM commitments WHERE id = %s", (commitment_id,)
+    ).fetchone()[0]
+    db._conn().execute(
+        "UPDATE memory_commitment_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - 40 * 86400, job_id),
+    )
+
+    counts = db.prune_operational_tables(30)
+
+    assert counts["commitment_jobs"] == 1
+    row = db._conn().execute(
+        "SELECT source_job_id FROM commitments WHERE id = %s", (commitment_id,)
+    ).fetchone()
+    assert row is not None  # the commitment itself must survive
+    assert row[0] is None  # detached from its now-deleted job
+
+
+def test_prune_operational_tables_never_erases_capture_coverage(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    m1 = db.mirror_message(session_id, "e1", "user", "hello")
+    m2 = db.mirror_message(session_id, "e2", "assistant", "hi")
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, m1, m2, idempotency_key=f"key-{session_id}"
+    )
+    db.claim_next_capture_job()
+    db.complete_capture_job(job_id, [])
+    db._conn().execute(
+        "UPDATE memory_capture_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - 40 * 86400, job_id),
+    )
+
+    db.prune_operational_tables(30)  # deletes the only capture job for this session
+
+    # Before R2-GAP-001's fix, this would now re-surface messages 1-2 as
+    # "uncovered" because the MAX(...) cursor was derived from the very job
+    # row just deleted. It must still report nothing to catch up on.
+    assert db.find_uncovered_capture_range(lag_agent_id, session_id) is None
+
+
+def test_prune_operational_tables_never_erases_message_embedding_coverage(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    message_id = db.mirror_message(session_id, "e1", "user", "hello")
+    job_id = db.enqueue_message_embedding_job(
+        lag_agent_id, session_id, message_id, idempotency_key=f"emb-{session_id}"
+    )
+    db.claim_next_message_embedding_job()
+    db.fail_message_embedding_job(job_id, "boom", 0.0, max_attempts=1)  # -> terminal 'failed'
+    db._conn().execute(
+        "UPDATE message_embedding_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - 40 * 86400, job_id),
+    )
+
+    db.prune_operational_tables(30)  # deletes the only embedding job for this session
+
+    assert db.find_uncovered_message_ids_for_embedding(lag_agent_id, session_id) == []
+
+
+def test_prune_operational_tables_never_erases_commitment_coverage_or_its_channel(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    m1 = db.mirror_message(session_id, "e1", "user", "hello")
+    m2 = db.mirror_message(session_id, "e2", "assistant", "hi")
+    job_id = db.enqueue_commitment_job(
+        lag_agent_id, session_id, "!room:example.org", m1, m2,
+        idempotency_key=f"commit-{session_id}",
+    )
+    db.claim_next_commitment_job()
+    db.fail_commitment_job(job_id, "boom", 0.0, max_attempts=1)  # -> terminal 'failed'
+    db._conn().execute(
+        "UPDATE memory_commitment_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - 40 * 86400, job_id),
+    )
+
+    db.prune_operational_tables(30)  # deletes the only commitment job for this session
+
+    # Both "nothing new to catch up on" AND the remembered channel must
+    # survive — without session_job_coverage.channel, a session whose only
+    # commitment job was pruned would look indistinguishable from one that
+    # never had commitments enabled, permanently exiting reconciliation.
+    assert db.find_uncovered_commitment_range(lag_agent_id, session_id) is None
+    row = db._conn().execute(
+        "SELECT channel FROM session_job_coverage WHERE session_id = %s AND lane = 'commitment'",
+        (session_id,),
+    ).fetchone()
+    assert row == ("!room:example.org",)
+
+
+def test_delete_session_removes_proposals_whose_job_was_already_pruned(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    db.claim_next_capture_job()
+    proposals = db.complete_capture_job(job_id, ["remember this"])
+    proposal_id = proposals[0]["id"]
+    db._conn().execute(
+        "UPDATE memory_capture_jobs SET updated_at = %s WHERE id = %s",
+        (time.time() - 40 * 86400, job_id),
+    )
+    db.prune_operational_tables(30)  # job_id gone; the proposal now has job_id = NULL
+
+    result = db.delete_session(lag_agent_id, session_id)
+
+    # Before R2-GAP-001's fix, delete_session found a session's proposals by
+    # walking memory_capture_jobs.session_id — with the job already pruned,
+    # this proposal would have been silently left behind (orphaned).
+    assert proposal_id in result["proposal_ids"]
+    row = db._conn().execute(
+        "SELECT 1 FROM memory_proposals WHERE id = %s", (proposal_id,)
+    ).fetchone()
+    assert row is None
+
+
+# ---------------------------------------------------------------------------
+# R2-GAP-003: stale-running job reclaim
+# ---------------------------------------------------------------------------
+
+def _mark_running(db, table: str, job_id: int, age_seconds: float) -> None:
+    """Force one job row into 'running' at a given age, bypassing claim_next_*_job().
+
+    Deliberately doesn't go through claim_next_*_job(): that claims
+    whatever the globally oldest *eligible* pending row happens to be
+    across this shared dev database (potentially a leftover row from
+    unrelated earlier manual testing, not the one this test just created)
+    — see R2-GAP-015. Setting state/updated_at directly by this test's own
+    job_id is what actually pins down "this specific job."
+    """
+    db._conn().execute(
+        f"UPDATE {table} SET state = 'running', updated_at = %s WHERE id = %s",
+        (time.time() - age_seconds, job_id),
+    )
+
+
+def test_reclaim_stale_running_jobs_resets_an_old_running_capture_job(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    _mark_running(db, "memory_capture_jobs", job_id, 7200)  # 2h old — a crashed worker
+
+    counts = db.reclaim_stale_running_jobs()
+
+    # reclaim_stale_running_jobs() is deliberately global, not per-agent
+    # (see its docstring), so >= rather than == — this shared dev database
+    # may have other genuinely stale rows at the same moment. The precise
+    # assertion is that THIS job specifically transitioned back to pending.
+    assert counts["capture_jobs"] >= 1
+    row = db._conn().execute(
+        "SELECT state FROM memory_capture_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "pending"
+
+
+def test_reclaim_stale_running_jobs_resets_an_old_running_commitment_job(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_commitment_job(
+        lag_agent_id, session_id, "cli", 1, 2, idempotency_key=f"commit-{session_id}"
+    )
+    _mark_running(db, "memory_commitment_jobs", job_id, 7200)
+
+    counts = db.reclaim_stale_running_jobs()
+
+    assert counts["commitment_jobs"] >= 1
+    row = db._conn().execute(
+        "SELECT state FROM memory_commitment_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "pending"
+
+
+def test_reclaim_stale_running_jobs_resets_an_old_running_embedding_job(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    message_id = db.mirror_message(session_id, "e1", "user", "hello")
+    job_id = db.enqueue_message_embedding_job(
+        lag_agent_id, session_id, message_id, idempotency_key=f"emb-{session_id}"
+    )
+    _mark_running(db, "message_embedding_jobs", job_id, 7200)
+
+    counts = db.reclaim_stale_running_jobs()
+
+    assert counts["message_embedding_jobs"] >= 1
+    row = db._conn().execute(
+        "SELECT state FROM message_embedding_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "pending"
+
+
+def test_reclaim_stale_running_jobs_leaves_a_recently_claimed_job_alone(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    _mark_running(db, "memory_capture_jobs", job_id, 5)  # 5s old — well within the default threshold
+
+    db.reclaim_stale_running_jobs()
+
+    row = db._conn().execute(
+        "SELECT state FROM memory_capture_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "running"
+
+
+def test_reclaim_stale_running_jobs_respects_a_custom_threshold(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    _mark_running(db, "memory_capture_jobs", job_id, 30)  # 30 seconds ago
+
+    counts = db.reclaim_stale_running_jobs(stale_after_seconds=10)
+
+    assert counts["capture_jobs"] >= 1
+    row = db._conn().execute(
+        "SELECT state FROM memory_capture_jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "pending"
+
+
+def test_queue_lag_summary_reports_a_stuck_running_job(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    _mark_running(db, "memory_capture_jobs", job_id, 7200)
+
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary["capture"]["running_count"] == 1
+    assert summary["capture"]["oldest_running_age_s"] >= 7200.0
 
 
 # ---------------------------------------------------------------------------
@@ -2098,7 +2392,10 @@ def test_deleting_a_session_row_directly_cascades_to_commitments(db, session_id)
     assert row[0] == 0
 
 
-def test_deleting_a_commitment_job_directly_cascades_to_commitments(db, session_id):
+def test_deleting_a_commitment_job_directly_detaches_but_preserves_commitments(db, session_id):
+    # R2-GAP-001: fk_commitments_job is ON DELETE SET NULL, not CASCADE — a
+    # commitment must survive its originating job being deleted (e.g. by
+    # retention pruning), only losing the now-meaningless back-pointer.
     db.upsert_session(session_id, "main")
     commitment = _create_commitment(db, session_id)
     source_job_id = db._conn().execute(
@@ -2108,9 +2405,10 @@ def test_deleting_a_commitment_job_directly_cascades_to_commitments(db, session_
     db._conn().execute("DELETE FROM memory_commitment_jobs WHERE id = %s", (source_job_id,))
 
     row = db._conn().execute(
-        "SELECT count(*) FROM commitments WHERE id = %s", (commitment["id"],)
+        "SELECT source_job_id FROM commitments WHERE id = %s", (commitment["id"],)
     ).fetchone()
-    assert row[0] == 0
+    assert row is not None
+    assert row[0] is None
 
 
 def test_deleting_a_session_row_directly_cascades_to_message_embedding_jobs(db, session_id):
@@ -2200,9 +2498,9 @@ def test_memory_proposals_rejects_an_unrecognized_status(db, session_id):
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     _assert_check_violation(
         db,
-        "INSERT INTO memory_proposals (job_id, agent_id, claim_text, created_at, status) "
-        "VALUES (%s, 'main', 'x', 0, 'bogus')",
-        (job_id,),
+        "INSERT INTO memory_proposals (job_id, session_id, agent_id, claim_text, created_at, status) "
+        "VALUES (%s, %s, 'main', 'x', 0, 'bogus')",
+        (job_id, session_id),
     )
 
 
@@ -2226,9 +2524,9 @@ def test_memory_proposals_accepts_every_documented_status(db, session_id):
     job_id = db.enqueue_capture_job("main", session_id, 1, 2, idempotency_key=f"key-{session_id}")
     for status in ("pending", "promoted", "rejected", "superseded"):
         db._conn().execute(
-            "INSERT INTO memory_proposals (job_id, agent_id, claim_text, created_at, status) "
-            "VALUES (%s, 'main', %s, 0, %s)",
-            (job_id, f"claim-{status}", status),
+            "INSERT INTO memory_proposals (job_id, session_id, agent_id, claim_text, created_at, status) "
+            "VALUES (%s, %s, 'main', %s, 0, %s)",
+            (job_id, session_id, f"claim-{status}", status),
         )  # must not raise for any of these
 
 

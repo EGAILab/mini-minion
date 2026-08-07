@@ -25,11 +25,23 @@ Schema (created automatically on first connect):
            source_to_message_id, idempotency_key, state, attempts, run_after,
            last_error, created_at, updated_at) — durable extraction queue
            (Stage One Phase 2, slice C)
-  memory_proposals(id, job_id, agent_id, claim_text, created_at, status) —
-           structured, unreviewed extraction output (Stage One Phase 2,
-           slice C); status (Stage One Phase 5, slice B) defaults to
-           "pending" until a later slice's review flow assigns
-           "promoted"/"rejected"/"superseded"
+  memory_proposals(id, job_id, session_id, agent_id, claim_text, created_at,
+           status) — structured, unreviewed extraction output (Stage One
+           Phase 2, slice C); status (Stage One Phase 5, slice B) defaults
+           to "pending" until a later slice's review flow assigns
+           "promoted"/"rejected"/"superseded". job_id is nullable and
+           ON DELETE SET NULL (R2-GAP-001) — pruning the originating
+           capture job detaches it but never deletes the proposal itself;
+           session_id (added alongside that fix) is the reliable way to
+           find a session's proposals regardless of whether its job row
+           still exists.
+  session_job_coverage(agent_id, session_id, lane, covered_through_id,
+           updated_at) — durable "highest id a job was ever enqueued for"
+           cursor per (session, lane), lane in
+           ('capture', 'commitment', 'message_embedding'). Added by R2-GAP-001
+           so retention pruning old job rows (which used to double as the
+           coverage cursor via MAX(...)) can no longer reset reconciliation's
+           notion of what's already been enqueued.
   memory_commitment_jobs(id, agent_id, session_id, channel,
            source_from_message_id, source_to_message_id, idempotency_key,
            state, attempts, run_after, last_error, created_at, updated_at)
@@ -560,6 +572,140 @@ def _migration_004_referential_integrity(conn) -> None:
         conn.execute(f"ALTER TABLE {table} VALIDATE CONSTRAINT {name}")
 
 
+def _migration_005_decouple_retention_from_outputs(conn) -> None:
+    """Break retention's accidental power to delete outputs and erase coverage (R2-GAP-001).
+
+    Migration 004 made ``memory_proposals.job_id`` and
+    ``commitments.source_job_id`` ``ON DELETE CASCADE`` against the job
+    tables that ``prune_operational_tables()`` (MEM-GAP-015) deletes old
+    rows from. Combined, those two features meant enabling retention could
+    silently delete a proposal or commitment that had already been produced
+    (and possibly reviewed/promoted) — exactly the "durable output" this
+    module's docstring promises retention never touches. Separately, every
+    ``find_uncovered_*`` reconciliation method used ``MAX(job table column)``
+    as its "already covered" cursor, so pruning old job rows also reset that
+    cursor back to zero — enabling retention could make reconciliation
+    re-enqueue a session's entire history for extraction/embedding.
+
+    This migration fixes both, without touching migration 004's own body
+    (never edit an already-applied migration — see this file's module
+    docstring and ``schema_migrations.py``):
+
+    1. Gives ``memory_proposals`` its own ``session_id`` column (backfilled
+       from its job's ``session_id`` — always resolvable here since
+       migration 004's CASCADE is still in effect at the moment this runs,
+       so no proposal can yet have a dangling ``job_id``). This is what
+       lets :meth:`delete_session` find a session's proposals directly
+       instead of walking through its (now potentially-pruned) capture
+       jobs.
+    2. Adds ``session_job_coverage`` — one row per ``(session_id, lane)``
+       recording the highest message/range id a job has ever been
+       successfully enqueued for. ``enqueue_capture_job``/
+       ``enqueue_commitment_job``/``enqueue_message_embedding_job`` advance
+       it going forward; ``find_uncovered_*`` reads it instead of
+       ``MAX(job table)``. Retention never deletes from this table, so
+       pruning old job rows can no longer erase coverage. Backfilled once
+       here from the job tables' current ``MAX`` values.
+    3. Flips ``fk_memory_proposals_job`` and ``fk_commitments_job`` from
+       ``ON DELETE CASCADE`` to ``ON DELETE SET NULL`` — pruning a job now
+       merely detaches its (already-materialized) proposal/commitment from
+       the deleted operational row instead of deleting it too. Both
+       ``job_id``/``source_job_id`` columns lose their ``NOT NULL``
+       constraint first, since a ``SET NULL`` target column must be
+       nullable.
+
+    ``prune_operational_tables()``'s docstring is corrected in the same
+    change that adds this migration — see its current text for what it now
+    accurately promises.
+    """
+    now = time.time()
+
+    # --- 1. memory_proposals.session_id ---
+    conn.execute("ALTER TABLE memory_proposals ADD COLUMN IF NOT EXISTS session_id TEXT")
+    conn.execute(
+        "UPDATE memory_proposals p SET session_id = j.session_id "
+        "FROM memory_capture_jobs j WHERE p.job_id = j.id AND p.session_id IS NULL"
+    )
+    conn.execute("ALTER TABLE memory_proposals ALTER COLUMN session_id SET NOT NULL")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS proposals_session_idx ON memory_proposals (session_id)"
+    )
+
+    # --- 2. session_job_coverage, backfilled from current job-table state ---
+    # `channel` is only meaningful for the 'commitment' lane (a session's
+    # commitment jobs are additionally scoped to a Matrix room id / "cli" —
+    # see find_uncovered_commitment_range's docstring); NULL for the other
+    # two lanes, which have no such concept.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS session_job_coverage (
+            agent_id            TEXT NOT NULL,
+            session_id          TEXT NOT NULL,
+            lane                TEXT NOT NULL,
+            covered_through_id  BIGINT NOT NULL,
+            channel             TEXT,
+            updated_at          DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (session_id, lane)
+        )
+    """)
+    conn.execute(
+        """
+        INSERT INTO session_job_coverage (agent_id, session_id, lane, covered_through_id, updated_at)
+        SELECT agent_id, session_id, 'capture', MAX(source_to_message_id), %s
+        FROM memory_capture_jobs GROUP BY agent_id, session_id
+        ON CONFLICT (session_id, lane) DO NOTHING
+        """,
+        (now,),
+    )
+    # DISTINCT ON, not GROUP BY: the coverage row needs the *channel of the
+    # single most-recently-covered job*, not an aggregate — matches
+    # find_uncovered_commitment_range's pre-existing "most recently covered
+    # job's channel" semantics.
+    conn.execute(
+        """
+        INSERT INTO session_job_coverage (agent_id, session_id, lane, covered_through_id, channel, updated_at)
+        SELECT DISTINCT ON (session_id) agent_id, session_id, 'commitment', source_to_message_id, channel, %s
+        FROM memory_commitment_jobs
+        ORDER BY session_id, source_to_message_id DESC
+        ON CONFLICT (session_id, lane) DO NOTHING
+        """,
+        (now,),
+    )
+    conn.execute(
+        """
+        INSERT INTO session_job_coverage (agent_id, session_id, lane, covered_through_id, updated_at)
+        SELECT agent_id, session_id, 'message_embedding', MAX(message_id), %s
+        FROM message_embedding_jobs GROUP BY agent_id, session_id
+        ON CONFLICT (session_id, lane) DO NOTHING
+        """,
+        (now,),
+    )
+
+    # --- 3. CASCADE -> SET NULL for the two output-parent FKs ---
+    conn.execute("ALTER TABLE memory_proposals ALTER COLUMN job_id DROP NOT NULL")
+    conn.execute("ALTER TABLE memory_proposals DROP CONSTRAINT IF EXISTS fk_memory_proposals_job")
+    _add_constraint_if_missing(
+        conn, "memory_proposals", "fk_memory_proposals_job",
+        "FOREIGN KEY (job_id) REFERENCES memory_capture_jobs(id) ON DELETE SET NULL NOT VALID",
+    )
+    conn.execute("ALTER TABLE memory_proposals VALIDATE CONSTRAINT fk_memory_proposals_job")
+
+    conn.execute("ALTER TABLE commitments ALTER COLUMN source_job_id DROP NOT NULL")
+    conn.execute("ALTER TABLE commitments DROP CONSTRAINT IF EXISTS fk_commitments_job")
+    _add_constraint_if_missing(
+        conn, "commitments", "fk_commitments_job",
+        "FOREIGN KEY (source_job_id) REFERENCES memory_commitment_jobs(id) ON DELETE SET NULL NOT VALID",
+    )
+    conn.execute("ALTER TABLE commitments VALIDATE CONSTRAINT fk_commitments_job")
+
+    # --- 4. session_id FK for defense-in-depth, matching migration 004's
+    #        "structurally guarantee the manual cleanup" precedent ---
+    _add_constraint_if_missing(
+        conn, "memory_proposals", "fk_memory_proposals_session",
+        "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE NOT VALID",
+    )
+    conn.execute("ALTER TABLE memory_proposals VALIDATE CONSTRAINT fk_memory_proposals_session")
+
+
 # Every migration SessionDB knows about, in the order they were introduced.
 # Append new migrations here — never edit an existing entry's `apply`
 # function once it has shipped (see _migration_001_baseline's docstring).
@@ -568,7 +714,50 @@ _SESSION_DB_MIGRATIONS = [
     Migration(2, "drop_legacy_message_embeddings", _migration_002_drop_legacy_message_embeddings),
     Migration(3, "message_embedding_jobs", _migration_003_message_embedding_jobs),
     Migration(4, "referential_integrity", _migration_004_referential_integrity),
+    Migration(5, "decouple_retention_from_outputs", _migration_005_decouple_retention_from_outputs),
 ]
+
+
+def _advance_job_coverage(
+    conn, agent_id: str, session_id: str, lane: str, covered_through_id: int,
+    channel: str | None = None,
+) -> None:
+    """Upsert ``session_job_coverage``'s high-water mark for one ``(session_id, lane)`` (R2-GAP-001).
+
+    Called by ``enqueue_capture_job``/``enqueue_commitment_job``/
+    ``enqueue_message_embedding_job`` right after a genuinely new job row is
+    inserted — never on their ``ON CONFLICT ... DO NOTHING`` no-op path,
+    since a job that already existed already advanced coverage the first
+    time it was enqueued. ``GREATEST`` makes this safe even if jobs are ever
+    enqueued out of id order.
+
+    Args:
+        conn: An open connection (this class's autocommit connection).
+        agent_id: The agent this session belongs to.
+        session_id: The session this job's range/message belongs to.
+        lane: One of ``"capture"``, ``"commitment"``, ``"message_embedding"``.
+        covered_through_id: The highest message id this job's range/target
+            reaches — coverage never moves backward past what was already
+            recorded.
+        channel: Only meaningful for the ``"commitment"`` lane (a Matrix
+            room id, or ``"cli"``) — always overwritten to the latest
+            enqueue's channel, since a session's commitment channel doesn't
+            move backward the way an id-based cursor does. ``None`` for the
+            other two lanes, which leaves any existing (always-NULL) value
+            unchanged.
+    """
+    now = time.time()
+    conn.execute(
+        """
+        INSERT INTO session_job_coverage (agent_id, session_id, lane, covered_through_id, channel, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (session_id, lane) DO UPDATE SET
+            covered_through_id = GREATEST(session_job_coverage.covered_through_id, EXCLUDED.covered_through_id),
+            channel = COALESCE(EXCLUDED.channel, session_job_coverage.channel),
+            updated_at = EXCLUDED.updated_at
+        """,
+        (agent_id, session_id, lane, covered_through_id, channel, now),
+    )
 
 
 def _msg_text(msg: dict) -> str | None:
@@ -826,9 +1015,12 @@ class SessionDB:
 
         Removes, in dependency order: ``message_embeddings`` (keyed by
         message id, no ``session_id`` column of its own), ``message_mirrors``,
-        ``messages``, this session's ``memory_proposals`` (via their
-        ``memory_capture_jobs``), ``memory_capture_jobs``,
-        ``memory_commitment_jobs``, ``message_embedding_jobs``,
+        ``messages``, this session's ``memory_proposals`` (found by their own
+        ``session_id`` column — R2-GAP-001: no longer via
+        ``memory_capture_jobs``, since a proposal's originating job may have
+        already been pruned by retention by the time a session is deleted),
+        ``memory_capture_jobs``, ``memory_commitment_jobs``,
+        ``message_embedding_jobs``, ``session_job_coverage``,
         ``commitments``, and finally the ``sessions`` row itself.
 
         Deliberately does **not** touch anything outside this database, and
@@ -876,24 +1068,18 @@ class SessionDB:
         conn.execute("DELETE FROM message_mirrors WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM messages WHERE session_id = %s", (session_id,))
 
-        job_ids = [
+        proposal_ids = [
             r[0] for r in conn.execute(
-                "SELECT id FROM memory_capture_jobs WHERE session_id = %s", (session_id,)
+                "SELECT id FROM memory_proposals WHERE session_id = %s", (session_id,)
             ).fetchall()
         ]
-        proposal_ids: list[int] = []
-        if job_ids:
-            proposal_ids = [
-                r[0] for r in conn.execute(
-                    "SELECT id FROM memory_proposals WHERE job_id = ANY(%s)", (job_ids,)
-                ).fetchall()
-            ]
-            if proposal_ids:
-                conn.execute(
-                    "DELETE FROM memory_proposals WHERE id = ANY(%s)", (proposal_ids,)
-                )
+        if proposal_ids:
+            conn.execute(
+                "DELETE FROM memory_proposals WHERE id = ANY(%s)", (proposal_ids,)
+            )
         conn.execute("DELETE FROM memory_capture_jobs WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM memory_commitment_jobs WHERE session_id = %s", (session_id,))
+        conn.execute("DELETE FROM session_job_coverage WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM commitments WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
 
@@ -1409,7 +1595,8 @@ class SessionDB:
                 ``idempotency_key`` already exists.
         """
         now = time.time()
-        row = self._conn().execute(
+        conn = self._conn()
+        row = conn.execute(
             """
             INSERT INTO memory_capture_jobs
                 (agent_id, session_id, source_from_message_id, source_to_message_id,
@@ -1423,7 +1610,10 @@ class SessionDB:
                 idempotency_key, now, now, now,
             ),
         ).fetchone()
-        return row[0] if row else None
+        if row is None:
+            return None
+        _advance_job_coverage(conn, agent_id, session_id, "capture", source_to_message_id)
+        return row[0]
 
     def claim_next_capture_job(self) -> dict | None:
         """Atomically claim one pending, due capture job for processing.
@@ -1485,18 +1675,19 @@ class SessionDB:
         now = time.time()
         conn = self._conn()
         job_row = conn.execute(
-            "SELECT agent_id FROM memory_capture_jobs WHERE id = %s", (job_id,)
+            "SELECT agent_id, session_id FROM memory_capture_jobs WHERE id = %s", (job_id,)
         ).fetchone()
         agent_id = job_row[0] if job_row else ""
+        session_id = job_row[1] if job_row else ""
         new_proposals = []
         for claim in proposals:
             row = conn.execute(
                 """
-                INSERT INTO memory_proposals (job_id, agent_id, claim_text, created_at)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO memory_proposals (job_id, session_id, agent_id, claim_text, created_at)
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (job_id, agent_id, claim, now),
+                (job_id, session_id, agent_id, claim, now),
             ).fetchone()
             new_proposals.append({"id": row[0], "agent_id": agent_id, "claim_text": claim})
         conn.execute(
@@ -1564,7 +1755,8 @@ class SessionDB:
                 ``idempotency_key`` already exists.
         """
         now = time.time()
-        row = self._conn().execute(
+        conn = self._conn()
+        row = conn.execute(
             """
             INSERT INTO memory_commitment_jobs
                 (agent_id, session_id, channel, source_from_message_id,
@@ -1579,7 +1771,12 @@ class SessionDB:
                 source_to_message_id, idempotency_key, now, now, now,
             ),
         ).fetchone()
-        return row[0] if row else None
+        if row is None:
+            return None
+        _advance_job_coverage(
+            conn, agent_id, session_id, "commitment", source_to_message_id, channel=channel,
+        )
+        return row[0]
 
     def claim_next_commitment_job(self) -> dict | None:
         """Atomically claim one pending, due commitment-extraction job.
@@ -1795,7 +1992,8 @@ class SessionDB:
                 ``idempotency_key`` already exists.
         """
         now = time.time()
-        row = self._conn().execute(
+        conn = self._conn()
+        row = conn.execute(
             """
             INSERT INTO message_embedding_jobs
                 (agent_id, session_id, message_id, idempotency_key,
@@ -1806,7 +2004,10 @@ class SessionDB:
             """,
             (agent_id, session_id, message_id, idempotency_key, now, now, now),
         ).fetchone()
-        return row[0] if row else None
+        if row is None:
+            return None
+        _advance_job_coverage(conn, agent_id, session_id, "message_embedding", message_id)
+        return row[0]
 
     def claim_next_message_embedding_job(self) -> dict | None:
         """Atomically claim one pending, due message-embedding job for processing.
@@ -1927,12 +2128,17 @@ class SessionDB:
         if not self._session_owned_by(session_id, agent_id):
             return []
         conn = self._conn()
+        # Reads the durable session_job_coverage cursor (R2-GAP-001) rather
+        # than MAX(message_id) over message_embedding_jobs directly — that
+        # table's rows are exactly what retention pruning deletes, so using
+        # it as the coverage source would let pruning silently reset this
+        # cursor and cause the same historical messages to be re-embedded.
         row = conn.execute(
-            "SELECT MAX(message_id) FROM message_embedding_jobs "
-            "WHERE agent_id = %s AND session_id = %s",
-            (agent_id, session_id),
+            "SELECT covered_through_id FROM session_job_coverage "
+            "WHERE session_id = %s AND lane = 'message_embedding'",
+            (session_id,),
         ).fetchone()
-        last_covered = row[0] if row and row[0] is not None else 0
+        last_covered = row[0] if row is not None else 0
         rows = conn.execute(
             "SELECT id FROM messages "
             "WHERE session_id = %s AND role IN ('user', 'assistant') "
@@ -1953,19 +2159,25 @@ class SessionDB:
         SQL aggregate over ``memory_capture_jobs``/``memory_commitment_jobs``
         — a fact anyone with a database connection can observe, including a
         separate ``minion-assist memory status --deep`` CLI invocation.
-        "Pending" here means ``state = 'pending'`` (claimed-but-running or
-        already-finished jobs are excluded — a stuck ``'running'`` job is a
-        different, rarer failure mode this doesn't attempt to detect).
+        "Pending" here means ``state = 'pending'``. ``running_count``/
+        ``oldest_running_age_s`` (R2-GAP-003) separately surface jobs stuck
+        in ``'running'`` — normally that state is transient (a worker holds
+        it only for the duration of one claim-to-complete cycle), so a
+        running job that's been sitting for a long time means its worker
+        crashed mid-job; :meth:`reclaim_stale_running_jobs` is what recovers
+        those, this method is only what makes them visible before that
+        happens.
 
         Args:
             agent_id: Which agent's queues to summarize.
 
         Returns:
-            dict: ``{"capture": {"pending_count", "oldest_pending_age_s"},
-                "commitment": {"pending_count", "oldest_pending_age_s"},
-                "message_embedding": {"pending_count", "oldest_pending_age_s"}}``.
-                ``oldest_pending_age_s`` is seconds since the oldest pending
-                job was created, or ``None`` if the queue is empty.
+            dict: ``{"capture": {...}, "commitment": {...},
+                "message_embedding": {...}}``, each a dict with
+                ``pending_count``, ``oldest_pending_age_s``,
+                ``running_count``, ``oldest_running_age_s``.
+                ``oldest_*_age_s`` is seconds since the oldest matching job
+                was last updated, or ``None`` if that state is empty.
         """
         conn = self._conn()
         now = time.time()
@@ -1981,12 +2193,77 @@ class SessionDB:
             oldest_pending_age_s = (
                 now - oldest_created_at if oldest_created_at is not None else None
             )
-            return {"pending_count": pending_count, "oldest_pending_age_s": oldest_pending_age_s}
+            running_row = conn.execute(
+                f"SELECT count(*), MIN(updated_at) FROM {table} "
+                "WHERE agent_id = %s AND state = 'running'",
+                (agent_id,),
+            ).fetchone()
+            running_count = running_row[0] or 0
+            oldest_running_updated_at = running_row[1]
+            oldest_running_age_s = (
+                now - oldest_running_updated_at if oldest_running_updated_at is not None else None
+            )
+            return {
+                "pending_count": pending_count,
+                "oldest_pending_age_s": oldest_pending_age_s,
+                "running_count": running_count,
+                "oldest_running_age_s": oldest_running_age_s,
+            }
 
         return {
             "capture": _lane("memory_capture_jobs"),
             "commitment": _lane("memory_commitment_jobs"),
             "message_embedding": _lane("message_embedding_jobs"),
+        }
+
+    def reclaim_stale_running_jobs(self, stale_after_seconds: float = 3600.0) -> dict:
+        """Reset jobs stuck in ``'running'`` back to ``'pending'`` (R2-GAP-003).
+
+        None of the three job queues use a claim lease/owner — a worker
+        crash (or process kill) between claiming a job and completing it
+        leaves that row in ``'running'`` forever, invisible to the normal
+        pending-queue claim query and therefore never retried. Since this
+        codebase runs exactly one worker per lane (never multiple
+        concurrent claimants racing each other), a full owner/lease system
+        would be more machinery than the actual failure mode warrants —
+        the minimum fix that closes the gap is resetting anything that's
+        been ``'running'`` for implausibly long back to ``'pending'`` once,
+        at process startup, before any worker starts claiming.
+
+        A job legitimately in ``'running'`` for the *current* process is
+        never at risk of being reclaimed by this: workers claim and
+        complete a job within a single method call (seconds, not the
+        default one-hour threshold), and this is only ever called once at
+        startup before workers begin claiming — never while workers are
+        already running.
+
+        Args:
+            stale_after_seconds: How long a row may sit in ``'running'``
+                (measured from its ``updated_at``, set at claim time)
+                before it's considered abandoned and reset. Defaults to one
+                hour — far longer than any real capture/commitment/
+                embedding call is expected to take, so this only ever
+                fires for a genuinely crashed worker.
+
+        Returns:
+            dict: ``{"capture_jobs", "commitment_jobs", "message_embedding_jobs"}``
+                — number of rows reset in each table.
+        """
+        conn = self._conn()
+        cutoff = time.time() - stale_after_seconds
+
+        def _reclaim(table: str) -> int:
+            cur = conn.execute(
+                f"UPDATE {table} SET state = 'pending' "
+                "WHERE state = 'running' AND updated_at < %s",
+                (cutoff,),
+            )
+            return cur.rowcount
+
+        return {
+            "capture_jobs": _reclaim("memory_capture_jobs"),
+            "commitment_jobs": _reclaim("memory_commitment_jobs"),
+            "message_embedding_jobs": _reclaim("message_embedding_jobs"),
         }
 
     def prune_operational_tables(self, retention_days: float, dry_run: bool = False) -> dict:
@@ -1997,10 +2274,19 @@ class SessionDB:
         older than the cutoff — a job still in flight or waiting to be
         retried is never touched regardless of age. This is pure
         operational bookkeeping (queue history, not memory content):
-        deleting an old completed/failed job row does not affect the
-        capture/commitment/embedding output it already produced, which
-        lives in ``memory_proposals``/``commitments``/``message_embeddings``
-        respectively and is untouched by this method.
+        deleting an old completed/failed job row does not delete the
+        capture/commitment output it already produced (``memory_proposals``/
+        ``commitments`` survive via ``ON DELETE SET NULL``, not ``CASCADE``
+        — R2-GAP-001) and does not reset reconciliation's notion of what's
+        already been covered (tracked separately in
+        ``session_job_coverage``, which this method never touches). Prior
+        to R2-GAP-001 this docstring claimed outputs were simply "untouched"
+        by this method, which was false: migration 004's original
+        ``ON DELETE CASCADE`` meant pruning a job *did* delete its
+        proposal/commitment children, and the coverage cursor *was* derived
+        from these same job rows. Both are now fixed at the schema/query
+        level (migration 005), which is what makes this docstring's claim
+        accurate rather than aspirational.
 
         Args:
             retention_days: How many days a terminal-state row may age
@@ -2074,12 +2360,16 @@ class SessionDB:
         if not self._session_owned_by(session_id, agent_id):
             return None
         conn = self._conn()
+        # See find_uncovered_message_ids_for_embedding's comment: reads the
+        # durable session_job_coverage cursor (R2-GAP-001), not
+        # MAX(memory_capture_jobs.source_to_message_id) — that table's rows
+        # are exactly what retention pruning deletes.
         row = conn.execute(
-            "SELECT MAX(source_to_message_id) FROM memory_capture_jobs "
-            "WHERE agent_id = %s AND session_id = %s",
-            (agent_id, session_id),
+            "SELECT covered_through_id FROM session_job_coverage "
+            "WHERE session_id = %s AND lane = 'capture'",
+            (session_id,),
         ).fetchone()
-        last_covered = row[0] if row and row[0] is not None else 0
+        last_covered = row[0] if row is not None else 0
         row = conn.execute(
             "SELECT MIN(id), MAX(id) FROM messages "
             "WHERE session_id = %s AND role IN ('user', 'assistant') "
@@ -2122,16 +2412,17 @@ class SessionDB:
         if not self._session_owned_by(session_id, agent_id):
             return None
         conn = self._conn()
+        # See find_uncovered_message_ids_for_embedding's comment: reads the
+        # durable session_job_coverage cursor (R2-GAP-001), including its
+        # channel column, not memory_commitment_jobs directly — that
+        # table's rows are exactly what retention pruning deletes, and
+        # without a durably-remembered channel a session whose commitment
+        # jobs were all pruned would look indistinguishable from one that
+        # never had any, permanently exiting commitment reconciliation.
         row = conn.execute(
-            """
-            SELECT channel, MAX(source_to_message_id)
-            FROM memory_commitment_jobs
-            WHERE agent_id = %s AND session_id = %s
-            GROUP BY channel
-            ORDER BY MAX(source_to_message_id) DESC
-            LIMIT 1
-            """,
-            (agent_id, session_id),
+            "SELECT channel, covered_through_id FROM session_job_coverage "
+            "WHERE session_id = %s AND lane = 'commitment'",
+            (session_id,),
         ).fetchone()
         if row is None:
             return None

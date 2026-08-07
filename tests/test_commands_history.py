@@ -122,6 +122,19 @@ def test_history_load_by_index(tmp_path):
     assert result.handled
     assert "aaa" in result.message
     ctx.sessions["main"].switch_session.assert_called_once_with("aaa-000")
+    # R2-GAP-004: a successful switch reports the new id so callers with an
+    # external binding to persist (MatrixMessageHandler -> room_session_mgr)
+    # know to update it — see CommandResult.new_session_id's docstring.
+    assert result.new_session_id == "aaa-000"
+
+
+def test_history_already_on_current_reports_no_new_session_id(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "aaa-000", [{"role": "user", "content": "a"}])
+
+    result = dispatch_command(_ctx("1", stm, session_id="aaa-000"))
+    assert result.handled
+    assert result.new_session_id is None
 
 
 def test_history_load_index_out_of_range(tmp_path):

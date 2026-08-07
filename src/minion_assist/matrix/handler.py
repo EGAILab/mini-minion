@@ -293,6 +293,13 @@ class MatrixMessageHandler:
         room_cfg=None,
     ) -> None:
         """Run the agent turn in a thread-pool thread and post the reply."""
+        # R2-GAP-004: resolved *before* command interception below, not
+        # after — a command handler (/new, /compact, /session, etc.) must
+        # see this room's own isolated session, not the shared REPL
+        # default. Building it unconditionally here (rather than only on
+        # the non-command path, as before) is what fixes that.
+        session = self._get_or_build_session(agent_id, room_id, session_id)
+
         # Slash command interception — only active when agents_cfg is provided.
         # Supports both / and ! prefix.  Element Web blocks unknown /commands
         # client-side (showing "Unrecognised command"); ! is the conventional
@@ -315,12 +322,24 @@ class MatrixMessageHandler:
                         thread_id=thread_id,
                     )
                     return
+                # R2-GAP-004: every single-target command handler in
+                # commands.py resolves "the session to act on" via
+                # ctx.sessions.get(ctx.target_agent_id) — target_agent_id is
+                # always this room's own agent_id here, so overriding just
+                # that one entry (leaving every other agent's shared REPL
+                # session untouched) redirects every such lookup to this
+                # room's real session, with no per-command special-casing
+                # and no change to the CLI REPL's own dispatch path
+                # (self._sessions is never mutated, only a fresh dict is
+                # built for this one call).
+                _matrix_sessions = dict(self._sessions)
+                _matrix_sessions[agent_id] = session
                 ctx = CommandContext(
                     raw=text,
                     command=cmd,
                     args=args,
                     target_agent_id=agent_id,
-                    sessions=self._sessions,
+                    sessions=_matrix_sessions,
                     agents_cfg=self._agents_cfg,
                     session_store=self._session_store,
                     mcp_manager=self._mcp_manager,
@@ -331,11 +350,19 @@ class MatrixMessageHandler:
                 )
                 result = dispatch_command(ctx)
                 if result.handled:
+                    # R2-GAP-004: /session <arg> switches this room's live
+                    # AgentSession to a different session_id in place
+                    # (commands.py's switch_session() call) but has no way
+                    # to persist that — only this handler has a reference
+                    # to room_session_mgr. Without this, the switch would
+                    # silently revert to the old binding on the next bot
+                    # restart.
+                    if result.new_session_id is not None:
+                        await self._room_session_mgr.rebind(room_id, agent_id, result.new_session_id)
                     if result.message:
                         await self._outbound.send_text(room_id, result.message, thread_id=thread_id)
                     return  # consumed — skip LLM
 
-        session = self._get_or_build_session(agent_id, room_id, session_id)
         loop = asyncio.get_running_loop()
 
         # Build per-turn extra tools (injected for this turn only).

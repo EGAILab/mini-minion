@@ -96,3 +96,34 @@ class MatrixRoomSessionManager:
         )
         await self._conn.commit()
         return session_id
+
+    async def rebind(self, room_id: str, agent_id: str, session_id: str) -> None:
+        """Point ``(room_id, agent_id)`` at a different, already-existing ``session_id``.
+
+        R2-GAP-004: ``/session <arg>`` switches a room's live
+        :class:`~minion_assist.agents.session.AgentSession` to a different
+        session in place (``switch_session()``), but that's purely
+        in-memory — without also updating the row this method writes, the
+        switch would silently revert to whatever was last persisted the
+        next time the bot restarts and re-resolves this room's binding via
+        :meth:`get_or_create_session_id`.
+
+        Unlike that method, this always overwrites — there is no
+        get-or-create branch, since the caller already knows exactly which
+        session_id it wants bound.
+
+        Args:
+            room_id: The Matrix room whose binding should change.
+            agent_id: The agent this room routes to.
+            session_id: The session_id to bind, replacing whatever was
+                bound before.
+        """
+        if self._conn is None:
+            raise RuntimeError("MatrixRoomSessionManager.start() has not been called.")
+        await self._conn.execute(
+            "INSERT INTO room_sessions (room_id, agent_id, session_id, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (room_id, agent_id) DO UPDATE SET session_id = excluded.session_id",
+            (room_id, agent_id, session_id, int(time.time())),
+        )
+        await self._conn.commit()

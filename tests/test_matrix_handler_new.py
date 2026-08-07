@@ -46,7 +46,8 @@ def _make_client(user_id="@bot:example.org"):
 
 
 def _make_handler(config=None, sessions=None, user_id="@bot:example.org", agents_cfg=None,
-                  session_store=None, mcp_manager=None, skills=None, short_term=None):
+                  session_store=None, mcp_manager=None, skills=None, short_term=None,
+                  session_factories=None):
     config = config or _make_config(user_id=user_id)
     sessions = sessions or {"main": MagicMock()}
     outbound = MagicMock()
@@ -59,6 +60,7 @@ def _make_handler(config=None, sessions=None, user_id="@bot:example.org", agents
     bot_loop.should_suppress.return_value = False
     room_session_mgr = MagicMock()
     room_session_mgr.get_or_create_session_id = AsyncMock(return_value="room-session-abc")
+    room_session_mgr.rebind = AsyncMock()
     return MatrixMessageHandler(
         client=_make_client(user_id),
         config=config,
@@ -72,6 +74,7 @@ def _make_handler(config=None, sessions=None, user_id="@bot:example.org", agents
         mcp_manager=mcp_manager,
         skills=skills,
         short_term=short_term,
+        session_factories=session_factories,
     )
 
 
@@ -223,16 +226,24 @@ def _make_agents_cfg():
 
 
 def test_slash_command_new_clears_history():
-    session = MagicMock()
-    session.send.return_value = "response"
-    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+    # R2-GAP-004 regression: /new must reset THIS room's own session, built
+    # via session_factories, not the shared REPL default in `sessions`.
+    shared_session = MagicMock()
+    room_session = MagicMock()
+    room_session.send.return_value = "response"
+    handler = _make_handler(
+        sessions={"main": shared_session},
+        agents_cfg=_make_agents_cfg(),
+        session_factories={"main": lambda session_id: room_session},
+    )
 
     _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="/new"),
     ))
-    session.reset.assert_called_once()
-    session.send.assert_not_called()
+    room_session.reset.assert_called_once()
+    room_session.send.assert_not_called()
+    shared_session.reset.assert_not_called()
 
 
 def test_slash_command_reply_sent_to_room():
@@ -287,15 +298,64 @@ def test_unknown_slash_command_falls_through_to_llm():
 
 def test_bang_prefix_new_clears_history():
     """!new should work identically to /new (Element-safe prefix)."""
-    session = MagicMock()
-    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+    # R2-GAP-004 regression — see test_slash_command_new_clears_history.
+    shared_session = MagicMock()
+    room_session = MagicMock()
+    handler = _make_handler(
+        sessions={"main": shared_session},
+        agents_cfg=_make_agents_cfg(),
+        session_factories={"main": lambda session_id: room_session},
+    )
 
     _run(handler.handle_room_message(
         _make_room(),
         _make_event(body="!new"),
     ))
-    session.reset.assert_called_once()
-    session.send.assert_not_called()
+    room_session.reset.assert_called_once()
+    room_session.send.assert_not_called()
+    shared_session.reset.assert_not_called()
+
+
+def test_session_switch_rebinds_the_room_session_manager_binding():
+    # R2-GAP-004: /session <arg> switches the room's live AgentSession's
+    # session_id in place, but only the handler can persist that switch
+    # into MatrixRoomSessionManager's durable (room_id, agent_id) binding —
+    # without this, the switch would silently revert on the next restart.
+    from minion_assist.commands import CommandResult
+
+    session = MagicMock()
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    with patch(
+        "minion_assist.commands.dispatch_command",
+        return_value=CommandResult(handled=True, message="switched", new_session_id="new-sid-123"),
+    ):
+        _run(handler.handle_room_message(
+            _make_room(room_id="!room:example.org"),
+            _make_event(body="/session 2"),
+        ))
+
+    handler._room_session_mgr.rebind.assert_called_once_with(
+        "!room:example.org", "main", "new-sid-123",
+    )
+
+
+def test_command_without_a_session_switch_never_rebinds():
+    from minion_assist.commands import CommandResult
+
+    session = MagicMock()
+    handler = _make_handler(sessions={"main": session}, agents_cfg=_make_agents_cfg())
+
+    with patch(
+        "minion_assist.commands.dispatch_command",
+        return_value=CommandResult(handled=True, message="ok"),
+    ):
+        _run(handler.handle_room_message(
+            _make_room(),
+            _make_event(body="/status"),
+        ))
+
+    handler._room_session_mgr.rebind.assert_not_called()
 
 
 def test_bang_prefix_session_dispatched():

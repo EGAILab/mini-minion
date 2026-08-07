@@ -84,6 +84,17 @@ class CommandResult:
     should_exit: bool = False    # True = break out of the REPL loop
     message: str | None = None  # text to print to the user (None = print nothing)
     activate_agent_id: str | None = None  # non-None → switch the REPL's active agent
+    new_session_id: str | None = None  # non-None → /session <arg> switched the active
+                                        # session's id in place (R2-GAP-004); the caller
+                                        # is responsible for persisting that anywhere it
+                                        # tracks a session_id binding outside this
+                                        # session's own in-memory state — the CLI REPL
+                                        # has nothing to persist here (SessionStore was
+                                        # already updated by switch_session() itself),
+                                        # but MatrixMessageHandler uses this to update
+                                        # MatrixRoomSessionManager's (room_id, agent_id)
+                                        # binding, or a restart would silently revert
+                                        # the switch
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +758,7 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
             return CommandResult(
                 handled=True,
                 message=f"{header}\n\n{body}",
+                new_session_id=target_id,
             )
 
         # --- /rename ---
