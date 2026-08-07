@@ -1955,6 +1955,53 @@ def _resolve_embeddings() -> EmbeddingConfig | None:
 embeddings: EmbeddingConfig | None = _resolve_embeddings()
 
 
+@dataclass(frozen=True)
+class SessionSearchConfig:
+    """Relevance tuning for session-message search (R2-GAP-012).
+
+    Configured via the optional ``"session_search"`` section in
+    config.json::
+
+        "session_search": {
+            "min_similarity": 0.15
+        }
+
+    Attributes:
+        min_similarity: Minimum cosine similarity (``1 - cosine_distance``,
+            roughly in ``[-1, 1]`` — 1 means identical, 0 means unrelated)
+            a vector-search hit must clear to be returned at all. Without
+            a floor, ``SessionDB._vector_search_messages()`` always returns
+            its ``limit`` nearest neighbors even when none of them are
+            actually related to the query — "nearest" isn't the same as
+            "relevant." Deliberately configurable (unlike e.g.
+            ``_BACKFILL_WINDOW_MESSAGES``) since the right threshold
+            depends on the configured embedding model's own similarity
+            distribution, which this project has no way to calibrate
+            automatically. ``0.15`` is a conservative default — low enough
+            to rarely reject a genuinely relevant hit, high enough to drop
+            clearly-unrelated ones.
+    """
+    min_similarity: float = 0.15
+
+
+def _resolve_session_search() -> SessionSearchConfig:
+    """Read the ``"session_search"`` section from config.json and build a SessionSearchConfig.
+
+    Returns:
+        SessionSearchConfig: Defaults applied for any missing/absent field.
+    """
+    raw = _raw.get("session_search", {})
+    if not isinstance(raw, dict):
+        return SessionSearchConfig()
+    return SessionSearchConfig(min_similarity=float(raw.get("min_similarity", 0.15)))
+
+
+# session_search: relevance tuning for session-message search (R2-GAP-012).
+# Configure in config.json: "session_search": {"min_similarity": 0.15}.
+# Omit the section to use the default threshold.
+session_search: SessionSearchConfig = _resolve_session_search()
+
+
 def _resolve_voice() -> VoiceConfig:
     """Read the ``"voice"`` section from config.json and build a VoiceConfig.
 

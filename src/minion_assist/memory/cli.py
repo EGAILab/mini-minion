@@ -543,13 +543,14 @@ def _build_db():
     "never raises, report and degrade" contract as :func:`_build_index`.
     """
     from ..config import database as database_cfg  # noqa: PLC0415
+    from ..config import session_search as session_search_cfg  # noqa: PLC0415
 
     if not database_cfg.url:
         return None
     try:
         from ..session.db import SessionDB  # noqa: PLC0415
 
-        return SessionDB(database_cfg.url)
+        return SessionDB(database_cfg.url, min_similarity=session_search_cfg.min_similarity)
     except Exception as exc:
         print(f"Warning: database unavailable ({exc}).")
         return None

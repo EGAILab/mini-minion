@@ -510,6 +510,30 @@ class CodexProvider:
         self._thread_id = None
         self._sent_count = 0
 
+    def close(self) -> None:
+        """Terminate this instance's Codex subprocess and stop its background auth-refresh thread (R2-GAP-013).
+
+        A no-op if ``chat()`` was never called (``_rpc`` is still ``None`` —
+        the subprocess is only launched lazily, on first use, so a
+        room/session that was built but never actually sent a message has
+        nothing to close). Safe to call more than once: the underlying
+        ``_CodexRpcClient.close()`` already swallows errors from an
+        already-terminated process, and re-signalling an already-stopped
+        ``stop_event`` is harmless.
+
+        Every ``CodexProvider`` instance owns its own subprocess (never
+        shared across conversations — see this class's docstring), so
+        without an explicit close, each one only ever gets cleaned up by
+        the OS when the whole bot process exits. Called by
+        ``AgentSession.close()``, in turn called by ``matrix/channel.py``'s
+        shutdown path for every room-scoped session it built.
+        """
+        if self._auth_refresh_stop is not None:
+            self._auth_refresh_stop.set()
+        if self._rpc is not None:
+            self._rpc.close()
+            self._rpc = None
+
     def _get_rpc(self) -> _CodexRpcClient:
         """Return the active RPC client, launching the Codex subprocess if not yet started."""
         if self._rpc is None:

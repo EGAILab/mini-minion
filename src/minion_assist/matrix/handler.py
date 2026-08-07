@@ -52,10 +52,16 @@ class MatrixMessageHandler:
         client:              Authenticated matrix-nio ``AsyncClient``.
         config:              Active :class:`~minion_assist.matrix.config.MatrixConfig`.
         sessions:            Dict mapping agent_id → ``AgentSession``. This is the
-                              REPL's shared default session, used only as a fallback
-                              (see ``_get_or_build_session``) — normal Matrix traffic
-                              is dispatched to a room-scoped session instead
-                              (MEM-GAP-001).
+                              REPL's shared default session — normal Matrix traffic is
+                              always dispatched to a room-scoped session instead
+                              (MEM-GAP-001), built via ``session_factories``, never
+                              this dict directly (R2-GAP-009: a missing factory now
+                              fails the turn closed, it no longer falls back here).
+                              Still the base ``CommandContext.sessions`` command
+                              dispatch overrides with the room session for the calling
+                              agent (R2-GAP-004) — legitimately process-global commands
+                              (``/mcp-reload``, ``/diagnose``, etc.) still read every
+                              other configured agent's entry from here.
         outbound:            :class:`~minion_assist.matrix.outbound.MatrixOutbound`.
         dedupe:              :class:`~minion_assist.matrix.inbound_dedupe.MatrixInboundDeduper`.
         bot_loop:            :class:`~minion_assist.matrix.bot_loop.BotLoopProtection`.
@@ -117,13 +123,40 @@ class MatrixMessageHandler:
         # singleton for the REPL (MEM-GAP-001).
         self._room_sessions: dict[tuple[str, str], "AgentSession"] = {}
 
-    def _get_or_build_session(self, agent_id: str, room_id: str, session_id: str) -> "AgentSession":
+    def close_room_sessions(self) -> None:
+        """Dispose every room session's provider resources (R2-GAP-013).
+
+        Called once, during Matrix channel shutdown
+        (``matrix/monitor.py``'s ``_cleanup``) — without it, each room that
+        ever used a Codex-backed agent leaked its subprocess for the life
+        of the bot process (each ``CodexProvider`` instance in
+        ``self._room_sessions`` owns its own subprocess, never shared —
+        see that class's docstring), only ever cleaned up by the OS when
+        the whole process exited. A stateless provider (OpenAI-
+        completions, Anthropic) has nothing to close, so this is a no-op
+        for those rooms — see ``AgentSession.close()``'s docstring.
+        """
+        for session in self._room_sessions.values():
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _get_or_build_session(self, agent_id: str, room_id: str, session_id: str) -> "AgentSession | None":
         """Return this room's isolated ``AgentSession``, building it on first use.
 
-        Falls back to the shared ``sessions[agent_id]`` (the REPL's default
-        session) only if no factory was wired for ``agent_id`` — logged
-        loudly rather than silently, since that fallback reintroduces the
-        exact cross-room history sharing this method exists to prevent.
+        R2-GAP-009: returns ``None`` — fails *closed* — when no factory was
+        wired for ``agent_id``, instead of the earlier fallback to the
+        shared ``sessions[agent_id]`` (the REPL's default session). That
+        fallback was a deliberate, accepted trade-off when room-scoping was
+        first built (favoring availability — the agent still responds even
+        when misconfigured), but it reintroduces the exact cross-room
+        history sharing room-scoping exists to prevent, silently, for as
+        long as the misconfiguration lasts. For a single-user deployment,
+        refusing to respond until it's fixed is the safer default: a
+        missing factory becomes immediately visible (the room gets an
+        explicit error, not silence) rather than a quiet, ongoing isolation
+        leak. Still logged loudly either way.
         """
         cache_key = (agent_id, room_id)
         cached = self._room_sessions.get(cache_key)
@@ -132,14 +165,14 @@ class MatrixMessageHandler:
         factory = self._session_factories.get(agent_id)
         if factory is None:
             print(
-                f"[matrix] Warning: no room-session factory for agent '{agent_id}' — "
-                f"falling back to the shared default session for room {room_id}. "
-                "Every room routed to this agent will share history until this is fixed.",
+                f"[matrix] ERROR: no room-session factory for agent '{agent_id}' — "
+                f"refusing to process room {room_id}'s message rather than share history "
+                "with every other room routed to this agent. Wire a session_factory for "
+                "this agent in minion.py's Matrix construction.",
                 file=sys.stderr,
             )
-            session = self._sessions[agent_id]
-        else:
-            session = factory(session_id)
+            return None
+        session = factory(session_id)
         self._room_sessions[cache_key] = session
         return session
 
@@ -299,6 +332,19 @@ class MatrixMessageHandler:
         # default. Building it unconditionally here (rather than only on
         # the non-command path, as before) is what fixes that.
         session = self._get_or_build_session(agent_id, room_id, session_id)
+        if session is None:
+            # R2-GAP-009: fail closed — no session_factory is wired for
+            # this agent, so there is no isolated session to use and no
+            # safe fallback. Refuse the turn (command or not) rather than
+            # silently share history via the old shared-session fallback.
+            await self._outbound.send_text(
+                room_id,
+                "This agent has no room-scoped session configured — refusing to respond "
+                "rather than risk mixing this room's history with another's. "
+                "Contact the operator.",
+                thread_id=thread_id,
+            )
+            return
 
         # Slash command interception — only active when agents_cfg is provided.
         # Supports both / and ! prefix.  Element Web blocks unknown /commands

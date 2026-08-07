@@ -510,12 +510,22 @@ def test_dispatch_status_deep_without_a_database_says_so():
     assert "Database: not configured" in result.message
 
 
+def _empty_lag_lane(**overrides) -> dict:
+    lane = {
+        "pending_count": 0, "oldest_pending_age_s": None,
+        "running_count": 0, "oldest_running_age_s": None,
+        "failed_count": 0,
+    }
+    lane.update(overrides)
+    return lane
+
+
 def test_dispatch_status_deep_reports_queue_lag_from_the_database():
     db = MagicMock()
     db.queue_lag_summary.return_value = {
-        "capture": {"pending_count": 3, "oldest_pending_age_s": 120.0},
-        "commitment": {"pending_count": 0, "oldest_pending_age_s": None},
-        "message_embedding": {"pending_count": 2, "oldest_pending_age_s": 5.0},
+        "capture": _empty_lag_lane(pending_count=3, oldest_pending_age_s=120.0),
+        "commitment": _empty_lag_lane(),
+        "message_embedding": _empty_lag_lane(pending_count=2, oldest_pending_age_s=5.0),
     }
     with patch("minion_assist.config.streaming") as mock_streaming:
         mock_streaming.chat_mode = False
@@ -526,6 +536,93 @@ def test_dispatch_status_deep_reports_queue_lag_from_the_database():
     assert "message_embedding_pending=2" in result.message
 
 
+def test_dispatch_status_deep_reports_a_stuck_running_job():
+    db = MagicMock()
+    db.queue_lag_summary.return_value = {
+        "capture": _empty_lag_lane(running_count=1, oldest_running_age_s=7200.0),
+        "commitment": _empty_lag_lane(),
+        "message_embedding": _empty_lag_lane(),
+    }
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    assert "capture_running=1" in result.message
+
+
+def test_dispatch_status_deep_reports_a_failed_job_count():
+    db = MagicMock()
+    db.queue_lag_summary.return_value = {
+        "capture": _empty_lag_lane(),
+        "commitment": _empty_lag_lane(),
+        "message_embedding": _empty_lag_lane(failed_count=4),
+    }
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    assert "message_embedding_failed=4" in result.message
+
+
+def test_dispatch_status_deep_omits_stuck_line_when_everything_is_healthy():
+    db = MagicMock()
+    db.queue_lag_summary.return_value = {
+        "capture": _empty_lag_lane(),
+        "commitment": _empty_lag_lane(),
+        "message_embedding": _empty_lag_lane(),
+    }
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    assert "_running=" not in result.message
+    assert "_failed=" not in result.message
+
+
+def test_dispatch_status_deep_reports_missing_embedding_coverage():
+    db = MagicMock()
+    db.queue_lag_summary.return_value = {
+        "capture": _empty_lag_lane(),
+        "commitment": _empty_lag_lane(),
+        "message_embedding": _empty_lag_lane(),
+    }
+    db.embedding_coverage_summary.return_value = {
+        "missing_count": 5, "model_identity": "test-endpoint::test-model",
+    }
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    assert "5 message(s)" in result.message
+    assert "test-endpoint::test-model" in result.message
+
+
+def test_dispatch_status_deep_omits_embedding_coverage_line_without_a_vector_lane():
+    db = MagicMock()
+    db.queue_lag_summary.return_value = {
+        "capture": _empty_lag_lane(),
+        "commitment": _empty_lag_lane(),
+        "message_embedding": _empty_lag_lane(),
+    }
+    db.embedding_coverage_summary.return_value = None
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    assert "embedding coverage" not in result.message
+
+
+def test_dispatch_status_deep_survives_an_embedding_coverage_query_failure():
+    db = MagicMock()
+    db.queue_lag_summary.return_value = {
+        "capture": _empty_lag_lane(),
+        "commitment": _empty_lag_lane(),
+        "message_embedding": _empty_lag_lane(),
+    }
+    db.embedding_coverage_summary.side_effect = Exception("connection lost")
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    assert result.handled
+    assert "embedding coverage unavailable" in result.message
+    assert "connection lost" in result.message
+
+
 def test_dispatch_status_deep_reports_index_summary_from_the_agents_memory():
     session = _make_session()
     session.memory = MagicMock()
@@ -534,10 +631,11 @@ def test_dispatch_status_deep_reports_index_summary_from_the_agents_memory():
     }
     db = MagicMock()
     db.queue_lag_summary.return_value = {
-        "capture": {"pending_count": 0, "oldest_pending_age_s": None},
-        "commitment": {"pending_count": 0, "oldest_pending_age_s": None},
-        "message_embedding": {"pending_count": 0, "oldest_pending_age_s": None},
+        "capture": _empty_lag_lane(),
+        "commitment": _empty_lag_lane(),
+        "message_embedding": _empty_lag_lane(),
     }
+    db.embedding_coverage_summary.return_value = None
     with patch("minion_assist.config.streaming") as mock_streaming:
         mock_streaming.chat_mode = False
         result = dispatch_command(

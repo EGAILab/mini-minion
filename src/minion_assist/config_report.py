@@ -189,6 +189,7 @@ def _config_sections() -> list[tuple[str, object]]:
         ("codex", _cfg.codex_cfg),
         ("database", _cfg.database),
         ("embeddings", _cfg.embeddings),
+        ("session_search", _cfg.session_search),
         ("voice", _cfg.voice),
     ]
 

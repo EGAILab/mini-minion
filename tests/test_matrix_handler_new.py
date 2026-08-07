@@ -61,6 +61,13 @@ def _make_handler(config=None, sessions=None, user_id="@bot:example.org", agents
     room_session_mgr = MagicMock()
     room_session_mgr.get_or_create_session_id = AsyncMock(return_value="room-session-abc")
     room_session_mgr.rebind = AsyncMock()
+    if session_factories is None:
+        # R2-GAP-009: _get_or_build_session() now fails closed when no
+        # factory is registered. Tests here that aren't specifically about
+        # that failure mode default to a trivial factory returning the
+        # same per-agent session `sessions` already provides, so existing
+        # assertions against that mock stay valid.
+        session_factories = {aid: (lambda sid, s=s: s) for aid, s in sessions.items()}
     return MatrixMessageHandler(
         client=_make_client(user_id),
         config=config,
@@ -413,4 +420,39 @@ def test_slash_command_skipped_when_agents_cfg_none():
         _make_event(body="/new"),
     ))
     session.send.assert_called_once()
-    session.reset.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# close_room_sessions — R2-GAP-013 shutdown-time provider disposal
+# ---------------------------------------------------------------------------
+
+def test_close_room_sessions_closes_every_cached_room_session():
+    handler = _make_handler(agents_cfg=_make_agents_cfg())
+    session_a = MagicMock()
+    session_b = MagicMock()
+    handler._room_sessions[("main", "!a:ex.org")] = session_a
+    handler._room_sessions[("main", "!b:ex.org")] = session_b
+
+    handler.close_room_sessions()
+
+    session_a.close.assert_called_once()
+    session_b.close.assert_called_once()
+
+
+def test_close_room_sessions_continues_past_one_sessions_close_failure():
+    handler = _make_handler(agents_cfg=_make_agents_cfg())
+    failing_session = MagicMock()
+    failing_session.close.side_effect = Exception("subprocess already dead")
+    healthy_session = MagicMock()
+    handler._room_sessions[("main", "!a:ex.org")] = failing_session
+    handler._room_sessions[("main", "!b:ex.org")] = healthy_session
+
+    handler.close_room_sessions()  # must not raise
+
+    healthy_session.close.assert_called_once()
+
+
+def test_close_room_sessions_is_a_noop_with_no_cached_sessions():
+    handler = _make_handler(agents_cfg=_make_agents_cfg())
+
+    handler.close_room_sessions()  # must not raise

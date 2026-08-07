@@ -397,10 +397,12 @@ def main() -> None:
     if database_cfg.url:
         try:
             from .session.db import SessionDB  # noqa: PLC0415
+            from .config import session_search as session_search_cfg  # noqa: PLC0415
             _db = SessionDB(
                 database_cfg.url,
                 embedding_dimensions=_embedding_dims,
                 embedding_provider=_embedding_provider,
+                min_similarity=session_search_cfg.min_similarity,
             )
             print(f"Database connected: {database_cfg.url.split('@')[-1]}")
             # Reconcile every session's JSONL against message_mirrors — mirrors

@@ -598,6 +598,30 @@ class AgentSession:
         """The agent's LLM provider.  Exposed for the ``/provider test`` command."""
         return self._provider
 
+    def close(self) -> None:
+        """Release this session's provider resources, if it holds any (R2-GAP-013).
+
+        Only ``CodexProvider`` currently needs this — it owns a long-lived
+        ``codex`` subprocess per instance (see ``providers/codex.py``'s
+        module docstring on why one instance can't be shared across
+        concurrent conversations). A stateless provider (OpenAI-completions,
+        Anthropic — one HTTP call per turn, nothing persistent) has no
+        ``close`` method at all, so this is a no-op for those, the same
+        duck-typed "does this provider support X" check
+        :meth:`compact_now`/``/new`` already use for ``reset_session``.
+
+        Called by ``matrix/channel.py``'s shutdown path for every
+        room-scoped session it built (``matrix/handler.py``'s
+        ``_room_sessions``) — without it, each Matrix room that ever used a
+        Codex-backed agent leaked its subprocess for the life of the bot
+        process, only ever cleaned up by the OS when the whole bot exited.
+        """
+        if hasattr(self._provider, "close"):
+            try:
+                self._provider.close()
+            except Exception:
+                pass
+
     @property
     def registry(self) -> "ToolRegistry":
         """The agent's tool registry.

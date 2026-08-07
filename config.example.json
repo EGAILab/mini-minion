@@ -78,6 +78,10 @@
     "model": "nomic-embed-text-v1.5",
     "dimensions": 768
   },
+  "session_search": {
+    "_comment": "Optional (R2-GAP-012) — relevance tuning for session-message search. min_similarity is a cosine-similarity floor (roughly -1..1) a vector-search hit must clear to be returned at all, so an unrelated 'nearest neighbor' isn't always returned. Only matters when embeddings above is configured. Omit this section to use the default (0.15).",
+    "min_similarity": 0.15
+  },
   "memory": {
     "_comment": "Controls the per-turn background fact-extraction daemon.",
     "enable_extraction": true

@@ -760,6 +760,39 @@ def test_send_does_not_mark_injected_when_the_provider_call_fails(tmp_path):
     mock_index.mark_injected.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# close() — R2-GAP-013 per-room provider resource disposal
+# ---------------------------------------------------------------------------
+
+def test_close_calls_the_providers_close_when_supported(tmp_path):
+    provider = _mock_provider()
+    provider.close = Mock()
+    session = _make_session(tmp_path, provider=provider)
+
+    session.close()
+
+    provider.close.assert_called_once()
+
+
+def test_close_is_a_noop_when_the_provider_has_no_close(tmp_path):
+    # spec= restricts the mock to exactly these attributes -- no auto-created
+    # `close`, the same as a real stateless provider (OpenAI-completions,
+    # Anthropic) that never defines one.
+    provider = Mock(spec=["chat"])
+    session = _make_session(tmp_path, provider=provider)
+
+    session.close()  # must not raise
+    assert not hasattr(provider, "close")
+
+
+def test_close_swallows_a_providers_close_exception(tmp_path):
+    provider = _mock_provider()
+    provider.close = Mock(side_effect=Exception("subprocess already dead"))
+    session = _make_session(tmp_path, provider=provider)
+
+    session.close()  # must not raise
+
+
 def test_context_generation_starts_at_zero(tmp_path):
     session = _make_session(tmp_path)
     assert session._context_generation == 0

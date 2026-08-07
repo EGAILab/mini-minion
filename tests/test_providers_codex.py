@@ -542,6 +542,49 @@ def test_reset_session_causes_new_thread_start():
 
 
 # ---------------------------------------------------------------------------
+# close() — R2-GAP-013 per-room resource disposal
+# ---------------------------------------------------------------------------
+
+
+def test_close_closes_the_rpc_client_when_one_exists():
+    stub = _StubRpc()
+    stub.close = MagicMock()
+    p = _make_provider(stub)
+
+    p.close()
+
+    stub.close.assert_called_once()
+    assert p._rpc is None
+
+
+def test_close_is_a_noop_when_chat_was_never_called():
+    """No subprocess was ever launched (_rpc is still None) -- nothing to close."""
+    p = _make_provider(_StubRpc())
+    p._rpc = None
+
+    p.close()  # must not raise
+
+    assert p._rpc is None
+
+
+def test_close_stops_the_auth_refresh_event_when_one_exists():
+    p = _make_provider(_StubRpc())
+    p._auth_refresh_stop = threading.Event()
+
+    p.close()
+
+    assert p._auth_refresh_stop.is_set()
+
+
+def test_close_is_safe_to_call_twice():
+    stub = _StubRpc()
+    p = _make_provider(stub)
+
+    p.close()
+    p.close()  # must not raise the second time
+
+
+# ---------------------------------------------------------------------------
 # Background auth-refresh thread (overnight token-expiry fix)
 #
 # The Codex subprocess is launched once and kept alive for the life of the

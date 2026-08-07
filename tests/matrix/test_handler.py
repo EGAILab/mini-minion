@@ -82,13 +82,22 @@ def _make_room(room_id="!room:ex.org"):
     return r
 
 
-def _make_handler(config=None, sessions=None, dedupe=None, bot_loop=None, outbound=None):
+def _make_handler(config=None, sessions=None, dedupe=None, bot_loop=None, outbound=None,
+                  session_factories=None):
     config = config or _make_config()
     sessions = sessions or {"main": _make_session()}
     dedupe = dedupe or _make_dedupe()
     bot_loop = bot_loop or _make_bot_loop()
     outbound = outbound or _make_outbound()
     room_session_mgr = _make_room_session_mgr()
+    if session_factories is None:
+        # R2-GAP-009: _get_or_build_session() now fails closed when no
+        # factory is registered — these tests are about
+        # routing/delivery/dedup, not that failure mode, so default to a
+        # trivial factory returning the same per-agent session `sessions`
+        # already provides (keeps every existing assertion against that
+        # object valid).
+        session_factories = {aid: (lambda sid, s=s: s) for aid, s in sessions.items()}
     return MatrixMessageHandler(
         client=_make_client(),
         config=config,
@@ -98,6 +107,7 @@ def _make_handler(config=None, sessions=None, dedupe=None, bot_loop=None, outbou
         bot_loop=bot_loop,
         room_session_mgr=room_session_mgr,
         exec_approval_handler=None,
+        session_factories=session_factories,
     )
 
 

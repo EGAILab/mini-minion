@@ -178,15 +178,25 @@ async def monitor_matrix(
         if exc:
             print(f"[matrix] Sync loop exited with error: {exc}", file=sys.stderr)
 
-    await _cleanup(client, dedupe, room_session_mgr)
+    await _cleanup(client, dedupe, room_session_mgr, msg_handler)
     print("[matrix] Disconnected.")
 
 
 async def _cleanup(
-    client, dedupe: MatrixInboundDeduper, room_session_mgr: MatrixRoomSessionManager
+    client, dedupe: MatrixInboundDeduper, room_session_mgr: MatrixRoomSessionManager,
+    msg_handler: MatrixMessageHandler,
 ) -> None:
     # Each step is wrapped individually: one failure shouldn't prevent the others
     # from running during shutdown.
+    try:
+        # R2-GAP-013: closes every room session's provider resources (e.g.
+        # terminates a Codex subprocess) before the databases/client below —
+        # order doesn't strictly matter here, but disposing sessions first
+        # means a slow provider shutdown can't delay the client/db cleanup
+        # that follows.
+        msg_handler.close_room_sessions()
+    except Exception:
+        pass
     try:
         await client.close()
     except Exception:

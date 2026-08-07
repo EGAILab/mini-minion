@@ -873,6 +873,46 @@ def _migration_007_deletion_tombstones(conn) -> None:
     )
 
 
+def _migration_008_language_neutral_fts(conn) -> None:
+    """Switch ``messages.search_vector`` from hardcoded 'english' to 'simple' (R2-GAP-012).
+
+    Migration 001's baseline generated ``search_vector`` with PostgreSQL's
+    ``'english'`` text-search configuration — English stemming (e.g.
+    "running" matches "run") and English stopword removal, hardcoded with
+    no way for a non-English deployment to get comparable lexical recall.
+    ``'simple'`` is PostgreSQL's built-in language-neutral configuration:
+    pure tokenization and lowercasing, no stemming, no stopword removal,
+    for any language using whitespace/punctuation-delimited words — a
+    genuine trade for English users (losing stemming) in exchange for
+    every other language getting real, non-broken lexical search instead
+    of none at all.
+
+    A generated column's expression can't be altered in place
+    (``ALTER COLUMN ... SET EXPRESSION`` doesn't exist in PostgreSQL) —
+    dropping and recreating it is the only way, which also drops its GIN
+    index (recreated here too). This is a full table rewrite; acceptable
+    as a one-time migration cost, unlike an operation this project would
+    ever want to repeat on a schedule.
+
+    Application code's own ``to_tsvector('english', ...)``/
+    ``websearch_to_tsquery('english', ...)``/``ts_headline('english', ...)``
+    calls (``search_messages()``) are updated to ``'simple'`` in the same
+    change that adds this migration — they must always match whatever
+    config built ``search_vector``, or FTS matching breaks entirely
+    (a stored-with-stemming column queried with a non-stemmed term, or
+    vice versa, simply won't align).
+    """
+    conn.execute("ALTER TABLE messages DROP COLUMN search_vector")
+    conn.execute("""
+        ALTER TABLE messages ADD COLUMN search_vector tsvector GENERATED ALWAYS AS (
+            to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(tool_name, ''))
+        ) STORED
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS messages_fts_idx ON messages USING GIN (search_vector)"
+    )
+
+
 # Every migration SessionDB knows about, in the order they were introduced.
 # Append new migrations here — never edit an existing entry's `apply`
 # function once it has shipped (see _migration_001_baseline's docstring).
@@ -884,6 +924,7 @@ _SESSION_DB_MIGRATIONS = [
     Migration(5, "decouple_retention_from_outputs", _migration_005_decouple_retention_from_outputs),
     Migration(6, "range_based_job_coverage", _migration_006_range_based_job_coverage),
     Migration(7, "deletion_tombstones", _migration_007_deletion_tombstones),
+    Migration(8, "language_neutral_fts", _migration_008_language_neutral_fts),
 ]
 
 
@@ -934,6 +975,30 @@ def _record_job_coverage_range(
 # configurable (yet) — same "no knob without evaluation data" reasoning as
 # capture_worker.py's own hardcoded constants.
 _BACKFILL_WINDOW_MESSAGES = 20
+
+# R2-GAP-011: how many of a session's most-recent eligible messages
+# (find_uncovered_capture_ranges/find_uncovered_commitment_ranges/
+# find_uncovered_message_ids_for_embedding) or most-recent eligible
+# candidate rows (find_uncovered_message_ids_for_embedding's anti-join)
+# one reconciliation pass will scan. Without a bound, a lifelong session
+# with a very large message history would have its *entire* history
+# re-scanned every pass, purely to re-confirm coverage that essentially
+# never changes for old messages. A real gap almost always appears near
+# the tail (a turn that just happened failed to enqueue) and reconciliation
+# runs frequently, so bounding to the most recent slice trades "detect an
+# arbitrarily old gap immediately" for "keep every pass's cost bounded
+# regardless of session size" — a deliberate choice, not a full fix for
+# every theoretical case (an old gap from a reconciliation *outage* could
+# still be missed; this is a known, accepted limitation, not claimed as
+# complete). backfill_agent's manual one-off CLI backfill deliberately
+# stays unbounded (list_message_ids, not this limit) since it's rare and
+# explicit, not run automatically on a timer.
+_RECONCILIATION_SCAN_LIMIT = 2000
+
+# Sentinel distinguishing "caller didn't pass limit, use the current
+# _RECONCILIATION_SCAN_LIMIT" from "caller explicitly passed None for
+# unbounded" — see _eligible_message_ids's docstring.
+_UNSET = object()
 
 
 def _chunk_run(run: list[int]) -> list[tuple[int, int]]:
@@ -1038,6 +1103,12 @@ class SessionDB:
             (the default) means the vector lane stays empty even if
             ``embedding_dimensions`` created the table — search degrades to
             FTS-only, exactly as if no embedding backend were configured.
+        min_similarity: R2-GAP-012 — minimum cosine similarity a vector-
+            search hit must clear to be returned by
+            :meth:`_vector_search_messages` at all. ``0.0`` (the default)
+            preserves the old always-return-``limit``-nearest-neighbors
+            behavior; callers wanting a real relevance floor pass
+            ``config.session_search.min_similarity``.
     """
 
     def __init__(
@@ -1045,6 +1116,7 @@ class SessionDB:
         url: str,
         embedding_dimensions: int | None = None,
         embedding_provider: "EmbeddingProvider | None" = None,
+        min_similarity: float = 0.0,
     ) -> None:
         import psycopg  # noqa: PLC0415
         self._url = url
@@ -1052,6 +1124,7 @@ class SessionDB:
         self._has_vector = False
         self._embedding_dimensions = embedding_dimensions
         self._embedding_provider = embedding_provider
+        self._min_similarity = min_similarity
         self._ensure_schema()
 
     # ------------------------------------------------------------------
@@ -1520,6 +1593,12 @@ class SessionDB:
         full-text query can never surface another agent's conversation
         history — agents are meant to be completely isolated from each
         other's memory, even though they share one PostgreSQL database.
+
+        R2-GAP-012: uses PostgreSQL's ``'simple'`` text-search
+        configuration (tokenize + lowercase, no stemming/stopwords) rather
+        than ``'english'`` — must always match whatever configuration
+        ``messages.search_vector`` was generated with (migration 008), or
+        matching breaks; see that migration's docstring for why.
         """
         rows = self._conn().execute(
             """
@@ -1530,15 +1609,15 @@ class SessionDB:
                 m.content,
                 m.tool_name,
                 m.timestamp,
-                ts_headline('english', coalesce(m.content, ''),
-                    websearch_to_tsquery('english', %s),
+                ts_headline('simple', coalesce(m.content, ''),
+                    websearch_to_tsquery('simple', %s),
                     'MaxWords=30, MinWords=10, StartSel=[, StopSel=]'
                 ) AS snippet,
-                ts_rank(m.search_vector, websearch_to_tsquery('english', %s)) AS rank
+                ts_rank(m.search_vector, websearch_to_tsquery('simple', %s)) AS rank
             FROM messages m
             JOIN sessions s ON s.id = m.session_id
             WHERE s.agent_id = %s
-              AND m.search_vector @@ websearch_to_tsquery('english', %s)
+              AND m.search_vector @@ websearch_to_tsquery('simple', %s)
             ORDER BY rank DESC
             LIMIT %s
             """,
@@ -1563,6 +1642,13 @@ class SessionDB:
         Scoped by ``agent_id`` through the same ``sessions`` join
         :meth:`search_messages` uses, so this can never surface another
         agent's message content (MEM-GAP-002).
+
+        R2-GAP-012: filters out anything below ``self._min_similarity``
+        (``config.session_search.min_similarity``) — without a floor, this
+        always returned its ``limit`` nearest neighbors even when every one
+        of them was actually unrelated to the query. "Nearest" only means
+        "relevant" once real matches exist; for a novel query, the nearest
+        vectors are still whatever happened to be closest, not a match.
         """
         if self._embedding_provider is None or not self.has_vector_lane:
             return []
@@ -1583,10 +1669,14 @@ class SessionDB:
             JOIN message_embeddings me ON me.message_id = m.id AND me.model_identity = %s
             JOIN sessions s ON s.id = m.session_id
             WHERE s.agent_id = %s
+              AND 1 - (me.embedding <=> %s::vector) >= %s
             ORDER BY me.embedding <=> %s::vector
             LIMIT %s
             """,
-            (query_vector, self._embedding_provider.model_identity, agent_id, query_vector, limit),
+            (
+                query_vector, self._embedding_provider.model_identity, agent_id,
+                query_vector, self._min_similarity, query_vector, limit,
+            ),
         ).fetchall()
         return [
             {
@@ -1815,7 +1905,9 @@ class SessionDB:
         ).fetchall()
         return [(r[0], r[1]) for r in rows]
 
-    def _eligible_message_ids(self, session_id: str) -> list[int]:
+    def _eligible_message_ids(
+        self, session_id: str, limit: "int | None | object" = _UNSET
+    ) -> list[int]:
         """User/assistant message ids with non-empty content, ascending.
 
         Shared by :meth:`find_uncovered_capture_ranges`/
@@ -1826,13 +1918,39 @@ class SessionDB:
         periodically, so a run of pure tool-call messages with no actual
         dialogue must never become its own pointless enqueued job the way
         it's harmless for a one-off manual backfill to occasionally do.
+
+        Args:
+            limit: R2-GAP-011 — when omitted (the default), returns only
+                the *most recent* :data:`_RECONCILIATION_SCAN_LIMIT`
+                eligible ids, not the session's entire history — see that
+                constant's comment for why. The default is resolved
+                inside the method body (a private ``_UNSET`` sentinel),
+                not baked into the parameter list, specifically so tests
+                can lower ``_RECONCILIATION_SCAN_LIMIT`` and see this
+                method's behavior actually change. Pass ``None`` explicitly
+                for the old fully-unbounded behavior (only meaningful for
+                tests/tools that genuinely want the whole history); pass
+                an ``int`` to override the bound directly.
         """
+        if limit is _UNSET:
+            limit = _RECONCILIATION_SCAN_LIMIT
+        if limit is None:
+            rows = self._conn().execute(
+                "SELECT id FROM messages WHERE session_id = %s "
+                "AND role IN ('user', 'assistant') AND content IS NOT NULL ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            return [r[0] for r in rows]
+        # DESC + LIMIT to get the most-recent slice cheaply (an index scan
+        # bounded by `limit`, not a full-table scan), then reverse in
+        # Python back to the ascending order compute_backfill_windows needs.
         rows = self._conn().execute(
             "SELECT id FROM messages WHERE session_id = %s "
-            "AND role IN ('user', 'assistant') AND content IS NOT NULL ORDER BY id",
-            (session_id,),
+            "AND role IN ('user', 'assistant') AND content IS NOT NULL "
+            "ORDER BY id DESC LIMIT %s",
+            (session_id, limit),
         ).fetchall()
-        return [r[0] for r in rows]
+        return [r[0] for r in reversed(rows)]
 
     def list_session_ids_for_agent(self, agent_id: str) -> list[str]:
         """Every session id ever recorded for one agent — no recency limit.
@@ -2540,6 +2658,10 @@ class SessionDB:
         model_identity = self.embedding_model_identity
         if model_identity is None:
             return []
+        # R2-GAP-011: bounded to the most recent _RECONCILIATION_SCAN_LIMIT
+        # eligible messages, same reasoning as _eligible_message_ids' own
+        # limit — DESC + LIMIT for a cheap bounded scan, reversed back to
+        # ascending order in Python.
         rows = self._conn().execute(
             """
             SELECT m.id FROM messages m
@@ -2548,11 +2670,55 @@ class SessionDB:
                 SELECT 1 FROM message_embeddings me
                 WHERE me.message_id = m.id AND me.model_identity = %s
             )
-            ORDER BY m.id
+            ORDER BY m.id DESC LIMIT %s
             """,
-            (session_id, model_identity),
+            (session_id, model_identity, _RECONCILIATION_SCAN_LIMIT),
         ).fetchall()
-        return [r[0] for r in rows]
+        return [r[0] for r in reversed(rows)]
+
+    def embedding_coverage_summary(self, agent_id: str) -> dict | None:
+        """Count how many of one agent's messages are missing an embedding under the active model (R2-GAP-014).
+
+        Unlike :meth:`find_uncovered_message_ids_for_embedding` (bounded to
+        :data:`_RECONCILIATION_SCAN_LIMIT`, and scoped to one session — it
+        exists to hand reconciliation a boundedly-sized list of ids to
+        enqueue), this is a plain ``count(*)`` across *every* session this
+        agent owns — no id list to build, so no memory-bound reason to
+        limit it, and unlike the automatic periodic reconciliation pass,
+        this only runs when something (``/status deep``) actually asks for
+        it. Answers a different question than reconciliation's own
+        progress: not "what should I enqueue right now" but "how far
+        behind is this agent's embedding coverage overall, across its
+        entire history" — visible operational context reconciliation
+        itself has no reason to expose.
+
+        Args:
+            agent_id: Which agent's message history to check.
+
+        Returns:
+            dict | None: ``{"missing_count", "model_identity"}``, or
+                ``None`` if no vector lane is configured (no pgvector, or
+                no embedding provider) — "coverage" isn't a meaningful
+                concept without an active model to measure it against.
+        """
+        if not self.has_vector_lane:
+            return None
+        model_identity = self.embedding_model_identity
+        if model_identity is None:
+            return None
+        row = self._conn().execute(
+            """
+            SELECT count(*) FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE s.agent_id = %s AND m.role IN ('user', 'assistant') AND m.content IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM message_embeddings me
+                WHERE me.message_id = m.id AND me.model_identity = %s
+            )
+            """,
+            (agent_id, model_identity),
+        ).fetchone()
+        return {"missing_count": row[0] or 0, "model_identity": model_identity}
 
     # ------------------------------------------------------------------
     # Queue health (MEM-GAP-016)
@@ -2573,7 +2739,12 @@ class SessionDB:
         running job that's been sitting for a long time means its worker
         crashed mid-job; :meth:`reclaim_stale_running_jobs` is what recovers
         those, this method is only what makes them visible before that
-        happens.
+        happens. ``failed_count`` (R2-GAP-014) surfaces jobs that gave up
+        retrying entirely (``attempts`` reached ``max_attempts`` — see
+        ``fail_capture_job``/``fail_commitment_job``/``fail_message_embedding_job``);
+        those are the ones ``memory_retention`` will eventually prune, but
+        until then they're real, permanently-lost work with nothing else
+        making that visible.
 
         Args:
             agent_id: Which agent's queues to summarize.
@@ -2582,7 +2753,8 @@ class SessionDB:
             dict: ``{"capture": {...}, "commitment": {...},
                 "message_embedding": {...}}``, each a dict with
                 ``pending_count``, ``oldest_pending_age_s``,
-                ``running_count``, ``oldest_running_age_s``.
+                ``running_count``, ``oldest_running_age_s``,
+                ``failed_count``.
                 ``oldest_*_age_s`` is seconds since the oldest matching job
                 was last updated, or ``None`` if that state is empty.
         """
@@ -2610,11 +2782,17 @@ class SessionDB:
             oldest_running_age_s = (
                 now - oldest_running_updated_at if oldest_running_updated_at is not None else None
             )
+            failed_row = conn.execute(
+                f"SELECT count(*) FROM {table} WHERE agent_id = %s AND state = 'failed'",
+                (agent_id,),
+            ).fetchone()
+            failed_count = failed_row[0] or 0
             return {
                 "pending_count": pending_count,
                 "oldest_pending_age_s": oldest_pending_age_s,
                 "running_count": running_count,
                 "oldest_running_age_s": oldest_running_age_s,
+                "failed_count": failed_count,
             }
 
         return {

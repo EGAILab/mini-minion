@@ -142,45 +142,23 @@ def test_a_rooms_history_never_reaches_a_different_rooms_session():
         assert session.send.call_count == 1
 
 
-def test_falls_back_to_shared_session_and_warns_when_no_factory_for_agent(capsys):
+def test_missing_factory_fails_closed_instead_of_sharing_the_default_session(capsys):
+    # R2-GAP-009: a missing session_factory used to fall back to the shared
+    # REPL default session (reintroducing cross-room history sharing,
+    # silently past the first stderr warning). It must now refuse the turn
+    # entirely instead — no fallback session is ever built or used.
     shared_session = MagicMock()
-    shared_session.send.return_value = "fallback reply"
+    shared_session.send.return_value = "should never be called"
     dedupe = MagicMock()
     dedupe.is_seen = AsyncMock(return_value=False)
     bot_loop = MagicMock()
     bot_loop.should_suppress.return_value = False
+    outbound = _make_outbound()
     handler = MatrixMessageHandler(
         client=_make_client(),
         config=_make_config(),
         sessions={"main": shared_session},
-        outbound=_make_outbound(),
-        dedupe=dedupe,
-        bot_loop=bot_loop,
-        room_session_mgr=_make_room_session_mgr(),
-        session_factories=None,  # nothing wired for "main"
-    )
-
-    _run(handler.handle_room_message(_make_room("!movie:ex.org"), _make_event()))
-
-    shared_session.send.assert_called_once()
-    assert "no room-session factory" in capsys.readouterr().err
-
-
-def test_fallback_session_is_shared_across_rooms_and_is_still_flagged_each_time(capsys):
-    # Documents the known trade-off of the fallback path: without a factory,
-    # different rooms DO share history again (the pre-fix behavior) — which
-    # is exactly why it prints a warning rather than failing silently.
-    shared_session = MagicMock()
-    shared_session.send.return_value = "fallback reply"
-    dedupe = MagicMock()
-    dedupe.is_seen = AsyncMock(return_value=False)
-    bot_loop = MagicMock()
-    bot_loop.should_suppress.return_value = False
-    handler = MatrixMessageHandler(
-        client=_make_client(),
-        config=_make_config(),
-        sessions={"main": shared_session},
-        outbound=_make_outbound(),
+        outbound=outbound,
         dedupe=dedupe,
         bot_loop=bot_loop,
         room_session_mgr=_make_room_session_mgr(),
@@ -190,4 +168,8 @@ def test_fallback_session_is_shared_across_rooms_and_is_still_flagged_each_time(
     _run(handler.handle_room_message(_make_room("!movie:ex.org"), _make_event(event_id="$e1")))
     _run(handler.handle_room_message(_make_room("!work:ex.org"), _make_event(event_id="$e2")))
 
-    assert shared_session.send.call_count == 2
+    shared_session.send.assert_not_called()
+    assert outbound.send_text.call_count == 2
+    for call in outbound.send_text.call_args_list:
+        assert "refusing to respond" in call.args[1]
+    assert "ERROR" in capsys.readouterr().err

@@ -488,6 +488,24 @@ def _format_deep_status(ctx: CommandContext) -> list[str]:
             f"  message_embedding_pending={message_embedding['pending_count']}"
             f" (oldest {_format_duration(message_embedding['oldest_pending_age_s'])})"
         )
+        # R2-GAP-003/R2-GAP-014: running_count/oldest_running_age_s and
+        # failed_count exist on `lag` since Phase 0, but were never actually
+        # printed here — a stuck-running or permanently-failed job was
+        # invisible in /status deep even though queue_lag_summary() already
+        # reported it. Only shown when nonzero, so the common healthy case
+        # doesn't get noisier.
+        stuck_bits = []
+        for lane_name, lane in (("capture", capture), ("commitment", commitment),
+                                 ("message_embedding", message_embedding)):
+            if lane["running_count"]:
+                stuck_bits.append(
+                    f"{lane_name}_running={lane['running_count']}"
+                    f" (oldest {_format_duration(lane['oldest_running_age_s'])})"
+                )
+            if lane["failed_count"]:
+                stuck_bits.append(f"{lane_name}_failed={lane['failed_count']}")
+        if stuck_bits:
+            lines.append(f"      {'  '.join(stuck_bits)}")
         session = ctx.sessions.get(aid)
         memory = getattr(session, "memory", None)
         if memory is not None:
@@ -504,6 +522,20 @@ def _format_deep_status(ctx: CommandContext) -> list[str]:
                     f"{index_status['file_count']} files, "
                     f"last_indexed={_format_age(index_status['last_indexed_at'], now)}"
                 )
+        # R2-GAP-014: how far behind this agent's embedding coverage is
+        # overall (every session, not just what reconciliation would
+        # enqueue in one bounded pass) — None when no vector lane is
+        # configured, in which case there's nothing meaningful to report.
+        try:
+            coverage = ctx.db.embedding_coverage_summary(aid)
+        except Exception as exc:
+            lines.append(f"      embedding coverage unavailable: {exc}")
+            continue
+        if coverage is not None and coverage["missing_count"]:
+            lines.append(
+                f"      embedding coverage: {coverage['missing_count']} message(s) "
+                f"missing an embedding under {coverage['model_identity']!r}"
+            )
     return lines
 
 

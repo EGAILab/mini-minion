@@ -1098,6 +1098,22 @@ def test_search_messages_finds_the_owning_agents_own_session(db, session_id):
     assert [r["session_id"] for r in results] == [session_id]
 
 
+def test_search_vector_uses_the_language_neutral_simple_config(db):
+    # R2-GAP-012: messages.search_vector must be generated with PostgreSQL's
+    # 'simple' text-search config (migration 008), not 'english' — the
+    # actual schema-level proof the migration took effect, independent of
+    # any single word's stemming/stopword behavior under either config.
+    row = db._conn().execute(
+        "SELECT pg_get_expr(ad.adbin, ad.adrelid) FROM pg_attrdef ad "
+        "JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum "
+        "WHERE a.attrelid = 'messages'::regclass AND a.attname = 'search_vector'"
+    ).fetchone()
+    assert row is not None
+    definition = row[0]
+    assert "'simple'" in definition
+    assert "'english'" not in definition
+
+
 def test_list_sessions_excludes_another_agents_session(db, session_id):
     # This is a shared dev database, so "researcher" may already have real
     # sessions of its own — the assertion is membership, not an empty list.
@@ -1437,6 +1453,7 @@ def test_queue_lag_summary_is_zero_for_an_agent_with_no_jobs(db, lag_agent_id):
     _empty_lane = {
         "pending_count": 0, "oldest_pending_age_s": None,
         "running_count": 0, "oldest_running_age_s": None,
+        "failed_count": 0,
     }
     assert summary == {
         "capture": _empty_lane,
@@ -1940,6 +1957,28 @@ def test_queue_lag_summary_reports_a_stuck_running_job(db, session_id, lag_agent
 
     assert summary["capture"]["running_count"] == 1
     assert summary["capture"]["oldest_running_age_s"] >= 7200.0
+
+
+def test_queue_lag_summary_reports_a_permanently_failed_job(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}"
+    )
+    db.claim_next_capture_job()
+    db.fail_capture_job(job_id, "boom", backoff_seconds=0.0, max_attempts=1)  # -> terminal 'failed'
+
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary["capture"]["failed_count"] == 1
+
+
+def test_queue_lag_summary_never_counts_pending_jobs_as_failed(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    db.enqueue_capture_job(lag_agent_id, session_id, 1, 2, idempotency_key=f"key-{session_id}")
+
+    summary = db.queue_lag_summary(lag_agent_id)
+
+    assert summary["capture"]["failed_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2452,6 +2491,49 @@ def test_find_uncovered_message_ids_for_embedding_is_model_aware(db_with_vector,
     assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == [id1]
 
 
+# ---------------------------------------------------------------------------
+# embedding_coverage_summary (R2-GAP-014)
+# ---------------------------------------------------------------------------
+
+def test_embedding_coverage_summary_counts_messages_missing_the_active_model(
+    db_with_vector, session_id, lag_agent_id
+):
+    db_with_vector.upsert_session(session_id, lag_agent_id)
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "first")
+    db_with_vector.mirror_message(session_id, "e2", "assistant", "second — never embedded")
+    job_id = db_with_vector.enqueue_message_embedding_job(
+        lag_agent_id, session_id, id1, idempotency_key=f"key-{session_id}"
+    )
+    db_with_vector.complete_message_embedding_job(
+        job_id, id1, db_with_vector.embedding_model_identity, [0.1, 0.2, 0.3]
+    )
+
+    summary = db_with_vector.embedding_coverage_summary(lag_agent_id)
+
+    assert summary == {"missing_count": 1, "model_identity": "test-endpoint::test-model"}
+
+
+def test_embedding_coverage_summary_zero_when_fully_covered(
+    db_with_vector, session_id, lag_agent_id
+):
+    db_with_vector.upsert_session(session_id, lag_agent_id)
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "first")
+    job_id = db_with_vector.enqueue_message_embedding_job(
+        lag_agent_id, session_id, id1, idempotency_key=f"key-{session_id}"
+    )
+    db_with_vector.complete_message_embedding_job(
+        job_id, id1, db_with_vector.embedding_model_identity, [0.1, 0.2, 0.3]
+    )
+
+    summary = db_with_vector.embedding_coverage_summary(lag_agent_id)
+
+    assert summary["missing_count"] == 0
+
+
+def test_embedding_coverage_summary_none_without_a_vector_lane(db, lag_agent_id):
+    assert db.embedding_coverage_summary(lag_agent_id) is None
+
+
 # --- vector lane / hybrid search ---
 
 def test_vector_search_messages_empty_without_a_provider(db, session_id):
@@ -2474,6 +2556,54 @@ def test_vector_search_messages_finds_a_cached_embedding(db_with_vector, session
     results = db_with_vector._vector_search_messages("anything", "main", limit=5)
 
     assert [r["id"] for r in results] == [message_id]
+
+
+# ---------------------------------------------------------------------------
+# Vector search relevance floor (R2-GAP-012)
+# ---------------------------------------------------------------------------
+
+def test_vector_search_messages_excludes_hits_below_min_similarity(session_id):
+    from unittest.mock import Mock
+
+    provider = Mock()
+    provider.model_identity = "test-endpoint::test-model"
+    provider.embed = Mock(return_value=[[1.0, 0.0, 0.0]])  # the query always embeds to this
+    db = SessionDB(_DB_URL, embedding_dimensions=3, embedding_provider=provider, min_similarity=0.5)
+    db.upsert_session(session_id, "main")
+    message_id = db.mirror_message(session_id, "e1", "user", "unrelated content")
+    job_id = db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+    )
+    # Orthogonal to the query vector -- cosine similarity 0, well below the 0.5 floor.
+    db.complete_message_embedding_job(job_id, message_id, "test-endpoint::test-model", [0.0, 1.0, 0.0])
+
+    results = db._vector_search_messages("query", "main", limit=5)
+
+    assert results == []
+
+
+def test_vector_search_messages_keeps_hits_at_or_above_min_similarity(session_id):
+    from unittest.mock import Mock
+
+    provider = Mock()
+    provider.model_identity = "test-endpoint::test-model"
+    provider.embed = Mock(return_value=[[1.0, 0.0, 0.0]])
+    db = SessionDB(_DB_URL, embedding_dimensions=3, embedding_provider=provider, min_similarity=0.5)
+    db.upsert_session(session_id, "main")
+    message_id = db.mirror_message(session_id, "e1", "user", "closely related content")
+    job_id = db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+    )
+    # Identical to the query vector -- cosine similarity 1, comfortably above the floor.
+    db.complete_message_embedding_job(job_id, message_id, "test-endpoint::test-model", [1.0, 0.0, 0.0])
+
+    results = db._vector_search_messages("query", "main", limit=5)
+
+    assert [r["id"] for r in results] == [message_id]
+
+
+def test_vector_search_messages_default_min_similarity_is_zero(db_with_vector):
+    assert db_with_vector._min_similarity == 0.0
 
 
 def test_vector_search_messages_is_scoped_to_the_given_agent(db_with_vector, session_id):
@@ -2554,6 +2684,75 @@ def test_delete_session_removes_message_embeddings(db_with_vector, session_id):
         "SELECT count(*) FROM message_embeddings WHERE message_id = %s", (message_id,)
     ).fetchone()
     assert row[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation scan bound (R2-GAP-011)
+# ---------------------------------------------------------------------------
+
+def test_eligible_message_ids_limit_keeps_only_the_most_recent_ids(db, session_id):
+    db.upsert_session(session_id, "main")
+    ids = [db.mirror_message(session_id, f"e{i}", "user", f"msg {i}") for i in range(5)]
+
+    result = db._eligible_message_ids(session_id, limit=2)
+
+    assert result == ids[-2:]  # the two most recent, still ascending
+
+
+def test_eligible_message_ids_limit_none_returns_full_history(db, session_id):
+    db.upsert_session(session_id, "main")
+    ids = [db.mirror_message(session_id, f"e{i}", "user", f"msg {i}") for i in range(5)]
+
+    result = db._eligible_message_ids(session_id, limit=None)
+
+    assert result == ids
+
+
+def test_find_uncovered_capture_ranges_uses_the_bounded_scan_by_default(
+    db, session_id, lag_agent_id
+):
+    # A very old, never-covered message must not surface once the session
+    # has grown past the reconciliation scan bound -- see
+    # _RECONCILIATION_SCAN_LIMIT's comment for the accepted trade-off.
+    import minion_assist.session.db as db_module
+
+    original_limit = db_module._RECONCILIATION_SCAN_LIMIT
+    db_module._RECONCILIATION_SCAN_LIMIT = 2
+    try:
+        db.upsert_session(session_id, lag_agent_id)
+        old_id1 = db.mirror_message(session_id, "e0", "user", "ancient, never covered")
+        old_id2 = db.mirror_message(session_id, "e1", "assistant", "also ancient")
+        recent_id1 = db.mirror_message(session_id, "e2", "user", "recent")
+        recent_id2 = db.mirror_message(session_id, "e3", "assistant", "also recent")
+
+        gaps = db.find_uncovered_capture_ranges(lag_agent_id, session_id)
+
+        assert gaps == [(recent_id1, recent_id2)]  # the ancient pair fell outside the scan
+        assert old_id1 not in [i for r in gaps for i in r]
+        assert old_id2 not in [i for r in gaps for i in r]
+    finally:
+        db_module._RECONCILIATION_SCAN_LIMIT = original_limit
+
+
+def test_find_uncovered_message_ids_for_embedding_uses_the_bounded_scan_by_default(
+    db_with_vector, session_id
+):
+    import minion_assist.session.db as db_module
+
+    original_limit = db_module._RECONCILIATION_SCAN_LIMIT
+    db_module._RECONCILIATION_SCAN_LIMIT = 2
+    try:
+        db_with_vector.upsert_session(session_id, "main")
+        db_with_vector.mirror_message(session_id, "e0", "user", "ancient")
+        db_with_vector.mirror_message(session_id, "e1", "assistant", "also ancient")
+        recent_id1 = db_with_vector.mirror_message(session_id, "e2", "user", "recent")
+        recent_id2 = db_with_vector.mirror_message(session_id, "e3", "assistant", "also recent")
+
+        result = db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id)
+
+        assert result == [recent_id1, recent_id2]
+    finally:
+        db_module._RECONCILIATION_SCAN_LIMIT = original_limit
 
 
 # ---------------------------------------------------------------------------
