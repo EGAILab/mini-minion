@@ -1320,6 +1320,94 @@ def test_delete_session_is_a_harmless_no_op_the_second_time(db, session_id):
 
 
 # ---------------------------------------------------------------------------
+# Deletion tombstones (R2-GAP-007)
+# ---------------------------------------------------------------------------
+
+def test_start_deletion_tombstone_creates_an_all_pending_row(db, session_id):
+    tombstone = db.start_deletion_tombstone("main", session_id)
+
+    assert tombstone == {
+        "jsonl_deleted": False, "db_deleted": False, "evidence_cleaned": False,
+        "proposal_ids": [], "completed_at": None,
+    }
+
+
+def test_start_deletion_tombstone_is_idempotent_and_preserves_progress(db, session_id):
+    db.start_deletion_tombstone("main", session_id)
+    db.mark_deletion_jsonl_done("main", session_id)
+
+    tombstone = db.start_deletion_tombstone("main", session_id)  # called again
+
+    assert tombstone["jsonl_deleted"] is True  # not reset
+
+
+def test_get_deletion_tombstone_returns_none_when_never_started(db, session_id):
+    assert db.get_deletion_tombstone("main", session_id) is None
+
+
+def test_mark_deletion_jsonl_done_updates_only_that_flag(db, session_id):
+    db.start_deletion_tombstone("main", session_id)
+    db.mark_deletion_jsonl_done("main", session_id)
+
+    tombstone = db.get_deletion_tombstone("main", session_id)
+
+    assert tombstone["jsonl_deleted"] is True
+    assert tombstone["db_deleted"] is False
+    assert tombstone["evidence_cleaned"] is False
+
+
+def test_mark_deletion_db_done_records_proposal_ids(db, session_id):
+    db.start_deletion_tombstone("main", session_id)
+
+    db.mark_deletion_db_done("main", session_id, [3, 7, 9])
+
+    tombstone = db.get_deletion_tombstone("main", session_id)
+    assert tombstone["db_deleted"] is True
+    assert tombstone["proposal_ids"] == [3, 7, 9]
+
+
+def test_mark_deletion_evidence_done_sets_completed_at(db, session_id):
+    db.start_deletion_tombstone("main", session_id)
+    db.mark_deletion_jsonl_done("main", session_id)
+    db.mark_deletion_db_done("main", session_id, [])
+
+    db.mark_deletion_evidence_done("main", session_id)
+
+    tombstone = db.get_deletion_tombstone("main", session_id)
+    assert tombstone["evidence_cleaned"] is True
+    assert tombstone["completed_at"] is not None
+
+
+def test_list_incomplete_deletion_tombstones_excludes_completed_ones(db, session_id):
+    other_session_id = f"{session_id}-other"
+    db.start_deletion_tombstone("main", session_id)
+    db.mark_deletion_jsonl_done("main", session_id)
+    db.mark_deletion_db_done("main", session_id, [])
+    db.mark_deletion_evidence_done("main", session_id)  # fully complete
+
+    db.start_deletion_tombstone("main", other_session_id)  # still incomplete
+    db.mark_deletion_jsonl_done("main", other_session_id)
+
+    incomplete = db.list_incomplete_deletion_tombstones()
+
+    ids = {(t["agent_id"], t["session_id"]) for t in incomplete}
+    assert ("main", session_id) not in ids
+    assert ("main", other_session_id) in ids
+    matching = next(t for t in incomplete if t["session_id"] == other_session_id)
+    assert matching["jsonl_deleted"] is True
+    assert matching["db_deleted"] is False
+
+
+def test_list_incomplete_deletion_tombstones_empty_when_nothing_started(db):
+    # No tombstone at all for a brand new, never-attempted session_id.
+    result = [
+        t for t in db.list_incomplete_deletion_tombstones()
+        if t["session_id"] == "no-such-session-id"
+    ]
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
 # queue_lag_summary (MEM-GAP-016)
 #
 # Uses a fresh, unique agent_id per test (not "main") since this method
@@ -1563,13 +1651,13 @@ def test_prune_operational_tables_deletes_old_failed_message_embedding_jobs(
 # Before this fix, memory_proposals.job_id / commitments.source_job_id were
 # ON DELETE CASCADE against the job tables prune_operational_tables() deletes
 # rows from — pruning an old job silently deleted its already-materialized
-# proposal/commitment too. Separately, find_uncovered_capture_range /
-# find_uncovered_commitment_range / find_uncovered_message_ids_for_embedding
-# derived their "already covered" cursor from MAX(job table column), so
-# pruning also reset reconciliation's notion of what had already been
-# enqueued. These tests prove both are fixed: outputs survive a job being
-# pruned (or deleted directly), and reconciliation still sees the range as
-# covered afterward.
+# proposal/commitment too. Separately, find_uncovered_capture_ranges /
+# find_uncovered_commitment_ranges / find_uncovered_message_ids_for_embedding
+# derived their "already covered" cursor from job-table state, so pruning
+# also reset reconciliation's notion of what had already been enqueued.
+# These tests prove both are fixed: outputs survive a job being pruned (or
+# deleted directly), and reconciliation still sees the range as covered
+# afterward.
 
 def test_prune_operational_tables_detaches_but_preserves_a_proposal_from_its_pruned_job(
     db, session_id, lag_agent_id
@@ -1636,30 +1724,36 @@ def test_prune_operational_tables_never_erases_capture_coverage(db, session_id, 
 
     db.prune_operational_tables(30)  # deletes the only capture job for this session
 
-    # Before R2-GAP-001's fix, this would now re-surface messages 1-2 as
-    # "uncovered" because the MAX(...) cursor was derived from the very job
-    # row just deleted. It must still report nothing to catch up on.
-    assert db.find_uncovered_capture_range(lag_agent_id, session_id) is None
+    # Before R2-GAP-001/R2-GAP-002's fix, this would now re-surface
+    # messages 1-2 as "uncovered" because the cursor was derived from the
+    # very job row just deleted. It must still report nothing to catch up
+    # on — coverage lives in session_job_coverage_ranges, never touched by
+    # pruning.
+    assert db.find_uncovered_capture_ranges(lag_agent_id, session_id) == []
 
 
 def test_prune_operational_tables_never_erases_message_embedding_coverage(
-    db, session_id, lag_agent_id
+    db_with_vector, session_id
 ):
-    db.upsert_session(session_id, lag_agent_id)
-    message_id = db.mirror_message(session_id, "e1", "user", "hello")
-    job_id = db.enqueue_message_embedding_job(
-        lag_agent_id, session_id, message_id, idempotency_key=f"emb-{session_id}"
+    db_with_vector.upsert_session(session_id, "main")
+    message_id = db_with_vector.mirror_message(session_id, "e1", "user", "hello")
+    job_id = db_with_vector.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"emb-{session_id}"
     )
-    db.claim_next_message_embedding_job()
-    db.fail_message_embedding_job(job_id, "boom", 0.0, max_attempts=1)  # -> terminal 'failed'
-    db._conn().execute(
+    db_with_vector.complete_message_embedding_job(
+        job_id, message_id, db_with_vector.embedding_model_identity, [0.1, 0.2, 0.3]
+    )
+    db_with_vector._conn().execute(
         "UPDATE message_embedding_jobs SET updated_at = %s WHERE id = %s",
         (time.time() - 40 * 86400, job_id),
     )
 
-    db.prune_operational_tables(30)  # deletes the only embedding job for this session
+    db_with_vector.prune_operational_tables(30)  # deletes the (done) embedding job row
 
-    assert db.find_uncovered_message_ids_for_embedding(lag_agent_id, session_id) == []
+    # Coverage is checked directly against message_embeddings, never a job
+    # table (R2-GAP-005), so pruning the already-terminal job row can't
+    # affect it.
+    assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == []
 
 
 def test_prune_operational_tables_never_erases_commitment_coverage_or_its_channel(
@@ -1682,12 +1776,14 @@ def test_prune_operational_tables_never_erases_commitment_coverage_or_its_channe
     db.prune_operational_tables(30)  # deletes the only commitment job for this session
 
     # Both "nothing new to catch up on" AND the remembered channel must
-    # survive — without session_job_coverage.channel, a session whose only
-    # commitment job was pruned would look indistinguishable from one that
-    # never had commitments enabled, permanently exiting reconciliation.
-    assert db.find_uncovered_commitment_range(lag_agent_id, session_id) is None
+    # survive — without session_job_coverage_ranges.channel, a session
+    # whose only commitment job was pruned would look indistinguishable
+    # from one that never had commitments enabled, permanently exiting
+    # reconciliation.
+    assert db.find_uncovered_commitment_ranges(lag_agent_id, session_id) == []
     row = db._conn().execute(
-        "SELECT channel FROM session_job_coverage WHERE session_id = %s AND lane = 'commitment'",
+        "SELECT channel FROM session_job_coverage_ranges "
+        "WHERE session_id = %s AND lane = 'commitment'",
         (session_id,),
     ).fetchone()
     assert row == ("!room:example.org",)
@@ -1847,31 +1943,32 @@ def test_queue_lag_summary_reports_a_stuck_running_job(db, session_id, lag_agent
 
 
 # ---------------------------------------------------------------------------
-# find_uncovered_capture_range / find_uncovered_commitment_range (MEM-GAP-007)
+# find_uncovered_capture_ranges / find_uncovered_commitment_ranges
+# (MEM-GAP-007, R2-GAP-002)
 # ---------------------------------------------------------------------------
 
-def test_find_uncovered_capture_range_none_without_any_messages(db, session_id):
+def test_find_uncovered_capture_ranges_empty_without_any_messages(db, session_id):
     db.upsert_session(session_id, "main")
 
-    assert db.find_uncovered_capture_range("main", session_id) is None
+    assert db.find_uncovered_capture_ranges("main", session_id) == []
 
 
-def test_find_uncovered_capture_range_returns_none_for_an_unowned_session(db, session_id):
+def test_find_uncovered_capture_ranges_empty_for_an_unowned_session(db, session_id):
     db.upsert_session(session_id, "researcher")
     db.mirror_message(session_id, "e1", "user", "hello")
 
-    assert db.find_uncovered_capture_range("main", session_id) is None
+    assert db.find_uncovered_capture_ranges("main", session_id) == []
 
 
-def test_find_uncovered_capture_range_returns_the_full_range_with_no_prior_job(db, session_id):
+def test_find_uncovered_capture_ranges_returns_the_full_range_with_no_prior_job(db, session_id):
     db.upsert_session(session_id, "main")
     id1 = db.mirror_message(session_id, "e1", "user", "hello")
     id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
 
-    assert db.find_uncovered_capture_range("main", session_id) == (id1, id2)
+    assert db.find_uncovered_capture_ranges("main", session_id) == [(id1, id2)]
 
 
-def test_find_uncovered_capture_range_none_when_fully_covered(db, session_id):
+def test_find_uncovered_capture_ranges_empty_when_fully_covered(db, session_id):
     db.upsert_session(session_id, "main")
     id1 = db.mirror_message(session_id, "e1", "user", "hello")
     id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
@@ -1879,10 +1976,10 @@ def test_find_uncovered_capture_range_none_when_fully_covered(db, session_id):
         "main", session_id, id1, id2, idempotency_key=f"key-{session_id}"
     )
 
-    assert db.find_uncovered_capture_range("main", session_id) is None
+    assert db.find_uncovered_capture_ranges("main", session_id) == []
 
 
-def test_find_uncovered_capture_range_returns_only_the_gap_after_the_last_job(db, session_id):
+def test_find_uncovered_capture_ranges_returns_only_the_gap_after_the_last_job(db, session_id):
     db.upsert_session(session_id, "main")
     id1 = db.mirror_message(session_id, "e1", "user", "first turn")
     id2 = db.mirror_message(session_id, "e2", "assistant", "first reply")
@@ -1892,10 +1989,45 @@ def test_find_uncovered_capture_range_returns_only_the_gap_after_the_last_job(db
     id3 = db.mirror_message(session_id, "e3", "user", "second turn")
     id4 = db.mirror_message(session_id, "e4", "assistant", "second reply")
 
-    assert db.find_uncovered_capture_range("main", session_id) == (id3, id4)
+    assert db.find_uncovered_capture_ranges("main", session_id) == [(id3, id4)]
 
 
-def test_find_uncovered_capture_range_treats_a_failed_job_as_still_covering(db, session_id):
+def test_find_uncovered_capture_ranges_finds_a_sparse_gap_below_a_later_covered_range(
+    db, session_id
+):
+    # R2-GAP-002: the whole point of moving off a high-water-mark cursor —
+    # a missed enqueue for an EARLIER exchange must still surface even
+    # after a LATER exchange was successfully covered.
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first turn — enqueue missed")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "first reply — enqueue missed")
+    id3 = db.mirror_message(session_id, "e3", "user", "second turn — enqueued fine")
+    id4 = db.mirror_message(session_id, "e4", "assistant", "second reply — enqueued fine")
+    db.enqueue_capture_job(
+        "main", session_id, id3, id4, idempotency_key=f"key-{session_id}"
+    )
+
+    assert db.find_uncovered_capture_ranges("main", session_id) == [(id1, id2)]
+
+
+def test_find_uncovered_capture_ranges_finds_a_sparse_gap_and_a_tail_gap_together(
+    db, session_id
+):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first turn — missed")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "first reply — missed")
+    id3 = db.mirror_message(session_id, "e3", "user", "second turn — covered")
+    id4 = db.mirror_message(session_id, "e4", "assistant", "second reply — covered")
+    db.enqueue_capture_job(
+        "main", session_id, id3, id4, idempotency_key=f"key-{session_id}"
+    )
+    id5 = db.mirror_message(session_id, "e5", "user", "third turn — never enqueued")
+    id6 = db.mirror_message(session_id, "e6", "assistant", "third reply — never enqueued")
+
+    assert db.find_uncovered_capture_ranges("main", session_id) == [(id1, id2), (id5, id6)]
+
+
+def test_find_uncovered_capture_ranges_treats_a_failed_job_as_still_covering(db, session_id):
     db.upsert_session(session_id, "main")
     id1 = db.mirror_message(session_id, "e1", "user", "hello")
     id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
@@ -1906,35 +2038,53 @@ def test_find_uncovered_capture_range_treats_a_failed_job_as_still_covering(db, 
     db.fail_capture_job(job_id, "boom", backoff_seconds=999.0, max_attempts=1)
 
     # Still "covered" -- a failed extraction attempt is not an unenqueued gap.
-    assert db.find_uncovered_capture_range("main", session_id) is None
+    assert db.find_uncovered_capture_ranges("main", session_id) == []
 
 
-def test_find_uncovered_capture_range_excludes_tool_and_empty_messages(db, session_id):
+def test_find_uncovered_capture_ranges_excludes_tool_and_empty_messages(db, session_id):
     db.upsert_session(session_id, "main")
     id1 = db.mirror_message(session_id, "e1", "user", "hello")
     db.mirror_message(session_id, "e2", "tool", "tool output", tool_name="bash")
     id3 = db.mirror_message(session_id, "e3", "assistant", "hi there")
 
-    assert db.find_uncovered_capture_range("main", session_id) == (id1, id3)
+    assert db.find_uncovered_capture_ranges("main", session_id) == [(id1, id3)]
 
 
-def test_find_uncovered_commitment_range_none_without_any_prior_job(db, session_id):
+def test_find_uncovered_capture_ranges_survives_the_covering_job_being_pruned(
+    db, session_id, lag_agent_id
+):
+    # R2-GAP-001/R2-GAP-002 together: coverage lives in
+    # session_job_coverage_ranges, which retention pruning never touches —
+    # deleting the job row itself must not make an already-covered range
+    # look uncovered again.
+    db.upsert_session(session_id, lag_agent_id)
+    id1 = db.mirror_message(session_id, "e1", "user", "hello")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, id1, id2, idempotency_key=f"key-{session_id}"
+    )
+    db._conn().execute("DELETE FROM memory_capture_jobs WHERE id = %s", (job_id,))
+
+    assert db.find_uncovered_capture_ranges(lag_agent_id, session_id) == []
+
+
+def test_find_uncovered_commitment_ranges_empty_without_any_prior_job(db, session_id):
     # A session with zero commitment jobs ever is left alone -- most likely
     # means commitments were disabled, not a missed enqueue (see docstring).
     db.upsert_session(session_id, "main")
     db.mirror_message(session_id, "e1", "user", "hello")
 
-    assert db.find_uncovered_commitment_range("main", session_id) is None
+    assert db.find_uncovered_commitment_ranges("main", session_id) == []
 
 
-def test_find_uncovered_commitment_range_returns_none_for_an_unowned_session(db, session_id):
+def test_find_uncovered_commitment_ranges_empty_for_an_unowned_session(db, session_id):
     db.upsert_session(session_id, "researcher")
     db.mirror_message(session_id, "e1", "user", "hello")
 
-    assert db.find_uncovered_commitment_range("main", session_id) is None
+    assert db.find_uncovered_commitment_ranges("main", session_id) == []
 
 
-def test_find_uncovered_commitment_range_returns_the_gap_after_the_last_job(db, session_id):
+def test_find_uncovered_commitment_ranges_returns_the_gap_after_the_last_job(db, session_id):
     db.upsert_session(session_id, "main")
     id1 = db.mirror_message(session_id, "e1", "user", "first turn")
     id2 = db.mirror_message(session_id, "e2", "assistant", "first reply")
@@ -1944,10 +2094,25 @@ def test_find_uncovered_commitment_range_returns_the_gap_after_the_last_job(db, 
     id3 = db.mirror_message(session_id, "e3", "user", "second turn")
     id4 = db.mirror_message(session_id, "e4", "assistant", "second reply")
 
-    assert db.find_uncovered_commitment_range("main", session_id) == ("cli", id3, id4)
+    assert db.find_uncovered_commitment_ranges("main", session_id) == [("cli", id3, id4)]
 
 
-def test_find_uncovered_commitment_range_uses_the_most_recently_covered_jobs_channel(
+def test_find_uncovered_commitment_ranges_finds_a_sparse_gap_below_a_later_covered_range(
+    db, session_id
+):
+    db.upsert_session(session_id, "main")
+    id1 = db.mirror_message(session_id, "e1", "user", "first turn — missed")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "first reply — missed")
+    id3 = db.mirror_message(session_id, "e3", "user", "second turn — covered")
+    id4 = db.mirror_message(session_id, "e4", "assistant", "second reply — covered")
+    db.enqueue_commitment_job(
+        "main", session_id, "cli", id3, id4, idempotency_key=f"key-{session_id}"
+    )
+
+    assert db.find_uncovered_commitment_ranges("main", session_id) == [("cli", id1, id2)]
+
+
+def test_find_uncovered_commitment_ranges_uses_the_most_recently_covered_jobs_channel(
     db, session_id
 ):
     db.upsert_session(session_id, "main")
@@ -1959,13 +2124,12 @@ def test_find_uncovered_commitment_range_uses_the_most_recently_covered_jobs_cha
     id3 = db.mirror_message(session_id, "e3", "user", "second turn")
     id4 = db.mirror_message(session_id, "e4", "assistant", "second reply")
 
-    channel, from_id, to_id = db.find_uncovered_commitment_range("main", session_id)
+    gaps = db.find_uncovered_commitment_ranges("main", session_id)
 
-    assert channel == "!room:example.org"
-    assert (from_id, to_id) == (id3, id4)
+    assert gaps == [("!room:example.org", id3, id4)]
 
 
-def test_find_uncovered_commitment_range_none_when_fully_covered(db, session_id):
+def test_find_uncovered_commitment_ranges_empty_when_fully_covered(db, session_id):
     db.upsert_session(session_id, "main")
     id1 = db.mirror_message(session_id, "e1", "user", "hello")
     id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
@@ -1973,7 +2137,45 @@ def test_find_uncovered_commitment_range_none_when_fully_covered(db, session_id)
         "main", session_id, "cli", id1, id2, idempotency_key=f"key-{session_id}"
     )
 
-    assert db.find_uncovered_commitment_range("main", session_id) is None
+    assert db.find_uncovered_commitment_ranges("main", session_id) == []
+
+
+def test_find_uncovered_commitment_ranges_survives_the_covering_job_being_pruned(
+    db, session_id, lag_agent_id
+):
+    db.upsert_session(session_id, lag_agent_id)
+    id1 = db.mirror_message(session_id, "e1", "user", "hello")
+    id2 = db.mirror_message(session_id, "e2", "assistant", "hi there")
+    job_id = db.enqueue_commitment_job(
+        lag_agent_id, session_id, "cli", id1, id2, idempotency_key=f"key-{session_id}"
+    )
+    db._conn().execute("DELETE FROM memory_commitment_jobs WHERE id = %s", (job_id,))
+
+    assert db.find_uncovered_commitment_ranges(lag_agent_id, session_id) == []
+
+
+# ---------------------------------------------------------------------------
+# list_capture_job_ranges / list_commitment_job_ranges (R2-GAP-002)
+# ---------------------------------------------------------------------------
+
+def test_list_capture_job_ranges_survives_the_job_being_pruned(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_capture_job(
+        lag_agent_id, session_id, 5, 9, idempotency_key=f"key-{session_id}"
+    )
+    db._conn().execute("DELETE FROM memory_capture_jobs WHERE id = %s", (job_id,))
+
+    assert db.list_capture_job_ranges(session_id) == [(5, 9)]
+
+
+def test_list_commitment_job_ranges_survives_the_job_being_pruned(db, session_id, lag_agent_id):
+    db.upsert_session(session_id, lag_agent_id)
+    job_id = db.enqueue_commitment_job(
+        lag_agent_id, session_id, "cli", 5, 9, idempotency_key=f"key-{session_id}"
+    )
+    db._conn().execute("DELETE FROM memory_commitment_jobs WHERE id = %s", (job_id,))
+
+    assert db.list_commitment_job_ranges(session_id) == [(5, 9)]
 
 
 # ---------------------------------------------------------------------------
@@ -2142,52 +2344,112 @@ def test_fail_message_embedding_job_gives_up_after_max_attempts(db, session_id):
     assert row[0] == "failed"
 
 
-# --- find_uncovered_message_ids_for_embedding ---
+# --- find_uncovered_message_ids_for_embedding (R2-GAP-002/R2-GAP-005) ---
+# Checks message_embeddings directly for the active model, not a job-table
+# cursor -- needs db_with_vector (a configured provider), not the plain
+# db fixture, for anything but the "no provider configured" case.
 
 def test_find_uncovered_message_ids_for_embedding_returns_empty_for_an_unowned_session(
-    db, session_id
+    db_with_vector, session_id
 ):
-    db.upsert_session(session_id, "researcher")
+    db_with_vector.upsert_session(session_id, "researcher")
+    db_with_vector.mirror_message(session_id, "e1", "user", "hello")
+
+    assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == []
+
+
+def test_find_uncovered_message_ids_for_embedding_returns_empty_without_a_provider(db, session_id):
+    db.upsert_session(session_id, "main")
     db.mirror_message(session_id, "e1", "user", "hello")
 
     assert db.find_uncovered_message_ids_for_embedding("main", session_id) == []
 
 
-def test_find_uncovered_message_ids_for_embedding_returns_all_new_messages(db, session_id):
-    db.upsert_session(session_id, "main")
-    id1 = db.mirror_message(session_id, "e1", "user", "first")
-    id2 = db.mirror_message(session_id, "e2", "assistant", "second")
+def test_find_uncovered_message_ids_for_embedding_returns_all_new_messages(
+    db_with_vector, session_id
+):
+    db_with_vector.upsert_session(session_id, "main")
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "first")
+    id2 = db_with_vector.mirror_message(session_id, "e2", "assistant", "second")
 
-    assert db.find_uncovered_message_ids_for_embedding("main", session_id) == [id1, id2]
+    assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == [id1, id2]
 
 
 def test_find_uncovered_message_ids_for_embedding_excludes_tool_and_empty_messages(
-    db, session_id
+    db_with_vector, session_id
 ):
-    db.upsert_session(session_id, "main")
-    id1 = db.mirror_message(session_id, "e1", "user", "question")
-    db.mirror_message(session_id, "e2", "tool", "raw output", tool_name="read")
-    db.mirror_message(session_id, "e3", "assistant", None)
+    db_with_vector.upsert_session(session_id, "main")
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "question")
+    db_with_vector.mirror_message(session_id, "e2", "tool", "raw output", tool_name="read")
+    db_with_vector.mirror_message(session_id, "e3", "assistant", None)
 
-    assert db.find_uncovered_message_ids_for_embedding("main", session_id) == [id1]
-
-
-def test_find_uncovered_message_ids_for_embedding_excludes_already_queued_ids(db, session_id):
-    db.upsert_session(session_id, "main")
-    id1 = db.mirror_message(session_id, "e1", "user", "first")
-    id2 = db.mirror_message(session_id, "e2", "assistant", "second")
-    db.enqueue_message_embedding_job("main", session_id, id1, idempotency_key=f"key-{session_id}")
-
-    # Cursor is MAX(message_id) already covered, so only ids after id1 remain.
-    assert db.find_uncovered_message_ids_for_embedding("main", session_id) == [id2]
+    assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == [id1]
 
 
-def test_find_uncovered_message_ids_for_embedding_empty_when_fully_covered(db, session_id):
-    db.upsert_session(session_id, "main")
-    id1 = db.mirror_message(session_id, "e1", "user", "hello")
-    db.enqueue_message_embedding_job("main", session_id, id1, idempotency_key=f"key-{session_id}")
+def test_find_uncovered_message_ids_for_embedding_still_reports_a_merely_pending_job(
+    db_with_vector, session_id
+):
+    # Coverage means "has an actual embedding," not "has a job enqueued" —
+    # a pending (not yet completed) job doesn't hide a message from
+    # reconciliation. Harmless: enqueue_message_embedding_job is
+    # idempotency-keyed, so re-enqueuing the same pending job no-ops.
+    db_with_vector.upsert_session(session_id, "main")
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "first")
+    db_with_vector.enqueue_message_embedding_job(
+        "main", session_id, id1, idempotency_key=f"key-{session_id}"
+    )
 
-    assert db.find_uncovered_message_ids_for_embedding("main", session_id) == []
+    assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == [id1]
+
+
+def test_find_uncovered_message_ids_for_embedding_excludes_a_completed_embedding(
+    db_with_vector, session_id
+):
+    db_with_vector.upsert_session(session_id, "main")
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "first")
+    id2 = db_with_vector.mirror_message(session_id, "e2", "assistant", "second")
+    job_id = db_with_vector.enqueue_message_embedding_job(
+        "main", session_id, id1, idempotency_key=f"key-{session_id}"
+    )
+    db_with_vector.complete_message_embedding_job(
+        job_id, id1, db_with_vector.embedding_model_identity, [0.1, 0.2, 0.3]
+    )
+
+    assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == [id2]
+
+
+def test_find_uncovered_message_ids_for_embedding_empty_when_fully_covered(
+    db_with_vector, session_id
+):
+    db_with_vector.upsert_session(session_id, "main")
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "hello")
+    job_id = db_with_vector.enqueue_message_embedding_job(
+        "main", session_id, id1, idempotency_key=f"key-{session_id}"
+    )
+    db_with_vector.complete_message_embedding_job(
+        job_id, id1, db_with_vector.embedding_model_identity, [0.1, 0.2, 0.3]
+    )
+
+    assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == []
+
+
+def test_find_uncovered_message_ids_for_embedding_is_model_aware(db_with_vector, session_id):
+    # R2-GAP-005: a message embedded under an OLD model must re-surface as
+    # uncovered once the active model changes -- this is what makes
+    # periodic reconciliation the automatic backfill mechanism after a
+    # model switch, with no separate manual "rebuild" command needed.
+    db_with_vector.upsert_session(session_id, "main")
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "hello")
+    job_id = db_with_vector.enqueue_message_embedding_job(
+        "main", session_id, id1, idempotency_key=f"key-{session_id}"
+    )
+    db_with_vector.complete_message_embedding_job(
+        job_id, id1, "old-endpoint::old-model", [0.1, 0.2, 0.3]
+    )
+
+    # Embedded under the OLD model; db_with_vector's active model
+    # (mock_embedding_provider) is "test-endpoint::test-model" — still uncovered.
+    assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == [id1]
 
 
 # --- vector lane / hybrid search ---

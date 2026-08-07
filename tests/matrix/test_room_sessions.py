@@ -98,3 +98,45 @@ def test_start_required(tmp_path):
             await mgr.get_or_create_session_id("!room:ex.org", "main")
 
     _run(_go())
+
+
+# ---------------------------------------------------------------------------
+# Concurrent first-message race (R2-GAP-010)
+# ---------------------------------------------------------------------------
+
+def test_concurrent_first_messages_for_the_same_room_agree_on_one_session_id(tmp_path):
+    # Two Matrix events arriving together right after joining a room, both
+    # racing to create the same (room_id, agent_id) binding — before the
+    # fix, a plain select-then-insert could let both see no existing row
+    # and both attempt an INSERT, the loser raising a uniqueness violation
+    # instead of the two callers agreeing on a winner.
+    async def _go():
+        mgr = _mgr(tmp_path)
+        await mgr.start()
+        try:
+            results = await asyncio.gather(
+                *(mgr.get_or_create_session_id("!room:ex.org", "main") for _ in range(10))
+            )
+        finally:
+            await mgr.stop()
+        return results
+
+    results = _run(_go())
+    assert len(set(results)) == 1  # every caller agrees on the same session_id
+    uuid.UUID(results[0])  # a real session_id, not an opaque key
+
+
+def test_get_or_create_after_rebind_returns_the_rebound_id(tmp_path):
+    async def _go():
+        mgr = _mgr(tmp_path)
+        await mgr.start()
+        original = await mgr.get_or_create_session_id("!room:ex.org", "main")
+        new_id = str(uuid.uuid4())
+        await mgr.rebind("!room:ex.org", "main", new_id)
+        resolved = await mgr.get_or_create_session_id("!room:ex.org", "main")
+        await mgr.stop()
+        return original, new_id, resolved
+
+    original, new_id, resolved = _run(_go())
+    assert resolved == new_id
+    assert resolved != original

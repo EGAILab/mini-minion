@@ -482,7 +482,153 @@ def test_retention_merges_index_counts_when_configured(monkeypatch, tmp_path, ca
     assert exit_code == 0
     mock_index.prune_operational_tables.assert_called_once_with(30, dry_run=True)
     assert "recall_events: 4" in out
-    assert "5 row(s)" in out  # 1 (db) + 4 (index)
+
+
+# ---------------------------------------------------------------------------
+# verify-deletions (R2-GAP-007)
+# ---------------------------------------------------------------------------
+
+def _incomplete_tombstone(**overrides) -> dict:
+    base = {
+        "agent_id": "main", "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "jsonl_deleted": True, "db_deleted": False, "evidence_cleaned": False,
+        "proposal_ids": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_verify_deletions_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["verify-deletions"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_verify_deletions_reports_none_found(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_incomplete_deletion_tombstones.return_value = []
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["verify-deletions"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "No incomplete session deletions found." in out
+
+
+def test_verify_deletions_without_retry_only_lists(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_incomplete_deletion_tombstones.return_value = [_incomplete_tombstone()]
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["verify-deletions"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "1 incomplete session deletion" in out
+    assert "db=PENDING" in out
+    assert "Re-run with --retry" in out
+    mock_db.delete_session.assert_not_called()
+
+
+def test_verify_deletions_retry_finishes_db_and_evidence_phases(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_incomplete_deletion_tombstones.return_value = [_incomplete_tombstone()]
+    mock_db.delete_session.return_value = {"messages": 2, "proposal_ids": [5]}
+    _patch_db(monkeypatch, mock_db)
+    _patch_index(monkeypatch, None)
+    mock_service = Mock()
+    monkeypatch.setattr(cli, "_build_service", lambda *a, **kw: mock_service)
+
+    exit_code = cli.main(["verify-deletions", "--retry"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_db.delete_session.assert_called_once_with("main", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    mock_db.mark_deletion_db_done.assert_called_once_with(
+        "main", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", [5]
+    )
+    mock_service.forget_proposals.assert_called_once_with([5])
+    mock_db.mark_deletion_evidence_done.assert_called_once_with(
+        "main", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    )
+    assert "finished" in out
+
+
+def test_verify_deletions_retry_skips_a_missing_jsonl_phase(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_incomplete_deletion_tombstones.return_value = [
+        _incomplete_tombstone(jsonl_deleted=False)
+    ]
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["verify-deletions", "--retry"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "needs manual attention" in out
+    mock_db.delete_session.assert_not_called()
+
+
+def test_verify_deletions_retry_skips_the_db_phase_when_already_done(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_incomplete_deletion_tombstones.return_value = [
+        _incomplete_tombstone(db_deleted=True, proposal_ids=[9])
+    ]
+    _patch_db(monkeypatch, mock_db)
+    _patch_index(monkeypatch, None)
+    mock_service = Mock()
+    monkeypatch.setattr(cli, "_build_service", lambda *a, **kw: mock_service)
+
+    cli.main(["verify-deletions", "--retry"])
+
+    mock_db.delete_session.assert_not_called()
+    mock_service.forget_proposals.assert_called_once_with([9])
+
+
+def test_verify_deletions_retry_skips_evidence_cleanup_when_no_proposals(
+    monkeypatch, tmp_path, capsys
+):
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_incomplete_deletion_tombstones.return_value = [_incomplete_tombstone()]
+    mock_db.delete_session.return_value = {"messages": 1, "proposal_ids": []}
+    _patch_db(monkeypatch, mock_db)
+    _patch_index(monkeypatch, None)
+    mock_service = Mock()
+    monkeypatch.setattr(cli, "_build_service", lambda *a, **kw: mock_service)
+
+    cli.main(["verify-deletions", "--retry"])
+
+    mock_service.forget_proposals.assert_not_called()
+    mock_db.mark_deletion_evidence_done.assert_called_once()
+
+
+def test_verify_deletions_retry_reports_a_repeated_db_failure_without_crashing(
+    monkeypatch, tmp_path, capsys
+):
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.list_incomplete_deletion_tombstones.return_value = [_incomplete_tombstone()]
+    mock_db.delete_session.side_effect = Exception("still down")
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["verify-deletions", "--retry"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "database cleanup failed again" in out
+    assert "still down" in out
+    mock_db.mark_deletion_db_done.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

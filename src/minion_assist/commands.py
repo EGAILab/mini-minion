@@ -1254,56 +1254,93 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
 
             # Fetch name before deleting so we can include it in the confirmation.
             display_name = ctx.short_term.get_name(agent_id, target_id)
-            ctx.short_term.delete_session(agent_id, target_id)
             hint = f"[{display_name}]" if display_name else target_id[:8]
 
-            # Cross-store cleanup (MEM-GAP-003): the JSONL file above was
-            # always this session's only source of truth for the local/basic
-            # profile, but a PostgreSQL-mirrored session also has messages,
-            # capture/commitment jobs, proposals, and commitments living in
-            # SessionDB — none of which the JSONL delete above touches.
-            # ctx.db is only set when a database is actually configured, so
-            # this whole block is a no-op in the local/basic profile.
-            pg_note = ""
-            if ctx.db is not None:
-                try:
-                    pg_result = ctx.db.delete_session(agent_id, target_id)
-                except Exception as exc:
-                    # Surface this loudly rather than silently claiming a
-                    # complete deletion — the JSONL file is already gone, but
-                    # PostgreSQL records may still exist and be searchable.
-                    pg_note = (
-                        f" WARNING: database cleanup failed ({exc}) — "
-                        "PostgreSQL records for this session may still exist."
-                    )
-                else:
-                    if pg_result is not None:
-                        proposal_ids = pg_result.get("proposal_ids") or []
-                        forget_note = ""
-                        if proposal_ids:
-                            # Only SessionDB knows which proposal ids it just
-                            # deleted; only the matching agent's MemoryService
-                            # can clean up their indexed chunks, draft
-                            # previews, and knowledge-graph evidence
-                            # citations (a separate class/connection).
-                            agent_session = ctx.sessions.get(agent_id)
-                            memory = getattr(agent_session, "memory", None)
-                            if memory is not None:
-                                try:
-                                    memory.forget_proposals(proposal_ids)
-                                except Exception as exc:
-                                    forget_note = (
-                                        f" (evidence cleanup for {len(proposal_ids)} "
-                                        f"proposal(s) failed: {exc})"
-                                    )
-                        pg_note = (
-                            f" Also removed {pg_result['messages']} database message(s) "
-                            f"and {len(proposal_ids)} proposal(s).{forget_note}"
-                        )
-                    # pg_result is None: this session_id was never mirrored to
-                    # PostgreSQL for this agent (e.g. it predates the database
-                    # being configured) — nothing more to clean up, not an error.
+            if ctx.db is None:
+                # Local/basic profile — the JSONL file is this session's
+                # only store, a single atomic operation with nothing to
+                # resume if it fails.
+                ctx.short_term.delete_session(agent_id, target_id)
+                return CommandResult(handled=True, message=f"Deleted session {hint}.")
 
+            # Cross-store cleanup (MEM-GAP-003), now tombstone-tracked
+            # (R2-GAP-007): the JSONL file above was always this session's
+            # only source of truth for the local/basic profile, but a
+            # PostgreSQL-mirrored session also has messages, capture/
+            # commitment jobs, proposals, and commitments living in
+            # SessionDB, plus indexed evidence in PostgresMemoryIndex —
+            # three independent operations against three stores, none of
+            # which can share a transaction. start_deletion_tombstone()
+            # records intent *before* anything is touched, and each phase
+            # marks itself done as it completes, so a failure partway
+            # through (e.g. a transient DB connection drop) leaves a
+            # durable, discoverable record — see
+            # `minion-assist memory verify-deletions` — instead of a
+            # session that's half-deleted with no trace of what's left.
+            ctx.db.start_deletion_tombstone(agent_id, target_id)
+
+            ctx.short_term.delete_session(agent_id, target_id)
+            ctx.db.mark_deletion_jsonl_done(agent_id, target_id)
+
+            try:
+                pg_result = ctx.db.delete_session(agent_id, target_id)
+            except Exception as exc:
+                # Surface this loudly rather than silently claiming a
+                # complete deletion — the JSONL file is already gone, but
+                # PostgreSQL records may still exist and be searchable.
+                # Re-running /delete-session on this target won't work
+                # (it's no longer in the listing), hence the CLI pointer.
+                return CommandResult(
+                    handled=True,
+                    message=(
+                        f"Deleted session {hint} locally. WARNING: database cleanup failed "
+                        f"({exc}) — PostgreSQL records may still exist. Run "
+                        "'minion-assist memory verify-deletions --retry' to finish it."
+                    ),
+                )
+            proposal_ids = (pg_result.get("proposal_ids") or []) if pg_result is not None else []
+            ctx.db.mark_deletion_db_done(agent_id, target_id, proposal_ids)
+            # pg_result is None: this session_id was never mirrored to
+            # PostgreSQL for this agent (e.g. it predates the database
+            # being configured) — nothing more to clean up, not an error.
+
+            forget_note = ""
+            if proposal_ids:
+                # Only SessionDB knows which proposal ids it just deleted;
+                # only the matching agent's MemoryService can clean up
+                # their indexed chunks, draft previews, and
+                # knowledge-graph evidence citations (a separate
+                # class/connection).
+                agent_session = ctx.sessions.get(agent_id)
+                memory = getattr(agent_session, "memory", None)
+                if memory is not None:
+                    try:
+                        memory.forget_proposals(proposal_ids)
+                    except Exception as exc:
+                        forget_note = (
+                            f" (evidence cleanup for {len(proposal_ids)} proposal(s) failed: "
+                            f"{exc} — run 'minion-assist memory verify-deletions --retry' "
+                            "to finish it)"
+                        )
+                    else:
+                        ctx.db.mark_deletion_evidence_done(agent_id, target_id)
+                else:
+                    # No live MemoryService in this dispatch context (e.g.
+                    # the target agent has no active session right now) —
+                    # can't clean up evidence here; the tombstone stays
+                    # incomplete for `verify-deletions --retry` to finish.
+                    forget_note = (
+                        f" ({len(proposal_ids)} proposal(s) still need evidence cleanup — "
+                        "run 'minion-assist memory verify-deletions --retry' to finish it)"
+                    )
+            else:
+                ctx.db.mark_deletion_evidence_done(agent_id, target_id)
+
+            pg_note = (
+                f" Also removed {pg_result['messages']} database message(s) "
+                f"and {len(proposal_ids)} proposal(s).{forget_note}"
+                if pg_result is not None else ""
+            )
             return CommandResult(handled=True, message=f"Deleted session {hint}.{pg_note}")
 
     # --- Plugin commands ---

@@ -35,13 +35,26 @@ Schema (created automatically on first connect):
            session_id (added alongside that fix) is the reliable way to
            find a session's proposals regardless of whether its job row
            still exists.
-  session_job_coverage(agent_id, session_id, lane, covered_through_id,
-           updated_at) — durable "highest id a job was ever enqueued for"
-           cursor per (session, lane), lane in
-           ('capture', 'commitment', 'message_embedding'). Added by R2-GAP-001
-           so retention pruning old job rows (which used to double as the
-           coverage cursor via MAX(...)) can no longer reset reconciliation's
-           notion of what's already been enqueued.
+  session_job_coverage_ranges(id, agent_id, session_id, lane, channel,
+           from_id, to_id, created_at) — append-only record of every
+           capture/commitment range ever successfully enqueued (lane in
+           ('capture', 'commitment') — message_embedding coverage is
+           instead checked directly against message_embeddings, see its
+           method docstring). Added by R2-GAP-002, superseding R2-GAP-001's
+           single-high-water-mark session_job_coverage table: exact ranges,
+           not just a cutoff, let gap detection find a sparse hole below
+           the overall maximum, not only a tail gap — and retention pruning
+           the job tables still can't erase this, since nothing ever
+           deletes from it.
+  deletion_tombstones(agent_id, session_id, requested_at, jsonl_deleted,
+           db_deleted, evidence_cleaned, proposal_ids, completed_at) —
+           one row per ``/delete-session`` attempt (R2-GAP-007), tracking
+           which of its three cross-store cleanup phases have completed so
+           a partial failure is discoverable and resumable
+           (``minion-assist memory verify-deletions``) instead of silently
+           stuck. Never deleted once written, even after completion —
+           itself the durable proof a session was fully, deliberately
+           removed.
   memory_commitment_jobs(id, agent_id, session_id, channel,
            source_from_message_id, source_to_message_id, idempotency_key,
            state, attempts, run_after, last_error, created_at, updated_at)
@@ -706,6 +719,160 @@ def _migration_005_decouple_retention_from_outputs(conn) -> None:
     conn.execute("ALTER TABLE memory_proposals VALIDATE CONSTRAINT fk_memory_proposals_session")
 
 
+def _migration_006_range_based_job_coverage(conn) -> None:
+    """Exact per-range job coverage, replacing the single high-water mark (R2-GAP-002).
+
+    Migration 005's ``session_job_coverage`` fixed retention erasing
+    coverage, but it only ever stored one ``covered_through_id`` scalar per
+    ``(session_id, lane)`` — a high-water mark can represent a *tail* gap
+    (nothing enqueued since X) but not a *sparse* one (message 1's enqueue
+    failed, message 2's later succeeded — 1 is hidden forever, since
+    anything below the mark reads as "covered"). This migration replaces it
+    with an append-only table of every range a job was ever successfully
+    enqueued for, so gap detection can check each message individually
+    against the exact ranges recorded, not just a single cutoff.
+
+    Two lanes, two different fixes:
+
+    - **capture / commitment** — no way to tell "attempted, zero results"
+      from "never attempted" by looking at *outputs* (an extraction that
+      legitimately found nothing looks identical to one that never ran), so
+      these two lanes keep needing an explicit "this range was enqueued"
+      record. ``session_job_coverage_ranges`` is that record, one row per
+      successful enqueue, retention-proof because nothing ever deletes from
+      it (unlike the job tables retention prunes).
+    - **message_embedding** — moves to a *better* fix than a coverage table
+      at all (R2-GAP-005): ``message_embeddings`` is already keyed by
+      ``(message_id, model_identity)`` and is itself never pruned, so
+      ``find_uncovered_message_ids_for_embedding`` can anti-join against it
+      directly for the *currently active* model — simultaneously exact
+      (no sparse-gap blind spot) and model-aware (a model switch now
+      correctly re-surfaces every historical message as needing a new
+      embedding, instead of looking permanently "covered" by the old
+      model's job history).
+
+    Backfill prefers the job tables themselves (still fully intact at
+    migration time) over ``session_job_coverage``'s already-collapsed
+    high-water mark — one row per existing job preserves whatever sparse
+    structure hasn't been pruned yet, which is strictly more information
+    than a single cutoff. A session whose job rows were *already* pruned by
+    a production deployment that had retention enabled before this
+    migration ran (not this project's own deployment — retention has never
+    been applied here) falls back to a single synthetic ``(1,
+    covered_through_id)`` range from the old table, so no session regresses
+    to "never covered."
+
+    ``session_job_coverage`` (migration 005) is dropped at the end — fully
+    superseded on both lanes, one commit after it was introduced.
+    """
+    now = time.time()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS session_job_coverage_ranges (
+            id          BIGSERIAL PRIMARY KEY,
+            agent_id    TEXT NOT NULL,
+            session_id  TEXT NOT NULL,
+            lane        TEXT NOT NULL,
+            channel     TEXT,
+            from_id     BIGINT NOT NULL,
+            to_id       BIGINT NOT NULL,
+            created_at  DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS session_job_coverage_ranges_lookup_idx "
+        "ON session_job_coverage_ranges (session_id, lane)"
+    )
+
+    conn.execute(
+        """
+        INSERT INTO session_job_coverage_ranges
+            (agent_id, session_id, lane, channel, from_id, to_id, created_at)
+        SELECT agent_id, session_id, 'capture', NULL,
+               source_from_message_id, source_to_message_id, %s
+        FROM memory_capture_jobs
+        """,
+        (now,),
+    )
+    conn.execute(
+        """
+        INSERT INTO session_job_coverage_ranges
+            (agent_id, session_id, lane, channel, from_id, to_id, created_at)
+        SELECT agent_id, session_id, 'commitment', channel,
+               source_from_message_id, source_to_message_id, %s
+        FROM memory_commitment_jobs
+        """,
+        (now,),
+    )
+    # Fallback only for a (session, lane) with no surviving job rows at all
+    # (already pruned) but a remembered high-water mark — everything else
+    # was already backfilled above with better fidelity.
+    conn.execute(
+        """
+        INSERT INTO session_job_coverage_ranges
+            (agent_id, session_id, lane, channel, from_id, to_id, created_at)
+        SELECT c.agent_id, c.session_id, c.lane, c.channel, 1, c.covered_through_id, %s
+        FROM session_job_coverage c
+        WHERE c.lane IN ('capture', 'commitment')
+        AND NOT EXISTS (
+            SELECT 1 FROM session_job_coverage_ranges r
+            WHERE r.session_id = c.session_id AND r.lane = c.lane
+        )
+        """,
+        (now,),
+    )
+
+    conn.execute("DROP TABLE IF EXISTS session_job_coverage")
+
+
+def _migration_007_deletion_tombstones(conn) -> None:
+    """Track ``/delete-session``'s multi-phase cross-store cleanup so it's resumable (R2-GAP-007).
+
+    ``/delete-session`` deletes a session's JSONL file, then its
+    ``SessionDB`` rows, then (if any proposals were found) their indexed
+    evidence in ``PostgresMemoryIndex`` — three independent operations
+    against three different stores, none wrapped in a shared transaction
+    (can't be: a filesystem delete and two separate database connections).
+    Before this migration, a failure partway through (the DB delete raises
+    on a transient connection drop, say) left no record of which phases
+    had actually completed — the only way to notice was reading a stack
+    trace at the moment it happened, and the only way to "retry" was
+    re-running ``/delete-session`` on the same target, which no longer
+    works once the JSONL file is already gone (it can't be found by
+    listing/index again).
+
+    One row per deletion attempt, keyed by ``(agent_id, session_id)``,
+    updated as each phase completes. ``minion-assist memory
+    verify-deletions [--retry]`` (``memory/cli.py``) lists/finishes any
+    tombstone whose ``completed_at`` is still ``NULL`` — the durable record
+    is what makes an incomplete deletion discoverable and resumable without
+    depending on the file that's the whole reason a retry might be needed.
+
+    ``proposal_ids`` (an array, not a foreign key) is deliberately a plain
+    snapshot of whatever :meth:`SessionDB.delete_session` returned the
+    moment the DB phase completed — by the time evidence cleanup might
+    need retrying, the ``memory_proposals`` rows those ids referred to are
+    already gone (deleted in that same phase), so this is a record of
+    *which evidence chunks to remove elsewhere*, not a live reference.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deletion_tombstones (
+            agent_id          TEXT NOT NULL,
+            session_id        TEXT NOT NULL,
+            requested_at      DOUBLE PRECISION NOT NULL,
+            jsonl_deleted     BOOLEAN NOT NULL DEFAULT FALSE,
+            db_deleted        BOOLEAN NOT NULL DEFAULT FALSE,
+            evidence_cleaned  BOOLEAN NOT NULL DEFAULT FALSE,
+            proposal_ids      BIGINT[] NOT NULL DEFAULT '{}',
+            completed_at      DOUBLE PRECISION,
+            PRIMARY KEY (agent_id, session_id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS deletion_tombstones_incomplete_idx "
+        "ON deletion_tombstones (requested_at) WHERE completed_at IS NULL"
+    )
+
+
 # Every migration SessionDB knows about, in the order they were introduced.
 # Append new migrations here — never edit an existing entry's `apply`
 # function once it has shipped (see _migration_001_baseline's docstring).
@@ -715,49 +882,128 @@ _SESSION_DB_MIGRATIONS = [
     Migration(3, "message_embedding_jobs", _migration_003_message_embedding_jobs),
     Migration(4, "referential_integrity", _migration_004_referential_integrity),
     Migration(5, "decouple_retention_from_outputs", _migration_005_decouple_retention_from_outputs),
+    Migration(6, "range_based_job_coverage", _migration_006_range_based_job_coverage),
+    Migration(7, "deletion_tombstones", _migration_007_deletion_tombstones),
 ]
 
 
-def _advance_job_coverage(
-    conn, agent_id: str, session_id: str, lane: str, covered_through_id: int,
+def _record_job_coverage_range(
+    conn, agent_id: str, session_id: str, lane: str, from_id: int, to_id: int,
     channel: str | None = None,
 ) -> None:
-    """Upsert ``session_job_coverage``'s high-water mark for one ``(session_id, lane)`` (R2-GAP-001).
+    """Append one covered range to ``session_job_coverage_ranges`` (R2-GAP-002).
 
-    Called by ``enqueue_capture_job``/``enqueue_commitment_job``/
-    ``enqueue_message_embedding_job`` right after a genuinely new job row is
-    inserted — never on their ``ON CONFLICT ... DO NOTHING`` no-op path,
-    since a job that already existed already advanced coverage the first
-    time it was enqueued. ``GREATEST`` makes this safe even if jobs are ever
-    enqueued out of id order.
+    Called by ``enqueue_capture_job``/``enqueue_commitment_job`` right
+    after a genuinely new job row is inserted — never on their
+    ``ON CONFLICT ... DO NOTHING`` no-op path, since a job that already
+    existed already recorded its range the first time it was enqueued.
+    Deliberately append-only (unlike migration 005's superseded
+    high-water-mark table, which upserted): every enqueue's exact range
+    stays individually visible, which is what lets gap detection find a
+    sparse hole below the overall maximum, not just a tail gap.
 
     Args:
         conn: An open connection (this class's autocommit connection).
         agent_id: The agent this session belongs to.
-        session_id: The session this job's range/message belongs to.
-        lane: One of ``"capture"``, ``"commitment"``, ``"message_embedding"``.
-        covered_through_id: The highest message id this job's range/target
-            reaches — coverage never moves backward past what was already
-            recorded.
+        session_id: The session this job's range belongs to.
+        lane: ``"capture"`` or ``"commitment"`` — ``message_embedding``
+            never calls this (see :meth:`SessionDB.find_uncovered_message_ids_for_embedding`'s
+            docstring for why that lane doesn't need a coverage table).
+        from_id: Lowest message id this job's range covers.
+        to_id: Highest message id this job's range covers.
         channel: Only meaningful for the ``"commitment"`` lane (a Matrix
-            room id, or ``"cli"``) — always overwritten to the latest
-            enqueue's channel, since a session's commitment channel doesn't
-            move backward the way an id-based cursor does. ``None`` for the
-            other two lanes, which leaves any existing (always-NULL) value
-            unchanged.
+            room id, or ``"cli"``) — ``None`` for ``"capture"``.
     """
-    now = time.time()
     conn.execute(
-        """
-        INSERT INTO session_job_coverage (agent_id, session_id, lane, covered_through_id, channel, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (session_id, lane) DO UPDATE SET
-            covered_through_id = GREATEST(session_job_coverage.covered_through_id, EXCLUDED.covered_through_id),
-            channel = COALESCE(EXCLUDED.channel, session_job_coverage.channel),
-            updated_at = EXCLUDED.updated_at
-        """,
-        (agent_id, session_id, lane, covered_through_id, channel, now),
+        "INSERT INTO session_job_coverage_ranges "
+        "(agent_id, session_id, lane, channel, from_id, to_id, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (agent_id, session_id, lane, channel, from_id, to_id, time.time()),
     )
+
+
+# Fixed message-count window for one backfilled/reconciled capture or
+# commitment job (moved here from memory/consolidation.py so
+# find_uncovered_capture_ranges/find_uncovered_commitment_ranges below can
+# share it without a circular import — memory/consolidation.py already
+# imports SessionDB from this module, so the reverse direction isn't
+# available). Bounds how much history a single extract_facts() call ever
+# receives — a live per-turn job only ever covers one exchange (2
+# messages), so an unbounded gap window could dwarf that by orders of
+# magnitude and risk exceeding the extraction model's context. Not
+# configurable (yet) — same "no knob without evaluation data" reasoning as
+# capture_worker.py's own hardcoded constants.
+_BACKFILL_WINDOW_MESSAGES = 20
+
+
+def _chunk_run(run: list[int]) -> list[tuple[int, int]]:
+    """Split one contiguous run of uncovered message ids into bounded (from, to) windows."""
+    return [
+        (chunk[0], chunk[-1])
+        for chunk in (
+            run[i : i + _BACKFILL_WINDOW_MESSAGES]
+            for i in range(0, len(run), _BACKFILL_WINDOW_MESSAGES)
+        )
+    ]
+
+
+def compute_backfill_windows(
+    message_ids: list[int], covered_ranges: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Find bounded (from_id, to_id) windows covering every uncovered message in a session.
+
+    Shared by :meth:`SessionDB.find_uncovered_capture_ranges`/
+    :meth:`SessionDB.find_uncovered_commitment_ranges` (periodic
+    reconciliation, R2-GAP-002) and ``memory/consolidation.py``'s
+    ``backfill_agent`` (one-off manual backfill, Stage One Phase 5, slice
+    D) — one gap-finding algorithm for both, promoted here from a private
+    helper local to ``consolidation.py`` once reconciliation needed the
+    exact same logic rather than a second, subtly different
+    implementation.
+
+    "Contiguous" here means adjacent *by position in message_ids* (this
+    session's own message order), not adjacent integers — ``messages`` is
+    one shared table with a single id sequence across every session, so
+    two of one session's own messages are almost never numerically
+    consecutive (other sessions' messages get ids in between). Walking
+    ``message_ids`` in order and tracking runs of "not covered" sidesteps
+    that entirely.
+
+    Args:
+        message_ids: The candidate message ids to check, ascending. Each
+            caller decides what's eligible for its own purposes —
+            ``backfill_agent`` passes every message id in a session
+            (:meth:`SessionDB.list_message_ids`); the ``find_uncovered_*``
+            reconciliation methods pass only user/assistant messages with
+            non-empty content, so a run of pure tool-call messages with no
+            actual dialogue never becomes an enqueued (and pointless) job.
+        covered_ranges: Every ``(from_id, to_id)`` pair a job has ever been
+            enqueued for, in this session and lane (as
+            :meth:`SessionDB.list_capture_job_ranges`/
+            :meth:`SessionDB.list_commitment_job_ranges` return).
+
+    Returns:
+        list[tuple[int, int]]: Windows to enqueue, each at most
+            :data:`_BACKFILL_WINDOW_MESSAGES` messages wide, covering
+            exactly the gaps — messages already covered by an existing
+            job are never included in any window.
+    """
+    covered: set[int] = set()
+    for from_id, to_id in covered_ranges:
+        covered.update(range(from_id, to_id + 1))
+
+    windows: list[tuple[int, int]] = []
+    current_run: list[int] = []
+    for mid in message_ids:
+        if mid in covered:
+            if current_run:
+                windows.extend(_chunk_run(current_run))
+                current_run = []
+        else:
+            current_run.append(mid)
+    if current_run:
+        windows.extend(_chunk_run(current_run))
+    return windows
 
 
 def _msg_text(msg: dict) -> str | None:
@@ -1020,7 +1266,7 @@ class SessionDB:
         ``memory_capture_jobs``, since a proposal's originating job may have
         already been pruned by retention by the time a session is deleted),
         ``memory_capture_jobs``, ``memory_commitment_jobs``,
-        ``message_embedding_jobs``, ``session_job_coverage``,
+        ``message_embedding_jobs``, ``session_job_coverage_ranges``,
         ``commitments``, and finally the ``sessions`` row itself.
 
         Deliberately does **not** touch anything outside this database, and
@@ -1079,11 +1325,118 @@ class SessionDB:
             )
         conn.execute("DELETE FROM memory_capture_jobs WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM memory_commitment_jobs WHERE session_id = %s", (session_id,))
-        conn.execute("DELETE FROM session_job_coverage WHERE session_id = %s", (session_id,))
+        conn.execute("DELETE FROM session_job_coverage_ranges WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM commitments WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
 
         return {"messages": len(message_ids), "proposal_ids": proposal_ids}
+
+    # ------------------------------------------------------------------
+    # Deletion tombstones (R2-GAP-007)
+    # ------------------------------------------------------------------
+    # See _migration_007_deletion_tombstones's docstring for why
+    # /delete-session's three cross-store phases (JSONL, this class's own
+    # delete_session, PostgresMemoryIndex evidence cleanup — orchestrated
+    # by commands.py, not this class) need a durable, resumable record.
+
+    def start_deletion_tombstone(self, agent_id: str, session_id: str) -> dict:
+        """Create (or return the existing) tombstone row for one deletion attempt.
+
+        ``ON CONFLICT ... DO NOTHING`` makes this safe to call even if a
+        tombstone already exists for this exact ``(agent_id, session_id)``
+        — returns whatever phases are already recorded as done rather than
+        resetting them, so calling this again never un-does progress.
+
+        Returns:
+            dict: ``{"jsonl_deleted", "db_deleted", "evidence_cleaned",
+                "proposal_ids", "completed_at"}`` — the tombstone's current
+                state (freshly all-``False``/empty for a brand new one).
+        """
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO deletion_tombstones (agent_id, session_id, requested_at) "
+            "VALUES (%s, %s, %s) ON CONFLICT (agent_id, session_id) DO NOTHING",
+            (agent_id, session_id, time.time()),
+        )
+        return self.get_deletion_tombstone(agent_id, session_id)
+
+    def get_deletion_tombstone(self, agent_id: str, session_id: str) -> dict | None:
+        """Return one deletion attempt's current state, or ``None`` if none was ever started."""
+        row = self._conn().execute(
+            "SELECT jsonl_deleted, db_deleted, evidence_cleaned, proposal_ids, completed_at "
+            "FROM deletion_tombstones WHERE agent_id = %s AND session_id = %s",
+            (agent_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "jsonl_deleted": row[0],
+            "db_deleted": row[1],
+            "evidence_cleaned": row[2],
+            "proposal_ids": list(row[3]) if row[3] else [],
+            "completed_at": row[4],
+        }
+
+    def mark_deletion_jsonl_done(self, agent_id: str, session_id: str) -> None:
+        """Record that the JSONL-file phase of one deletion attempt has completed."""
+        self._conn().execute(
+            "UPDATE deletion_tombstones SET jsonl_deleted = TRUE "
+            "WHERE agent_id = %s AND session_id = %s",
+            (agent_id, session_id),
+        )
+
+    def mark_deletion_db_done(
+        self, agent_id: str, session_id: str, proposal_ids: list[int]
+    ) -> None:
+        """Record that :meth:`delete_session`'s phase has completed.
+
+        Args:
+            proposal_ids: Exactly what that call returned — snapshotted
+                here so a later evidence-cleanup retry (which needs these
+                ids) never has to re-derive them from rows that no longer
+                exist by the time it runs.
+        """
+        self._conn().execute(
+            "UPDATE deletion_tombstones SET db_deleted = TRUE, proposal_ids = %s "
+            "WHERE agent_id = %s AND session_id = %s",
+            (proposal_ids, agent_id, session_id),
+        )
+
+    def mark_deletion_evidence_done(self, agent_id: str, session_id: str) -> None:
+        """Record that the indexed-evidence cleanup phase has completed — the whole attempt is now done."""
+        self._conn().execute(
+            "UPDATE deletion_tombstones SET evidence_cleaned = TRUE, completed_at = %s "
+            "WHERE agent_id = %s AND session_id = %s",
+            (time.time(), agent_id, session_id),
+        )
+
+    def list_incomplete_deletion_tombstones(self) -> list[dict]:
+        """Every deletion attempt that hasn't finished all three phases, oldest first.
+
+        Used by ``minion-assist memory verify-deletions`` to surface (and,
+        with ``--retry``, finish) any deletion a prior process crash or
+        transient failure left stuck partway through.
+
+        Returns:
+            list[dict]: ``{"agent_id", "session_id", "jsonl_deleted",
+                "db_deleted", "evidence_cleaned", "proposal_ids"}`` per
+                incomplete attempt.
+        """
+        rows = self._conn().execute(
+            "SELECT agent_id, session_id, jsonl_deleted, db_deleted, evidence_cleaned, proposal_ids "
+            "FROM deletion_tombstones WHERE completed_at IS NULL ORDER BY requested_at"
+        ).fetchall()
+        return [
+            {
+                "agent_id": r[0],
+                "session_id": r[1],
+                "jsonl_deleted": r[2],
+                "db_deleted": r[3],
+                "evidence_cleaned": r[4],
+                "proposal_ids": list(r[5]) if r[5] else [],
+            }
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Message operations
@@ -1419,26 +1772,67 @@ class SessionDB:
         return [r[0] for r in rows]
 
     def list_capture_job_ranges(self, session_id: str) -> list[tuple[int, int]]:
-        """Every ``(source_from_message_id, source_to_message_id)`` pair ever enqueued for one session.
+        """Every capture range ever successfully enqueued for one session.
 
-        Every job state counts as "covered" here, including ``failed`` —
-        backfill's job is to catch messages that were *never attempted*,
-        not to retry a job that already ran and failed (that's
-        ``CaptureWorker``'s own retry/backoff loop's responsibility, up to
-        ``_MAX_ATTEMPTS``).
+        Reads ``session_job_coverage_ranges`` (R2-GAP-002), not
+        ``memory_capture_jobs`` directly — a range is recorded once, at
+        enqueue time, and never removed even after retention prunes the
+        job row itself, so a session's full enqueue history stays visible
+        regardless of how old its jobs are. Every job state originally
+        counted as "covered" here, including ``failed`` — extraction
+        having been *attempted* (successfully enqueued) is the bar, not
+        having *succeeded*; retrying a failed attempt is
+        ``CaptureWorker``'s own retry/backoff responsibility, up to
+        ``_MAX_ATTEMPTS`` — and since a range is recorded unconditionally
+        at enqueue time, that's still exactly what this returns.
 
         Stage One Phase 5, slice D: the other half of
-        ``backfill_agent``'s gap computation.
+        ``backfill_agent``'s gap computation, also used by
+        :meth:`find_uncovered_capture_ranges` (R2-GAP-002).
         """
         rows = self._conn().execute(
-            """
-            SELECT source_from_message_id, source_to_message_id
-            FROM memory_capture_jobs
-            WHERE session_id = %s
-            """,
+            "SELECT from_id, to_id FROM session_job_coverage_ranges "
+            "WHERE session_id = %s AND lane = 'capture'",
             (session_id,),
         ).fetchall()
         return [(r[0], r[1]) for r in rows]
+
+    def list_commitment_job_ranges(self, session_id: str) -> list[tuple[int, int]]:
+        """Every commitment-extraction range ever successfully enqueued for one session.
+
+        Same source and reasoning as :meth:`list_capture_job_ranges` — see
+        its docstring. Channel isn't returned here (unlike
+        :meth:`find_uncovered_commitment_ranges`'s result, which pairs
+        each gap with a channel) since this is purely the "which message
+        ids are covered" half of the gap computation; channel is a
+        separate lookup for the one case (a genuinely uncovered gap) where
+        it's actually needed.
+        """
+        rows = self._conn().execute(
+            "SELECT from_id, to_id FROM session_job_coverage_ranges "
+            "WHERE session_id = %s AND lane = 'commitment'",
+            (session_id,),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def _eligible_message_ids(self, session_id: str) -> list[int]:
+        """User/assistant message ids with non-empty content, ascending.
+
+        Shared by :meth:`find_uncovered_capture_ranges`/
+        :meth:`find_uncovered_commitment_ranges` — deliberately narrower
+        than :meth:`list_message_ids` (which returns *every* message,
+        tool calls included, for :func:`compute_backfill_windows`'s other
+        caller, ``backfill_agent``): reconciliation runs automatically and
+        periodically, so a run of pure tool-call messages with no actual
+        dialogue must never become its own pointless enqueued job the way
+        it's harmless for a one-off manual backfill to occasionally do.
+        """
+        rows = self._conn().execute(
+            "SELECT id FROM messages WHERE session_id = %s "
+            "AND role IN ('user', 'assistant') AND content IS NOT NULL ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def list_session_ids_for_agent(self, agent_id: str) -> list[str]:
         """Every session id ever recorded for one agent — no recency limit.
@@ -1612,7 +2006,9 @@ class SessionDB:
         ).fetchone()
         if row is None:
             return None
-        _advance_job_coverage(conn, agent_id, session_id, "capture", source_to_message_id)
+        _record_job_coverage_range(
+            conn, agent_id, session_id, "capture", source_from_message_id, source_to_message_id,
+        )
         return row[0]
 
     def claim_next_capture_job(self) -> dict | None:
@@ -1773,8 +2169,9 @@ class SessionDB:
         ).fetchone()
         if row is None:
             return None
-        _advance_job_coverage(
-            conn, agent_id, session_id, "commitment", source_to_message_id, channel=channel,
+        _record_job_coverage_range(
+            conn, agent_id, session_id, "commitment", source_from_message_id, source_to_message_id,
+            channel=channel,
         )
         return row[0]
 
@@ -2004,10 +2401,11 @@ class SessionDB:
             """,
             (agent_id, session_id, message_id, idempotency_key, now, now, now),
         ).fetchone()
-        if row is None:
-            return None
-        _advance_job_coverage(conn, agent_id, session_id, "message_embedding", message_id)
-        return row[0]
+        # No coverage-table bookkeeping here, unlike enqueue_capture_job/
+        # enqueue_commitment_job — this lane's coverage is checked directly
+        # against message_embeddings instead (see
+        # find_uncovered_message_ids_for_embedding's docstring, R2-GAP-005).
+        return row[0] if row is not None else None
 
     def claim_next_message_embedding_job(self) -> dict | None:
         """Atomically claim one pending, due message-embedding job for processing.
@@ -2103,47 +2501,56 @@ class SessionDB:
     def find_uncovered_message_ids_for_embedding(
         self, agent_id: str, session_id: str
     ) -> list[int]:
-        """Return mirrored user/assistant message ids newer than this session's last embedding job.
+        """Return mirrored user/assistant message ids with no embedding under the active model.
 
-        Same "coarse catch-up" purpose as :meth:`find_uncovered_capture_range`
-        (MEM-GAP-007's enqueue-can-fail problem, applied to embedding jobs),
-        but returns an explicit list of message ids rather than a
-        ``(from_id, to_id)`` range tuple: a capture job covers *every*
-        message in a range regardless of role, so a range is enough: an
-        embedding job is one-per-message, and messages with no content
-        (e.g. bare tool calls) or a non-user/assistant role never get a job
-        at all — collapsing to a range and reconstructing member ids from it
-        would incorrectly include those. Returning the exact ids sidesteps
-        that.
+        R2-GAP-005/R2-GAP-002: anti-joins directly against
+        ``message_embeddings`` for :attr:`embedding_model_identity` —
+        never a cursor derived from ``message_embedding_jobs``. This fixes
+        two things at once: it's *model-aware* (switching the configured
+        embedding model makes every historical message re-appear as
+        uncovered for the new model, since ``message_embeddings`` is keyed
+        by ``(message_id, model_identity)`` and an old model's rows simply
+        don't match the new one — no separate "rebuild" operation needed,
+        periodic reconciliation naturally backfills it), and it's *exact*
+        (a genuine per-message check, not a high-water mark, so a sparse
+        gap is found exactly like a tail one). Unlike the capture/
+        commitment lanes, this needs no coverage-ranges table at all:
+        ``message_embeddings`` is itself the durable, never-pruned record
+        of what's actually been done, and "attempted but produced zero
+        results" isn't a possible outcome here (unlike extraction) — a
+        message either has a vector for the active model or it doesn't.
 
         Args:
             agent_id: The agent this session must belong to.
             session_id: The session to check.
 
         Returns:
-            list[int]: Message ids with no embedding job yet, ascending, or
-                ``[]`` if ``session_id`` isn't owned by ``agent_id`` or
+            list[int]: Message ids missing an embedding under the active
+                model, ascending, or ``[]`` if ``session_id`` isn't owned
+                by ``agent_id``, no embedding model is configured, or
                 there's nothing to catch up on.
         """
         if not self._session_owned_by(session_id, agent_id):
             return []
-        conn = self._conn()
-        # Reads the durable session_job_coverage cursor (R2-GAP-001) rather
-        # than MAX(message_id) over message_embedding_jobs directly — that
-        # table's rows are exactly what retention pruning deletes, so using
-        # it as the coverage source would let pruning silently reset this
-        # cursor and cause the same historical messages to be re-embedded.
-        row = conn.execute(
-            "SELECT covered_through_id FROM session_job_coverage "
-            "WHERE session_id = %s AND lane = 'message_embedding'",
-            (session_id,),
-        ).fetchone()
-        last_covered = row[0] if row is not None else 0
-        rows = conn.execute(
-            "SELECT id FROM messages "
-            "WHERE session_id = %s AND role IN ('user', 'assistant') "
-            "AND content IS NOT NULL AND id > %s ORDER BY id",
-            (session_id, last_covered),
+        # has_vector_lane guards against querying message_embeddings before
+        # it exists — that table is only created when pgvector AND an
+        # embedding provider are both configured (see _ensure_schema()).
+        if not self.has_vector_lane:
+            return []
+        model_identity = self.embedding_model_identity
+        if model_identity is None:
+            return []
+        rows = self._conn().execute(
+            """
+            SELECT m.id FROM messages m
+            WHERE m.session_id = %s AND m.role IN ('user', 'assistant') AND m.content IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM message_embeddings me
+                WHERE me.message_id = m.id AND me.model_identity = %s
+            )
+            ORDER BY m.id
+            """,
+            (session_id, model_identity),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -2279,13 +2686,13 @@ class SessionDB:
         ``commitments`` survive via ``ON DELETE SET NULL``, not ``CASCADE``
         — R2-GAP-001) and does not reset reconciliation's notion of what's
         already been covered (tracked separately in
-        ``session_job_coverage``, which this method never touches). Prior
-        to R2-GAP-001 this docstring claimed outputs were simply "untouched"
-        by this method, which was false: migration 004's original
-        ``ON DELETE CASCADE`` meant pruning a job *did* delete its
-        proposal/commitment children, and the coverage cursor *was* derived
-        from these same job rows. Both are now fixed at the schema/query
-        level (migration 005), which is what makes this docstring's claim
+        ``session_job_coverage_ranges``, which this method never touches —
+        R2-GAP-002). Prior to R2-GAP-001 this docstring claimed outputs
+        were simply "untouched" by this method, which was false: migration
+        004's original ``ON DELETE CASCADE`` meant pruning a job *did*
+        delete its proposal/commitment children, and the coverage cursor
+        *was* derived from these same job rows. Both are now fixed at the
+        schema/query level (migrations 005/006), which is what makes this docstring's claim
         accurate rather than aspirational.
 
         Args:
@@ -2318,10 +2725,10 @@ class SessionDB:
             "message_embedding_jobs": _prune("message_embedding_jobs"),
         }
 
-    def find_uncovered_capture_range(
+    def find_uncovered_capture_ranges(
         self, agent_id: str, session_id: str
-    ) -> tuple[int, int] | None:
-        """Return the range of mirrored messages newer than this session's last capture job.
+    ) -> list[tuple[int, int]]:
+        """Return every gap of mirrored messages no capture job has ever covered.
 
         MEM-GAP-007: ``AgentSession._send_locked()``'s own
         ``enqueue_capture_job()`` call can fail (e.g. a transient
@@ -2329,17 +2736,19 @@ class SessionDB:
         capture job would simply never exist — nothing ever retried it.
         :class:`~minion_assist.memory.reconciliation_scheduler.ReconciliationScheduler`
         calls this periodically per session and enqueues one catch-up job
-        covering the whole gap when it finds one.
+        per gap it finds.
 
-        Deliberately coarser than ``_send_locked()``'s own per-turn range
-        (exactly "the last exchange"): reconstructing exact per-turn
-        boundaries from message content alone (which messages belong to
-        which turn, given tool calls can appear in between) would risk
-        getting the pairing subtly wrong. Returning "everything mirrored
-        since the last job's covered end" is simpler and safe — however
-        many turns accumulated in the gap (normally zero; only nonzero
-        after a genuine enqueue failure) become one catch-up job instead
-        of exactly reconstructed per-turn ones.
+        R2-GAP-002: earlier versions of this method only ever looked at
+        the single highest-covered id (a high-water mark), so a *sparse*
+        gap — message 1's enqueue failed, message 2's later succeeded —
+        was permanently invisible: 1 sits below the mark set by 2, so it
+        read as "covered" forever. Using :func:`compute_backfill_windows`
+        against every range :meth:`list_capture_job_ranges` has ever
+        recorded finds every such gap exactly, tail or sparse, the same
+        algorithm ``backfill_agent``'s one-off manual backfill already
+        used — see that function's docstring for why "contiguous" means
+        adjacent in this session's own eligible-message order, not
+        adjacent integers.
 
         A job counts as "covering" its range regardless of its current
         ``state`` (pending/running/done/failed) — a failed extraction
@@ -2352,90 +2761,67 @@ class SessionDB:
             session_id: The session to check.
 
         Returns:
-            tuple[int, int] | None: ``(from_id, to_id)`` for uncovered
-                mirrored user/assistant messages, or ``None`` if
-                ``session_id`` isn't owned by ``agent_id`` or there's
-                nothing to catch up on.
+            list[tuple[int, int]]: ``(from_id, to_id)`` for every
+                uncovered gap, each at most
+                :data:`~minion_assist.session.db._BACKFILL_WINDOW_MESSAGES`
+                messages wide, or ``[]`` if ``session_id`` isn't owned by
+                ``agent_id`` or there's nothing to catch up on.
         """
         if not self._session_owned_by(session_id, agent_id):
-            return None
-        conn = self._conn()
-        # See find_uncovered_message_ids_for_embedding's comment: reads the
-        # durable session_job_coverage cursor (R2-GAP-001), not
-        # MAX(memory_capture_jobs.source_to_message_id) — that table's rows
-        # are exactly what retention pruning deletes.
-        row = conn.execute(
-            "SELECT covered_through_id FROM session_job_coverage "
-            "WHERE session_id = %s AND lane = 'capture'",
-            (session_id,),
-        ).fetchone()
-        last_covered = row[0] if row is not None else 0
-        row = conn.execute(
-            "SELECT MIN(id), MAX(id) FROM messages "
-            "WHERE session_id = %s AND role IN ('user', 'assistant') "
-            "AND content IS NOT NULL AND id > %s",
-            (session_id, last_covered),
-        ).fetchone()
-        if row is None or row[0] is None:
-            return None
-        return (row[0], row[1])
+            return []
+        message_ids = self._eligible_message_ids(session_id)
+        if not message_ids:
+            return []
+        covered = self.list_capture_job_ranges(session_id)
+        return compute_backfill_windows(message_ids, covered)
 
-    def find_uncovered_commitment_range(
+    def find_uncovered_commitment_ranges(
         self, agent_id: str, session_id: str
-    ) -> tuple[str, int, int] | None:
-        """Return the range of mirrored messages newer than this session's last commitment job.
+    ) -> list[tuple[str, int, int]]:
+        """Return every gap of mirrored messages no commitment job has ever covered.
 
-        Same reasoning and "coarser catch-up, not exact per-turn
-        reconstruction" trade-off as :meth:`find_uncovered_capture_range` —
-        see its docstring.
+        Same reasoning as :meth:`find_uncovered_capture_ranges` — see its
+        docstring, including R2-GAP-002's sparse-gap fix.
 
         Commitment jobs are additionally channel-scoped (a Matrix room id,
         or ``"cli"``), so this only reconciles a session that has *at
-        least one* prior commitment job to infer the channel from. A
+        least one* prior commitment job to infer a channel from. A
         session with zero commitment jobs ever most likely means
         commitments were disabled (``config.json``'s
         ``commitments.enabled``) when its messages were created, not a
         missed enqueue — left alone rather than guessing at a channel.
+        Every gap in one pass shares the single most-recently-enqueued
+        channel — this method has no per-gap channel to fall back on for
+        a range nothing was ever enqueued for, the same limitation the
+        single-gap version of this method always had.
 
         Args:
             agent_id: The agent this session must belong to.
             session_id: The session to check.
 
         Returns:
-            tuple[str, int, int] | None: ``(channel, from_id, to_id)`` for
-                uncovered mirrored user/assistant messages, using the most
-                recently covered job's channel, or ``None`` if
-                ``session_id`` isn't owned by ``agent_id``, this session
-                has no prior commitment job, or there's nothing to catch
-                up on.
+            list[tuple[str, int, int]]: ``(channel, from_id, to_id)`` for
+                every uncovered gap, or ``[]`` if ``session_id`` isn't
+                owned by ``agent_id``, this session has no prior
+                commitment job, or there's nothing to catch up on.
         """
         if not self._session_owned_by(session_id, agent_id):
-            return None
-        conn = self._conn()
-        # See find_uncovered_message_ids_for_embedding's comment: reads the
-        # durable session_job_coverage cursor (R2-GAP-001), including its
-        # channel column, not memory_commitment_jobs directly — that
-        # table's rows are exactly what retention pruning deletes, and
-        # without a durably-remembered channel a session whose commitment
-        # jobs were all pruned would look indistinguishable from one that
-        # never had any, permanently exiting commitment reconciliation.
-        row = conn.execute(
-            "SELECT channel, covered_through_id FROM session_job_coverage "
-            "WHERE session_id = %s AND lane = 'commitment'",
+            return []
+        channel_row = self._conn().execute(
+            "SELECT channel FROM session_job_coverage_ranges "
+            "WHERE session_id = %s AND lane = 'commitment' "
+            "ORDER BY created_at DESC LIMIT 1",
             (session_id,),
         ).fetchone()
-        if row is None:
-            return None
-        channel, last_covered = row[0], row[1] or 0
-        row2 = conn.execute(
-            "SELECT MIN(id), MAX(id) FROM messages "
-            "WHERE session_id = %s AND role IN ('user', 'assistant') "
-            "AND content IS NOT NULL AND id > %s",
-            (session_id, last_covered),
-        ).fetchone()
-        if row2 is None or row2[0] is None:
-            return None
-        return (channel, row2[0], row2[1])
+        if channel_row is None:
+            return []
+        channel = channel_row[0]
+        message_ids = self._eligible_message_ids(session_id)
+        if not message_ids:
+            return []
+        covered = self.list_commitment_job_ranges(session_id)
+        windows = compute_backfill_windows(message_ids, covered)
+        return [(channel, from_id, to_id) for from_id, to_id in windows]
 
     # ------------------------------------------------------------------
     # Commitment lifecycle — Stage One Phase 6, slice C

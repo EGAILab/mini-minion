@@ -18,8 +18,6 @@ import pytest
 from minion_assist.memory.consolidation import (
     MemoryConsolidator,
     StaleProposalError,
-    _chunk_run,
-    _compute_backfill_windows,
     _hash_text,
     _topic_key_from_rel_path,
     backfill_agent,
@@ -30,6 +28,7 @@ from minion_assist.memory.consolidation import (
     rank_proposals,
 )
 from minion_assist.memory.files import MemoryFileRepository
+from minion_assist.session.db import _chunk_run, compute_backfill_windows
 from minion_assist.providers.base import LLMResponse
 
 
@@ -916,7 +915,7 @@ def test_chunk_run_splits_a_long_run_into_bounded_windows():
 def test_compute_backfill_windows_covers_a_never_captured_session():
     message_ids = [10, 11, 12, 13]
 
-    windows = _compute_backfill_windows(message_ids, covered_ranges=[])
+    windows = compute_backfill_windows(message_ids, covered_ranges=[])
 
     assert windows == [(10, 13)]
 
@@ -924,7 +923,7 @@ def test_compute_backfill_windows_covers_a_never_captured_session():
 def test_compute_backfill_windows_skips_a_fully_covered_session():
     message_ids = [10, 11, 12, 13]
 
-    windows = _compute_backfill_windows(message_ids, covered_ranges=[(10, 13)])
+    windows = compute_backfill_windows(message_ids, covered_ranges=[(10, 13)])
 
     assert windows == []
 
@@ -934,7 +933,7 @@ def test_compute_backfill_windows_finds_the_gap_in_a_partially_covered_session()
     # early messages) and continued after (captured live, per turn).
     message_ids = [1, 2, 3, 4, 5, 6]
 
-    windows = _compute_backfill_windows(message_ids, covered_ranges=[(4, 5), (6, 6)])
+    windows = compute_backfill_windows(message_ids, covered_ranges=[(4, 5), (6, 6)])
 
     assert windows == [(1, 3)]
 
@@ -942,7 +941,7 @@ def test_compute_backfill_windows_finds_the_gap_in_a_partially_covered_session()
 def test_compute_backfill_windows_finds_multiple_separate_gaps():
     message_ids = [1, 2, 3, 4, 5, 6, 7]
 
-    windows = _compute_backfill_windows(message_ids, covered_ranges=[(3, 5)])
+    windows = compute_backfill_windows(message_ids, covered_ranges=[(3, 5)])
 
     assert windows == [(1, 2), (6, 7)]
 
@@ -954,7 +953,7 @@ def test_compute_backfill_windows_ignores_other_sessions_ids_interleaved_in_the_
     # history and must be treated as one contiguous gap.
     message_ids = [1, 2, 5, 6]
 
-    windows = _compute_backfill_windows(message_ids, covered_ranges=[])
+    windows = compute_backfill_windows(message_ids, covered_ranges=[])
 
     assert windows == [(1, 6)]
 

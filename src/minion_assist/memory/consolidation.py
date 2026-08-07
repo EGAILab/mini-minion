@@ -114,14 +114,19 @@ too, not just the file content.
 Historical backfill (Task 10)
 --------------------------------
 :func:`backfill_agent` finds message ranges in an agent's session history
-that no ``memory_capture_jobs`` row has ever covered (comparing every
-session's actual message ids against every capture job's recorded
-range — true gap-filling, not just "skip sessions with any coverage"),
-chunks each gap into bounded windows (:data:`_BACKFILL_WINDOW_MESSAGES`),
-and enqueues one capture job per window via the existing
-``SessionDB.enqueue_capture_job``. It does not run extraction itself —
-the already-running ``CaptureWorker`` picks these jobs up and processes
-them exactly like a live turn's job, so no second extraction path exists.
+that no capture job has ever covered (comparing every session's actual
+message ids against every capture job's recorded range, read from
+``session_job_coverage_ranges`` — true gap-filling, not just "skip sessions
+with any coverage"), chunks each gap into bounded windows via
+:func:`~minion_assist.session.db.compute_backfill_windows`, and enqueues
+one capture job per window via the existing ``SessionDB.enqueue_capture_job``.
+It does not run extraction itself — the already-running ``CaptureWorker``
+picks these jobs up and processes them exactly like a live turn's job, so
+no second extraction path exists. ``compute_backfill_windows`` lives in
+``session/db.py``, not here — :class:`~minion_assist.memory.reconciliation_scheduler.ReconciliationScheduler`
+needed the exact same gap-finding logic for its own periodic capture/
+commitment catch-up (R2-GAP-002), so the algorithm was promoted to a
+shared location rather than duplicated.
 
 Talks to
 --------
@@ -130,6 +135,7 @@ Talks to
   :meth:`SessionDB.list_session_ids_for_agent`,
   :meth:`SessionDB.list_message_ids`,
   :meth:`SessionDB.list_capture_job_ranges`,
+  :func:`~minion_assist.session.db.compute_backfill_windows`,
   :meth:`SessionDB.enqueue_capture_job`.
 - ``memory/postgres_index.py`` — :meth:`PostgresMemoryIndex.recall_stats`
   (ranking), :meth:`PostgresMemoryIndex.hybrid_search` (finding a merge
@@ -159,6 +165,8 @@ import hashlib
 import uuid
 from datetime import date
 from typing import TYPE_CHECKING
+
+from ..session.db import compute_backfill_windows
 
 if TYPE_CHECKING:
     from ..providers.base import LLMProvider
@@ -402,73 +410,6 @@ def is_preview_stale(files: MemoryFileRepository, preview: dict) -> bool:
     return _hash_text(current_content) != preview["based_on_content_hash"]
 
 
-# Fixed message-count window for one backfilled capture job (Stage One
-# Phase 5, slice D). Bounds how much history a single extract_facts() call
-# ever receives — a live per-turn job only ever covers one exchange (2
-# messages), so an unbounded backfill window could dwarf that by orders of
-# magnitude and risk exceeding the extraction model's context. Not
-# configurable (yet) — same "no knob without evaluation data" reasoning as
-# capture_worker.py's own hardcoded constants.
-_BACKFILL_WINDOW_MESSAGES = 20
-
-
-def _chunk_run(run: list[int]) -> list[tuple[int, int]]:
-    """Split one contiguous run of uncovered message ids into bounded (from, to) windows."""
-    return [
-        (chunk[0], chunk[-1])
-        for chunk in (
-            run[i : i + _BACKFILL_WINDOW_MESSAGES]
-            for i in range(0, len(run), _BACKFILL_WINDOW_MESSAGES)
-        )
-    ]
-
-
-def _compute_backfill_windows(
-    message_ids: list[int], covered_ranges: list[tuple[int, int]]
-) -> list[tuple[int, int]]:
-    """Find bounded (from_id, to_id) windows covering every uncaptured message in a session.
-
-    "Contiguous" here means adjacent *by position in message_ids* (this
-    session's own message order), not adjacent integers — ``messages`` is
-    one shared table with a single id sequence across every session, so
-    two of one session's own messages are almost never numerically
-    consecutive (other sessions' messages get ids in between). Walking
-    ``message_ids`` in order and tracking runs of "not covered" sidesteps
-    that entirely.
-
-    Args:
-        message_ids: Every message id in one session, ascending (as
-            :meth:`~minion_assist.session.db.SessionDB.list_message_ids`
-            returns).
-        covered_ranges: Every ``(from_id, to_id)`` pair any capture job
-            (of any state) has ever been enqueued for, in this session
-            (as :meth:`~minion_assist.session.db.SessionDB.list_capture_job_ranges`
-            returns).
-
-    Returns:
-        list[tuple[int, int]]: Windows to enqueue, each at most
-            :data:`_BACKFILL_WINDOW_MESSAGES` messages wide, covering
-            exactly the gaps — messages already covered by an existing
-            job are never included in any window.
-    """
-    covered: set[int] = set()
-    for from_id, to_id in covered_ranges:
-        covered.update(range(from_id, to_id + 1))
-
-    windows: list[tuple[int, int]] = []
-    current_run: list[int] = []
-    for mid in message_ids:
-        if mid in covered:
-            if current_run:
-                windows.extend(_chunk_run(current_run))
-                current_run = []
-        else:
-            current_run.append(mid)
-    if current_run:
-        windows.extend(_chunk_run(current_run))
-    return windows
-
-
 def backfill_agent(db: SessionDB, agent_id: str, model_id: str) -> int:
     """Enqueue capture jobs for every historical message range never captured (Task 10).
 
@@ -499,7 +440,7 @@ def backfill_agent(db: SessionDB, agent_id: str, model_id: str) -> int:
         if not message_ids:
             continue
         covered = db.list_capture_job_ranges(session_id)
-        for from_id, to_id in _compute_backfill_windows(message_ids, covered):
+        for from_id, to_id in compute_backfill_windows(message_ids, covered):
             idempotency_key = (
                 f"{agent_id}:{session_id}:{from_id}-{to_id}:"
                 f"{_EXTRACTION_PROMPT_VERSION}:{model_id}"

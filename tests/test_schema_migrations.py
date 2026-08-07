@@ -101,12 +101,15 @@ def test_run_migrations_applies_migrations_in_version_order_even_if_list_is_unso
     assert order == [1, 2]
 
 
-def test_run_migrations_creates_the_ledger_table_first():
+def test_run_migrations_creates_the_ledger_table_right_after_acquiring_the_lock():
     conn = _FakeConn()
 
     run_migrations(conn, "session_db", [Migration(1, "baseline", _migration_a_v1)])
 
-    assert conn.executed[0][0].strip().startswith("CREATE TABLE IF NOT EXISTS schema_migrations")
+    # R2-GAP-008: the advisory lock is acquired before anything else,
+    # including the ledger table itself.
+    assert conn.executed[0][0].strip().startswith("SELECT pg_advisory_lock")
+    assert conn.executed[1][0].strip().startswith("CREATE TABLE IF NOT EXISTS schema_migrations")
 
 
 def test_run_migrations_second_call_applies_nothing_new():
@@ -181,3 +184,43 @@ def test_two_migrations_with_identical_source_produce_the_same_checksum():
     run_migrations(conn, "session_db", [Migration(1, "old name", _migration_a_v1)])
 
     run_migrations(conn, "session_db", [Migration(1, "new name", _migration_a_v1)])  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Advisory lock (R2-GAP-008)
+# ---------------------------------------------------------------------------
+
+def test_run_migrations_acquires_and_releases_the_advisory_lock_for_its_component():
+    conn = _FakeConn()
+
+    run_migrations(conn, "session_db", [Migration(1, "baseline", _migration_a_v1)])
+
+    lock_calls = [e for e in conn.executed if "pg_advisory_lock" in e[0]]
+    unlock_calls = [e for e in conn.executed if "pg_advisory_unlock" in e[0]]
+    assert len(lock_calls) == 1
+    assert lock_calls[0][1] == ("session_db",)
+    assert len(unlock_calls) == 1
+    assert unlock_calls[0][1] == ("session_db",)
+
+
+def test_run_migrations_releases_the_lock_even_when_a_migration_raises():
+    conn = _FakeConn()
+
+    def _boom(c):
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_migrations(conn, "session_db", [Migration(1, "baseline", _boom)])
+
+    unlock_calls = [e for e in conn.executed if "pg_advisory_unlock" in e[0]]
+    assert len(unlock_calls) == 1
+
+
+def test_run_migrations_locks_are_scoped_independently_per_component():
+    conn = _FakeConn()
+    run_migrations(conn, "session_db", [Migration(1, "baseline", _migration_a_v1)])
+    run_migrations(conn, "memory_index", [Migration(1, "baseline", _migration_b_v1)])
+
+    lock_calls = [e for e in conn.executed if "pg_advisory_lock" in e[0]]
+    components_locked = {params[0] for _sql, params in lock_calls}
+    assert components_locked == {"session_db", "memory_index"}

@@ -123,6 +123,22 @@ def _checksum(fn: Callable) -> str:
 def run_migrations(conn, component: str, migrations: list[Migration]) -> list[int]:
     """Bring one component's schema up to date, verifying ledger history as it goes.
 
+    R2-GAP-008: the whole body runs under a session-level PostgreSQL
+    advisory lock keyed by ``component`` (``pg_advisory_lock(hashtext(component))``,
+    acquired before even the ledger table is created and released in a
+    ``finally``). Without it, two processes starting at once (e.g. the bot
+    and a maintenance CLI invocation, or two bot instances during a
+    deployment) could both read "version N missing" before either had
+    applied it, then both call ``migration.apply(conn)`` and both try to
+    insert the same ``(component, version)`` ledger row — one succeeds, the
+    other hits the ledger's primary-key conflict having already run
+    ``apply()`` a second time, which is only actually safe because every
+    migration's own SQL is independently idempotent (``IF NOT EXISTS``
+    etc.) — this lock removes the need to rely on that as the *only*
+    protection. A second caller simply blocks on ``pg_advisory_lock`` until
+    the first finishes, then finds the ledger already up to date and
+    applies nothing.
+
     Args:
         conn: An open, autocommit database connection.
         component: This migration set's ledger key (e.g. ``"session_db"``).
@@ -139,42 +155,46 @@ def run_migrations(conn, component: str, migrations: list[Migration]) -> list[in
             ``migrations``, or an already-applied migration's checksum no
             longer matches its current source.
     """
-    conn.execute(_LEDGER_TABLE_SQL)
+    conn.execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (component,))
+    try:
+        conn.execute(_LEDGER_TABLE_SQL)
 
-    applied_checksums: dict[int, str] = {
-        row[0]: row[1]
-        for row in conn.execute(
-            "SELECT version, checksum FROM schema_migrations WHERE component = %s",
-            (component,),
-        ).fetchall()
-    }
+        applied_checksums: dict[int, str] = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT version, checksum FROM schema_migrations WHERE component = %s",
+                (component,),
+            ).fetchall()
+        }
 
-    known_versions = {m.version for m in migrations}
-    unknown = sorted(set(applied_checksums) - known_versions)
-    if unknown:
-        raise SchemaMigrationError(
-            f"{component}: the database has migration(s) {unknown} recorded as applied, "
-            "but this version of minion-assist doesn't define them. Refusing to start — "
-            "this usually means the database was touched by a newer version of the app."
-        )
+        known_versions = {m.version for m in migrations}
+        unknown = sorted(set(applied_checksums) - known_versions)
+        if unknown:
+            raise SchemaMigrationError(
+                f"{component}: the database has migration(s) {unknown} recorded as applied, "
+                "but this version of minion-assist doesn't define them. Refusing to start — "
+                "this usually means the database was touched by a newer version of the app."
+            )
 
-    newly_applied: list[int] = []
-    for migration in sorted(migrations, key=lambda m: m.version):
-        checksum = _checksum(migration.apply)
-        if migration.version in applied_checksums:
-            if applied_checksums[migration.version] != checksum:
-                raise SchemaMigrationError(
-                    f"{component}: migration {migration.version} ('{migration.name}') has "
-                    "changed since it was applied — checksum mismatch. Editing an "
-                    "already-applied migration is unsafe; add a new migration instead of "
-                    "modifying history."
-                )
-            continue
-        migration.apply(conn)
-        conn.execute(
-            "INSERT INTO schema_migrations (component, version, name, checksum, applied_at) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (component, migration.version, migration.name, checksum, time.time()),
-        )
-        newly_applied.append(migration.version)
-    return newly_applied
+        newly_applied: list[int] = []
+        for migration in sorted(migrations, key=lambda m: m.version):
+            checksum = _checksum(migration.apply)
+            if migration.version in applied_checksums:
+                if applied_checksums[migration.version] != checksum:
+                    raise SchemaMigrationError(
+                        f"{component}: migration {migration.version} ('{migration.name}') has "
+                        "changed since it was applied — checksum mismatch. Editing an "
+                        "already-applied migration is unsafe; add a new migration instead of "
+                        "modifying history."
+                    )
+                continue
+            migration.apply(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations (component, version, name, checksum, applied_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (component, migration.version, migration.name, checksum, time.time()),
+            )
+            newly_applied.append(migration.version)
+        return newly_applied
+    finally:
+        conn.execute("SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (component,))

@@ -68,8 +68,8 @@ def test_run_pass_skips_a_session_within_the_quiet_period():
 
     scheduler._run_pass()
 
-    db.find_uncovered_capture_range.assert_not_called()
-    db.find_uncovered_commitment_range.assert_not_called()
+    db.find_uncovered_capture_ranges.assert_not_called()
+    db.find_uncovered_commitment_ranges.assert_not_called()
 
 
 def test_run_pass_reconciles_a_session_past_the_quiet_period():
@@ -77,15 +77,15 @@ def test_run_pass_reconciles_a_session_past_the_quiet_period():
     old = time.time() - 3600
     db.list_session_ids_for_agent.return_value = ["s1"]
     db.get_sessions_by_ids.return_value = {"s1": _session_info("s1", old)}
-    db.find_uncovered_capture_range.return_value = None
-    db.find_uncovered_commitment_range.return_value = None
+    db.find_uncovered_capture_ranges.return_value = []
+    db.find_uncovered_commitment_ranges.return_value = []
     db.has_vector_lane = False
     scheduler = ReconciliationScheduler(_make_cfg(quiet_seconds=60), db, ["main"], Mock())
 
     scheduler._run_pass()
 
-    db.find_uncovered_capture_range.assert_called_once_with("main", "s1")
-    db.find_uncovered_commitment_range.assert_called_once_with("main", "s1")
+    db.find_uncovered_capture_ranges.assert_called_once_with("main", "s1")
+    db.find_uncovered_commitment_ranges.assert_called_once_with("main", "s1")
 
 
 def test_run_pass_reconciles_a_session_that_has_never_been_active():
@@ -93,14 +93,14 @@ def test_run_pass_reconciles_a_session_that_has_never_been_active():
     db = Mock()
     db.list_session_ids_for_agent.return_value = ["s1"]
     db.get_sessions_by_ids.return_value = {"s1": _session_info("s1", None)}
-    db.find_uncovered_capture_range.return_value = None
-    db.find_uncovered_commitment_range.return_value = None
+    db.find_uncovered_capture_ranges.return_value = []
+    db.find_uncovered_commitment_ranges.return_value = []
     db.has_vector_lane = False
     scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
 
     scheduler._run_pass()  # must not raise
 
-    db.find_uncovered_capture_range.assert_called_once_with("main", "s1")
+    db.find_uncovered_capture_ranges.assert_called_once_with("main", "s1")
 
 
 def test_run_pass_skips_agents_with_no_sessions():
@@ -119,7 +119,7 @@ def test_run_pass_skips_agents_with_no_sessions():
 
 def test_catch_up_capture_enqueues_a_job_for_the_gap():
     db = Mock()
-    db.find_uncovered_capture_range.return_value = (10, 12)
+    db.find_uncovered_capture_ranges.return_value = [(10, 12)]
     scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
 
     scheduler._catch_up_capture("main", "sess-1")
@@ -135,7 +135,7 @@ def test_catch_up_capture_enqueues_a_job_for_the_gap():
 
 def test_catch_up_capture_does_nothing_when_fully_covered():
     db = Mock()
-    db.find_uncovered_capture_range.return_value = None
+    db.find_uncovered_capture_ranges.return_value = []
     scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
 
     scheduler._catch_up_capture("main", "sess-1")
@@ -143,9 +143,26 @@ def test_catch_up_capture_does_nothing_when_fully_covered():
     db.enqueue_capture_job.assert_not_called()
 
 
+def test_catch_up_capture_enqueues_one_job_per_gap_including_a_sparse_one():
+    # R2-GAP-002 regression: find_uncovered_capture_ranges can now report a
+    # sparse hole (below the tail) alongside a normal tail gap in the same
+    # pass — each must become its own catch-up job.
+    db = Mock()
+    db.find_uncovered_capture_ranges.return_value = [(3, 4), (10, 12)]
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._catch_up_capture("main", "sess-1")
+
+    assert db.enqueue_capture_job.call_count == 2
+    first_call, second_call = db.enqueue_capture_job.call_args_list
+    assert first_call.args[:4] == ("main", "sess-1", 3, 4)
+    assert second_call.args[:4] == ("main", "sess-1", 10, 12)
+    assert first_call.args[4] != second_call.args[4]  # distinct idempotency keys
+
+
 def test_catch_up_commitment_enqueues_a_job_for_the_gap_with_the_right_channel():
     db = Mock()
-    db.find_uncovered_commitment_range.return_value = ("!room:example.org", 10, 12)
+    db.find_uncovered_commitment_ranges.return_value = [("!room:example.org", 10, 12)]
     scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
 
     scheduler._catch_up_commitment("main", "sess-1")
@@ -162,12 +179,27 @@ def test_catch_up_commitment_enqueues_a_job_for_the_gap_with_the_right_channel()
 
 def test_catch_up_commitment_does_nothing_when_fully_covered():
     db = Mock()
-    db.find_uncovered_commitment_range.return_value = None
+    db.find_uncovered_commitment_ranges.return_value = []
     scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
 
     scheduler._catch_up_commitment("main", "sess-1")
 
     db.enqueue_commitment_job.assert_not_called()
+
+
+def test_catch_up_commitment_enqueues_one_job_per_gap():
+    db = Mock()
+    db.find_uncovered_commitment_ranges.return_value = [
+        ("!room:example.org", 3, 4), ("!room:example.org", 10, 12),
+    ]
+    scheduler = ReconciliationScheduler(_make_cfg(), db, ["main"], Mock())
+
+    scheduler._catch_up_commitment("main", "sess-1")
+
+    assert db.enqueue_commitment_job.call_count == 2
+    first_call, second_call = db.enqueue_commitment_job.call_args_list
+    assert first_call.args[:5] == ("main", "sess-1", "!room:example.org", 3, 4)
+    assert second_call.args[:5] == ("main", "sess-1", "!room:example.org", 10, 12)
 
 
 # ---------------------------------------------------------------------------

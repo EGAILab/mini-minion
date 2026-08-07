@@ -22,15 +22,18 @@ Two kinds of gap, two mechanisms
 2. **Job-coverage gaps** — capture/commitment/message-embedding jobs have no
    equivalent "diff against a source of truth" (an enqueue intent isn't
    itself persisted anywhere durable before the attempt). Instead,
-   :meth:`~minion_assist.session.db.SessionDB.find_uncovered_capture_range`/
-   :meth:`~minion_assist.session.db.SessionDB.find_uncovered_commitment_range`/
+   :meth:`~minion_assist.session.db.SessionDB.find_uncovered_capture_ranges`/
+   :meth:`~minion_assist.session.db.SessionDB.find_uncovered_commitment_ranges`/
    :meth:`~minion_assist.session.db.SessionDB.find_uncovered_message_ids_for_embedding`
-   look for mirrored messages newer than a session's last enqueued job and
-   enqueue catch-up jobs for the gap — see those methods' docstrings for why
-   "coarse catch-up" rather than exact per-turn reconstruction (capture/
-   commitment), and why the embedding gap-finder returns exact message ids
-   instead of a range (MEM-GAP-006: one job per message, unlike capture/
-   commitment's one job per range).
+   find every gap in a session's job coverage — not just a tail gap, a
+   sparse one too (R2-GAP-002) — and enqueue one catch-up job per gap. See
+   those methods' docstrings for why "bounded windows over exact gaps"
+   rather than exact per-turn reconstruction (capture/commitment), and why
+   the embedding gap-finder returns exact message ids instead of a range
+   (MEM-GAP-006: one job per message, unlike capture/commitment's one job
+   per range) and is checked directly against ``message_embeddings``
+   rather than a coverage table (R2-GAP-005: makes it model-aware for
+   free).
 
 Quiet-period guard
 -------------------
@@ -45,8 +48,8 @@ entirely in the common case.
 Talks to
 --------
 - ``session/db.py`` — :meth:`SessionDB.reconcile_all_sessions`,
-  :meth:`SessionDB.find_uncovered_capture_range`,
-  :meth:`SessionDB.find_uncovered_commitment_range`,
+  :meth:`SessionDB.find_uncovered_capture_ranges`,
+  :meth:`SessionDB.find_uncovered_commitment_ranges`,
   :meth:`SessionDB.find_uncovered_message_ids_for_embedding`,
   :meth:`SessionDB.list_session_ids_for_agent`, :meth:`SessionDB.get_sessions_by_ids`,
   :meth:`SessionDB.enqueue_capture_job`, :meth:`SessionDB.enqueue_commitment_job`,
@@ -153,29 +156,35 @@ class ReconciliationScheduler:
                 self._catch_up_message_embedding(agent_id, session_id)
 
     def _catch_up_capture(self, agent_id: str, session_id: str) -> None:
-        gap = self._db.find_uncovered_capture_range(agent_id, session_id)
-        if gap is None:
+        # R2-GAP-002: find_uncovered_capture_ranges returns every gap, not
+        # just one — a sparse hole below the tail is now detectable, so
+        # more than one catch-up job can come out of a single pass.
+        gaps = self._db.find_uncovered_capture_ranges(agent_id, session_id)
+        if not gaps:
             return
-        from_id, to_id = gap
         from .extractor import _EXTRACTION_PROMPT_VERSION  # noqa: PLC0415
 
-        idem_key = f"{agent_id}:{session_id}:{from_id}-{to_id}:{_EXTRACTION_PROMPT_VERSION}:reconcile"
-        self._db.enqueue_capture_job(agent_id, session_id, from_id, to_id, idem_key)
+        for from_id, to_id in gaps:
+            idem_key = (
+                f"{agent_id}:{session_id}:{from_id}-{to_id}:"
+                f"{_EXTRACTION_PROMPT_VERSION}:reconcile"
+            )
+            self._db.enqueue_capture_job(agent_id, session_id, from_id, to_id, idem_key)
 
     def _catch_up_commitment(self, agent_id: str, session_id: str) -> None:
-        gap = self._db.find_uncovered_commitment_range(agent_id, session_id)
-        if gap is None:
+        gaps = self._db.find_uncovered_commitment_ranges(agent_id, session_id)
+        if not gaps:
             return
-        channel, from_id, to_id = gap
         from .commitments import _COMMITMENT_PROMPT_VERSION  # noqa: PLC0415
 
-        idem_key = (
-            f"{agent_id}:{session_id}:{channel}:{from_id}-{to_id}:"
-            f"{_COMMITMENT_PROMPT_VERSION}:reconcile"
-        )
-        self._db.enqueue_commitment_job(
-            agent_id, session_id, channel, from_id, to_id, idem_key
-        )
+        for channel, from_id, to_id in gaps:
+            idem_key = (
+                f"{agent_id}:{session_id}:{channel}:{from_id}-{to_id}:"
+                f"{_COMMITMENT_PROMPT_VERSION}:reconcile"
+            )
+            self._db.enqueue_commitment_job(
+                agent_id, session_id, channel, from_id, to_id, idem_key
+            )
 
     def _catch_up_message_embedding(self, agent_id: str, session_id: str) -> None:
         """Enqueue one embedding job per message this session's gap-finder reports missing.

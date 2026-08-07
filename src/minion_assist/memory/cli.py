@@ -20,6 +20,8 @@ Currently supported:
 - ``minion-assist memory retention``                    — dry-run report (default).
 - ``minion-assist memory retention --apply``             — prune stale operational/telemetry rows.
 - ``minion-assist memory retention [--days N]``          — override the configured retention window.
+- ``minion-assist memory verify-deletions``              — list incomplete /delete-session attempts (R2-GAP-007).
+- ``minion-assist memory verify-deletions --retry``      — finish their remaining cross-store cleanup phases.
 - ``minion-assist memory pin KEY --agent ID``            — pin a topic note.
 - ``minion-assist memory unpin KEY --agent ID``          — unpin a topic note.
 - ``minion-assist memory pins [--agent ID]``             — list pinned notes.
@@ -57,6 +59,12 @@ Talks to
   :meth:`~minion_assist.memory.postgres_index.PostgresMemoryIndex.prune_operational_tables`
   — the same methods ``memory/retention_scheduler.py``'s daily scheduler
   calls, exposed here for an on-demand dry-run or manual run (MEM-GAP-015).
+  ``verify-deletions`` reads :meth:`~minion_assist.session.db.SessionDB.list_incomplete_deletion_tombstones`
+  and, with ``--retry``, calls :meth:`~minion_assist.session.db.SessionDB.delete_session`/
+  :meth:`~minion_assist.session.db.SessionDB.mark_deletion_db_done`/
+  :meth:`~minion_assist.session.db.SessionDB.mark_deletion_evidence_done`
+  and (via :func:`_build_service`) :meth:`~minion_assist.memory.service.MemoryService.forget_proposals`
+  to finish whatever ``commands.py``'s ``/delete-session`` left incomplete (R2-GAP-007).
 - ``minion.py`` — ``main()`` dispatches ``sys.argv[1] == "memory"`` here
   before falling through to the interactive REPL.
 - ``config.py`` — reads ``workspace``, ``agents``, ``bootstrap``, and
@@ -179,6 +187,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "Override retention_days from config.json's memory_retention section "
             "(falls back to that section's configured value, or its default of 30)."
         ),
+    )
+
+    verify_deletions = sub.add_parser(
+        "verify-deletions",
+        help=(
+            "List (and, with --retry, finish) any /delete-session attempt left "
+            "incomplete by a crash or transient failure (R2-GAP-007). "
+            "Requires a configured database."
+        ),
+    )
+    verify_deletions.add_argument(
+        "--retry",
+        action="store_true",
+        help="Finish every incomplete deletion's remaining phases. Without this flag, only lists them.",
     )
 
     pin = sub.add_parser(
@@ -771,6 +793,88 @@ def _run_retention(args: argparse.Namespace) -> int:
         print(f"  {name}: {count}")
     if dry_run:
         print("Re-run with --apply to actually delete these rows.")
+    return 0
+
+
+def _run_verify_deletions(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory verify-deletions [--retry]`` (R2-GAP-007).
+
+    ``/delete-session``'s cross-store cleanup (JSONL file, ``SessionDB``
+    rows, indexed evidence) runs as three separate phases, each recorded
+    in a ``deletion_tombstones`` row as it completes — see
+    ``session/db.py``'s ``_migration_007_deletion_tombstones`` docstring.
+    This command is the only way to finish one that got stuck: the JSONL
+    file is already gone by the time any later phase could fail, so
+    re-running ``/delete-session`` on the same target no longer works
+    (it can't be found by listing/index again).
+
+    Without ``--retry``: lists every incomplete tombstone and which phases
+    are still pending, without touching anything. With ``--retry``:
+    attempts to finish each one's remaining phases in order — the
+    JSONL phase is never retried here (this command has no
+    ``ShortTermMemory`` wiring, and by construction the tombstone always
+    already has it marked done or the file genuinely couldn't be deleted,
+    which needs manual attention, not an automated retry).
+    """
+    db = _build_db()
+    if db is None:
+        print("Error: no database configured (or it's unreachable) — nothing to verify.")
+        return 1
+
+    tombstones = db.list_incomplete_deletion_tombstones()
+    if not tombstones:
+        print("No incomplete session deletions found.")
+        return 0
+
+    print(f"{len(tombstones)} incomplete session deletion(s):")
+    for t in tombstones:
+        print(
+            f"  [{t['agent_id']}] {t['session_id'][:8]} — "
+            f"jsonl={'done' if t['jsonl_deleted'] else 'PENDING'} "
+            f"db={'done' if t['db_deleted'] else 'PENDING'} "
+            f"evidence={'done' if t['evidence_cleaned'] else 'PENDING'}"
+        )
+
+    if not args.retry:
+        print("Re-run with --retry to finish these.")
+        return 0
+
+    from ..config import bootstrap as bootstrap_cfg  # noqa: PLC0415
+    from ..config import workspace  # noqa: PLC0415
+
+    index = _build_index()
+    for t in tombstones:
+        agent_id, session_id = t["agent_id"], t["session_id"]
+        if not t["jsonl_deleted"]:
+            print(
+                f"  [{agent_id}] {session_id[:8]}: JSONL deletion never completed — "
+                "this needs manual attention, not an automated retry; skipping."
+            )
+            continue
+
+        proposal_ids = t["proposal_ids"]
+        if not t["db_deleted"]:
+            try:
+                pg_result = db.delete_session(agent_id, session_id)
+            except Exception as exc:
+                print(f"  [{agent_id}] {session_id[:8]}: database cleanup failed again ({exc}).")
+                continue
+            proposal_ids = (pg_result.get("proposal_ids") or []) if pg_result is not None else []
+            db.mark_deletion_db_done(agent_id, session_id, proposal_ids)
+
+        if not t["evidence_cleaned"]:
+            if proposal_ids:
+                service = _build_service(workspace, agent_id, bootstrap_cfg, index=index)
+                try:
+                    service.forget_proposals(proposal_ids)
+                except Exception as exc:
+                    print(
+                        f"  [{agent_id}] {session_id[:8]}: evidence cleanup failed again ({exc})."
+                    )
+                    continue
+            db.mark_deletion_evidence_done(agent_id, session_id)
+
+        print(f"  [{agent_id}] {session_id[:8]}: finished.")
     return 0
 
 
@@ -1441,6 +1545,7 @@ _HANDLERS = {
     "doctor": _run_doctor,
     "reindex": _run_reindex,
     "retention": _run_retention,
+    "verify-deletions": _run_verify_deletions,
     "pin": _run_pin,
     "unpin": _run_unpin,
     "pins": _run_pins,

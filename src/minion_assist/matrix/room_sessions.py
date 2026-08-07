@@ -64,6 +64,19 @@ class MatrixRoomSessionManager:
     async def get_or_create_session_id(self, room_id: str, agent_id: str) -> str:
         """Return the session_id bound to ``(room_id, agent_id)``, creating one if needed.
 
+        R2-GAP-010: always attempts the insert first
+        (``INSERT ... ON CONFLICT (room_id, agent_id) DO NOTHING``), then
+        selects whichever row actually exists — never a plain
+        select-then-insert. The previous shape had a real race: two
+        concurrent first messages for the same ``(room_id, agent_id)``
+        (e.g. two events arriving together right after joining a room)
+        could both see no row from the ``SELECT``, then both attempt an
+        ``INSERT`` — one succeeds, the other hits the ``PRIMARY KEY
+        (room_id, agent_id)`` violation and raises, dropping that message
+        or crashing the handler. Minting a session_id that ends up unused
+        (the loser's) is harmless — it's just a UUID no row ever
+        references — so there's no cleanup needed for the discarded one.
+
         Args:
             room_id:  The Matrix room this message arrived in.
             agent_id: The agent handling this room.
@@ -77,25 +90,28 @@ class MatrixRoomSessionManager:
         """
         if self._conn is None:
             raise RuntimeError("MatrixRoomSessionManager.start() has not been called.")
+        # No binding yet for this room+agent: mint a fresh session, never one
+        # inherited from the old shared/default session — a new room starts
+        # with a clean slate rather than silently picking up unrelated
+        # history mixed in from every other room this agent has ever seen.
+        # DO NOTHING means this INSERT is a harmless no-op when a binding
+        # already exists (the common case, every message after the first).
+        candidate_session_id = str(uuid.uuid4())
+        await self._conn.execute(
+            "INSERT INTO room_sessions (room_id, agent_id, session_id, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (room_id, agent_id) DO NOTHING",
+            (room_id, agent_id, candidate_session_id, int(time.time())),
+        )
+        await self._conn.commit()
+        # Re-select regardless of whether our own INSERT won — this is what
+        # makes every concurrent caller agree on the same winning session_id.
         async with self._conn.execute(
             "SELECT session_id FROM room_sessions WHERE room_id = ? AND agent_id = ?",
             (room_id, agent_id),
         ) as cursor:
             row = await cursor.fetchone()
-        if row is not None:
-            return row[0]
-        # No binding yet for this room+agent: mint a fresh session, never one
-        # inherited from the old shared/default session — a new room starts
-        # with a clean slate rather than silently picking up unrelated
-        # history mixed in from every other room this agent has ever seen.
-        session_id = str(uuid.uuid4())
-        await self._conn.execute(
-            "INSERT INTO room_sessions (room_id, agent_id, session_id, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (room_id, agent_id, session_id, int(time.time())),
-        )
-        await self._conn.commit()
-        return session_id
+        return row[0]
 
     async def rebind(self, room_id: str, agent_id: str, session_id: str) -> None:
         """Point ``(room_id, agent_id)`` at a different, already-existing ``session_id``.

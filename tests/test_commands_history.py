@@ -669,3 +669,93 @@ def test_delete_session_with_db_but_no_memory_available_skips_forget_silently(tm
 
     assert result.handled
     assert "2 database message" in result.message
+
+
+# ---------------------------------------------------------------------------
+# Tests: /delete-session tombstone tracking (R2-GAP-007)
+# ---------------------------------------------------------------------------
+
+def test_delete_session_marks_every_phase_done_on_full_success(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.return_value = {"messages": 1, "proposal_ids": [7]}
+    memory = MagicMock()
+
+    dispatch_command(_delete_ctx_with_db("2", stm, db, session_id="cur-001", memory=memory))
+
+    db.start_deletion_tombstone.assert_called_once_with("main", "old-001")
+    db.mark_deletion_jsonl_done.assert_called_once_with("main", "old-001")
+    db.mark_deletion_db_done.assert_called_once_with("main", "old-001", [7])
+    db.mark_deletion_evidence_done.assert_called_once_with("main", "old-001")
+
+
+def test_delete_session_marks_jsonl_and_db_done_even_with_no_proposals(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.return_value = {"messages": 3, "proposal_ids": []}
+
+    dispatch_command(_delete_ctx_with_db("2", stm, db, session_id="cur-001"))
+
+    db.mark_deletion_jsonl_done.assert_called_once_with("main", "old-001")
+    db.mark_deletion_db_done.assert_called_once_with("main", "old-001", [])
+    # Nothing to clean up evidence-wise -- the whole attempt still completes.
+    db.mark_deletion_evidence_done.assert_called_once_with("main", "old-001")
+
+
+def test_delete_session_db_failure_marks_jsonl_but_not_db_or_evidence_done(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.side_effect = Exception("connection refused")
+
+    result = dispatch_command(_delete_ctx_with_db("2", stm, db, session_id="cur-001"))
+
+    db.start_deletion_tombstone.assert_called_once_with("main", "old-001")
+    db.mark_deletion_jsonl_done.assert_called_once_with("main", "old-001")
+    db.mark_deletion_db_done.assert_not_called()
+    db.mark_deletion_evidence_done.assert_not_called()
+    assert "verify-deletions --retry" in result.message
+
+
+def test_delete_session_forget_proposals_failure_leaves_evidence_phase_unmarked(tmp_path):
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    db = MagicMock()
+    db.delete_session.return_value = {"messages": 1, "proposal_ids": [42]}
+    memory = MagicMock()
+    memory.forget_proposals.side_effect = Exception("index unreachable")
+
+    result = dispatch_command(
+        _delete_ctx_with_db("2", stm, db, session_id="cur-001", memory=memory)
+    )
+
+    db.mark_deletion_db_done.assert_called_once_with("main", "old-001", [42])
+    db.mark_deletion_evidence_done.assert_not_called()
+    assert "verify-deletions --retry" in result.message
+
+
+def test_delete_session_without_db_never_touches_a_tombstone(tmp_path):
+    """No ctx.db -- there's nothing multi-phase to track, and no crash from a missing method."""
+    stm = ShortTermMemory(tmp_path / "sessions")
+    _write_session(stm, "main", "old-001", [{"role": "user", "content": "old"}])
+    time.sleep(0.01)
+    _write_session(stm, "main", "cur-001", [{"role": "user", "content": "current"}])
+
+    result = dispatch_command(_delete_ctx("2", stm, session_id="cur-001"))
+
+    assert result.handled
+    assert "Deleted session" in result.message
