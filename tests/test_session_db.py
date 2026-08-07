@@ -11,7 +11,16 @@ this doesn't break test runs in environments without Docker/Postgres.
 
 Every test uses a fresh, random session_id and cleans up its own rows in an
 autouse fixture, so tests never collide with each other or leave rows behind
-in the shared dev database.
+in the shared dev database. As of R2-GAP-015, ``_DB_URL`` also isn't
+literally the shared dev database at all when run through the normal
+``pytest`` entry point — ``tests/conftest.py``'s ``pytest_configure`` hook
+patches ``minion_assist.config.database`` to point at a fresh, isolated
+PostgreSQL schema before this module is even imported, so table-name
+collisions with a real running bot process or another concurrent test run
+are structurally impossible, not just conventionally avoided. Falls back to
+the literal dev URL only if that hook didn't run (e.g. this file executed
+standalone, bypassing the root conftest.py) or config.json genuinely has no
+``database.url`` configured.
 """
 
 from __future__ import annotations
@@ -21,10 +30,11 @@ import uuid
 
 import pytest
 
+from minion_assist.config import database as _database_cfg
 from minion_assist.memory.short_term import ShortTermMemory
 from minion_assist.messages import EVENT_ID_KEY, ensure_event_id
 
-_DB_URL = "postgresql://minion:minion@localhost:5433/minion_assist"
+_DB_URL = _database_cfg.url or "postgresql://minion:minion@localhost:5433/minion_assist"
 
 try:
     import psycopg as _psycopg
@@ -2604,6 +2614,37 @@ def test_vector_search_messages_keeps_hits_at_or_above_min_similarity(session_id
 
 def test_vector_search_messages_default_min_similarity_is_zero(db_with_vector):
     assert db_with_vector._min_similarity == 0.0
+
+
+def test_message_embeddings_self_heals_a_dimension_change(session_id):
+    # R2-GAP-015 regression: found via test-isolation work sharing one
+    # schema across SessionDB instances constructed with different
+    # embedding_dimensions -- also a real production scenario if
+    # embeddings.dimensions ever changes in config.json. Without healing,
+    # the table silently keeps its old width and a later real embed() call
+    # fails with a dimension mismatch instead of picking up the new width.
+    from unittest.mock import Mock
+
+    old_provider = Mock()
+    old_provider.model_identity = "old-model"
+    old_provider.embed = Mock(return_value=[[0.0] * 5])
+    SessionDB(_DB_URL, embedding_dimensions=5, embedding_provider=old_provider)
+
+    new_provider = Mock()
+    new_provider.model_identity = "new-model"
+    db = SessionDB(_DB_URL, embedding_dimensions=3, embedding_provider=new_provider)
+    db.upsert_session(session_id, "main")
+    message_id = db.mirror_message(session_id, "e1", "user", "hello")
+    job_id = db.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"key-{session_id}"
+    )
+
+    db.complete_message_embedding_job(job_id, message_id, "new-model", [0.1, 0.2, 0.3])  # must not raise
+
+    result = db._conn().execute(
+        "SELECT embedding FROM message_embeddings WHERE message_id = %s", (message_id,)
+    ).fetchone()
+    assert result is not None
 
 
 def test_vector_search_messages_is_scoped_to_the_given_agent(db_with_vector, session_id):

@@ -310,7 +310,12 @@ def test_fire_does_nothing_once_stopped(monkeypatch):
 
 import pytest
 
-_DB_URL = "postgresql://minion:minion@localhost:5433/minion_assist"
+# _DB_URL sourced from minion_assist.config.database.url (patched to an
+# isolated per-session schema by tests/conftest.py — R2-GAP-015), not a
+# literal — see that file's module docstring.
+from minion_assist.config import database as _database_cfg
+
+_DB_URL = _database_cfg.url or "postgresql://minion:minion@localhost:5433/minion_assist"
 
 try:
     import psycopg as _psycopg

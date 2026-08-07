@@ -11,7 +11,7 @@ Currently supported:
 - ``minion-assist memory migrate``            — dry-run report (default).
 - ``minion-assist memory migrate --apply``    — perform the Phase 0 merge.
 - ``minion-assist memory migrate --rollback MANIFEST`` — undo a previous apply.
-- ``minion-assist memory status [--agent ID] [--deep]``          — note counts (+ index health).
+- ``minion-assist memory status [--agent ID] [--deep]``          — note counts (+ index health, queue lag, embedding coverage — R2-GAP-016).
 - ``minion-assist memory list [--agent ID]``            — list topic note keys.
 - ``minion-assist memory get PATH --agent ID``          — bounded exact read.
 - ``minion-assist memory search QUERY [--agent ID] [--corpus C]`` — keyword search.
@@ -65,6 +65,13 @@ Talks to
   :meth:`~minion_assist.session.db.SessionDB.mark_deletion_evidence_done`
   and (via :func:`_build_service`) :meth:`~minion_assist.memory.service.MemoryService.forget_proposals`
   to finish whatever ``commands.py``'s ``/delete-session`` left incomplete (R2-GAP-007).
+  ``status --deep`` also calls :meth:`~minion_assist.session.db.SessionDB.queue_lag_summary`/
+  :meth:`~minion_assist.session.db.SessionDB.embedding_coverage_summary` —
+  the same durable-database facts the in-process REPL's ``/status deep``
+  command already showed, previously missing from this standalone CLI
+  entirely (R2-GAP-016). Never shows :class:`~minion_assist.worker_health.WorkerHealth`
+  data — that's in-process-only liveness for whichever bot process is
+  actually running, meaningless from a separate CLI invocation.
 - ``minion.py`` — ``main()`` dispatches ``sys.argv[1] == "memory"`` here
   before falling through to the interactive REPL.
 - ``config.py`` — reads ``workspace``, ``agents``, ``bootstrap``, and
@@ -595,6 +602,13 @@ def _run_status(args: argparse.Namespace) -> int:
     from ..config import workspace  # noqa: PLC0415
 
     index = _build_index() if args.deep else None
+    # R2-GAP-016: previously this standalone CLI only ever opened the
+    # lexical index, never SessionDB — queue lag and embedding coverage
+    # (both plain database facts, not in-process state) were reportable
+    # here but simply weren't, unlike the in-process `/status deep` REPL
+    # command, which had always shown them. Same "never raises, degrade to
+    # unavailable" contract as _build_index().
+    db = _build_db() if args.deep else None
 
     for agent_id in _selected_agents(sorted(agents_cfg), args.agent):
         service = _build_service(workspace, agent_id, bootstrap_cfg, index=index)
@@ -618,6 +632,42 @@ def _run_status(args: argparse.Namespace) -> int:
                     f"  index: {deep['total_chunks']} chunk(s) across {deep['file_count']} "
                     f"file(s) ({corpus_str}) — last indexed at {last}"
                 )
+            if db is None:
+                print("  queues: no database configured — queue/embedding data unavailable")
+            else:
+                try:
+                    lag = db.queue_lag_summary(agent_id)
+                except Exception as exc:
+                    print(f"  queues: unavailable ({exc})")
+                else:
+                    print(
+                        f"  queues: capture_pending={lag['capture']['pending_count']}"
+                        f"  commitment_pending={lag['commitment']['pending_count']}"
+                        f"  message_embedding_pending={lag['message_embedding']['pending_count']}"
+                    )
+                    stuck_bits = []
+                    for lane_name, lane in lag.items():
+                        if lane["running_count"]:
+                            stuck_bits.append(f"{lane_name}_running={lane['running_count']}")
+                        if lane["failed_count"]:
+                            stuck_bits.append(f"{lane_name}_failed={lane['failed_count']}")
+                    if stuck_bits:
+                        print(f"    {'  '.join(stuck_bits)}")
+                try:
+                    coverage = db.embedding_coverage_summary(agent_id)
+                except Exception as exc:
+                    print(f"  embedding coverage: unavailable ({exc})")
+                else:
+                    if coverage is not None and coverage["missing_count"]:
+                        print(
+                            f"  embedding coverage: {coverage['missing_count']} message(s) "
+                            f"missing an embedding under {coverage['model_identity']!r}"
+                        )
+                # Deliberately not shown here: WorkerHealth (consecutive
+                # failures, last poll/success) — that's in-process-only
+                # liveness for whichever bot process is actually running,
+                # meaningless from a separate CLI invocation. Only the
+                # running bot's own `/status deep` has it.
     return 0
 
 

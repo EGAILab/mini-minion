@@ -1199,6 +1199,24 @@ class SessionDB:
         # of requiring a destructive migration.
         if self._has_vector and self._embedding_dimensions:
             dims = int(self._embedding_dimensions)
+            # Self-healing: if message_embeddings already exists with a
+            # DIFFERENT vector width than currently configured, drop and
+            # recreate rather than silently keep serving the old width
+            # until some later real embed() call fails with a dimension
+            # mismatch (a real production scenario if embeddings.dimensions
+            # ever changes in config.json — and, found via R2-GAP-015's own
+            # test-isolation work, also a real *test* scenario: two
+            # SessionDB instances constructed with different
+            # embedding_dimensions sharing one schema). Safe: this table is
+            # a pure derived cache regenerable from `messages` plus the
+            # embedding provider, never a source of truth — see this
+            # table's own module-docstring entry.
+            existing_dims = conn.execute(
+                "SELECT atttypmod FROM pg_attribute "
+                "WHERE attrelid = to_regclass('message_embeddings') AND attname = 'embedding'"
+            ).fetchone()
+            if existing_dims is not None and existing_dims[0] not in (None, -1) and existing_dims[0] != dims:
+                conn.execute("DROP TABLE message_embeddings")
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS message_embeddings (
                     message_id     BIGINT NOT NULL,

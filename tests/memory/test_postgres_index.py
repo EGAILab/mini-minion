@@ -4,7 +4,11 @@ Requires a live PostgreSQL instance matching config.json's configured URL
 (same instance tests/test_session_db.py uses) — the whole module is skipped
 if one isn't reachable. Every test uses a fresh, random agent_id and cleans
 up its own rows in an autouse fixture, so tests never collide with each
-other or leave rows behind in the shared dev database.
+other or leave rows behind in the shared dev database. ``_DB_URL`` is
+sourced from ``minion_assist.config.database.url`` (patched to an isolated
+per-session schema by ``tests/conftest.py`` — see its module docstring,
+R2-GAP-015), not a literal, so this connects to that isolated schema when
+run through the normal ``pytest`` entry point.
 """
 
 from __future__ import annotations
@@ -15,7 +19,9 @@ from datetime import date as _date
 
 import pytest
 
-_DB_URL = "postgresql://minion:minion@localhost:5433/minion_assist"
+from minion_assist.config import database as _database_cfg
+
+_DB_URL = _database_cfg.url or "postgresql://minion:minion@localhost:5433/minion_assist"
 
 try:
     import psycopg as _psycopg
@@ -1300,6 +1306,87 @@ def test_old_chunk_id_keyed_table_self_heals_into_the_new_schema():
         conn = _psycopg.connect(_DB_URL, autocommit=True)
         conn.execute(
             "DELETE FROM memory_chunk_embeddings WHERE content_hash = 'hash-migration-test'"
+        )
+        conn.close()
+
+
+def test_self_healing_migration_is_scoped_to_the_active_schema_only():
+    # R2-GAP-015 regression: found via the round-two remediation's own test-
+    # isolation work actually exercising a second schema for the first time.
+    # The self-healing detection query used to filter only by table_name,
+    # not table_schema -- a second schema's own same-named
+    # memory_chunk_embeddings table (with an identically-named
+    # auto-generated "..._pkey" constraint, the common case) silently mixed
+    # both schemas' primary-key columns into one result, so the *correctly*
+    # shaped table's columns polluted the check and the genuinely
+    # old-shaped table in the target schema was never healed.
+    other_schema = f"test_other_{uuid.uuid4().hex[:8]}"
+    target_schema = f"test_target_{uuid.uuid4().hex[:8]}"
+    conn = _psycopg.connect(_DB_URL, autocommit=True)
+    conn.execute(f'CREATE SCHEMA "{other_schema}"')
+    conn.execute(f'CREATE SCHEMA "{target_schema}"')
+    # A second schema with the CORRECT (already-migrated) shape -- same
+    # table name, and (Postgres' default naming) likely the same
+    # auto-generated primary-key constraint name too.
+    conn.execute(f"""
+        CREATE TABLE "{other_schema}".memory_chunk_embeddings (
+            content_hash TEXT NOT NULL,
+            model_identity TEXT NOT NULL,
+            embedding vector(3) NOT NULL,
+            PRIMARY KEY (content_hash, model_identity)
+        )
+    """)
+    # The schema this test actually targets still has the OLD
+    # (chunk_id-keyed) shape that must be detected and healed.
+    conn.execute(f"""
+        CREATE TABLE "{target_schema}".memory_chunk_embeddings (
+            chunk_id BIGINT PRIMARY KEY,
+            model_identity TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            embedding vector(3) NOT NULL
+        )
+    """)
+    conn.close()
+
+    target_url = f"{_DB_URL}?options=-c%20search_path%3D{target_schema}"
+    try:
+        migrated = PostgresMemoryIndex(target_url, embedding_dimensions=3)
+        assert migrated.has_vector_lane is True
+
+        # Would previously raise psycopg.errors.InvalidColumnReference --
+        # the old chunk_id-keyed table was never actually dropped/recreated
+        # with the (content_hash, model_identity) primary key ON CONFLICT
+        # depends on, because the contaminated detection query didn't see
+        # a clean {"chunk_id"} match.
+        migrated.cache_embedding("hash-scoped-test", "test/model", [0.1, 0.2, 0.3])
+        result = migrated.get_cached_embedding("hash-scoped-test", "test/model")
+
+        assert result is not None
+        assert result[0] == pytest.approx(0.1, abs=1e-4)
+    finally:
+        conn = _psycopg.connect(_DB_URL, autocommit=True)
+        conn.execute(f'DROP SCHEMA "{other_schema}" CASCADE')
+        conn.execute(f'DROP SCHEMA "{target_schema}" CASCADE')
+        conn.close()
+
+
+def test_memory_chunk_embeddings_self_heals_a_dimension_change():
+    # R2-GAP-015 regression: same reasoning as session/db.py's identical
+    # message_embeddings check -- found via test-isolation work sharing one
+    # schema across PostgresMemoryIndex instances constructed with
+    # different embedding_dimensions, also a real production scenario if
+    # embeddings.dimensions ever changes in config.json.
+    PostgresMemoryIndex(_DB_URL, embedding_dimensions=5)
+
+    healed = PostgresMemoryIndex(_DB_URL, embedding_dimensions=3)
+    try:
+        healed.cache_embedding("hash-dim-heal-test", "test/model", [0.1, 0.2, 0.3])  # must not raise
+        result = healed.get_cached_embedding("hash-dim-heal-test", "test/model")
+        assert result is not None
+    finally:
+        conn = _psycopg.connect(_DB_URL, autocommit=True)
+        conn.execute(
+            "DELETE FROM memory_chunk_embeddings WHERE content_hash = 'hash-dim-heal-test'"
         )
         conn.close()
 

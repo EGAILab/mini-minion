@@ -185,6 +185,117 @@ def test_status_without_deep_never_builds_an_index(monkeypatch, tmp_path, capsys
     assert exit_code == 0
 
 
+def test_status_without_deep_never_builds_a_db(monkeypatch, tmp_path, capsys):
+    def _fail_if_called():
+        raise AssertionError("status without --deep must not call _build_db()")
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_build_db", _fail_if_called)
+
+    exit_code = cli.main(["status"])
+
+    assert exit_code == 0
+
+
+# --- status --deep: queue lag / embedding coverage (R2-GAP-016) ---
+
+def _mock_lag(**overrides) -> dict:
+    lane = {
+        "pending_count": 0, "oldest_pending_age_s": None,
+        "running_count": 0, "oldest_running_age_s": None,
+        "failed_count": 0,
+    }
+    lag = {"capture": dict(lane), "commitment": dict(lane), "message_embedding": dict(lane)}
+    for key, patch_dict in overrides.items():
+        lag[key].update(patch_dict)
+    return lag
+
+
+def test_status_deep_reports_queue_lag_from_the_database(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+    mock_db = Mock()
+    mock_db.queue_lag_summary.return_value = _mock_lag(capture={"pending_count": 3})
+    mock_db.embedding_coverage_summary.return_value = None
+    monkeypatch.setattr(cli, "_build_db", lambda: mock_db)
+
+    exit_code = cli.main(["status", "--deep"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    mock_db.queue_lag_summary.assert_called_once_with("main")
+    assert "capture_pending=3" in out
+
+
+def test_status_deep_reports_stuck_running_and_failed_jobs(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+    mock_db = Mock()
+    mock_db.queue_lag_summary.return_value = _mock_lag(
+        capture={"running_count": 1}, message_embedding={"failed_count": 2},
+    )
+    mock_db.embedding_coverage_summary.return_value = None
+    monkeypatch.setattr(cli, "_build_db", lambda: mock_db)
+
+    exit_code = cli.main(["status", "--deep"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "capture_running=1" in out
+    assert "message_embedding_failed=2" in out
+
+
+def test_status_deep_reports_missing_embedding_coverage(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+    mock_db = Mock()
+    mock_db.queue_lag_summary.return_value = _mock_lag()
+    mock_db.embedding_coverage_summary.return_value = {
+        "missing_count": 9, "model_identity": "test-endpoint::test-model",
+    }
+    monkeypatch.setattr(cli, "_build_db", lambda: mock_db)
+
+    exit_code = cli.main(["status", "--deep"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "9 message(s)" in out
+    assert "test-endpoint::test-model" in out
+
+
+def test_status_deep_without_a_database_reports_queues_unavailable(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+
+    exit_code = cli.main(["status", "--deep"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "queues: no database configured" in out
+
+
+def test_status_deep_survives_a_queue_lag_query_failure(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+    mock_db = Mock()
+    mock_db.queue_lag_summary.side_effect = Exception("connection lost")
+    mock_db.embedding_coverage_summary.return_value = None
+    monkeypatch.setattr(cli, "_build_db", lambda: mock_db)
+
+    exit_code = cli.main(["status", "--deep"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "queues: unavailable" in out
+    assert "connection lost" in out
+
+
 # ---------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------

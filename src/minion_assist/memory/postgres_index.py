@@ -713,18 +713,51 @@ class PostgresMemoryIndex:
             # write path until now — so it's safe to detect and drop it
             # here rather than requiring a manual fix on any machine that
             # already ran the earlier code.
+            #
+            # table_schema/constraint_schema = current_schema() on *both*
+            # sides of the join (R2-GAP-015 fix): information_schema views
+            # span every schema the connection can see, not just the one
+            # new unqualified objects like this table actually land in
+            # (current_schema(), the first entry in search_path). Without
+            # this, a second schema with its own same-named table and an
+            # identically-named auto-generated "..._pkey" constraint (e.g.
+            # a test's isolated schema alongside the real deployment's
+            # public schema) silently mixes both schemas' primary-key
+            # columns into one result — found via test isolation work
+            # actually exercising a second schema for the first time ever,
+            # not a hypothetical.
             old_pk_cols = conn.execute("""
                 SELECT kcu.column_name
                 FROM information_schema.table_constraints tc
                 JOIN information_schema.key_column_usage kcu
                     ON tc.constraint_name = kcu.constraint_name
+                    AND tc.constraint_schema = kcu.constraint_schema
                 WHERE tc.table_name = 'memory_chunk_embeddings'
+                  AND tc.table_schema = current_schema()
                   AND tc.constraint_type = 'PRIMARY KEY'
             """).fetchall()
             if old_pk_cols and {r[0] for r in old_pk_cols} == {"chunk_id"}:
                 conn.execute("DROP TABLE memory_chunk_embeddings")
 
             dims = int(self._embedding_dimensions)
+            # Same self-healing reasoning as the key-shape check above, for
+            # a dimension change instead: if the table already exists with
+            # a different vector width than currently configured, drop and
+            # recreate rather than silently keep serving the old width
+            # (see session/db.py's identical message_embeddings check for
+            # the full rationale — a real production scenario if
+            # embeddings.dimensions ever changes, and, found via
+            # R2-GAP-015, also a real test scenario). to_regclass()
+            # resolves via the same search_path as the CREATE TABLE below,
+            # so this is already correctly schema-scoped without needing
+            # the explicit current_schema() filter the constraint query
+            # above does.
+            existing_dims = conn.execute(
+                "SELECT atttypmod FROM pg_attribute "
+                "WHERE attrelid = to_regclass('memory_chunk_embeddings') AND attname = 'embedding'"
+            ).fetchone()
+            if existing_dims is not None and existing_dims[0] not in (None, -1) and existing_dims[0] != dims:
+                conn.execute("DROP TABLE memory_chunk_embeddings")
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS memory_chunk_embeddings (
                     content_hash   TEXT NOT NULL,

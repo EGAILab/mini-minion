@@ -2940,12 +2940,23 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **2689 cases** across all modules. Two are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met. The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **3181 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic
 uv run pytest -v
 ```
+
+### Database test isolation (R2-GAP-015)
+
+Tests that touch PostgreSQL (`tests/test_session_db.py`, `tests/memory/test_postgres_index.py`, `tests/memory/test_reconciliation_scheduler.py`, `tests/test_tools_session_search.py`, `tests/test_minion.py`, etc.) are skipped automatically unless a live database is reachable at the URL configured in `config.json` (defaulting to `postgresql://minion:minion@localhost:5433/minion_assist` — see [PostgreSQL Session Store](#postgresql-session-store)).
+
+When a database *is* reachable, `tests/conftest.py` creates a fresh, randomly-named PostgreSQL schema (`pytest_<random>`) at the start of the run and points `minion_assist.config.database` at it via the connection URL's `search_path` option, so every table/type reference in the app and test code transparently lands in that isolated schema — no application code changes needed. The schema is dropped at the end of the run. This means:
+
+- Test runs never leave leftover rows behind in your real `public` schema, and never collide with rows from a previous or concurrent test run.
+- Every full test-suite invocation starts from a schema-migration-fresh, empty database, so tests can't accidentally depend on state left over by another test file.
+
+If schema creation fails for any reason (e.g. the configured database user lacks `CREATE SCHEMA` privileges), the fixture silently falls back to running directly against the configured database/schema — the same behavior as before this mechanism existed.
 
 ### Dependency management
 
