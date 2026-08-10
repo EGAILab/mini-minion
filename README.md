@@ -552,6 +552,8 @@ Ada: The screenshot shows ...
 - Unsupported MIME types or oversized files are rejected with an error message.
 - The OpenAI provider converts images to base64 `image_url` data URLs. The Anthropic provider uses its native base64 image block format.
 
+**Matrix:** sending an image (with or without a caption) in a Matrix room works the same way, no `/attach` needed — the bot downloads the file from the homeserver's media repository and stages it into the same `{workspace}/attachments/` store. A caption becomes the accompanying text prompt; a caption-less image is sent with a placeholder prompt so the model still describes it. If the download fails or the file is invalid/oversized, the bot replies in the room with the reason instead of silently ignoring the message.
+
 ---
 
 ## MCP Servers
@@ -734,6 +736,8 @@ Each room-scoped session also gets its own freshly constructed LLM provider — 
 **Missing factories fail closed (R2-GAP-009).** If a Matrix-routed agent has no `session_factory` wired (a startup misconfiguration — e.g. a new agent added to `groups` but not to `minion.py`'s Matrix construction), `_get_or_build_session()` used to fall back to the shared REPL default session, silently reintroducing cross-room history sharing for as long as the misconfiguration lasted (loudly logged, but the agent kept responding). It now refuses the message entirely instead — the room gets an explicit "no room-scoped session configured" reply and nothing is ever routed through the shared fallback. Safer default for a single-user deployment: a broken config becomes immediately visible rather than a quiet, ongoing isolation leak.
 
 **Per-room provider resources are disposed on shutdown (R2-GAP-013).** Each room-scoped Codex provider owns its own subprocess (never shared — concurrent Matrix messages to different rooms would otherwise cross-deliver responses). Before this, nothing ever closed them: a long-running bot process accumulated one leaked subprocess per Codex-backed room it had ever used, until the whole process exited. `AgentSession.close()` calls the provider's own `close()` if it has one (a no-op duck-typed check — a stateless HTTP provider has nothing to close); `MatrixMessageHandler.close_room_sessions()` calls it for every cached room session; `matrix/monitor.py`'s shutdown path (`_cleanup()`) calls that once, alongside closing the Matrix client and stopping the dedupe/room-binding databases. Idle eviction *while the bot keeps running* is deliberately out of scope — that would need a lifetime-policy config decision (how idle, how many rooms) this round didn't make; only shutdown-time disposal is implemented.
+
+**Image messages:** sending an image in a room (captioned or not) is handled the same way as the REPL's `/attach` — see [Image Attachments](#image-attachments) above for the full behavior. Before this, `monitor.py` only ever registered a callback for text events, so `m.image` events were never even received; the bot would answer a follow-up question about an image with no idea one had been sent.
 
 **Markdown formatting:** agent responses are automatically converted from markdown to `org.matrix.custom.html` before sending, so bold, code blocks, lists, and links render natively in Element and other Matrix clients. The `matrix/format.py` module handles conversion (using `markdown-it-py`) and intelligent paragraph chunking.
 

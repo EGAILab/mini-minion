@@ -1,15 +1,20 @@
 """Matrix inbound message handler.
 
 ``MatrixMessageHandler`` is the central routing point for inbound Matrix
-room messages.  For each ``m.room.message`` event it:
+room messages.  For each ``m.room.message`` event (text or image — see
+``monitor.py``'s callback registration) it:
 
 1. Deduplicates (skips events already processed on a previous sync).
 2. Skips the bot's own messages.
 3. Applies bot-loop rate limiting.
 4. Resolves the target agent from the room config or falls back to the default.
-5. Checks the sender against the allowlist / group policy.
+5. Checks the sender against the allowlist / group policy, and — for
+   ``m.image`` events — downloads and stages the file as a
+   ``MediaAttachment`` (``_download_image_attachment``), replying with an
+   in-room error instead of silently dropping the message if that fails.
 6. Posts an ack reaction if configured.
-7. Dispatches the message to the appropriate ``AgentSession``.
+7. Dispatches the message (plus any staged image) to the appropriate
+   ``AgentSession``.
 8. Delivers the agent's response back to the room (full text, no streaming in v1).
 
 Threading note
@@ -24,16 +29,20 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .allowlist import check_allowlist, normalise_matrix_user_id
 from .config import MatrixConfig
 from ..heartbeat_token import is_heartbeat_ok, strip_heartbeat_token
+from ..media import safe_filename, stage_attachment
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from ..agents.session import AgentSession
+    from ..media import MediaAttachment
     from .bot_loop import BotLoopProtection
     from .exec_approvals import MatrixExecApprovalHandler
     from .inbound_dedupe import MatrixInboundDeduper
@@ -80,6 +89,16 @@ class MatrixMessageHandler:
                               (MEM-GAP-016) — enables ``/status deep`` from
                               Matrix chat.
         exec_approval_handler: Optional exec-approval handler for tool calls.
+        media_dir:           Optional attachment store directory (same
+                              ``{workspace}/attachments`` tree the REPL's
+                              ``/attach`` command stages files into). When
+                              set, inbound ``m.image`` events are downloaded
+                              and staged here so they can be forwarded to
+                              the LLM as multimodal attachments. When
+                              ``None``, image messages are rejected with an
+                              in-room explanation instead of silently
+                              vanishing (the bug this parameter fixes — see
+                              ``_download_image_attachment``'s docstring).
     """
 
     def __init__(
@@ -100,6 +119,7 @@ class MatrixMessageHandler:
         session_factories: "dict[str, Callable[[str], AgentSession]] | None" = None,
         db: object = None,
         worker_health: dict | None = None,
+        media_dir: "Path | None" = None,
     ) -> None:
         self._client = client
         self._config = config
@@ -117,6 +137,7 @@ class MatrixMessageHandler:
         self._db = db
         self._worker_health = worker_health
         self._session_factories = session_factories or {}
+        self._media_dir = media_dir
         # Lazily built, then reused for the life of this handler — each
         # (agent_id, room_id) gets exactly one long-lived AgentSession
         # instance, the same way `sessions[agent_id]` is a long-lived
@@ -181,7 +202,9 @@ class MatrixMessageHandler:
 
         Args:
             room:  matrix-nio ``MatrixRoom`` object.
-            event: matrix-nio ``RoomMessageText`` (or similar) event object.
+            event: matrix-nio ``RoomMessageText`` or ``RoomMessageImage``
+                event object (``monitor.py`` registers this callback for
+                both types).
         """
         # getattr with a default safely extracts fields from nio event objects
         # even if a future SDK version renames them.
@@ -190,8 +213,19 @@ class MatrixMessageHandler:
         room_id: str = getattr(room, "room_id", "") or ""
         body: str = getattr(event, "body", "") or ""
 
-        # Ignore empty messages (e.g. image-only events with no text body).
-        if not body.strip():
+        # RoomMessageImage is a distinct nio event class from
+        # RoomMessageText — isinstance, not msgtype string comparison,
+        # because a bare (unspec'd) test MagicMock always evaluates False
+        # here, leaving every existing text-path test unaffected.
+        from nio import RoomMessageImage  # noqa: PLC0415 — lazy import
+
+        is_image = isinstance(event, RoomMessageImage)
+
+        # Ignore empty non-image messages (e.g. edits, redactions, or other
+        # non-text events with no body). Image events proceed even with an
+        # empty body — a caption-less image is still a real image to answer
+        # questions about.
+        if not is_image and not body.strip():
             return
 
         # Step 1 — Deduplication.
@@ -241,6 +275,32 @@ class MatrixMessageHandler:
             if not self._is_mentioned(body):
                 return
 
+        # Step 5c — Image download and staging.
+        # Previously the bot never even saw m.image events (see class
+        # docstring's "Threading note" and monitor.py's callback
+        # registration), so a sent image silently vanished with no
+        # feedback — the LLM never learned an image existed at all,
+        # image-with-no-caption or not. Download the file from the
+        # homeserver's media repo now and stage it through the same
+        # media.stage_attachment() the REPL's /attach command uses, so the
+        # rest of the turn (below) is identical to a text message except
+        # for the extra `attachment` argument.
+        attachment: "MediaAttachment | None" = None
+        if is_image:
+            attachment, error = await self._download_image_attachment(event)
+            if attachment is None:
+                thread_id = self._resolve_thread_id(event)
+                await self._outbound.send_text(
+                    room_id,
+                    f"Couldn't process that image: {error}",
+                    thread_id=thread_id,
+                )
+                return
+            if not body.strip():
+                # No caption — give the LLM a minimal prompt so the turn
+                # still proceeds instead of looking like an empty message.
+                body = "[Image attached]"
+
         # Step 6 — Room session resolution (MEM-GAP-001).
         # A room is this deployment's unit of conversation isolation (see
         # docs/adr/0006-room-scoped-matrix-sessions.md) — every room gets its
@@ -272,7 +332,71 @@ class MatrixMessageHandler:
             session_id=session_id,
             thread_id=thread_id,
             room_cfg=room_cfg,
+            attachment=attachment,
         )
+
+    async def _download_image_attachment(
+        self, event
+    ) -> "tuple[MediaAttachment | None, str | None]":
+        """Download an m.image event's file and stage it as a MediaAttachment.
+
+        Returns a ``(attachment, error)`` pair where exactly one side is
+        ``None`` — mirrors the shape callers need to either proceed or show
+        an in-room error, without a separate exception type for what is
+        routine, expected failure (bad upload, oversized file, no media_dir
+        configured).
+
+        Reuses ``media.stage_attachment()`` — the exact same validation
+        (MIME sniffing, 15 MB size cap) and content-addressed storage the
+        REPL's ``/attach`` command already goes through, so a Matrix image
+        and a ``/attach``-ed file behave identically once staged.
+        """
+        if self._media_dir is None:
+            return None, "image attachments are not configured on this bot"
+
+        mxc = getattr(event, "url", None)
+        if not mxc:
+            return None, "message had no image URL"
+
+        try:
+            response = await self._client.download(mxc=mxc)
+        except Exception as exc:
+            return None, f"download failed ({exc})"
+
+        from nio.responses import DownloadError  # noqa: PLC0415 — lazy import
+
+        if isinstance(response, DownloadError):
+            return None, response.message or "download failed"
+
+        file_bytes = getattr(response, "body", None)
+        if not file_bytes:
+            return None, "downloaded file was empty"
+
+        # event.body is whatever the sender's client put there — often an
+        # actual filename, but for clients that support captions it's the
+        # free-text caption instead (e.g. "what is this?", or the "图里三
+        # 条线各是什么" caption from the original bug report this feature
+        # fixes), which can contain characters illegal in a Windows path
+        # (`?`, `:`, ...) or path-traversal segments. It is never used as a
+        # path directly: Path(...).name first drops any directory
+        # components, then safe_filename() (media.py's sanitizer, also
+        # used for the final staged filename) strips everything but
+        # alphanumerics/dot/dash/underscore, so the write below is always
+        # confined to tmp_dir regardless of what body contains.
+        # stage_attachment() sniffs the real MIME type from bytes, so an
+        # imprecise or missing extension here doesn't affect validation —
+        # it only affects the display name shown back to the user.
+        raw_filename = getattr(event, "body", None) or "matrix-image"
+        filename = safe_filename(Path(raw_filename).name) or "matrix-image"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir) / filename
+            tmp_path.write_bytes(file_bytes)
+            try:
+                attachment = stage_attachment(tmp_path, self._media_dir)
+            except (ValueError, FileNotFoundError) as exc:
+                return None, str(exc)
+
+        return attachment, None
 
     def _is_sender_allowed(self, sender: str, room_id: str, room_cfg) -> bool:
         """Return True if the sender is permitted to trigger the agent."""
@@ -324,8 +448,16 @@ class MatrixMessageHandler:
         session_id: str,
         thread_id: str | None,
         room_cfg=None,
+        attachment: "MediaAttachment | None" = None,
     ) -> None:
-        """Run the agent turn in a thread-pool thread and post the reply."""
+        """Run the agent turn in a thread-pool thread and post the reply.
+
+        attachment: An image staged by ``_download_image_attachment``, if
+            this turn came from an ``m.image`` event. Forwarded to
+            ``session.send()``'s existing multimodal ``attachments`` param
+            unchanged — the same param the REPL's ``/attach`` command
+            already exercises, so no new downstream handling is needed.
+        """
         # R2-GAP-004: resolved *before* command interception below, not
         # after — a command handler (/new, /compact, /session, etc.) must
         # see this room's own isolated session, not the shared REPL
@@ -444,6 +576,7 @@ class MatrixMessageHandler:
                 # in one shot.  Streaming draft-preview is deferred (TODO).
                 resp = session.send(
                     text,
+                    attachments=[attachment] if attachment else None,
                     on_event=None,
                     stream=False,
                     extra_tools=extra_tools or None,

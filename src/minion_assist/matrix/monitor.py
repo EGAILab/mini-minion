@@ -9,8 +9,8 @@ Lifecycle
 2. Open the inbound-dedupe and room-session databases.
 3. Construct the outbound adapter, bot-loop protection, exec-approval handler,
    and room-message handler.
-4. Register matrix-nio callbacks for ``RoomMessageText``, ``InviteEvent``, and
-   ``ReactionEvent`` (used by exec approvals).
+4. Register matrix-nio callbacks for ``RoomMessageText``, ``RoomMessageImage``,
+   ``InviteEvent``, and ``ReactionEvent`` (used by exec approvals).
 5. Start ``client.sync_forever()`` in a cancellation-aware task.
 6. On ``stop_event`` set: cancel the sync task and clean up.
 
@@ -99,6 +99,10 @@ async def monitor_matrix(
         exec_approval = MatrixExecApprovalHandler(outbound, config.exec_approvals)
 
     # Step 4: build the message handler that ties everything together.
+    # media_dir mirrors minion.py's own `_media_dir = workspace / "attachments"`
+    # used by the REPL's /attach command — Matrix images land in the same
+    # content-addressed attachment store, so a file is only ever staged once
+    # regardless of which channel it arrived through.
     msg_handler = MatrixMessageHandler(
         client=client,
         config=config,
@@ -116,11 +120,17 @@ async def monitor_matrix(
         session_factories=session_factories,
         db=db,
         worker_health=worker_health,
+        media_dir=workspace / "attachments",
     )
 
     try:
         # Import matrix-nio event types for use as callback type filters.
-        from nio import InviteEvent, ReactionEvent, RoomMessageText  # noqa: PLC0415
+        from nio import (  # noqa: PLC0415
+            InviteEvent,
+            ReactionEvent,
+            RoomMessageImage,
+            RoomMessageText,
+        )
     except ImportError as exc:
         raise RuntimeError(
             "matrix-nio is not installed. "
@@ -135,7 +145,12 @@ async def monitor_matrix(
     async def _on_invite(room, event):
         await handle_invite(client, room.room_id, event.sender, config)
 
-    client.add_event_callback(_on_room_message, RoomMessageText)
+    # RoomMessageText and RoomMessageImage share one callback — handler.py's
+    # handle_room_message() itself branches on isinstance(event, RoomMessageImage)
+    # to decide whether to download/stage the file before dispatching to the
+    # agent (previously image events were never registered at all, so a sent
+    # image silently vanished with no callback ever firing for it).
+    client.add_event_callback(_on_room_message, (RoomMessageText, RoomMessageImage))
     client.add_event_callback(_on_invite, InviteEvent)
 
     # Reactions are exec approvals' confirm/deny mechanism.

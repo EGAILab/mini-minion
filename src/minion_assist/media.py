@@ -66,11 +66,16 @@ class MediaAttachment:
     source_name: str
 
 
-def _safe_name(name: str) -> str:
+def safe_filename(name: str) -> str:
     """Convert a filename to a path-safe ASCII string.
 
     Replaces anything that isn't alphanumeric, dot, dash, or underscore
     with an underscore, then caps at 80 characters to avoid filesystem limits.
+    Public (no longer module-private) because matrix/handler.py also needs
+    it: an inbound image's caption/body — arbitrary, sender-controlled text
+    that can contain characters illegal in a Windows path (``?``, ``:``,
+    etc.) — is used as a display/temp-file name before ``stage_attachment``
+    ever sees it, so it must go through the same sanitizer.
     """
     import re
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
@@ -185,7 +190,7 @@ def stage_attachment(source: Path, media_dir: Path) -> MediaAttachment:
     today = date.today().isoformat()
     dest_dir = media_dir / today
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_name = f"{file_id}-{_safe_name(source.name)}"
+    dest_name = f"{file_id}-{safe_filename(source.name)}"
     dest = dest_dir / dest_name
 
     # Skip the copy if the content-hashed destination already exists.
