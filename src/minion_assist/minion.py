@@ -252,8 +252,32 @@ def main() -> None:
         action="store_true",
         help="Start in voice chat mode (speech-to-speech).",
     )
+    _parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Start in full-screen terminal UI mode (requires the 'tui' extra).",
+    )
     # parse_known_args so unrecognised flags (e.g. from test runners) don't error.
     _args, _ = _parser.parse_known_args()
+
+    # --- TUI app (--tui flag) ---
+    # Built here, before any of the console callbacks below or any
+    # AgentSession, because those callbacks must already be able to delegate
+    # to it (see the `if _tui_app is not None:` swaps a few lines down) —
+    # print()/input() do not work once a Textual app has put the terminal in
+    # raw mode. Only constructed, not run yet: MinionApp.run() happens much
+    # later, once every subsystem (sessions, MCP manager, memory workers,
+    # etc.) exists, at the same point --voice mode builds its VoiceSession.
+    _tui_app: object = None
+    if _args.tui:
+        try:
+            from .tui.app import MinionApp  # noqa: PLC0415 — optional dependency
+        except ImportError as exc:
+            raise SystemExit(
+                "minion-assist --tui requires the 'tui' extra. "
+                "Run: uv sync --extra tui"
+            ) from exc
+        _tui_app = MinionApp()
 
     # Validate that AGENTS (definitions.py) and agents_cfg (config.json) have the same keys.
     _cfg_ids = set(agents_cfg)
@@ -345,6 +369,19 @@ def main() -> None:
         _sys.stdout.flush()
         choice = input("Allow? [Y/n]: ").strip().lower()
         return "deny" if choice == "n" else "approve"
+
+    # --tui: swap every console callback for its TUI-modal equivalent.
+    # print()/input() cannot be used once MinionApp.run() puts the terminal
+    # in raw mode, so this must happen before any of the four names below
+    # are captured as a tool/provider constructor argument later in this
+    # function (bash_confirm=_console_confirm etc.) — reassigning the name
+    # here means every later reference picks up the TUI version with no
+    # other change needed.
+    if _tui_app is not None:
+        _console_confirm = _tui_app.confirm_git
+        _console_approve = _tui_app.approve_bash
+        _console_ask_user = _tui_app.ask_user
+        _console_approve_codex = _tui_app.approve_codex
 
     if codex_cfg.allow_all_commands:
         _codex_approve: "Callable[[str, dict], str]" = lambda m, p: "approve"
@@ -1298,6 +1335,14 @@ def main() -> None:
             elif isinstance(event, MemoryFlushed) and event.status == "failed":
                 print(f"\n  [Warning] Pre-compaction memory flush failed: {event.detail}")
 
+    # --tui: same reasoning as the console-callback swap above — _on_event
+    # is captured by name at every sessions[...].send(on_event=_on_event)
+    # call site (including the subagent relay wrapper above), so reassigning
+    # it here is sufficient; nothing downstream needs to know which mode is
+    # active.
+    if _tui_app is not None:
+        _on_event = _tui_app.on_agent_event
+
     # --- Voice mode (--voice flag) ---
     # Placed here so _on_event is already defined when VoiceSession is built.
     # VoiceSession.run() blocks until Ctrl+C; we then fall through to cleanup.
@@ -1319,6 +1364,46 @@ def main() -> None:
             _voice_session.run()
         except KeyboardInterrupt:
             print("\n[voice] Goodbye.")
+        finally:
+            if _matrix_channel is not None:
+                _matrix_channel.stop()
+            if mcp_manager is not None:
+                mcp_manager.close_sync()
+            if _capture_worker is not None:
+                _capture_worker.stop()
+            if _commitment_worker is not None:
+                _commitment_worker.stop()
+            if _message_embedding_worker is not None:
+                _message_embedding_worker.stop()
+            if _memory_watcher is not None:
+                _memory_watcher.stop()
+            if _memory_reconciliation is not None:
+                _memory_reconciliation.stop()
+        return
+
+    # --- TUI mode (--tui flag) ---
+    # Same shape as --voice above: _tui_app was already constructed near
+    # the top of main() (so its callback methods existed in time to be
+    # wired into tool/session construction); configure() wires in every
+    # subsystem now that all of them exist, then run() blocks until the
+    # user quits, then the same cleanup teardown as every other mode.
+    if _tui_app is not None:
+        _tui_app.configure(
+            sessions=sessions,
+            agents_cfg=agents_cfg,
+            session_store=session_store,
+            mcp_manager=mcp_manager,
+            skills=skills,
+            short_term=short_term,
+            db=_db,
+            worker_health=worker_health,
+            media_dir=_media_dir,
+            active_agent_id=_default_agent_id,
+            use_streaming=use_streaming,
+            completion_items=build_completion_items(agents_cfg, skills),
+        )
+        try:
+            _tui_app.run()
         finally:
             if _matrix_channel is not None:
                 _matrix_channel.stop()

@@ -1847,6 +1847,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/81/4da04ced5a082363ecfa159c010d200ecbd959ae410c10c0264a38cac0f5/markdown_it_py-4.2.0-py3-none-any.whl", hash = "sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a", size = 91687, upload-time = "2026-05-07T12:08:27.182Z" },
 ]
 
+[package.optional-dependencies]
+linkify = [
+    { name = "linkify-it-py" },
+]
+
 [[package]]
 name = "markupsafe"
 version = "3.0.3"
@@ -1966,6 +1971,18 @@ wheels = [
 ]
 
 [[package]]
+name = "mdit-py-plugins"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "markdown-it-py" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/59/fc/f8d0863f8862f25602c0404d75568e89fb6b4109804645e5cdfb1be5cf56/mdit_py_plugins-0.6.1.tar.gz", hash = "sha256:a2bca0f039f39dbd35fb74ae1b5f998608c437463371f0ff7f49a19a17a114d0", size = 56114, upload-time = "2026-05-13T09:03:38.91Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a5/69/6da5581c6a7fede7dc261bf4e67d6adca4196f176b43288b55b3db395b6e/mdit_py_plugins-0.6.1-py3-none-any.whl", hash = "sha256:214c82fb2ac524472ab6a5bcab1de80f73b50443e187f401bfd77efbc7c6481d", size = 66663, upload-time = "2026-05-13T09:03:37.76Z" },
+]
+
+[[package]]
 name = "mdurl"
 version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2004,6 +2021,7 @@ all = [
     { name = "psycopg", extra = ["binary"] },
     { name = "silero-vad" },
     { name = "sounddevice" },
+    { name = "textual" },
     { name = "tiktoken" },
     { name = "torch" },
     { name = "transformers" },
@@ -2027,6 +2045,9 @@ postgres = [
 ]
 tiktoken = [
     { name = "tiktoken" },
+]
+tui = [
+    { name = "textual" },
 ]
 voice = [
     { name = "kokoro" },
@@ -2078,6 +2099,8 @@ requires-dist = [
     { name = "silero-vad", marker = "extra == 'voice'", specifier = ">=4.0" },
     { name = "sounddevice", marker = "extra == 'all'", specifier = ">=0.4" },
     { name = "sounddevice", marker = "extra == 'voice'", specifier = ">=0.4" },
+    { name = "textual", marker = "extra == 'all'", specifier = ">=0.60" },
+    { name = "textual", marker = "extra == 'tui'", specifier = ">=0.60" },
     { name = "tiktoken", marker = "extra == 'all'", specifier = ">=0.7.0" },
     { name = "tiktoken", marker = "extra == 'tiktoken'", specifier = ">=0.7.0" },
     { name = "torch", marker = "extra == 'all'", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cu128" },
@@ -2088,7 +2111,7 @@ requires-dist = [
     { name = "watchdog", marker = "extra == 'all'", specifier = ">=6.0.0" },
     { name = "watchdog", marker = "extra == 'postgres'", specifier = ">=6.0.0" },
 ]
-provides-extras = ["anthropic", "tiktoken", "matrix", "postgres", "browser", "voice", "all"]
+provides-extras = ["anthropic", "tiktoken", "matrix", "postgres", "browser", "voice", "tui", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -4656,6 +4679,23 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/46/79/cf31d7a93a8fdc6aa0fbb665be84426a8c5a557d9240b6239e9e11e35fc5/termcolor-3.3.0.tar.gz", hash = "sha256:348871ca648ec6a9a983a13ab626c0acce02f515b9e1983332b17af7979521c5", size = 14434, upload-time = "2025-12-29T12:55:21.882Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/33/d1/8bb87d21e9aeb323cc03034f5eaf2c8f69841e40e4853c2627edf8111ed3/termcolor-3.3.0-py3-none-any.whl", hash = "sha256:cf642efadaf0a8ebbbf4bc7a31cec2f9b5f21a9f726f4ccbb08192c9c26f43a5", size = 7734, upload-time = "2025-12-29T12:55:20.718Z" },
+]
+
+[[package]]
+name = "textual"
+version = "8.2.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "markdown-it-py", extra = ["linkify"] },
+    { name = "mdit-py-plugins" },
+    { name = "platformdirs" },
+    { name = "pygments" },
+    { name = "rich" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/00/21/39a76b01bd5eea82a04baaca7580e105d8c59450df03998345bb2cfb307b/textual-8.2.8.tar.gz", hash = "sha256:3f106a9fbc73e39dd266c9712432087de78a6d644084c7c241d6a25c3169115b", size = 1860502, upload-time = "2026-06-30T06:51:24.495Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fb/be/35261223d9416a0751cdff1c7b4a6f881387218a12d439fe22fefebc8c04/textual-8.2.8-py3-none-any.whl", hash = "sha256:267375fd402dc8d981457212efa71f0e3365fd17bba144ba9bb3ed7563cb374a", size = 731418, upload-time = "2026-06-30T06:51:26.364Z" },
 ]
 
 [[package]]

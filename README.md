@@ -19,6 +19,7 @@ A minimal multi-agent CLI assistant with pluggable LLM providers, tool execution
 - [Dreaming](#dreaming)
 - [Browser Tool](#browser-tool)
 - [Voice Chat](#voice-chat)
+- [Terminal UI](#terminal-ui)
 - [PostgreSQL Session Store](#postgresql-session-store)
 - [Module Reference](#module-reference)
   - [config](#config)
@@ -1140,6 +1141,34 @@ src/minion_assist/voice/
 ```
 
 All ML packages (`silero_vad`, `torch`, `nemo`, `transformers`, `kokoro`, `piper`) are imported lazily inside `load()` methods — the voice package can be imported without any of the ML extras installed.
+
+---
+
+## Terminal UI
+
+```bash
+uv sync --extra tui
+minion-assist --tui
+```
+
+A full-screen chat interface (built on [Textual](https://github.com/Textualize/textual)) alongside the plain REPL — same agents, same sessions, same slash commands, same memory/tool stack; only the presentation layer differs. The plain REPL remains the default (`minion-assist` with no flags) and needs no extra dependency.
+
+**Phase 1 scope:** a core chat shell — scrollback chat pane with rendered markdown, single-line composer with slash-command suggestions, streaming responses, and TUI-native modal replacements for every console prompt (bash approval, git-commit confirmation, `AskUserTool` questions, Codex permission requests) so tool use works identically to the REPL. Inline image/audio rendering and a sidebar/status bar are planned for later phases — not yet implemented.
+
+**Details:**
+- Every slash command (`/new`, `/attach`, `/status`, `/session`, etc.) works exactly as in the REPL — `tui/app.py` dispatches through the same `commands.py` machinery the REPL and Matrix channel already share, not a separate reimplementation.
+- Streamed tokens accumulate as plain text while a response is in progress, then are re-rendered as formatted Markdown once the turn completes — mirrors the REPL's own "print raw tokens as they arrive" behavior, with a formatting upgrade at the end.
+- Bash commands, git commits, `AskUserTool` questions, and Codex tool-permission requests all show as a modal dialog instead of a `print()`/`input()` prompt (which cannot be used once the terminal is in raw mode) — same options and same defaults as the REPL's console prompts.
+- `Ctrl+C`/`Ctrl+Q` or typing `/quit` exits.
+
+### Module layout
+
+```
+src/minion_assist/tui/
+├── __init__.py
+├── app.py       # MinionApp — chat log, composer, turn dispatch, console-callback bridges
+└── widgets.py    # ApprovalModal, ConfirmModal, AskUserModal, CodexApprovalModal
+```
 
 ---
 
@@ -2944,7 +2973,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **3181 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **3201 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic
@@ -2970,6 +2999,7 @@ uv sync --extra tiktoken         # + tiktoken for accurate token estimation
 uv sync --extra postgres         # + psycopg3 + watchdog + pgvector for session store & memory index
 uv sync --extra browser          # + playwright for browser tool
 uv sync --extra voice            # + silero-vad, sounddevice, torch, transformers for voice chat
+uv sync --extra tui              # + textual for the full-screen terminal UI (--tui)
 uv sync --extra tiktoken --extra postgres  # combine any extras
 uv add <package>                 # add a runtime dependency
 uv add --dev <package>           # add a dev dependency
