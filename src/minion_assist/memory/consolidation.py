@@ -451,6 +451,75 @@ def backfill_agent(db: SessionDB, agent_id: str, model_id: str) -> int:
     return enqueued
 
 
+def embed_backfill_agent(db: SessionDB, agent_id: str, batch_size: int = 500) -> dict:
+    """Enqueue embedding jobs for every historical message never embedded (R3-GAP-003).
+
+    Same "gap-fill across an agent's full history" shape as
+    :func:`backfill_agent` above, but for the embedding lane. That lane
+    doesn't need a coverage-ranges table the way capture/commitment do —
+    ``message_embeddings`` is itself the exact, durable record of what's
+    done (see
+    :meth:`~minion_assist.session.db.SessionDB.find_uncovered_message_ids_for_embedding`'s
+    docstring) — so this walks every session's *entire* history in bounded
+    pages via
+    :meth:`~minion_assist.session.db.SessionDB.find_uncovered_message_ids_for_embedding_page`,
+    instead of computing gap ranges from a coverage table.
+
+    Does not embed anything itself — enqueues into the same
+    ``message_embedding_jobs`` queue a live turn and periodic
+    reconciliation already use, so the already-running
+    ``MessageEmbeddingWorker`` processes backfilled messages exactly like
+    any other job (same retry/backoff). Safe to re-run or interrupt
+    partway: each enqueue uses the same idempotency key format live turns
+    already use (``"{agent}:{message_id}:{model_identity}"``), so a
+    message that's already embedded or already has a pending job is
+    silently skipped the second time — no separate checkpoint table
+    needed for resumability.
+
+    Args:
+        db: The ``SessionDB`` sessions/messages/embedding jobs live in.
+        agent_id: Which agent's history to backfill.
+        batch_size: How many uncovered message ids to fetch per page, per
+            session — bounds the work of each individual database call
+            regardless of how large a single session's full history is.
+
+    Returns:
+        dict: ``{"sessions_scanned": int, "messages_enqueued": int}`` — the
+            second key is 0 if no embedding provider/model is configured,
+            or every session was already fully covered.
+    """
+    sessions_scanned = 0
+    messages_enqueued = 0
+    # Same no-op guard as reconciliation_scheduler.py's own catch-up pass —
+    # "coverage" isn't a meaningful concept without an active embedding
+    # model configured to measure it against.
+    if not db.has_vector_lane:
+        return {"sessions_scanned": 0, "messages_enqueued": 0}
+    model_identity = db.embedding_model_identity
+    if model_identity is None:
+        return {"sessions_scanned": 0, "messages_enqueued": 0}
+    for session_id in db.list_session_ids_for_agent(agent_id):
+        sessions_scanned += 1
+        after_id = 0
+        while True:
+            message_ids = db.find_uncovered_message_ids_for_embedding_page(
+                agent_id, session_id, after_id=after_id, batch_size=batch_size
+            )
+            if not message_ids:
+                break
+            for message_id in message_ids:
+                idempotency_key = f"{agent_id}:{message_id}:{model_identity}"
+                job_id = db.enqueue_message_embedding_job(
+                    agent_id, session_id, message_id, idempotency_key
+                )
+                if job_id is not None:
+                    messages_enqueued += 1
+            after_id = message_ids[-1]
+            if len(message_ids) < batch_size:
+                break
+    return {"sessions_scanned": sessions_scanned, "messages_enqueued": messages_enqueued}
+
+
 class StaleProposalError(Exception):
     """Raised by :meth:`MemoryConsolidator.approve` when the merge target changed since preview.
 

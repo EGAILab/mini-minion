@@ -1259,6 +1259,77 @@ def test_consolidate_backfill_without_a_database_reports_an_error(monkeypatch, t
 
 
 # ---------------------------------------------------------------------------
+# embed-backfill (R3-GAP-003)
+# ---------------------------------------------------------------------------
+
+def test_embed_backfill_reports_the_summary(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.has_vector_lane = True
+    _patch_db(monkeypatch, mock_db)
+    monkeypatch.setattr(
+        consolidation, "embed_backfill_agent",
+        lambda db, agent_id, batch_size: {"sessions_scanned": 4, "messages_enqueued": 7},
+    )
+
+    exit_code = cli.main(["embed-backfill", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "scanned 4 session" in out
+    assert "enqueued 7" in out
+
+
+def test_embed_backfill_without_a_database_reports_an_error(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+
+    exit_code = cli.main(["embed-backfill", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no database configured" in out
+
+
+def test_embed_backfill_without_a_vector_lane_reports_nothing_to_do(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.has_vector_lane = False
+    _patch_db(monkeypatch, mock_db)
+
+    exit_code = cli.main(["embed-backfill", "--agent", "main"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "no embedding provider configured" in out
+
+
+def test_embed_backfill_passes_the_batch_size_through(monkeypatch, tmp_path, capsys):
+    import minion_assist.memory.consolidation as consolidation
+
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    mock_db = Mock()
+    mock_db.has_vector_lane = True
+    _patch_db(monkeypatch, mock_db)
+    captured = {}
+
+    def _fake_embed_backfill_agent(db, agent_id, batch_size):
+        captured["batch_size"] = batch_size
+        return {"sessions_scanned": 0, "messages_enqueued": 0}
+
+    monkeypatch.setattr(consolidation, "embed_backfill_agent", _fake_embed_backfill_agent)
+
+    cli.main(["embed-backfill", "--agent", "main", "--batch-size", "50"])
+
+    assert captured["batch_size"] == 50
+
+
+# ---------------------------------------------------------------------------
 # import (Stage One Phase 7, slice E)
 # ---------------------------------------------------------------------------
 

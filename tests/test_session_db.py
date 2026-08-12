@@ -2716,6 +2716,123 @@ def test_find_uncovered_message_ids_for_embedding_is_model_aware(db_with_vector,
     assert db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id) == [id1]
 
 
+# --- find_uncovered_message_ids_for_embedding_page (R3-GAP-003) ---
+# Exhaustive, cursor-paginated sibling of the method above — used by
+# embed_backfill_agent (memory/consolidation.py) to walk a session's
+# entire history in bounded pages, unlike the tail-bounded method above.
+
+def test_find_uncovered_message_ids_for_embedding_page_returns_empty_for_an_unowned_session(
+    db_with_vector, session_id
+):
+    db_with_vector.upsert_session(session_id, "researcher")
+    db_with_vector.mirror_message(session_id, "e1", "user", "hello")
+
+    assert db_with_vector.find_uncovered_message_ids_for_embedding_page("main", session_id) == []
+
+
+def test_find_uncovered_message_ids_for_embedding_page_returns_empty_without_a_provider(
+    db, session_id
+):
+    db.upsert_session(session_id, "main")
+    db.mirror_message(session_id, "e1", "user", "hello")
+
+    assert db.find_uncovered_message_ids_for_embedding_page("main", session_id) == []
+
+
+def test_find_uncovered_message_ids_for_embedding_page_returns_all_new_messages(
+    db_with_vector, session_id
+):
+    db_with_vector.upsert_session(session_id, "main")
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "first")
+    id2 = db_with_vector.mirror_message(session_id, "e2", "assistant", "second")
+
+    result = db_with_vector.find_uncovered_message_ids_for_embedding_page("main", session_id)
+
+    assert result == [id1, id2]
+
+
+def test_find_uncovered_message_ids_for_embedding_page_excludes_a_completed_embedding(
+    db_with_vector, session_id
+):
+    db_with_vector.upsert_session(session_id, "main")
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "first")
+    id2 = db_with_vector.mirror_message(session_id, "e2", "assistant", "second")
+    job_id = db_with_vector.enqueue_message_embedding_job(
+        "main", session_id, id1, idempotency_key=f"key-{session_id}"
+    )
+    db_with_vector.complete_message_embedding_job(
+        job_id, id1, db_with_vector.embedding_model_identity, [0.1, 0.2, 0.3]
+    )
+
+    result = db_with_vector.find_uncovered_message_ids_for_embedding_page("main", session_id)
+
+    assert result == [id2]
+
+
+def test_find_uncovered_message_ids_for_embedding_page_respects_the_after_id_cursor(
+    db_with_vector, session_id
+):
+    # The load-bearing difference from find_uncovered_message_ids_for_embedding:
+    # this method is NOT bounded to the most recent _RECONCILIATION_SCAN_LIMIT
+    # messages — a caller pages forward via after_id to reach the entire
+    # history instead, however old.
+    db_with_vector.upsert_session(session_id, "main")
+    id1 = db_with_vector.mirror_message(session_id, "e1", "user", "first")
+    id2 = db_with_vector.mirror_message(session_id, "e2", "assistant", "second")
+    id3 = db_with_vector.mirror_message(session_id, "e3", "user", "third")
+
+    first_page = db_with_vector.find_uncovered_message_ids_for_embedding_page(
+        "main", session_id, after_id=0, batch_size=2
+    )
+    second_page = db_with_vector.find_uncovered_message_ids_for_embedding_page(
+        "main", session_id, after_id=first_page[-1], batch_size=2
+    )
+
+    assert first_page == [id1, id2]
+    assert second_page == [id3]
+
+
+def test_find_uncovered_message_ids_for_embedding_page_respects_batch_size(
+    db_with_vector, session_id
+):
+    db_with_vector.upsert_session(session_id, "main")
+    for i in range(5):
+        db_with_vector.mirror_message(session_id, f"e{i}", "user", f"message {i}")
+
+    result = db_with_vector.find_uncovered_message_ids_for_embedding_page(
+        "main", session_id, batch_size=3
+    )
+
+    assert len(result) == 3
+
+
+def test_find_uncovered_message_ids_for_embedding_page_finds_a_gap_below_the_reconciliation_window(
+    db_with_vector, session_id
+):
+    # The exact scenario R3-GAP-003 exists to fix: an ancient gap that has
+    # aged below _RECONCILIATION_SCAN_LIMIT is invisible to the tail-bounded
+    # method, but this exhaustive page still finds it from the start.
+    import minion_assist.session.db as db_module
+
+    original_limit = db_module._RECONCILIATION_SCAN_LIMIT
+    db_module._RECONCILIATION_SCAN_LIMIT = 2
+    try:
+        db_with_vector.upsert_session(session_id, "main")
+        ancient_id = db_with_vector.mirror_message(session_id, "e0", "user", "ancient gap")
+        db_with_vector.mirror_message(session_id, "e1", "assistant", "recent")
+        db_with_vector.mirror_message(session_id, "e2", "user", "also recent")
+
+        bounded = db_with_vector.find_uncovered_message_ids_for_embedding("main", session_id)
+        exhaustive = db_with_vector.find_uncovered_message_ids_for_embedding_page(
+            "main", session_id
+        )
+
+        assert ancient_id not in bounded
+        assert ancient_id in exhaustive
+    finally:
+        db_module._RECONCILIATION_SCAN_LIMIT = original_limit
+
+
 # ---------------------------------------------------------------------------
 # embedding_coverage_summary (R2-GAP-014)
 # ---------------------------------------------------------------------------

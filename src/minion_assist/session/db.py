@@ -2945,6 +2945,67 @@ class SessionDB:
         ).fetchall()
         return [r[0] for r in reversed(rows)]
 
+    def find_uncovered_message_ids_for_embedding_page(
+        self, agent_id: str, session_id: str, after_id: int = 0, batch_size: int = 500
+    ) -> list[int]:
+        """Exhaustive, paginated sibling of the method above (R3-GAP-003).
+
+        The method above deliberately bounds its scan to the most recent
+        :data:`_RECONCILIATION_SCAN_LIMIT` eligible messages, so periodic
+        reconciliation stays cheap — but that also means a gap that ages
+        below that window (e.g. weeks of failed embeddings on a lifelong
+        session that's since moved on) is reported by
+        :meth:`embedding_coverage_summary` but never actually repaired by
+        reconciliation. This method exists so a one-off, on-demand repair
+        command (see :func:`~minion_assist.memory.consolidation.embed_backfill_agent`)
+        can walk a session's *entire* history in bounded batches instead —
+        the same model-aware anti-join against ``message_embeddings``, but
+        scanning forward from a caller-supplied cursor (``after_id``)
+        instead of backward from "most recent."
+
+        Callers loop: call once with ``after_id=0``, then keep calling with
+        ``after_id`` set to the last id returned, until a page comes back
+        shorter than ``batch_size`` (meaning the session's history is
+        exhausted). Each call is an indexed forward scan capped at
+        ``batch_size`` matches — bounded work per call, however large the
+        session's full history is.
+
+        Args:
+            agent_id: The agent this session must belong to.
+            session_id: The session to scan.
+            after_id: Only consider message ids strictly greater than this
+                (the pagination cursor). ``0`` starts from the beginning,
+                since real message ids are always positive.
+            batch_size: Maximum number of uncovered ids to return per call.
+
+        Returns:
+            list[int]: Up to ``batch_size`` uncovered message ids, ascending,
+                or ``[]`` if ``session_id`` isn't owned by ``agent_id``, no
+                embedding model is configured, or nothing remains uncovered
+                past ``after_id``.
+        """
+        if not self._session_owned_by(session_id, agent_id):
+            return []
+        if not self.has_vector_lane:
+            return []
+        model_identity = self.embedding_model_identity
+        if model_identity is None:
+            return []
+        rows = self._conn().execute(
+            """
+            SELECT m.id FROM messages m
+            WHERE m.session_id = %s AND m.role IN ('user', 'assistant') AND m.content IS NOT NULL
+            AND m.id > %s
+            AND NOT EXISTS (
+                SELECT 1 FROM message_embeddings me
+                WHERE me.message_id = m.id AND me.model_identity = %s
+            )
+            ORDER BY m.id ASC LIMIT %s
+            """,
+            (session_id, after_id, model_identity, batch_size),
+        ).fetchall()
+        return [r[0] for r in rows]
+
     def embedding_coverage_summary(self, agent_id: str) -> dict | None:
         """Count how many of one agent's messages are missing an embedding under the active model (R2-GAP-014).
 

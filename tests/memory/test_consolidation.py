@@ -21,6 +21,7 @@ from minion_assist.memory.consolidation import (
     _hash_text,
     _topic_key_from_rel_path,
     backfill_agent,
+    embed_backfill_agent,
     find_merge_target,
     format_preview_report,
     is_preview_stale,
@@ -54,6 +55,12 @@ class _FakeDB:
         self._capture_jobs: dict[str, list[tuple[int, int]]] = {}
         self._agent_sessions: dict[str, list[str]] = {}
         self.enqueued: list[tuple] = []
+        # -- embed_backfill_agent fakes (R3-GAP-003) --
+        # session_id -> set of message ids already embedded/pending under the active model
+        self._embedded: dict[str, set[int]] = {}
+        self.has_vector_lane = True
+        self.embedding_model_identity: str | None = "some-model"
+        self.embed_enqueued: list[tuple] = []
 
     # -- proposals --
 
@@ -91,6 +98,29 @@ class _FakeDB:
             return None
         self.enqueued.append((agent_id, session_id, from_id, to_id, idempotency_key))
         return len(self.enqueued)
+
+    # -- embed_backfill_agent helpers (R3-GAP-003) --
+
+    def mark_embedded(self, session_id: str, message_id: int) -> None:
+        """Mark a message as already covered under the active model — excluded from pages."""
+        self._embedded.setdefault(session_id, set()).add(message_id)
+
+    def find_uncovered_message_ids_for_embedding_page(
+        self, agent_id, session_id, after_id: int = 0, batch_size: int = 500
+    ) -> list[int]:
+        covered = self._embedded.get(session_id, set())
+        ids = sorted(
+            i for i in self._sessions.get(session_id, []) if i > after_id and i not in covered
+        )
+        return ids[:batch_size]
+
+    def enqueue_message_embedding_job(
+        self, agent_id, session_id, message_id, idempotency_key
+    ) -> int | None:
+        if idempotency_key in {e[3] for e in self.embed_enqueued}:
+            return None
+        self.embed_enqueued.append((agent_id, session_id, message_id, idempotency_key))
+        return len(self.embed_enqueued)
 
 
 _EMPTY_STATS = {"recall_count": 0, "unique_queries": 0, "injected_count": 0, "last_recalled_at": None}
@@ -1021,3 +1051,106 @@ def test_backfill_agent_skips_a_session_with_no_messages():
     enqueued = backfill_agent(db, "main", "some-model")
 
     assert enqueued == 0
+
+
+# ---------------------------------------------------------------------------
+# embed_backfill_agent (R3-GAP-003)
+# ---------------------------------------------------------------------------
+
+def test_embed_backfill_agent_enqueues_a_job_for_every_uncovered_message():
+    db = _FakeDB()
+    db.add_session("main", "sess-1", [1, 2, 3])
+
+    result = embed_backfill_agent(db, "main")
+
+    assert result == {"sessions_scanned": 1, "messages_enqueued": 3}
+    assert [e[2] for e in db.embed_enqueued] == [1, 2, 3]
+
+
+def test_embed_backfill_agent_skips_an_already_embedded_message():
+    db = _FakeDB()
+    db.add_session("main", "sess-1", [1, 2, 3])
+    db.mark_embedded("sess-1", 2)
+
+    result = embed_backfill_agent(db, "main")
+
+    assert result["messages_enqueued"] == 2
+    assert [e[2] for e in db.embed_enqueued] == [1, 3]
+
+
+def test_embed_backfill_agent_covers_every_session_for_the_agent():
+    db = _FakeDB()
+    db.add_session("main", "sess-1", [1, 2])
+    db.add_session("main", "sess-2", [10, 11])
+
+    result = embed_backfill_agent(db, "main")
+
+    assert result == {"sessions_scanned": 2, "messages_enqueued": 4}
+
+
+def test_embed_backfill_agent_is_idempotent_on_a_second_run():
+    db = _FakeDB()
+    db.add_session("main", "sess-1", [1, 2, 3])
+
+    first_run = embed_backfill_agent(db, "main")
+    second_run = embed_backfill_agent(db, "main")
+
+    assert first_run["messages_enqueued"] == 3
+    assert second_run["messages_enqueued"] == 0
+    # Idempotent because the enqueue itself dedupes by key — a rerun after
+    # interruption re-derives the same "still uncovered" set and no-ops it.
+    assert second_run["sessions_scanned"] == 1
+
+
+def test_embed_backfill_agent_walks_past_a_single_batch():
+    # The load-bearing behavior distinguishing this from backfill_agent:
+    # a session larger than one page must still be fully covered, by
+    # looping the cursor forward until a short page signals the end.
+    db = _FakeDB()
+    db.add_session("main", "sess-1", list(range(1, 6)))  # 5 messages
+
+    result = embed_backfill_agent(db, "main", batch_size=2)
+
+    assert result == {"sessions_scanned": 1, "messages_enqueued": 5}
+    assert [e[2] for e in db.embed_enqueued] == [1, 2, 3, 4, 5]
+
+
+def test_embed_backfill_agent_skips_a_session_with_no_messages():
+    db = _FakeDB()
+    db.add_session("main", "sess-1", [])
+
+    result = embed_backfill_agent(db, "main")
+
+    assert result == {"sessions_scanned": 1, "messages_enqueued": 0}
+
+
+def test_embed_backfill_agent_no_ops_without_a_vector_lane():
+    db = _FakeDB()
+    db.has_vector_lane = False
+    db.add_session("main", "sess-1", [1, 2, 3])
+
+    result = embed_backfill_agent(db, "main")
+
+    assert result == {"sessions_scanned": 0, "messages_enqueued": 0}
+    assert db.embed_enqueued == []
+
+
+def test_embed_backfill_agent_no_ops_without_a_configured_model():
+    db = _FakeDB()
+    db.embedding_model_identity = None
+    db.add_session("main", "sess-1", [1, 2, 3])
+
+    result = embed_backfill_agent(db, "main")
+
+    assert result == {"sessions_scanned": 0, "messages_enqueued": 0}
+    assert db.embed_enqueued == []
+
+
+def test_embed_backfill_agent_uses_the_model_identity_in_the_idempotency_key():
+    db = _FakeDB()
+    db.embedding_model_identity = "endpoint::model-v2"
+    db.add_session("main", "sess-1", [1])
+
+    embed_backfill_agent(db, "main")
+
+    assert db.embed_enqueued[0][3] == "main:1:endpoint::model-v2"

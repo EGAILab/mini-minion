@@ -1516,6 +1516,8 @@ Restores `prior_content` (or deletes the file entirely if `prior_content == ""`,
 
 **Historical backfill (Task 10).** `backfill_agent(db, agent_id, model_id)` finds message ranges in an agent's session history that no `memory_capture_jobs` row has ever covered — true gap-filling, not just "skip sessions with any coverage": it diffs every session's actual message ids against every capture job's recorded range (any state, including `failed` — a failed job already exists in the retry/backoff pipeline, backfill's job is catching ranges *never attempted* at all), chunks each gap into bounded 20-message windows (`_BACKFILL_WINDOW_MESSAGES`), and enqueues one capture job per window via the existing `SessionDB.enqueue_capture_job` — using the exact same idempotency-key shape a live turn's job already uses, so re-running backfill is a safe no-op the second time. It does not run extraction itself: the already-running `CaptureWorker` picks up backfilled jobs and processes them exactly like a live turn's job.
 
+**Exhaustive embedding backfill (R3-GAP-003).** Periodic reconciliation's `_catch_up_message_embedding` (above) only self-heals *recent* missing embeddings — bounded to the same `_RECONCILIATION_SCAN_LIMIT` (2000) most-recent eligible messages every gap-finder uses, so a gap that ages below that window (e.g. an embedding provider outage lasting weeks on a busy, lifelong session) is reported by `embedding_coverage_summary` but never actually repaired automatically. `embed_backfill_agent(db, agent_id, batch_size=500)` (`memory/consolidation.py`) is the manual, exhaustive fix: it walks every session an agent has ever had in full, paging through `SessionDB.find_uncovered_message_ids_for_embedding_page` (a cursor-based sibling of the bounded gap-finder — `id > after_id ORDER BY id ASC LIMIT batch_size`, so each database call does bounded work no matter how large a single session's history is) until each session's entire history has been walked. Enqueues jobs via the same `enqueue_message_embedding_job`/idempotency-key shape a live turn already uses (`"{agent}:{message_id}:{model_identity}"`), so a message that's already embedded or already has a job pending is silently skipped — re-running after an interruption is a safe no-op for anything already covered, with no separate checkpoint table needed. Enqueues only; the already-running `MessageEmbeddingWorker` processes the jobs, and ongoing progress is visible via `memory status --deep`'s existing queue-lag/coverage reporting.
+
 New CLI commands:
 
 ```bash
@@ -1526,6 +1528,7 @@ minion-assist memory consolidate approve 7 --agent main         # apply preview 
 minion-assist memory consolidate reject 42 --agent main --reason "not useful"
 minion-assist memory consolidate rollback project-goals --agent main
 minion-assist memory consolidate backfill --agent main          # gap-fill historical capture jobs
+minion-assist memory embed-backfill --agent main                # gap-fill historical embedding jobs, exhaustively
 ```
 
 **`MemoryConsolidationScheduler`** (`memory/consolidation_scheduler.py`) automates preview drafting on a daily wall-clock schedule — the same scheduling shape as `DreamingScheduler` (reuses its `_seconds_until_next`), but deliberately a **separate, independently-configured schedule** (Task 9: "keep the poetic `DreamingScheduler` independently configurable; rename the consolidation schedule ... to avoid ambiguity"):
@@ -2996,7 +2999,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **3293 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **3313 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic

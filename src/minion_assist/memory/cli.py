@@ -32,6 +32,7 @@ Currently supported:
 - ``minion-assist memory consolidate reject PROPOSAL_ID --agent ID [--reason TEXT]`` — reject.
 - ``minion-assist memory consolidate rollback TARGET_KEY --agent ID``  — undo the last approve.
 - ``minion-assist memory consolidate backfill --agent ID``             — gap-fill historical capture jobs.
+- ``minion-assist memory embed-backfill --agent ID [--batch-size N]``   — gap-fill historical embedding jobs, exhaustively (R3-GAP-003).
 - ``minion-assist memory commitments list --agent ID [--status S] [--channel C]`` — list commitments.
 - ``minion-assist memory commitments dismiss COMMITMENT_ID --agent ID`` — dismiss without sending.
 - ``minion-assist memory commitments delete COMMITMENT_ID --agent ID``  — permanently delete.
@@ -51,6 +52,11 @@ Talks to
   :func:`format_preview_report`, :func:`is_preview_stale`,
   :func:`backfill_agent`, and :class:`MemoryConsolidator`, wired up by
   every ``consolidate`` subcommand (Stage One Phase 5, slice D).
+  :func:`~minion_assist.memory.consolidation.embed_backfill_agent` is the
+  ``embed-backfill`` top-level subcommand's equivalent for the embedding
+  lane (R3-GAP-003) — not nested under ``consolidate`` since it has
+  nothing to do with consolidation proposals, just gap-filling a
+  different durable job queue the same way.
 - ``session/db.py`` — :func:`_build_db` constructs the
   :class:`~minion_assist.session.db.SessionDB` every ``consolidate``
   subcommand needs (proposals live there, not in the lexical index).
@@ -171,6 +177,26 @@ def _build_parser() -> argparse.ArgumentParser:
             "Crash-safe full rebuild via shadow-table swap (Stage One Phase 3, slice C). "
             "Without this flag, performs a cheaper hash-diff reconciliation instead — only "
             "reindexes files that actually changed."
+        ),
+    )
+
+    embed_backfill = sub.add_parser(
+        "embed-backfill",
+        help=(
+            "Enqueue embedding jobs for every historical message never embedded under the "
+            "active model, exhaustively across an agent's full history (R3-GAP-003). "
+            "Requires a configured database and embedding provider."
+        ),
+    )
+    embed_backfill.add_argument("--agent", required=True, help="Which agent's history to backfill.")
+    embed_backfill.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help=(
+            "Uncovered message ids fetched per database call, per session (default 500). "
+            "Bounds the work of each individual call regardless of session history size — "
+            "does not need tuning for normal use."
         ),
     )
 
@@ -808,6 +834,44 @@ def _run_reindex(args: argparse.Namespace) -> int:
                 print(f"{agent_id}: reindexed {touched} file(s).")
             else:
                 print(f"{agent_id}: already up to date.")
+    return 0
+
+
+def _run_embed_backfill(args: argparse.Namespace) -> int:
+    """Handle ``minion-assist memory embed-backfill --agent ID [--batch-size N]`` (R3-GAP-003).
+
+    Exhaustive, resumable sibling of the periodic reconciliation pass that
+    already self-heals *recent* missing embeddings — this walks an agent's
+    *entire* message history (every session, not just the most recent
+    2000 eligible messages) and enqueues jobs for whatever's still missing
+    an embedding under the currently-configured model. See
+    :func:`~minion_assist.memory.consolidation.embed_backfill_agent`'s
+    docstring for why re-running this after an interruption is safe (same
+    idempotency-key dedup every other enqueue path already relies on).
+
+    Enqueues jobs only — doesn't embed anything itself. The already-running
+    ``MessageEmbeddingWorker`` processes them exactly like any other job;
+    ongoing progress after this command exits is visible via
+    ``minion-assist memory status --deep`` (queue lag + coverage), the same
+    place every other worker's progress is already surfaced.
+    """
+    from ..config import agents as agents_cfg  # noqa: PLC0415
+    from .consolidation import embed_backfill_agent  # noqa: PLC0415
+
+    agent_id = _selected_agents(sorted(agents_cfg), args.agent)[0]
+    db = _build_db()
+    if db is None:
+        print("Error: no database configured (or it's unreachable) — nothing to backfill.")
+        return 1
+    if not db.has_vector_lane:
+        print(f"{agent_id}: no embedding provider configured — nothing to backfill.")
+        return 0
+
+    result = embed_backfill_agent(db, agent_id, batch_size=args.batch_size)
+    print(
+        f"{agent_id}: scanned {result['sessions_scanned']} session(s), "
+        f"enqueued {result['messages_enqueued']} new embedding job(s)."
+    )
     return 0
 
 
@@ -1595,6 +1659,7 @@ _HANDLERS = {
     "search": _run_search,
     "doctor": _run_doctor,
     "reindex": _run_reindex,
+    "embed-backfill": _run_embed_backfill,
     "retention": _run_retention,
     "verify-deletions": _run_verify_deletions,
     "pin": _run_pin,
