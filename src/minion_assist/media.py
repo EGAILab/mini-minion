@@ -15,8 +15,18 @@ Why stage to disk instead of holding bytes in memory?
 
 Security:
     - Rejects paths containing dangerous segments (.env, .git, etc.)
-    - Sniffs file bytes to verify image MIME type (catches renamed ZIPs etc.)
+    - Sniffs file bytes to verify image/audio MIME type (catches renamed ZIPs etc.)
     - Enforces size limits before staging
+
+Audio (TUI Phase 2)
+--------------------
+Audio attachments are staged and validated the same way images are, and can
+be locally previewed (waveform) and played back in the TUI (tui/waveform.py,
+tui/attachment_widgets.py) — but unlike images, they are never sent to an
+LLM provider as multimodal content. No provider in this codebase understands
+an audio input block; messages.make_user_content() folds an audio
+attachment's description into the prompt's *text* instead (filename,
+duration), the same way it would describe any other file reference.
 """
 from __future__ import annotations
 
@@ -33,6 +43,23 @@ from .messages import ALLOWED_IMAGE_TYPES
 # Anthropic's vision limit is 20 MB; OpenAI's effective limit via base64 is ~20 MB
 # after encoding overhead.  15 MB gives a comfortable buffer below both limits.
 _MAX_IMAGE_BYTES = 15 * 1024 * 1024
+
+# Max audio file size in bytes (50 MB) — deliberately more generous than
+# images: audio is never base64-encoded into a provider request (see the
+# module docstring), so there is no wire-size budget to protect. This cap
+# exists purely to stop an accidental multi-hour recording from being
+# staged and decoded for a waveform preview.
+_MAX_AUDIO_BYTES = 50 * 1024 * 1024
+
+# MIME types accepted for audio attachments. Both the canonical and the
+# legacy "x-" variants are listed because Python's mimetypes module (used as
+# the extension-based fallback below) returns the "x-" form for wav/flac on
+# most platforms, while byte-sniffing (_sniff_audio_mime) returns the
+# canonical form — either can end up being the value actually checked.
+ALLOWED_AUDIO_TYPES: frozenset[str] = frozenset({
+    "audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3",
+    "audio/flac", "audio/x-flac", "audio/ogg", "audio/vorbis",
+})
 
 # Path segments that indicate dangerous or secret files.
 # If any component of the resolved path matches one of these, we reject it.
@@ -52,11 +79,15 @@ class MediaAttachment:
 
     Attributes:
         id:          Short unique ID (first 8 chars of sha256 of file content).
-        kind:        "image" (only kind supported in slice 1).
+        kind:        "image" or "audio".
         path:        Absolute path to the staged file in the attachment store.
-        media_type:  MIME type string, e.g. "image/png".
+        media_type:  MIME type string, e.g. "image/png" or "audio/wav".
         size_bytes:  Original file size in bytes.
-        source_name: Original filename, shown to the user in the REPL.
+        source_name: Original filename, shown to the user in the REPL/TUI.
+        duration_seconds: Audio duration, probed via soundfile at staging
+            time. Always None for images, and None for audio when soundfile
+            isn't installed or duration couldn't be determined — never a
+            reason to fail staging (informational metadata only).
     """
     id: str
     kind: str
@@ -64,6 +95,7 @@ class MediaAttachment:
     media_type: str
     size_bytes: int
     source_name: str
+    duration_seconds: float | None = None
 
 
 def safe_filename(name: str) -> str:
@@ -106,6 +138,48 @@ def _sniff_image_mime(path: Path) -> str | None:
     if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def _sniff_audio_mime(path: Path) -> str | None:
+    """Sniff the actual audio format from the first bytes of the file.
+
+    Same reasoning as _sniff_image_mime: don't trust the extension. Reads
+    only the first 12 bytes.
+    """
+    try:
+        header = path.read_bytes()[:12]
+    except OSError:
+        return None
+
+    if header[:4] == b"RIFF" and header[8:12] == b"WAVE":
+        return "audio/wav"
+    if header[:4] == b"fLaC":
+        return "audio/flac"
+    if header[:4] == b"OggS":
+        return "audio/ogg"
+    # MP3: either an ID3v2 tag prefix, or a raw MPEG frame sync (the first
+    # 11 bits of a frame header are always set).
+    if header[:3] == b"ID3":
+        return "audio/mpeg"
+    if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
+        return "audio/mpeg"
+    return None
+
+
+def _probe_audio_duration(path: Path) -> float | None:
+    """Best-effort audio duration in seconds. None if it can't be determined.
+
+    soundfile is an optional dependency (the tui extra) — staging an audio
+    file must still succeed without it, just without a duration to display.
+    """
+    try:
+        import soundfile as sf  # noqa: PLC0415 — optional dependency
+    except ImportError:
+        return None
+    try:
+        return float(sf.info(str(path)).duration)
+    except Exception:
+        return None
 
 
 def _reject_path(source: Path) -> str | None:
@@ -153,12 +227,14 @@ def stage_attachment(source: Path, media_dir: Path) -> MediaAttachment:
     size = source.stat().st_size
 
     # Determine MIME type:
-    # 1. Sniff bytes (most reliable — catches extension spoofing).
+    # 1. Sniff bytes (most reliable — catches extension spoofing). Image and
+    #    audio signatures never overlap, so trying both in sequence is safe.
     # 2. Fall back to extension guess.
-    sniffed_mime = _sniff_image_mime(source)
+    sniffed_mime = _sniff_image_mime(source) or _sniff_audio_mime(source)
     ext_mime, _ = mimetypes.guess_type(str(source))
 
     mime = sniffed_mime or ext_mime or ""
+    duration_seconds: float | None = None
 
     if mime in ALLOWED_IMAGE_TYPES:
         kind = "image"
@@ -174,10 +250,23 @@ def stage_attachment(source: Path, media_dir: Path) -> MediaAttachment:
                 f"File '{source.name}' does not appear to be a valid image "
                 f"(extension suggests {ext_mime}, but bytes don't match)."
             )
+    elif mime in ALLOWED_AUDIO_TYPES:
+        kind = "audio"
+        if size > _MAX_AUDIO_BYTES:
+            raise ValueError(
+                f"Audio file too large: {size:,} bytes (max {_MAX_AUDIO_BYTES:,} bytes)."
+            )
+        if sniffed_mime is None:
+            raise ValueError(
+                f"File '{source.name}' does not appear to be a valid audio file "
+                f"(extension suggests {ext_mime}, but bytes don't match)."
+            )
+        duration_seconds = _probe_audio_duration(source)
     else:
         raise ValueError(
             f"Unsupported file type '{mime or 'unknown'}' for '{source.name}'. "
-            f"Supported: {', '.join(sorted(ALLOWED_IMAGE_TYPES))}"
+            f"Supported images: {', '.join(sorted(ALLOWED_IMAGE_TYPES))}. "
+            f"Supported audio: {', '.join(sorted(ALLOWED_AUDIO_TYPES))}."
         )
 
     # Compute sha256 of file content to generate a stable, collision-resistant ID.
@@ -205,13 +294,20 @@ def stage_attachment(source: Path, media_dir: Path) -> MediaAttachment:
         media_type=mime,
         size_bytes=size,
         source_name=source.name,
+        duration_seconds=duration_seconds,
     )
 
 
 def describe_attachment(att: MediaAttachment) -> str:
-    """Return a short human-readable description for REPL display.
+    """Return a short human-readable description for REPL/TUI display.
 
     Example output: "screenshot.png (image/png, 142 KB)"
+             or:     "voice-memo.wav (audio/wav, 812 KB, 12.3s)"
     """
     size_kb = att.size_bytes / 1024
+    if att.duration_seconds is not None:
+        return (
+            f"{att.source_name} ({att.media_type}, {size_kb:.0f} KB, "
+            f"{att.duration_seconds:.1f}s)"
+        )
     return f"{att.source_name} ({att.media_type}, {size_kb:.0f} KB)"

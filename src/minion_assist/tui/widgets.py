@@ -1,13 +1,21 @@
-"""Modal screens replacing minion.py's console-based human-in-the-loop callbacks.
+"""Modal screens for tui/app.py.
 
-The plain REPL's ``_console_approve``/``_console_confirm``/``_console_ask_user``/
-``_console_approve_codex`` (in ``minion.py``) use ``print()``/``input()``. Those
-don't work inside a Textual app — Textual puts the terminal in raw mode and
-owns all keyboard input itself, so a blocking ``input()`` call would never see
-a keystroke. These ``ModalScreen`` subclasses are the TUI-native equivalent of
-the same four prompts, with identical decision semantics (same options, same
-defaults) — ``tui/app.py`` wires them in via ``push_screen_wait`` instead of
-the console versions.
+Two categories:
+
+1. Console-callback replacements — the plain REPL's ``_console_approve``/
+   ``_console_confirm``/``_console_ask_user``/``_console_approve_codex``
+   (in ``minion.py``) use ``print()``/``input()``. Those don't work inside
+   a Textual app — Textual puts the terminal in raw mode and owns all
+   keyboard input itself, so a blocking ``input()`` call would never see a
+   keystroke. These ``ModalScreen`` subclasses are the TUI-native
+   equivalent of the same four prompts, with identical decision semantics
+   (same options, same defaults) — ``tui/app.py`` wires them in via
+   ``push_screen_wait`` instead of the console versions.
+
+2. ``AttachFilePickerModal`` (Phase 2) — an interactive file browser for
+   ``/attach`` used with no path argument, wrapping Textual's built-in
+   ``DirectoryTree`` widget instead of requiring the user to type a full
+   path.
 
 All dynamic text shown in these modals (shell commands, tool call arguments,
 questions) comes from the LLM or the user's own input and is rendered via
@@ -20,11 +28,13 @@ misinterpreted as a style tag.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Static
+from textual.widgets import Button, DirectoryTree, Input, Static
 
 from ..tools.audit import ApprovalDecision
 
@@ -173,3 +183,40 @@ class CodexApprovalModal(ModalScreen[str]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         assert event.button.id is not None
         self.dismiss(event.button.id)
+
+
+class AttachFilePickerModal(ModalScreen["Path | None"]):
+    """Interactive file browser for ``/attach`` used with no path argument.
+
+    Enter (or double-click) on a file selects it and dismisses with its
+    path; Escape cancels and dismisses with ``None``. Directories expand/
+    collapse as normal DirectoryTree navigation — only file selection
+    dismisses this screen.
+    """
+
+    CSS = _MODAL_CSS + """
+    AttachFilePickerModal DirectoryTree {
+        width: 80;
+        height: 20;
+    }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, start_path: Path | None = None) -> None:
+        super().__init__()
+        self._start_path = start_path or Path.cwd()
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static("Select a file to attach (Esc to cancel)")
+            yield DirectoryTree(str(self._start_path))
+
+    def on_mount(self) -> None:
+        self.query_one(DirectoryTree).focus()
+
+    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        event.stop()
+        self.dismiss(event.path)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

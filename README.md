@@ -555,6 +555,8 @@ Ada: The screenshot shows ...
 
 **Matrix:** sending an image (with or without a caption) in a Matrix room works the same way, no `/attach` needed — the bot downloads the file from the homeserver's media repository and stages it into the same `{workspace}/attachments/` store. A caption becomes the accompanying text prompt; a caption-less image is sent with a placeholder prompt so the model still describes it. If the download fails or the file is invalid/oversized, the bot replies in the room with the reason instead of silently ignoring the message.
 
+**Audio (TUI Phase 2):** `/attach` also accepts audio files (WAV, MP3, FLAC, OGG — 50 MB cap) in both the REPL and the [Terminal UI](#terminal-ui), staged the same way as images. No provider in this codebase understands an audio input block, so an attached audio file is never sent to the LLM as audio — its filename and duration are folded into the prompt text instead (`make_user_content()` in `messages.py`), the same way a caption-less image gets a placeholder prompt. The waveform preview and **Play** button are TUI-only; the REPL stages and describes audio files but has no local playback UI.
+
 ---
 
 ## MCP Servers
@@ -1153,7 +1155,9 @@ minion-assist --tui
 
 A full-screen chat interface (built on [Textual](https://github.com/Textualize/textual)) alongside the plain REPL — same agents, same sessions, same slash commands, same memory/tool stack; only the presentation layer differs. The plain REPL remains the default (`minion-assist` with no flags) and needs no extra dependency.
 
-**Phase 1 scope:** a core chat shell — scrollback chat pane with rendered markdown, single-line composer with slash-command suggestions, streaming responses, and TUI-native modal replacements for every console prompt (bash approval, git-commit confirmation, `AskUserTool` questions, Codex permission requests) so tool use works identically to the REPL. Inline image/audio rendering and a sidebar/status bar are planned for later phases — not yet implemented.
+**Phase 1 (core chat shell):** scrollback chat pane with rendered markdown, single-line composer with slash-command suggestions, streaming responses, and TUI-native modal replacements for every console prompt (bash approval, git-commit confirmation, `AskUserTool` questions, Codex permission requests) so tool use works identically to the REPL.
+
+**Phase 2 (multimedia):** images and audio attached to a turn render inline in the chat log, and `/attach` gained an interactive file picker. A sidebar/status bar are planned for a later phase — not yet implemented.
 
 **Details:**
 - Every slash command (`/new`, `/attach`, `/status`, `/session`, etc.) works exactly as in the REPL — `tui/app.py` dispatches through the same `commands.py` machinery the REPL and Matrix channel already share, not a separate reimplementation.
@@ -1161,13 +1165,21 @@ A full-screen chat interface (built on [Textual](https://github.com/Textualize/t
 - Bash commands, git commits, `AskUserTool` questions, and Codex tool-permission requests all show as a modal dialog instead of a `print()`/`input()` prompt (which cannot be used once the terminal is in raw mode) — same options and same defaults as the REPL's console prompts.
 - `Ctrl+C`/`Ctrl+Q` or typing `/quit` exits.
 
+**Attachments (Phase 2):**
+- `/attach <path>` stages a file exactly as in the REPL. `/attach` with **no path** opens an interactive file browser (`Esc` to cancel, `Enter` to select) instead of requiring a typed path.
+- Images render inline in the chat log via [textual-image](https://github.com/lnqs/textual-image) (Kitty Terminal Graphics Protocol or Sixel, falling back to Unicode half-block rendering on terminals that support neither).
+- Audio files get a waveform preview and a **Play** button (local playback via the existing voice pipeline's `sounddevice` output — requires the `voice` extra too: `uv sync --extra voice`). Audio is **not** sent to the LLM — no provider in this codebase understands an audio input block yet — its filename and duration are folded into the prompt text instead, so the model at least knows the file was attached.
+- Supported audio formats: WAV, MP3, FLAC, OGG (50 MB cap — generous versus images' 15 MB, since audio is never base64-encoded into a provider request).
+
 ### Module layout
 
 ```
 src/minion_assist/tui/
 ├── __init__.py
-├── app.py       # MinionApp — chat log, composer, turn dispatch, console-callback bridges
-└── widgets.py    # ApprovalModal, ConfirmModal, AskUserModal, CodexApprovalModal
+├── app.py                   # MinionApp — chat log, composer, turn dispatch, console-callback bridges
+├── widgets.py                # ApprovalModal, ConfirmModal, AskUserModal, CodexApprovalModal, AttachFilePickerModal
+├── attachment_widgets.py     # ImageAttachmentView, AudioAttachmentView (inline chat-log rendering)
+└── waveform.py                # build_waveform() — audio -> downsampled amplitude envelope for the preview
 ```
 
 ---
@@ -2973,7 +2985,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **3201 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **3230 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic
@@ -2999,7 +3011,7 @@ uv sync --extra tiktoken         # + tiktoken for accurate token estimation
 uv sync --extra postgres         # + psycopg3 + watchdog + pgvector for session store & memory index
 uv sync --extra browser          # + playwright for browser tool
 uv sync --extra voice            # + silero-vad, sounddevice, torch, transformers for voice chat
-uv sync --extra tui              # + textual for the full-screen terminal UI (--tui)
+uv sync --extra tui              # + textual, textual-image, soundfile for the full-screen terminal UI (--tui)
 uv sync --extra tiktoken --extra postgres  # combine any extras
 uv add <package>                 # add a runtime dependency
 uv add --dev <package>           # add a dev dependency

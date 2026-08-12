@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from minion_assist.media import (
+    ALLOWED_AUDIO_TYPES,
     MediaAttachment,
     describe_attachment,
     stage_attachment,
@@ -67,6 +68,23 @@ def jpeg_file(tmp_path: Path) -> Path:
     """Write a minimal JPEG to a temp file and return its path."""
     p = tmp_path / "photo.jpg"
     p.write_bytes(MINIMAL_JPEG)
+    return p
+
+
+@pytest.fixture()
+def wav_file(tmp_path: Path) -> Path:
+    """Write a real, decodable 0.5s silent WAV via soundfile and return its path.
+
+    Unlike the image fixtures above (hand-written magic bytes are enough,
+    since only the signature is ever sniffed), duration probing actually
+    opens and parses the file — it needs a genuinely valid WAV structure,
+    not just a RIFF/WAVE header.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    p = tmp_path / "memo.wav"
+    sf.write(str(p), np.zeros(22050, dtype="float32"), 44100)
     return p
 
 
@@ -127,6 +145,66 @@ class TestStageAttachmentHappyPath:
         att1 = stage_attachment(png_file, tmp_store)
         att2 = stage_attachment(png_file, tmp_store)
         assert att1.path == att2.path
+
+
+# ---------------------------------------------------------------------------
+# stage_attachment — audio (TUI Phase 2)
+# ---------------------------------------------------------------------------
+
+class TestStageAttachmentAudio:
+    def test_kind_is_audio(self, wav_file, tmp_store):
+        att = stage_attachment(wav_file, tmp_store)
+        assert att.kind == "audio"
+
+    def test_media_type_is_wav(self, wav_file, tmp_store):
+        att = stage_attachment(wav_file, tmp_store)
+        assert att.media_type in ALLOWED_AUDIO_TYPES
+
+    def test_duration_is_probed(self, wav_file, tmp_store):
+        att = stage_attachment(wav_file, tmp_store)
+        # 22050 samples at 44100 Hz = 0.5s.
+        assert att.duration_seconds == pytest.approx(0.5, abs=0.01)
+
+    def test_staged_file_exists_on_disk(self, wav_file, tmp_store):
+        att = stage_attachment(wav_file, tmp_store)
+        assert att.path.exists()
+
+    def test_image_attachment_has_no_duration(self, png_file, tmp_store):
+        att = stage_attachment(png_file, tmp_store)
+        assert att.duration_seconds is None
+
+    def test_rejects_audio_file_with_wrong_bytes_for_extension(self, tmp_path, tmp_store):
+        fake_wav = tmp_path / "disguised.wav"
+        fake_wav.write_bytes(b"PK\x03\x04" + b"\x00" * 50)  # ZIP magic
+        with pytest.raises(ValueError, match="does not appear to be a valid audio file"):
+            stage_attachment(fake_wav, tmp_store)
+
+    def test_rejects_too_large_audio_file(self, tmp_path, tmp_store):
+        from minion_assist.media import _MAX_AUDIO_BYTES
+
+        big = tmp_path / "big.wav"
+        # RIFF/WAVE signature is enough to pass the sniff check that runs
+        # before the size check — the file never needs to be a fully valid
+        # WAV for this particular rejection to fire.
+        header = b"RIFF" + b"\x00" * 4 + b"WAVE"
+        big.write_bytes(header + b"\x00" * (_MAX_AUDIO_BYTES + 1))
+        with pytest.raises(ValueError, match="too large"):
+            stage_attachment(big, tmp_store)
+
+    def test_duration_probing_failure_does_not_fail_staging(self, tmp_path, tmp_store, monkeypatch):
+        """A soundfile probing error must never block staging — duration is
+        purely informational metadata, not a validation gate."""
+        import minion_assist.media as media_mod
+
+        monkeypatch.setattr(media_mod, "_probe_audio_duration", lambda path: None)
+        header = b"RIFF" + b"\x00" * 4 + b"WAVE"
+        wav = tmp_path / "unparseable.wav"
+        wav.write_bytes(header + b"\x00" * 100)
+
+        att = stage_attachment(wav, tmp_store)
+
+        assert att.kind == "audio"
+        assert att.duration_seconds is None
 
 
 # ---------------------------------------------------------------------------
@@ -213,3 +291,14 @@ class TestDescribeAttachment:
         desc = describe_attachment(att)
         # Expected: "test.png (image/png, N KB)"
         assert "(" in desc and ")" in desc
+
+    def test_audio_description_includes_duration(self, wav_file, tmp_store):
+        att = stage_attachment(wav_file, tmp_store)
+        desc = describe_attachment(att)
+        assert "memo.wav" in desc
+        assert "0.5s" in desc
+
+    def test_image_description_has_no_duration_suffix(self, png_file, tmp_store):
+        att = stage_attachment(png_file, tmp_store)
+        desc = describe_attachment(att)
+        assert "s)" not in desc

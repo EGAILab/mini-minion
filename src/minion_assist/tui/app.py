@@ -51,7 +51,14 @@ from ..agents.events import (
 from ..commands import CommandContext, dispatch_command, parse_command
 from ..media import MediaAttachment, describe_attachment, stage_attachment
 from ..tools.audit import ApprovalDecision
-from .widgets import ApprovalModal, AskUserModal, CodexApprovalModal, ConfirmModal
+from .attachment_widgets import AudioAttachmentView, ImageAttachmentView, PlayAudioRequested
+from .widgets import (
+    ApprovalModal,
+    AskUserModal,
+    AttachFilePickerModal,
+    CodexApprovalModal,
+    ConfirmModal,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -175,16 +182,17 @@ class MinionApp(App[None]):
             self.exit()
             return
 
-        # --- Attachment commands — same three as the REPL, same _media_dir. ---
+        # --- Attachment commands — same three as the REPL, same _media_dir,
+        # plus (Phase 2) an interactive file picker when /attach is used
+        # with no path argument. ---
+        if user_input.strip().lower() == "/attach":
+            self._open_attach_picker()
+            return
+
         if user_input.lower().startswith("/attach "):
             paths_str = user_input[len("/attach "):].strip()
             for p in paths_str.split():
-                try:
-                    att = stage_attachment(Path(p), self._media_dir)
-                    self._pending_attachments[self._active_agent_id].append(att)
-                    self._log_system(f"Attached: {describe_attachment(att)}")
-                except (ValueError, FileNotFoundError) as exc:
-                    self._log_system(f"Error: {exc}", error=True)
+                self._stage_and_report(Path(p))
             return
 
         if user_input.strip().lower() == "/attachments":
@@ -249,9 +257,37 @@ class MinionApp(App[None]):
         atts = self._pending_attachments.get(agent_id, [])
         self._pending_attachments[agent_id] = []
 
-        self._log_user(message)
+        self._log_user(message, atts)
         self.query_one("#composer", Input).disabled = True
         self.run_turn(agent_id, message, atts or None)
+
+    def _stage_and_report(self, path: Path) -> None:
+        """Stage one file and report the outcome to the chat log.
+
+        Shared by both /attach <path> and the file-picker's result — the
+        exact same validation/staging path (media.stage_attachment) either
+        way, only how the path was obtained differs.
+        """
+        try:
+            att = stage_attachment(path, self._media_dir)
+            self._pending_attachments[self._active_agent_id].append(att)
+            self._log_system(f"Attached: {describe_attachment(att)}")
+        except (ValueError, FileNotFoundError) as exc:
+            self._log_system(f"Error: {exc}", error=True)
+
+    @work
+    async def _open_attach_picker(self) -> None:
+        """Open the file-picker modal for a bare /attach and stage the result.
+
+        @work (not @work(thread=True)): this only awaits a screen dismissal,
+        no blocking I/O — push_screen_wait must run inside a worker context
+        (it raises NoActiveWorker otherwise, verified directly against
+        Textual's own source), but there's no reason to pay for a second OS
+        thread just to await a UI event on the main event loop.
+        """
+        path = await self.push_screen_wait(AttachFilePickerModal())
+        if path is not None:
+            self._stage_and_report(path)
 
     # ------------------------------------------------------------------
     # Agent turn execution (background thread) + chat log rendering (main
@@ -343,16 +379,52 @@ class MinionApp(App[None]):
 
         log.scroll_end(animate=False)
 
-    def _log_user(self, text: str) -> None:
+    def _log_user(self, text: str, attachments: Sequence[MediaAttachment] | None = None) -> None:
         log = self.query_one("#chat-log", VerticalScroll)
         log.mount(Static(Text("You:", style="bold cyan")))
         log.mount(Static(Text(text)))
+        for att in attachments or []:
+            if att.kind == "image":
+                log.mount(ImageAttachmentView(att))
+            elif att.kind == "audio":
+                log.mount(AudioAttachmentView(att))
         log.scroll_end(animate=False)
 
     def _log_system(self, text: str, error: bool = False) -> None:
         log = self.query_one("#chat-log", VerticalScroll)
         log.mount(Static(Text(text, style="red" if error else "dim")))
         log.scroll_end(animate=False)
+
+    # ------------------------------------------------------------------
+    # Audio playback (Phase 2) — AudioAttachmentView's Play button posts
+    # PlayAudioRequested, which bubbles up here regardless of which turn
+    # (or how long ago) the attachment was mounted.
+    # ------------------------------------------------------------------
+
+    def on_play_audio_requested(self, event: PlayAudioRequested) -> None:
+        event.stop()
+        self.play_audio_file(event.path)
+
+    @work(thread=True)
+    def play_audio_file(self, path: Path) -> None:
+        """Decode and play a staged audio file — local-only, never sent to the LLM.
+
+        Runs in a thread because both the decode (soundfile) and the
+        playback itself (sounddevice's blocking sd.wait(), inside
+        voice.audio.play_audio) would otherwise freeze the UI for the
+        clip's full duration.
+        """
+        try:
+            import soundfile as sf  # noqa: PLC0415 — optional dependency (tui extra)
+
+            from ..voice.audio import (
+                play_audio,  # noqa: PLC0415 — optional dependency (voice extra)
+            )
+
+            samples, samplerate = sf.read(str(path), dtype="float32")
+            play_audio(samples, samplerate)
+        except Exception as exc:
+            self.call_from_thread(self._log_system, f"Couldn't play audio: {exc}", True)
 
     # ------------------------------------------------------------------
     # Console-callback replacements — one pair (sync entry point called

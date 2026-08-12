@@ -43,7 +43,8 @@ from minion_assist.agents.events import (
 )
 from minion_assist.tools.audit import ApprovalDecision
 from minion_assist.tui.app import MinionApp
-from minion_assist.tui.widgets import ApprovalModal
+from minion_assist.tui.attachment_widgets import AudioAttachmentView, ImageAttachmentView
+from minion_assist.tui.widgets import ApprovalModal, AttachFilePickerModal
 
 
 def _run(coro):
@@ -234,7 +235,14 @@ class TestAttachments:
         async def _test():
             media_dir = tmp_path / "attachments"
             image_path = tmp_path / "shot.png"
-            image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 24)
+            # A genuinely decodable image, not just a valid PNG signature:
+            # once sent, this attachment is rendered inline via
+            # ImageAttachmentView -> textual_image, which actually opens
+            # the file through Pillow (unlike media.py's own sniff check,
+            # which only reads the first 12 bytes).
+            from PIL import Image as PILImage
+
+            PILImage.new("RGB", (2, 2)).save(image_path)
 
             session = _FakeSession()
             app = _configured_app(session, media_dir)
@@ -357,5 +365,243 @@ class TestConsoleCallbackModals:
                 decision = await worker.wait()
 
             assert decision == "deny"
+
+        _run(_test())
+
+
+class TestAttachmentRendering:
+    """Phase 2: attachments sent with a turn render inline in the chat log."""
+
+    def test_image_attachment_renders_inline(self, tmp_path):
+        async def _test():
+            from PIL import Image as PILImage
+
+            media_dir = tmp_path / "attachments"
+            image_path = tmp_path / "shot.png"
+            # A genuinely decodable image — ImageAttachmentView opens it
+            # through Pillow (via textual-image), not just a signature check.
+            PILImage.new("RGB", (2, 2)).save(image_path)
+
+            session = _FakeSession()
+            app = _configured_app(session, media_dir)
+            async with app.run_test():
+                app._process_input(f"/attach {image_path}")
+                await app.workers.wait_for_complete()
+                app._process_input("look at this")
+                await app.workers.wait_for_complete()
+
+                assert len(app.query(ImageAttachmentView)) == 1
+
+        _run(_test())
+
+    def test_audio_attachment_renders_waveform_and_play_button(self, tmp_path):
+        async def _test():
+            import numpy as np
+            import soundfile as sf
+
+            media_dir = tmp_path / "attachments"
+            audio_path = tmp_path / "memo.wav"
+            sf.write(str(audio_path), np.zeros(4410, dtype="float32"), 44100)
+
+            session = _FakeSession()
+            app = _configured_app(session, media_dir)
+            async with app.run_test():
+                app._process_input(f"/attach {audio_path}")
+                await app.workers.wait_for_complete()
+                app._process_input("listen to this")
+                await app.workers.wait_for_complete()
+
+                views = app.query(AudioAttachmentView)
+                assert len(views) == 1
+
+        _run(_test())
+
+    def test_attachment_only_renders_on_the_turn_it_was_sent_with(self, tmp_path):
+        """Staging (/attach) alone must not render anything yet — only
+        actually sending a message with it does."""
+        async def _test():
+            from PIL import Image as PILImage
+
+            media_dir = tmp_path / "attachments"
+            image_path = tmp_path / "shot.png"
+            PILImage.new("RGB", (2, 2)).save(image_path)
+
+            session = _FakeSession()
+            app = _configured_app(session, media_dir)
+            async with app.run_test():
+                app._process_input(f"/attach {image_path}")
+                await app.workers.wait_for_complete()
+
+                assert len(app.query(ImageAttachmentView)) == 0
+
+        _run(_test())
+
+
+class TestFilePicker:
+    """Phase 2: bare /attach opens an interactive DirectoryTree picker."""
+
+    def test_bare_attach_opens_the_picker(self, tmp_path):
+        async def _test():
+            media_dir = tmp_path / "attachments"
+            session = _FakeSession()
+            app = _configured_app(session, media_dir)
+            async with app.run_test() as pilot:
+                app._process_input("/attach")
+                await pilot.pause()
+
+                assert isinstance(app.screen, AttachFilePickerModal)
+
+                # Clean up: cancel so run_test()'s teardown doesn't hang
+                # waiting on the still-open modal's worker.
+                await pilot.press("escape")
+                await asyncio.wait_for(app.workers.wait_for_complete(), timeout=5)
+
+        _run(_test())
+
+    def test_escape_cancels_without_staging_anything(self, tmp_path):
+        async def _test():
+            media_dir = tmp_path / "attachments"
+            session = _FakeSession()
+            app = _configured_app(session, media_dir)
+            async with app.run_test() as pilot:
+                app._process_input("/attach")
+                await pilot.pause()
+
+                await pilot.press("escape")
+                await asyncio.wait_for(app.workers.wait_for_complete(), timeout=5)
+
+                assert app._pending_attachments["main"] == []
+
+        _run(_test())
+
+    def test_selecting_a_file_stages_it(self, tmp_path, monkeypatch):
+        async def _test():
+            from PIL import Image as PILImage
+
+            media_dir = tmp_path / "attachments"
+            pick_dir = tmp_path / "pickme"
+            pick_dir.mkdir()
+            PILImage.new("RGB", (2, 2)).save(pick_dir / "chosen.png")
+
+            # _open_attach_picker() starts the browser at Path.cwd() with no
+            # override hook — pin it to a directory containing exactly one
+            # known file so keyboard navigation is deterministic.
+            monkeypatch.setattr(Path, "cwd", staticmethod(lambda: pick_dir))
+
+            session = _FakeSession()
+            app = _configured_app(session, media_dir)
+            async with app.run_test() as pilot:
+                app._process_input("/attach")
+                await pilot.pause()
+
+                from textual.widgets import DirectoryTree
+
+                # DirectoryTree lives on the modal screen, not the app's
+                # default screen — App.query_one() only searches the
+                # default screen, so this must go through app.screen
+                # (the currently active/topmost screen) instead.
+                tree = app.screen.query_one(DirectoryTree)
+                tree.focus()
+                await pilot.pause()
+                # The cursor starts on the root (the picked directory
+                # itself, "pickme") — "down" moves it onto the one file
+                # inside before "enter" selects it. Selecting the root
+                # itself would just toggle/expand it, never firing
+                # FileSelected.
+                await pilot.press("down")
+                await pilot.press("enter")
+                # Bounded wait, not a bare await: if FileSelected ever fails
+                # to fire again (e.g. a future DirectoryTree/Textual
+                # behavior change), _open_attach_picker's worker never
+                # completes and a bare wait_for_complete() hangs forever
+                # instead of failing — exactly what happened once while
+                # writing this test, before the "down" press above was
+                # added.
+                await asyncio.wait_for(app.workers.wait_for_complete(), timeout=5)
+                await pilot.pause()
+
+                assert len(app._pending_attachments["main"]) == 1
+                assert app._pending_attachments["main"][0].source_name == "chosen.png"
+
+        _run(_test())
+
+
+class TestAudioPlayback:
+    """Phase 2: AudioAttachmentView's Play button -> PlayAudioRequested ->
+    MinionApp.play_audio_file(). voice.audio.play_audio is mocked out —
+    that function's own real behavior (sounddevice I/O) is voice/audio.py's
+    own test's responsibility, not this one's."""
+
+    def test_play_button_triggers_playback(self, tmp_path, monkeypatch):
+        async def _test():
+            from unittest.mock import Mock
+
+            import numpy as np
+            import soundfile as sf
+
+            media_dir = tmp_path / "attachments"
+            audio_path = tmp_path / "memo.wav"
+            sf.write(str(audio_path), np.zeros(4410, dtype="float32"), 44100)
+
+            play_mock = Mock()
+            monkeypatch.setattr("minion_assist.voice.audio.play_audio", play_mock)
+
+            session = _FakeSession()
+            app = _configured_app(session, media_dir)
+            async with app.run_test() as pilot:
+                app._process_input(f"/attach {audio_path}")
+                await app.workers.wait_for_complete()
+                app._process_input("listen")
+                await app.workers.wait_for_complete()
+
+                view = app.query_one(AudioAttachmentView)
+                view.query_one("#play").press()
+                # press() only posts Button.Pressed; the chain of handlers
+                # that turns it into a running play_audio_file worker
+                # (on_button_pressed -> post_message(PlayAudioRequested) ->
+                # on_play_audio_requested -> self.play_audio_file(...)) needs
+                # at least one event-loop tick to run before that worker
+                # exists for wait_for_complete() to wait on — without this
+                # pause, wait_for_complete() can return immediately having
+                # found nothing to wait for yet.
+                await pilot.pause()
+                await asyncio.wait_for(app.workers.wait_for_complete(), timeout=5)
+
+            play_mock.assert_called_once()
+            samples_arg, samplerate_arg = play_mock.call_args[0]
+            assert samplerate_arg == 44100
+            assert len(samples_arg) == 4410
+
+        _run(_test())
+
+    def test_playback_failure_is_reported_not_raised(self, tmp_path, monkeypatch):
+        async def _test():
+            import numpy as np
+            import soundfile as sf
+
+            media_dir = tmp_path / "attachments"
+            audio_path = tmp_path / "memo.wav"
+            sf.write(str(audio_path), np.zeros(4410, dtype="float32"), 44100)
+
+            def _raise(*args, **kwargs):
+                raise RuntimeError("sounddevice not installed")
+
+            monkeypatch.setattr("minion_assist.voice.audio.play_audio", _raise)
+
+            session = _FakeSession()
+            app = _configured_app(session, media_dir)
+            async with app.run_test() as pilot:
+                app._process_input(f"/attach {audio_path}")
+                await app.workers.wait_for_complete()
+                app._process_input("listen")
+                await app.workers.wait_for_complete()
+
+                view = app.query_one(AudioAttachmentView)
+                view.query_one("#play").press()
+                # See the sibling test above for why this pause is needed.
+                await pilot.pause()
+                await asyncio.wait_for(app.workers.wait_for_complete(), timeout=5)
+
+                assert "Couldn't play audio" in _chat_log_text(app)
 
         _run(_test())

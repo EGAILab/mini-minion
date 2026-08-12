@@ -61,6 +61,18 @@ def _make_image_attachment(path: str, source_name: str = "test.png") -> MagicMoc
     return att
 
 
+def _make_audio_attachment(source_name: str = "memo.wav", duration_seconds=12.3) -> MagicMock:
+    """Build a fake MediaAttachment for testing make_user_content's audio handling."""
+    att = MagicMock()
+    att.kind = "audio"
+    att.media_type = "audio/wav"
+    att.path = f"/tmp/{source_name}"
+    att.size_bytes = 100
+    att.source_name = source_name
+    att.duration_seconds = duration_seconds
+    return att
+
+
 def _make_image_block(source_name: str = "shot.png", path: str = "/tmp/shot.png") -> dict:
     return {
         "type": "image",
@@ -275,14 +287,41 @@ class TestMakeUserContent:
         image_blocks = [b for b in result if b.get("type") == "image"]
         assert len(image_blocks) == 2
 
-    def test_non_image_attachments_skipped(self):
-        # Non-image kind attachments are ignored (audio not supported in slice 1).
-        att = MagicMock()
-        att.kind = "audio"
+    def test_audio_only_attachment_folds_into_text_not_a_block(self):
+        # Audio has no provider-side content-block representation (TUI
+        # Phase 2) — it must not be silently dropped, but it also must not
+        # produce an "image" block. No image blocks -> falls back to string.
+        att = _make_audio_attachment("memo.wav", duration_seconds=12.3)
         result = make_user_content("text only", [att])
-        # No image blocks → falls back to string.
         assert isinstance(result, str)
-        assert result == "text only"
+        assert "text only" in result
+        assert "memo.wav" in result
+        assert "12.3s" in result
+
+    def test_audio_attachment_with_no_text_uses_generic_default_prompt(self):
+        att = _make_audio_attachment("memo.wav")
+        result = make_user_content("", [att])
+        assert isinstance(result, str)
+        # Not the image-specific default — no image was attached.
+        assert "image" not in result.lower()
+        assert "memo.wav" in result
+
+    def test_audio_and_image_together_audio_folds_into_text_block(self):
+        image_att = _make_image_attachment("/tmp/test.png")
+        audio_att = _make_audio_attachment("memo.wav", duration_seconds=5.0)
+        result = make_user_content("look and listen", [image_att, audio_att])
+        assert isinstance(result, list)
+        assert result[0]["type"] == "text"
+        assert "memo.wav" in result[0]["text"]
+        assert "look and listen" in result[0]["text"]
+        # Exactly one image block — audio never becomes a block of its own.
+        assert sum(1 for b in result if b.get("type") == "image") == 1
+
+    def test_audio_attachment_without_duration_omits_duration_suffix(self):
+        att = _make_audio_attachment("memo.wav", duration_seconds=None)
+        result = make_user_content("text only", [att])
+        assert "memo.wav" in result
+        assert "s]" not in result  # no dangling "Ns]" duration suffix
 
     def test_image_block_has_path(self):
         att = _make_image_attachment("/abs/path/img.png")

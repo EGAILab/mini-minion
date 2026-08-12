@@ -197,6 +197,13 @@ def make_user_content(text: str, attachments: list) -> str | list:
     Block order: text first, then images.  Some models require at least one
     text block, so we always include one even for empty user messages.
 
+    Audio attachments (TUI Phase 2) have no provider-side content-block
+    representation — no provider in this codebase understands an audio
+    input block yet (see media.py's module docstring) — so instead of being
+    silently dropped, each one's filename/duration is folded into the text
+    block itself, e.g. "[Attached audio: memo.wav, 12.3s]". The model can't
+    hear it, but it isn't left unaware the file exists either.
+
     Args:
         text:        The user's typed message (may be empty).
         attachments: List of MediaAttachment objects from media.py.
@@ -208,15 +215,30 @@ def make_user_content(text: str, attachments: list) -> str | list:
     if not attachments:
         return text
 
-    blocks: list[dict] = []
+    has_image = any(att.kind == "image" for att in attachments)
+    audio_descriptions = [
+        "[Attached audio: " + att.source_name
+        + (f", {att.duration_seconds:.1f}s" if att.duration_seconds is not None else "")
+        + "]"
+        for att in attachments if att.kind == "audio"
+    ]
 
-    # Text block first — required by most vision models even if empty.
-    # Use a default prompt when the user typed nothing (avoids a blank message).
-    prompt_text = text.strip() if text.strip() else "Please analyze the attached image."
-    blocks.append({"type": "text", "text": prompt_text})
+    # Use a default prompt when the user typed nothing (avoids a blank
+    # message) — worded around whichever attachment kinds are actually
+    # present rather than always assuming an image.
+    if text.strip():
+        prompt_text = text.strip()
+    elif has_image:
+        prompt_text = "Please analyze the attached image."
+    else:
+        prompt_text = "Please review the attached file(s)."
+    if audio_descriptions:
+        prompt_text = "\n".join([prompt_text, *audio_descriptions])
 
-    # Add one image block per attachment.
-    # Only image kind is supported in slice 1 — future slices may add audio.
+    blocks: list[dict] = [{"type": "text", "text": prompt_text}]
+
+    # Add one image block per attachment. Audio attachments were already
+    # folded into the text block above — nothing further to append here.
     for att in attachments:
         if att.kind == "image":
             blocks.append({
@@ -227,8 +249,8 @@ def make_user_content(text: str, attachments: list) -> str | list:
                 "source_name": att.source_name,
             })
 
-    # If no image blocks were added (e.g. all attachments were non-image),
-    # fall back to a plain string so the provider sees normal content.
+    # If no image blocks were added (e.g. every attachment was audio-only),
+    # fall back to a plain string so the provider sees normal text content.
     if len(blocks) == 1:
         return blocks[0]["text"]
 
