@@ -1237,7 +1237,7 @@ On every startup minion-assist will:
 | Table | Description |
 |---|---|
 | `sessions` | One row per session: `id`, `agent_id`, `source`, `started_at`, `last_active`, `turn_count`, `title`, `parent_id` |
-| `messages` | Every message with a `tsvector` generated column for FTS, GIN-indexed. Columns: `id` (BIGSERIAL), `session_id`, `role`, `content`, `tool_name`, `timestamp`, `search_vector` |
+| `messages` | Every message with a `tsvector` generated column for FTS, GIN-indexed. Columns: `id` (BIGSERIAL), `session_id`, `role`, `content`, `tool_name`, `timestamp`, `search_vector` (uses PostgreSQL's language-neutral `'simple'` text-search config, not `'english'` — R2-GAP-012, so non-English text and stopwords aren't silently stemmed/dropped) |
 | `message_embeddings` | Optional — created only when pgvector is available **and** an `"embeddings"` provider is configured (MEM-GAP-006). `PRIMARY KEY (message_id, model_identity)` — a model/dimension change adds new rows under a new `model_identity` rather than requiring a destructive migration, same shape as `memory_chunk_embeddings` below. Vector width (`vector(N)`) parameterized by `embeddings.dimensions`. |
 | `message_embedding_jobs` | Durable one-job-per-message embedding queue (MEM-GAP-006), structurally identical to `memory_capture_jobs` below but `message_id` instead of a source range. Columns: `id` (BIGSERIAL), `agent_id`, `session_id`, `message_id`, `idempotency_key` (UNIQUE, `"{agent}:{message_id}:{model_identity}"`), `state`, `attempts`, `run_after`, `last_error`, `created_at`, `updated_at`. |
 | `message_mirrors` | Idempotency ledger, `PRIMARY KEY (session_id, event_id)`. Every mirror attempt is keyed by a message's stable `event_id` (see below) — mirroring the same message twice is a no-op, not a duplicate row. |
@@ -1332,7 +1332,7 @@ Without a configured database, `CaptureWorker` is never constructed and `AgentSe
 
 | Table | Description |
 |---|---|
-| `memory_chunks` | One row per indexed chunk. Columns: `id` (BIGSERIAL), `agent_id`, `source_kind` (`durable`/`daily`/`import`, plus `proposal` since Phase 5 slice B), `rel_path`, `chunk_index`, `heading_path`, `content`, `start_line`, `end_line`, `chunk_hash`, `search_vector` (weighted: heading text at FTS weight `A`, body at `B`). |
+| `memory_chunks` | One row per indexed chunk. Columns: `id` (BIGSERIAL), `agent_id`, `source_kind` (`durable`/`daily`/`import`, plus `proposal` since Phase 5 slice B), `rel_path`, `chunk_index`, `heading_path`, `content`, `start_line`, `end_line`, `chunk_hash`, `search_vector` (weighted: heading text at FTS weight `A`, body at `B`; uses the language-neutral `'simple'` text-search config, not `'english'` — R3-GAP-005, same fix as `messages.search_vector` above). |
 | `memory_files` | Per-file reconciliation ledger, `PRIMARY KEY (agent_id, rel_path)`. Same role as `message_mirrors` above: lets a later slice diff "what's on disk" against "what's indexed" by content hash rather than reindexing everything unconditionally. |
 | `memory_chunks_shadow`, `memory_files_shadow` | Scratch space for `force_rebuild_agent()`'s crash-safe rebuild-and-swap (Stage One Phase 3, slice C) — same shape as the tables above, minus the generated `search_vector` (never searched directly). Empty except during/just after a `minion-assist memory reindex --force` run. |
 
@@ -2996,7 +2996,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **3291 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **3293 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic

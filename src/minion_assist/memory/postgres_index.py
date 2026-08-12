@@ -590,6 +590,52 @@ def _migration_002_nullable_revision_proposal_id(conn) -> None:
     conn.execute("ALTER TABLE memory_topic_revisions ALTER COLUMN proposal_id DROP NOT NULL")
 
 
+def _migration_003_language_neutral_memory_fts(conn) -> None:
+    """Switch ``memory_chunks.search_vector`` from hardcoded 'english' to 'simple' (R3-GAP-005).
+
+    Parity fix for ``session/db.py``'s migration 008 (R2-GAP-012), which
+    did the same thing for ``messages.search_vector`` — that round's own
+    scope was explicitly session search only, per the original report's
+    evidence (see this codebase's design doc §4t). This closes the
+    matching gap in the *durable-memory* corpus (``MEMORY.md``/topics/
+    daily notes) — the other lexical-search surface in this codebase, and
+    the one the 2026-08-12 audit specifically flagged as still
+    inconsistent with session search's already-fixed configuration.
+
+    Same reasoning as migration 008: PostgreSQL's ``'english'`` text-search
+    configuration applies English stemming and stopword removal, hardcoded
+    with no way for a non-English deployment to get comparable lexical
+    recall. ``'simple'`` is PostgreSQL's built-in language-neutral
+    configuration — pure tokenization and lowercasing, no stemming, no
+    stopword removal, for any language using whitespace/punctuation-
+    delimited words — a real trade (English loses stemming) for genuine,
+    non-broken lexical search in any language.
+
+    A generated column's expression can't be altered in place
+    (``ALTER COLUMN ... SET EXPRESSION`` doesn't exist in PostgreSQL) —
+    dropping and recreating it is the only way, which also drops its GIN
+    index (recreated here too). One-time full table rewrite, acceptable as
+    a migration cost, same as migration 008's.
+
+    ``search()``'s own ``websearch_to_tsquery('english', ...)`` calls are
+    updated to ``'simple'`` in the same change — they must always match
+    whatever configuration built ``search_vector``, or FTS matching
+    breaks entirely (a stored-with-stemming column queried with a
+    non-stemmed term, or vice versa, simply won't align).
+    """
+    conn.execute("ALTER TABLE memory_chunks DROP COLUMN search_vector")
+    conn.execute("""
+        ALTER TABLE memory_chunks ADD COLUMN search_vector tsvector GENERATED ALWAYS AS (
+            setweight(to_tsvector('simple', coalesce(heading_path, '')), 'A') ||
+            setweight(to_tsvector('simple', coalesce(content, '')), 'B')
+        ) STORED
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_chunks_fts_idx "
+        "ON memory_chunks USING GIN (search_vector)"
+    )
+
+
 # Every migration PostgresMemoryIndex knows about, in the order they were
 # introduced. Append new migrations here — never edit an existing entry's
 # `apply` function once it has shipped (see _migration_001_baseline's
@@ -597,6 +643,7 @@ def _migration_002_nullable_revision_proposal_id(conn) -> None:
 _MEMORY_INDEX_MIGRATIONS = [
     Migration(1, "baseline", _migration_001_baseline),
     Migration(2, "nullable_revision_proposal_id", _migration_002_nullable_revision_proposal_id),
+    Migration(3, "language_neutral_memory_fts", _migration_003_language_neutral_memory_fts),
 ]
 
 
@@ -1831,10 +1878,10 @@ class PostgresMemoryIndex:
             f"""
             SELECT id, rel_path, source_kind, chunk_index, heading_path, content,
                    start_line, end_line,
-                   ts_rank(search_vector, websearch_to_tsquery('english', %s)) AS score
+                   ts_rank(search_vector, websearch_to_tsquery('simple', %s)) AS score
             FROM memory_chunks
             WHERE agent_id = %s
-              AND search_vector @@ websearch_to_tsquery('english', %s)
+              AND search_vector @@ websearch_to_tsquery('simple', %s)
               {corpus_sql}
             ORDER BY score DESC
             LIMIT %s

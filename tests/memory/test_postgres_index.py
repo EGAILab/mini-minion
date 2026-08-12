@@ -1240,6 +1240,37 @@ def test_search_only_searches_the_given_agent(index, agent_id):
         index.remove_file(other_agent, "MEMORY.md")
 
 
+def test_search_vector_uses_the_language_neutral_simple_config(index):
+    # R3-GAP-005: memory_chunks.search_vector must be generated with
+    # PostgreSQL's 'simple' text-search config (migration 003), not
+    # 'english' — mirrors R2-GAP-012's identical fix for messages.search_vector
+    # (see tests/test_session_db.py). This is the schema-level proof the
+    # migration actually took effect, independent of any single word's
+    # stemming/stopword behavior under either config.
+    row = index._conn().execute(
+        "SELECT pg_get_expr(ad.adbin, ad.adrelid) FROM pg_attrdef ad "
+        "JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum "
+        "WHERE a.attrelid = 'memory_chunks'::regclass AND a.attname = 'search_vector'"
+    ).fetchone()
+    assert row is not None
+    definition = row[0]
+    assert "'simple'" in definition
+    assert "'english'" not in definition
+
+
+def test_search_finds_a_stopword_that_english_config_would_have_dropped(index, agent_id):
+    # Functional proof, not just schema: PostgreSQL's 'english' config treats
+    # "the" as a stopword and strips it from both the indexed document and
+    # the query, so searching "the" would never match under 'english'.
+    # 'simple' keeps every token verbatim, so this only passes post-migration.
+    index.reindex_file(agent_id, "MEMORY.md", "durable", "the artifact is hidden in the vault")
+
+    results = index.search(agent_id, "the")
+
+    assert len(results) == 1
+    assert results[0]["rel_path"] == "MEMORY.md"
+
+
 # ---------------------------------------------------------------------------
 # index_summary
 # ---------------------------------------------------------------------------
