@@ -3004,4 +3004,7 @@ uv sync --extra tiktoken --extra postgres  # combine any extras
 uv add <package>                 # add a runtime dependency
 uv add --dev <package>           # add a dev dependency
 uv run <command>                 # run a command in the project environment
+uv sync --all-extras             # install every extra at once (matches this repo's own dev environment)
 ```
+
+**Gotcha:** `uv run` re-syncs the environment to match `uv.lock` whenever the lockfile has changed (e.g. after `git pull`, or after any `pyproject.toml` edit) — and if that particular `uv run`/`uv sync` invocation doesn't repeat the `--extra` flags you'd previously installed, it prunes those extras back out, not just leaves them alone. If you use multiple extras together (e.g. `postgres` + `voice` + `tui`), run `uv sync --all-extras` again after any dependency-related update rather than a bare `uv sync`/`uv run`, or every `uv run`/`uv sync` call will need to repeat every `--extra` you actually use.
