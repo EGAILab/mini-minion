@@ -557,6 +557,8 @@ Ada: The screenshot shows ...
 
 **Audio (TUI Phase 2):** `/attach` also accepts audio files (WAV, MP3, FLAC, OGG — 50 MB cap) in both the REPL and the [Terminal UI](#terminal-ui), staged the same way as images. No provider in this codebase understands an audio input block, so an attached audio file is never sent to the LLM as audio — its filename and duration are folded into the prompt text instead (`make_user_content()` in `messages.py`), the same way a caption-less image gets a placeholder prompt. The waveform preview and **Play** button are TUI-only; the REPL stages and describes audio files but has no local playback UI.
 
+**Database-backed image search (R3-GAP-002):** an attached image is always sent to the model directly (as above) — this is about what becomes *searchable later*. Before this, an image's PostgreSQL row only ever contained the message's typed text; the image itself was invisible to capture (fact extraction), session FTS, and session-search vectors. When a database is configured, sending an image now durably enqueues a captioning job (`image_captions` table) — a background `ImageCaptionWorker` asks that message's own agent to describe the image factually, then folds the description into the message's stored text (`[Image: name] <description>`), which PostgreSQL's full-text search picks up automatically and which invalidates any stale embedding so the next reconciliation pass re-embeds the message with the caption included. If the owning agent's configured model has no `"image"` in `inputModalities`, the job is marked `unsupported` (visible via a direct query, not a silent failure) rather than retried forever. No new config key — this runs automatically whenever a database is configured, the same "not an opt-in feature" precedent already used for other data-integrity workers (`capture_worker`, `message_embedding_worker`).
+
 ---
 
 ## MCP Servers
@@ -2994,7 +2996,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **3247 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **3291 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic

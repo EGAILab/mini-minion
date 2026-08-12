@@ -379,6 +379,7 @@ _KNOWN_WORKER_NAMES = (
     "capture_worker",
     "commitment_worker",
     "message_embedding_worker",
+    "image_caption_worker",
     "memory_watcher",
     "memory_reconciliation",
     "memory_consolidation",

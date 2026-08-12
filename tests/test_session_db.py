@@ -2393,6 +2393,221 @@ def test_fail_message_embedding_job_gives_up_after_max_attempts(db, session_id):
     assert row[0] == "failed"
 
 
+# --- image_captions (R3-GAP-002) ---
+# Same claim/complete/fail shape as message_embedding_jobs above, plus
+# complete_image_caption_job's two extra effects: folding the caption into
+# messages.content (so FTS/capture see it with zero changes to either) and
+# invalidating any stale pre-existing embedding.
+
+def test_enqueue_image_caption_returns_a_job_id(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "what is this?")
+
+    job_id = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    assert job_id is not None
+
+
+def test_enqueue_image_caption_is_idempotent(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "what is this?")
+    key = f"cap-{session_id}"
+
+    first = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=key,
+    )
+    second = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=key,
+    )
+
+    assert first is not None
+    assert second is None
+
+
+def test_claim_next_image_caption_job_returns_the_enqueued_job(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "what is this?")
+    job_id = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    claimed = db.claim_next_image_caption_job()
+
+    # The queue is global (like every other job lane here) — some other
+    # pending row from the shared dev database could be claimed first, so
+    # only assert on our own job if it happens to be the one claimed.
+    if claimed is not None and claimed["id"] == job_id:
+        assert claimed["agent_id"] == "main"
+        assert claimed["session_id"] == session_id
+        assert claimed["message_id"] == message_id
+        assert claimed["path"] == "/tmp/shot.png"
+        assert claimed["media_type"] == "image/png"
+        assert claimed["source_name"] == "shot.png"
+        assert claimed["attempts"] == 0
+
+
+def test_complete_image_caption_job_marks_done_and_stores_caption(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "what is this?")
+    job_id = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    db.complete_image_caption_job(job_id, message_id, "shot.png", "A whiteboard diagram.")
+
+    row = db._conn().execute(
+        "SELECT state, caption FROM image_captions WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "done"
+    assert row[1] == "A whiteboard diagram."
+
+
+def test_complete_image_caption_job_folds_caption_into_message_content(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "what is this?")
+    job_id = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    db.complete_image_caption_job(job_id, message_id, "shot.png", "A whiteboard diagram.")
+
+    content = db._conn().execute(
+        "SELECT content FROM messages WHERE id = %s", (message_id,)
+    ).fetchone()[0]
+    assert "what is this?" in content
+    assert "[Image: shot.png]" in content
+    assert "A whiteboard diagram." in content
+
+
+def test_complete_image_caption_job_handles_no_original_text(db, session_id):
+    """An image sent with no typed caption still mirrors a row (content is
+    NULL) — completing the caption job must not choke on that NULL."""
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", None)
+    job_id = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    db.complete_image_caption_job(job_id, message_id, "shot.png", "A whiteboard diagram.")
+
+    content = db._conn().execute(
+        "SELECT content FROM messages WHERE id = %s", (message_id,)
+    ).fetchone()[0]
+    assert content == "[Image: shot.png] A whiteboard diagram."
+
+
+def test_complete_image_caption_job_makes_the_message_findable_by_fts(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "check this out")
+    job_id = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    db.complete_image_caption_job(job_id, message_id, "shot.png", "architecture topology diagram")
+
+    results = db.search_messages("topology", "main")
+    assert any(r["id"] == message_id for r in results)
+
+
+def test_complete_image_caption_job_invalidates_a_stale_embedding(db_with_vector, session_id):
+    db_with_vector.upsert_session(session_id, "main")
+    message_id = db_with_vector.add_message(session_id, "user", "what is this?")
+    embed_job = db_with_vector.enqueue_message_embedding_job(
+        "main", session_id, message_id, idempotency_key=f"emb-{session_id}"
+    )
+    db_with_vector.complete_message_embedding_job(
+        embed_job, message_id, "test-endpoint::test-model", [0.1, 0.2, 0.3]
+    )
+    cap_job = db_with_vector.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    db_with_vector.complete_image_caption_job(cap_job, message_id, "shot.png", "A diagram.")
+
+    remaining = db_with_vector._conn().execute(
+        "SELECT count(*) FROM message_embeddings WHERE message_id = %s", (message_id,)
+    ).fetchone()[0]
+    assert remaining == 0
+
+
+def test_mark_image_caption_unsupported_is_a_terminal_state(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "what is this?")
+    job_id = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    db.mark_image_caption_unsupported(job_id, "agent provider has no image input modality")
+
+    row = db._conn().execute(
+        "SELECT state, last_error FROM image_captions WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "unsupported"
+    assert "image input modality" in row[1]
+
+
+def test_fail_image_caption_job_retries_with_backoff(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "what is this?")
+    job_id = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    db.fail_image_caption_job(job_id, "boom", backoff_seconds=60.0, max_attempts=5)
+
+    row = db._conn().execute(
+        "SELECT state, attempts, last_error FROM image_captions WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "pending"
+    assert row[1] == 1
+    assert row[2] == "boom"
+
+
+def test_fail_image_caption_job_gives_up_after_max_attempts(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "what is this?")
+    job_id = db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    db.fail_image_caption_job(job_id, "boom", backoff_seconds=0.0, max_attempts=1)
+
+    row = db._conn().execute(
+        "SELECT state FROM image_captions WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row[0] == "failed"
+
+
+def test_delete_session_removes_image_captions(db, session_id):
+    db.upsert_session(session_id, "main")
+    message_id = db.add_message(session_id, "user", "what is this?")
+    db.enqueue_image_caption(
+        "main", session_id, message_id, "/tmp/shot.png", "image/png", "shot.png",
+        idempotency_key=f"cap-{session_id}",
+    )
+
+    db.delete_session("main", session_id)
+
+    remaining = db._conn().execute(
+        "SELECT count(*) FROM image_captions WHERE session_id = %s", (session_id,)
+    ).fetchone()[0]
+    assert remaining == 0
+
+
 # --- find_uncovered_message_ids_for_embedding (R2-GAP-002/R2-GAP-005) ---
 # Checks message_embeddings directly for the active model, not a job-table
 # cursor -- needs db_with_vector (a configured provider), not the plain

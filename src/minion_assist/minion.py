@@ -1008,6 +1008,24 @@ def main() -> None:
         )
         _message_embedding_worker.start()
 
+    # --- Durable image-caption worker (optional — only when a database is
+    # configured) ---
+    # R3-GAP-002 (2026-08-12 audit). One worker for the whole process, same
+    # shape as _capture_worker above — looks up the right already-constructed
+    # provider per job via _providers_by_agent, plus agents_cfg so it can
+    # tell up front whether a job's owning agent even has an image-capable
+    # model configured (see image_caption_worker.py's module docstring for
+    # why that check lives in the worker, not here).
+    _image_caption_worker = None
+    if _db is not None:
+        from .memory.image_caption_worker import ImageCaptionWorker  # noqa: PLC0415
+        worker_health["image_caption_worker"] = WorkerHealth("image_caption_worker")
+        _image_caption_worker = ImageCaptionWorker(
+            _db, agents_cfg, lambda aid: _providers_by_agent[aid],
+            health=worker_health["image_caption_worker"],
+        )
+        _image_caption_worker.start()
+
     # --- Memory index watcher (optional — only when a database is configured) ---
     # Stage One Phase 3, slice B: catches on-disk edits made outside the app
     # (e.g. hand-editing MEMORY.md in a text editor). Write-path sync already
@@ -1275,6 +1293,8 @@ def main() -> None:
             _commitment_worker.stop()
         if _message_embedding_worker is not None:
             _message_embedding_worker.stop()
+        if _image_caption_worker is not None:
+            _image_caption_worker.stop()
         if _memory_watcher is not None:
             _memory_watcher.stop()
         if _memory_reconciliation is not None:
@@ -1375,6 +1395,8 @@ def main() -> None:
                 _commitment_worker.stop()
             if _message_embedding_worker is not None:
                 _message_embedding_worker.stop()
+            if _image_caption_worker is not None:
+                _image_caption_worker.stop()
             if _memory_watcher is not None:
                 _memory_watcher.stop()
             if _memory_reconciliation is not None:
@@ -1415,6 +1437,8 @@ def main() -> None:
                 _commitment_worker.stop()
             if _message_embedding_worker is not None:
                 _message_embedding_worker.stop()
+            if _image_caption_worker is not None:
+                _image_caption_worker.stop()
             if _memory_watcher is not None:
                 _memory_watcher.stop()
             if _memory_reconciliation is not None:
@@ -1578,6 +1602,8 @@ def main() -> None:
             _commitment_worker.stop()
         if _message_embedding_worker is not None:
             _message_embedding_worker.stop()
+        if _image_caption_worker is not None:
+            _image_caption_worker.stop()
         if _memory_watcher is not None:
             _memory_watcher.stop()
         if _memory_reconciliation is not None:

@@ -827,6 +827,23 @@ class AgentSession:
                         context_generation=self._context_generation,
                         token_count=_mem_tokens,
                     ))
+                # R3-GAP-001 (2026-08-12 audit): proactive recall has no
+                # channel/session eligibility policy — every turn searches
+                # and injects the same agent-private corpus regardless of
+                # whether it's a private CLI/TUI session or a Matrix room
+                # other people can read. Deliberately deferred as a policy
+                # engine (see design/06-memory.md §5: single-user
+                # deployment, no separate-participant trust boundary to
+                # protect) — this log line is the accepted lightweight
+                # substitute, so a non-local injection is at least
+                # auditable after the fact instead of silent.
+                if channel not in (None, "cli", "tui"):
+                    _log.info(
+                        "Memory injected into non-local channel=%r "
+                        "(agent=%s, session=%s, keys=%r)",
+                        channel, self._agent_id, self._session_id,
+                        tuple(h.key for h in _injected_hits),
+                    )
         # Auto-inject active task context (architectural replacement for the
         # old "_TASK_SOUL_SUFFIX" instruction "call read_task at session start").
         # The agent sees current task progress on every turn without needing to
@@ -906,6 +923,25 @@ class AgentSession:
                 )
                 if _uid is not None:
                     _mirrored_ua_ids.append(_uid)
+                    # R3-GAP-002 (2026-08-12 audit): image attachments were
+                    # previously fully invisible to PostgreSQL —
+                    # _msg_text() strips every non-text content block
+                    # before mirror_message() ever sees the message, so
+                    # capture extraction/session search/FTS never saw so
+                    # much as a filename. Enqueue a durable captioning job
+                    # per image here (same try/except as the mirror call
+                    # above — never blocks the turn) so
+                    # ImageCaptionWorker can, asynchronously, generate a
+                    # searchable description and fold it into this exact
+                    # message's content later (session/db.py's
+                    # complete_image_caption_job).
+                    for _att in attachments or []:
+                        if _att.kind == "image":
+                            self._db.enqueue_image_caption(
+                                self._agent_id, self._session_id, _uid,
+                                str(_att.path), _att.media_type, _att.source_name,
+                                idempotency_key=f"{self._agent_id}:{_uid}:{_att.id}",
+                            )
                 if self._health is not None:
                     self._health.record_success()
             except Exception as _mirror_exc:

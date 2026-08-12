@@ -13,6 +13,7 @@ from minion_assist.agents.events import (
 )
 from minion_assist.agents.session import AgentSession, build_prompt_section
 from minion_assist.context import Compactor
+from minion_assist.media import MediaAttachment
 from minion_assist.memory.files import MemoryFileRepository
 from minion_assist.memory.models import MemoryHit
 from minion_assist.memory.service import MemoryService
@@ -700,6 +701,61 @@ def test_memory_injected_event_not_fired_when_nothing_matches(tmp_path):
     assert not [e for e in events if isinstance(e, MemoryInjected)]
 
 
+# ---------------------------------------------------------------------------
+# R3-GAP-001 (2026-08-12 audit): proactive recall has no channel/session
+# eligibility policy — deliberately deferred (single-user deployment, see
+# design/06-memory.md §5), but a non-local (Matrix) injection is logged as
+# the accepted lightweight substitute for a full policy engine.
+# ---------------------------------------------------------------------------
+
+def test_memory_injection_is_logged_for_a_non_local_channel(tmp_path, caplog):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert.")
+    session = _make_session_with_memory(tmp_path, memory)
+
+    with caplog.at_level("INFO", logger="minion_assist.agent_session"):
+        session.send("Tell me about Python", channel="!room:example.org")
+
+    assert any(
+        "Memory injected into non-local channel" in rec.message for rec in caplog.records
+    )
+    assert any("!room:example.org" in rec.message for rec in caplog.records)
+
+
+def test_memory_injection_is_not_logged_for_cli(tmp_path, caplog):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert.")
+    session = _make_session_with_memory(tmp_path, memory)
+
+    with caplog.at_level("INFO", logger="minion_assist.agent_session"):
+        session.send("Tell me about Python")  # channel defaults to None -> "cli"
+
+    assert not any("Memory injected into non-local channel" in rec.message for rec in caplog.records)
+
+
+def test_memory_injection_is_not_logged_for_tui(tmp_path, caplog):
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("python-facts", "User is a Python expert.")
+    session = _make_session_with_memory(tmp_path, memory)
+
+    with caplog.at_level("INFO", logger="minion_assist.agent_session"):
+        session.send("Tell me about Python", channel="tui")
+
+    assert not any("Memory injected into non-local channel" in rec.message for rec in caplog.records)
+
+
+def test_no_injection_no_log_even_for_a_non_local_channel(tmp_path, caplog):
+    """No memory matched -> nothing injected -> nothing to log, regardless
+    of channel."""
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    session = _make_session_with_memory(tmp_path, memory)
+
+    with caplog.at_level("INFO", logger="minion_assist.agent_session"):
+        session.send("hello", channel="!room:example.org")
+
+    assert not any("Memory injected" in rec.message for rec in caplog.records)
+
+
 def test_send_marks_injected_recall_telemetry_on_the_index(tmp_path):
     """Stage One Phase 5, slice A: send() must tell the index which surfaced result was injected."""
     mock_index = Mock()
@@ -1369,6 +1425,109 @@ def test_db_mirror_message_called_for_user_and_assistant(tmp_path):
     mirrored_event_ids = {call.args[1] for call in mock_db.mirror_message.call_args_list}
     history_event_ids = {m[EVENT_ID_KEY] for m in session.history}
     assert mirrored_event_ids == history_event_ids
+
+
+# ---------------------------------------------------------------------------
+# R3-GAP-002 (2026-08-12 audit): image attachments were fully invisible to
+# PostgreSQL — mirror_message() only ever saw the text half of the user's
+# message. A durable image_captions job must be enqueued per image
+# attachment, keyed to the message id mirror_message() just returned.
+# ---------------------------------------------------------------------------
+
+def _image_attachment(name="shot.png", att_id="abc12345") -> MediaAttachment:
+    return MediaAttachment(
+        id=att_id, kind="image", path=f"/tmp/{name}", media_type="image/png",
+        size_bytes=100, source_name=name,
+    )
+
+
+def _audio_attachment(name="memo.wav", att_id="def67890") -> MediaAttachment:
+    return MediaAttachment(
+        id=att_id, kind="audio", path=f"/tmp/{name}", media_type="audio/wav",
+        size_bytes=100, source_name=name, duration_seconds=3.0,
+    )
+
+
+def test_image_attachment_enqueues_a_caption_job(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=42)
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("what is this?", attachments=[_image_attachment()])
+
+    assert mock_db.enqueue_image_caption.called
+    call = mock_db.enqueue_image_caption.call_args
+    assert call.args[0] == "main"          # agent_id
+    assert call.args[1] == "test-session"  # session_id
+    assert call.args[2] == 42              # the mirrored message id
+    assert call.args[3] == "/tmp/shot.png"
+    assert call.args[4] == "image/png"
+    assert call.args[5] == "shot.png"
+    assert call.kwargs["idempotency_key"] == "main:42:abc12345"
+
+
+def test_multiple_image_attachments_enqueue_one_job_each(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=42)
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send(
+        "compare these",
+        attachments=[_image_attachment("a.png", "aaa"), _image_attachment("b.png", "bbb")],
+    )
+
+    assert mock_db.enqueue_image_caption.call_count == 2
+    keys = {c.kwargs["idempotency_key"] for c in mock_db.enqueue_image_caption.call_args_list}
+    assert keys == {"main:42:aaa", "main:42:bbb"}
+
+
+def test_audio_attachment_does_not_enqueue_a_caption_job(tmp_path):
+    """Audio already gets a text description folded in via make_user_content()
+    — no captioning pipeline needed or wanted for it."""
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=42)
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("listen to this", attachments=[_audio_attachment()])
+
+    assert not mock_db.enqueue_image_caption.called
+
+
+def test_no_attachments_does_not_enqueue_a_caption_job(tmp_path):
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=42)
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("hello")
+
+    assert not mock_db.enqueue_image_caption.called
+
+
+def test_caption_job_not_enqueued_when_message_was_already_mirrored(tmp_path):
+    """mirror_message() returning None means this exact (session, event_id)
+    was already mirrored (idempotent replay) — enqueueing again would just
+    rely on enqueue_image_caption's own idempotency key, but skipping the
+    call entirely when there's no new message id avoids a pointless DB
+    round-trip on every reconciliation replay of an already-processed turn."""
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=None)
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    session.send("what is this?", attachments=[_image_attachment()])
+
+    assert not mock_db.enqueue_image_caption.called
+
+
+def test_caption_enqueue_failure_does_not_crash_the_turn(tmp_path):
+    """Same 'never blocks the turn' guarantee as mirror_message() itself."""
+    mock_db = Mock()
+    mock_db.mirror_message = Mock(return_value=42)
+    mock_db.enqueue_image_caption = Mock(side_effect=RuntimeError("db down"))
+    session = _make_session_with_mock_db(tmp_path, mock_db)
+
+    result = session.send("what is this?", attachments=[_image_attachment()])
+
+    assert result is not None
 
 
 def test_second_turn_does_not_reassign_event_ids_from_first_turn(tmp_path):

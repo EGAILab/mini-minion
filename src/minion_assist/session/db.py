@@ -913,6 +913,68 @@ def _migration_008_language_neutral_fts(conn) -> None:
     )
 
 
+def _migration_009_image_captions(conn) -> None:
+    """Durable image-captioning queue (R3-GAP-002).
+
+    Before this, a user message's image attachments were fully invisible to
+    PostgreSQL: ``agents/session.py``'s ``_msg_text()`` strips every
+    non-text content block before ``mirror_message()`` ever sees the
+    message, so ``messages.content`` — the one thing capture extraction,
+    session FTS and session-search vectors all read — never contained so
+    much as a filename for an attached image. Audio attachments already
+    got a text description folded in via ``messages.py``'s
+    ``make_user_content()``; this closes the same gap for images.
+
+    Table shape mirrors ``message_embedding_jobs`` (same claim/complete/fail
+    lifecycle via ``FOR UPDATE SKIP LOCKED``), plus the attachment metadata
+    and eventual result inline — unlike embeddings, there is nowhere else
+    an image's path/media_type/source_name is already durably recorded in
+    this database, so this table has to carry both the queue state and the
+    payload, not just a foreign key to something that already exists.
+
+    ``state`` values: ``pending`` (queued), ``running`` (claimed),
+    ``done`` (captioned, ``caption`` set), ``unsupported`` (this agent's
+    provider isn't vision-capable — a terminal, non-retried state, not a
+    failure), ``failed`` (exhausted retries).
+
+    No pgvector/dimension-parameterized column here (unlike
+    ``message_embeddings``), so — unlike that table — this one belongs
+    inside the normal checksummed migration ledger, not
+    ``_ensure_schema()``'s dimension-parameterized bootstrap path.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_captions (
+            id               BIGSERIAL PRIMARY KEY,
+            agent_id         TEXT NOT NULL,
+            session_id       TEXT NOT NULL,
+            message_id       BIGINT NOT NULL,
+            path             TEXT NOT NULL,
+            media_type       TEXT NOT NULL,
+            source_name      TEXT NOT NULL,
+            idempotency_key  TEXT NOT NULL UNIQUE,
+            state            TEXT NOT NULL DEFAULT 'pending',
+            caption          TEXT,
+            attempts         INTEGER NOT NULL DEFAULT 0,
+            run_after        DOUBLE PRECISION NOT NULL,
+            last_error       TEXT,
+            created_at       DOUBLE PRECISION NOT NULL,
+            updated_at       DOUBLE PRECISION NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS image_captions_pending_idx
+        ON image_captions (state, run_after)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS image_captions_session_idx
+        ON image_captions (agent_id, session_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS image_captions_message_idx
+        ON image_captions (message_id)
+    """)
+
+
 # Every migration SessionDB knows about, in the order they were introduced.
 # Append new migrations here — never edit an existing entry's `apply`
 # function once it has shipped (see _migration_001_baseline's docstring).
@@ -925,6 +987,7 @@ _SESSION_DB_MIGRATIONS = [
     Migration(6, "range_based_job_coverage", _migration_006_range_based_job_coverage),
     Migration(7, "deletion_tombstones", _migration_007_deletion_tombstones),
     Migration(8, "language_neutral_fts", _migration_008_language_neutral_fts),
+    Migration(9, "image_captions", _migration_009_image_captions),
 ]
 
 
@@ -1357,8 +1420,11 @@ class SessionDB:
         ``memory_capture_jobs``, since a proposal's originating job may have
         already been pruned by retention by the time a session is deleted),
         ``memory_capture_jobs``, ``memory_commitment_jobs``,
-        ``message_embedding_jobs``, ``session_job_coverage_ranges``,
-        ``commitments``, and finally the ``sessions`` row itself.
+        ``message_embedding_jobs``, ``image_captions`` (R3-GAP-002 — a
+        deleted message's captioned attachment metadata/derived text has no
+        independent reason to survive the message it describes),
+        ``session_job_coverage_ranges``, ``commitments``, and finally the
+        ``sessions`` row itself.
 
         Deliberately does **not** touch anything outside this database, and
         does **not** touch any durable memory note a *promoted* proposal's
@@ -1402,6 +1468,7 @@ class SessionDB:
                 "DELETE FROM message_embeddings WHERE message_id = ANY(%s)", (message_ids,)
             )
         conn.execute("DELETE FROM message_embedding_jobs WHERE session_id = %s", (session_id,))
+        conn.execute("DELETE FROM image_captions WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM message_mirrors WHERE session_id = %s", (session_id,))
         conn.execute("DELETE FROM messages WHERE session_id = %s", (session_id,))
 
@@ -2628,6 +2695,190 @@ class SessionDB:
         conn.execute(
             """
             UPDATE message_embedding_jobs
+            SET state = %s, attempts = %s, run_after = %s, last_error = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (state, attempts, now + backoff_seconds, error, now, job_id),
+        )
+
+    # ------------------------------------------------------------------
+    # Image captioning (R3-GAP-002)
+    # ------------------------------------------------------------------
+    # Durable queue, same claim/complete/fail shape as the message-embedding
+    # lane above — see _migration_009_image_captions's docstring for why
+    # this table carries attachment metadata + result inline instead of
+    # just a foreign key.
+
+    def enqueue_image_caption(
+        self,
+        agent_id: str,
+        session_id: str,
+        message_id: int,
+        path: str,
+        media_type: str,
+        source_name: str,
+        idempotency_key: str,
+    ) -> int | None:
+        """Enqueue one image-captioning job, idempotently.
+
+        Args:
+            agent_id, session_id, message_id: Which message this image was
+                attached to.
+            path, media_type, source_name: The staged attachment's own
+                metadata (media.py's MediaAttachment fields) — recorded
+                here immediately, before captioning even runs, so
+                provenance/deletion tracking works regardless of whether
+                the caption job ever completes.
+            idempotency_key: Typically ``"{agent_id}:{message_id}:{attachment.id}"``
+                (media.py's content-hash-derived id) — attaching the same
+                image to the same message twice is a no-op, not a
+                duplicate job.
+
+        Returns:
+            int | None: The new job's id, or ``None`` if a job with this
+                ``idempotency_key`` already exists.
+        """
+        now = time.time()
+        row = self._conn().execute(
+            """
+            INSERT INTO image_captions
+                (agent_id, session_id, message_id, path, media_type, source_name,
+                 idempotency_key, state, attempts, run_after, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', 0, %s, %s, %s)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id
+            """,
+            (
+                agent_id, session_id, message_id, path, media_type, source_name,
+                idempotency_key, now, now, now,
+            ),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def claim_next_image_caption_job(self) -> dict | None:
+        """Atomically claim one pending, due image-captioning job for processing.
+
+        Identical mechanics to :meth:`claim_next_message_embedding_job` —
+        see its docstring.
+
+        Returns:
+            dict | None: ``{"id", "agent_id", "session_id", "message_id",
+                "path", "media_type", "source_name", "attempts"}``, or
+                ``None`` if no job is currently due.
+        """
+        now = time.time()
+        row = self._conn().execute(
+            """
+            UPDATE image_captions
+            SET state = 'running', updated_at = %s
+            WHERE id = (
+                SELECT id FROM image_captions
+                WHERE state = 'pending' AND run_after <= %s
+                ORDER BY id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, agent_id, session_id, message_id, path, media_type, source_name, attempts
+            """,
+            (now, now),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0], "agent_id": row[1], "session_id": row[2], "message_id": row[3],
+            "path": row[4], "media_type": row[5], "source_name": row[6], "attempts": row[7],
+        }
+
+    def complete_image_caption_job(
+        self, job_id: int, message_id: int, source_name: str, caption: str,
+    ) -> None:
+        """Store the caption, fold it into the message's searchable text, mark the job done.
+
+        Appending into ``messages.content`` — rather than a separate
+        searchable store — is deliberate: ``search_vector`` is a
+        PostgreSQL ``GENERATED`` column derived from ``content``, so FTS
+        picks up the caption automatically with no separate reindex step,
+        and ``capture_worker.py``'s extraction already reads
+        ``messages.content`` directly — both existing read paths benefit
+        with zero changes to either.
+
+        Any pre-existing embedding for this message is deleted (not
+        regenerated here) so the *existing* reconciliation self-healing
+        (:meth:`find_uncovered_message_ids_for_embedding`) naturally
+        re-embeds it with the caption included on its next pass, instead
+        of this method duplicating a "re-embed one message" code path.
+
+        Args:
+            job_id: The job to complete.
+            message_id: The message the caption belongs to.
+            source_name: The attachment's original filename, for the
+                ``[Image: name]`` marker prepended to the caption text.
+            caption: The generated factual description.
+        """
+        now = time.time()
+        conn = self._conn()
+        conn.execute(
+            "UPDATE image_captions SET state = 'done', caption = %s, updated_at = %s WHERE id = %s",
+            (caption, now, job_id),
+        )
+        # Read-then-build in Python rather than a single SQL expression:
+        # PostgreSQL's TRIM() only strips spaces by default, not newlines,
+        # so a SQL-side "TRIM(COALESCE(content, '') || marker)" leaves a
+        # stray leading "\n\n" when the original content was empty/NULL
+        # (an image sent with no typed caption) — caught by this method's
+        # own test for exactly that case.
+        existing = conn.execute(
+            "SELECT content FROM messages WHERE id = %s", (message_id,)
+        ).fetchone()
+        existing_content = (existing[0] if existing else None) or ""
+        marker = f"[Image: {source_name}] {caption}"
+        new_content = f"{existing_content}\n\n{marker}" if existing_content.strip() else marker
+        conn.execute(
+            "UPDATE messages SET content = %s WHERE id = %s", (new_content, message_id)
+        )
+        if self.has_vector_lane:
+            conn.execute("DELETE FROM message_embeddings WHERE message_id = %s", (message_id,))
+
+    def mark_image_caption_unsupported(self, job_id: int, reason: str) -> None:
+        """Terminal, non-retried state for a provider that can't caption images.
+
+        Distinct from :meth:`fail_image_caption_job`'s retry/backoff path:
+        an agent's configured ``inputModalities`` doesn't change between
+        retries, so retrying would just fail identically until
+        ``max_attempts`` exhausts it into ``'failed'`` anyway — marking it
+        ``'unsupported'`` immediately instead is R3-GAP-002's acceptance
+        criteria: "unsupported media produces an explicit diagnostic,"
+        not an eventual silent give-up indistinguishable from a real
+        transient failure.
+        """
+        now = time.time()
+        self._conn().execute(
+            """
+            UPDATE image_captions
+            SET state = 'unsupported', last_error = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (reason, now, job_id),
+        )
+
+    def fail_image_caption_job(
+        self, job_id: int, error: str, backoff_seconds: float, max_attempts: int = 5,
+    ) -> None:
+        """Record a failed captioning attempt — retry with backoff, or give up.
+
+        Identical mechanics to :meth:`fail_message_embedding_job` — see
+        its docstring.
+        """
+        now = time.time()
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT attempts FROM image_captions WHERE id = %s", (job_id,)
+        ).fetchone()
+        attempts = (row[0] if row else 0) + 1
+        state = "failed" if attempts >= max_attempts else "pending"
+        conn.execute(
+            """
+            UPDATE image_captions
             SET state = %s, attempts = %s, run_after = %s, last_error = %s, updated_at = %s
             WHERE id = %s
             """,
