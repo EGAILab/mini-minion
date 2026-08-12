@@ -41,11 +41,28 @@ is a silent no-op: ``minion_assist.config.database`` is left exactly as
 config.json says, and every DB-gated test's own ``_DB_AVAILABLE``-style
 skip marker (already established convention — see ``test_session_db.py``'s
 module docstring) handles "no database" exactly as it always did.
+
+Fail closed, not open, when the database IS reachable but isolation setup
+itself fails (e.g. ``CREATE SCHEMA`` errors for some transient reason).
+Originally this degraded the same as "unreachable" — silently leaving
+``config.database`` unpatched — which let every DB-gated test proceed
+*unisolated* against the real configured database, believing it was
+running in its own schema. Real incident this caused: a test constructing
+``PostgresMemoryIndex(embedding_dimensions=3)`` ran straight against the
+shared ``public`` schema of a live deployment's database (dimensions=1024),
+and ``_ensure_schema()``'s own legitimate dimension-mismatch self-healing
+logic dropped and recreated the live bot's ``memory_chunk_embeddings``
+table out from under it mid-session. "Reachable but not isolated" now
+aborts the whole test session via ``pytest.exit()`` instead of silently
+continuing — a loud failure here is far cheaper than quietly corrupting
+whatever this machine's config.json happens to point at.
 """
 
 from __future__ import annotations
 
 import uuid
+
+import pytest
 
 _BASE_DB_URL = "postgresql://minion:minion@localhost:5433/minion_assist"
 
@@ -62,13 +79,30 @@ def pytest_configure(config) -> None:
     except ImportError:
         return  # psycopg not installed -- DB-gated tests will skip themselves anyway
 
-    candidate_schema = f"pytest_{uuid.uuid4().hex[:12]}"
     try:
         conn = psycopg.connect(_BASE_DB_URL, autocommit=True, connect_timeout=2)
-        conn.execute(f'CREATE SCHEMA "{candidate_schema}"')
-        conn.close()
     except Exception:
-        return  # dev database unreachable -- leave config.database untouched
+        return  # dev database unreachable -- leave config.database untouched;
+        # every DB-gated test's own reachability check skips itself the same way.
+
+    candidate_schema = f"pytest_{uuid.uuid4().hex[:12]}"
+    try:
+        conn.execute(f'CREATE SCHEMA "{candidate_schema}"')
+    except Exception as exc:
+        conn.close()
+        # The database IS reachable (we just connected above) but isolation
+        # setup itself failed. Do NOT silently fall through here — that would
+        # let every DB-gated test run for real against whatever database
+        # config.json points at. See this function's docstring for the
+        # incident that motivated failing closed instead.
+        pytest.exit(
+            f"pytest DB isolation setup failed: could not create schema "
+            f"{candidate_schema!r} on a reachable database ({_BASE_DB_URL!r}). "
+            f"Refusing to run DB-gated tests unisolated against it. "
+            f"Original error: {type(exc).__name__}: {exc}",
+            returncode=1,
+        )
+    conn.close()
 
     _schema_name = candidate_schema
     isolated_url = (
