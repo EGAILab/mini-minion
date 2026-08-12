@@ -44,7 +44,9 @@ from minion_assist.agents.events import (
 from minion_assist.tools.audit import ApprovalDecision
 from minion_assist.tui.app import MinionApp
 from minion_assist.tui.attachment_widgets import AudioAttachmentView, ImageAttachmentView
+from minion_assist.tui.sidebar import Sidebar, _AgentListItem, _SessionListItem
 from minion_assist.tui.widgets import ApprovalModal, AttachFilePickerModal
+from minion_assist.worker_health import WorkerHealth
 
 
 def _run(coro):
@@ -56,8 +58,10 @@ def _run(coro):
 
 
 class _FakeSession:
-    """Stand-in for AgentSession.send() — records calls, optionally raises
-    or replays a scripted sequence of on_event() calls."""
+    """Stand-in for AgentSession — records calls, optionally raises or
+    replays a scripted sequence of on_event() calls. reload()/
+    switch_session()/session_id/history exist for /switch and /session,
+    exercised by TestSidebar."""
 
     def __init__(
         self, response: str = "ok", events: list | None = None, raises: Exception | None = None
@@ -66,6 +70,10 @@ class _FakeSession:
         self._response = response
         self._events = events or []
         self._raises = raises
+        self.session_id: str | None = None
+        self.reload_calls = 0
+        self.switch_calls: list[str] = []
+        self.history: list[dict] = []
 
     def send(self, message, attachments=None, on_event=None, stream=False, channel=None, **kwargs):
         self.send_calls.append(
@@ -78,6 +86,67 @@ class _FakeSession:
                 on_event(event)
         return self._response
 
+    def reload(self) -> None:
+        self.reload_calls += 1
+
+    def switch_session(self, session_id: str) -> None:
+        self.switch_calls.append(session_id)
+        self.session_id = session_id
+
+
+class _FakeSessionInfo:
+    """Stand-in for session.store.SessionInfo — only the fields /agents and
+    the sidebar actually read."""
+
+    def __init__(
+        self, agent_id: str, turn_count: int, last_active: str = "2026-08-12T00:00:00+00:00"
+    ):
+        self.agent_id = agent_id
+        self.turn_count = turn_count
+        self.last_active = last_active
+
+
+class _FakeSessionStore:
+    def __init__(self, infos: list[_FakeSessionInfo]):
+        self._infos = infos
+
+    def list_sessions(self) -> list[_FakeSessionInfo]:
+        return self._infos
+
+
+class _FakeShortTerm:
+    def __init__(
+        self,
+        sessions_by_agent: dict[str, list[Path]] | None = None,
+        names: dict[tuple[str, str], str] | None = None,
+    ):
+        self._sessions_by_agent = sessions_by_agent or {}
+        self._names = names or {}
+
+    def list_sessions(self, agent_id: str) -> list[Path]:
+        return self._sessions_by_agent.get(agent_id, [])
+
+    def get_name(self, agent_id: str, session_id: str) -> str | None:
+        return self._names.get((agent_id, session_id))
+
+
+class _FakeDB:
+    """Stand-in for SessionDB — only queue_lag_summary(), the one method
+    the status bar reads."""
+
+    def __init__(self, lag: dict | None = None, raises: Exception | None = None):
+        self._lag = lag or {
+            "capture": {"pending_count": 0},
+            "commitment": {"pending_count": 0},
+            "message_embedding": {"pending_count": 0},
+        }
+        self._raises = raises
+
+    def queue_lag_summary(self, agent_id: str) -> dict:
+        if self._raises is not None:
+            raise self._raises
+        return self._lag
+
 
 def _agents_cfg() -> dict:
     # Only "main" (no route_prefix) — routing across multiple agents is
@@ -87,21 +156,33 @@ def _agents_cfg() -> dict:
 
 
 def _configured_app(
-    session: _FakeSession, media_dir: Path, use_streaming: bool = False
+    session: _FakeSession,
+    media_dir: Path,
+    use_streaming: bool = False,
+    *,
+    sessions: dict | None = None,
+    agents_cfg: dict | None = None,
+    session_store: object = None,
+    short_term: object = None,
+    db: object = None,
+    worker_health: dict | None = None,
+    active_agent_id: str = "main",
+    completion_items: list[tuple[str, str]] | None = None,
 ) -> MinionApp:
     app = MinionApp()
     app.configure(
-        sessions={"main": session},
-        agents_cfg=_agents_cfg(),
-        session_store=None,
+        sessions=sessions or {"main": session},
+        agents_cfg=agents_cfg or _agents_cfg(),
+        session_store=session_store,
         mcp_manager=None,
         skills=None,
-        short_term=None,
-        db=None,
-        worker_health=None,
+        short_term=short_term,
+        db=db,
+        worker_health=worker_health,
         media_dir=media_dir,
-        active_agent_id="main",
+        active_agent_id=active_agent_id,
         use_streaming=use_streaming,
+        completion_items=completion_items or (),
     )
     return app
 
@@ -603,5 +684,335 @@ class TestAudioPlayback:
                 await asyncio.wait_for(app.workers.wait_for_complete(), timeout=5)
 
                 assert "Couldn't play audio" in _chat_log_text(app)
+
+        _run(_test())
+
+
+def _two_agent_setup(session_main: _FakeSession, session_researcher: _FakeSession) -> dict:
+    return {
+        "sessions": {"main": session_main, "researcher": session_researcher},
+        "agents_cfg": {
+            "main": SimpleNamespace(route_prefix=None),
+            "researcher": SimpleNamespace(route_prefix="/research"),
+        },
+    }
+
+
+class TestSidebar:
+    """Phase 3: agent/session lists are display-only; selecting a row runs
+    the equivalent /switch or /session command text — same dispatch path
+    as typing it, verified separately by TestSlashCommands."""
+
+    def test_agents_list_shows_turn_counts_and_marks_the_active_one(self, tmp_path):
+        async def _test():
+            session_main = _FakeSession()
+            session_researcher = _FakeSession()
+            store = _FakeSessionStore(
+                [_FakeSessionInfo("main", 12), _FakeSessionInfo("researcher", 3)]
+            )
+            app = _configured_app(
+                session_main, tmp_path,
+                session_store=store,
+                **_two_agent_setup(session_main, session_researcher),
+            )
+            async with app.run_test():
+                sidebar = app.query_one(Sidebar)
+                rows = [_plain_text(item.children[0]) for item in sidebar._agent_list.children]
+
+                assert any(r.startswith(">") and "Ada" in r and "12 turns" in r for r in rows)
+                assert any(
+                    not r.startswith(">") and "Elizabeth" in r and "3 turns" in r for r in rows
+                )
+
+        _run(_test())
+
+    def test_agents_list_without_a_session_store_still_shows_agents(self, tmp_path):
+        async def _test():
+            session_main = _FakeSession()
+            session_researcher = _FakeSession()
+            app = _configured_app(
+                session_main, tmp_path,
+                **_two_agent_setup(session_main, session_researcher),
+            )
+            async with app.run_test():
+                sidebar = app.query_one(Sidebar)
+                rows = [_plain_text(item.children[0]) for item in sidebar._agent_list.children]
+
+                assert any("Ada" in r for r in rows)
+                assert any("Elizabeth" in r for r in rows)
+                # No turn counts available without a session_store.
+                assert not any("turns" in r for r in rows)
+
+        _run(_test())
+
+    def test_clicking_an_agent_switches_the_active_agent(self, tmp_path):
+        async def _test():
+            session_main = _FakeSession()
+            session_researcher = _FakeSession()
+            app = _configured_app(
+                session_main, tmp_path,
+                **_two_agent_setup(session_main, session_researcher),
+            )
+            async with app.run_test() as pilot:
+                # Layout must settle before pilot.click() can compute
+                # correct on-screen coordinates for the target widget —
+                # without this, the click can land on the wrong item (or
+                # nothing) because the sidebar hasn't been arranged yet.
+                await pilot.pause()
+                sidebar = app.query_one(Sidebar)
+                target = next(
+                    item for item in sidebar._agent_list.children
+                    if isinstance(item, _AgentListItem) and item.agent_id == "researcher"
+                )
+                await pilot.click(target)
+                await pilot.pause()
+
+                assert app._active_agent_id == "researcher"
+                assert session_researcher.reload_calls == 1
+
+        _run(_test())
+
+    def test_clicking_an_agent_refreshes_the_sidebar_marker(self, tmp_path):
+        async def _test():
+            session_main = _FakeSession()
+            session_researcher = _FakeSession()
+            app = _configured_app(
+                session_main, tmp_path,
+                **_two_agent_setup(session_main, session_researcher),
+            )
+            async with app.run_test() as pilot:
+                await pilot.pause()  # let layout settle before clicking
+                sidebar = app.query_one(Sidebar)
+                target = next(
+                    item for item in sidebar._agent_list.children
+                    if isinstance(item, _AgentListItem) and item.agent_id == "researcher"
+                )
+                await pilot.click(target)
+                await pilot.pause()
+
+                rows = [_plain_text(item.children[0]) for item in sidebar._agent_list.children]
+                assert any(r.startswith(">") and "Elizabeth" in r for r in rows)
+
+        _run(_test())
+
+    def test_sessions_list_shows_names_and_marks_the_current_session(self, tmp_path):
+        async def _test():
+            session = _FakeSession()
+            session.session_id = "abc123"
+            short_term = _FakeShortTerm(
+                sessions_by_agent={"main": [Path("abc123.jsonl"), Path("def456.jsonl")]},
+                names={("main", "def456"): "Old debugging session"},
+            )
+            app = _configured_app(session, tmp_path, short_term=short_term)
+            async with app.run_test():
+                sidebar = app.query_one(Sidebar)
+                rows = [_plain_text(item.children[0]) for item in sidebar._session_list.children]
+
+                assert any("Old debugging session" in r for r in rows)
+                assert any(r.startswith(">") and "abc123"[:8] in r for r in rows)
+
+        _run(_test())
+
+    def test_clicking_a_session_restores_it(self, tmp_path):
+        async def _test():
+            session = _FakeSession()
+            session.session_id = "abc123"
+            short_term = _FakeShortTerm(
+                sessions_by_agent={"main": [Path("abc123.jsonl"), Path("def456.jsonl")]},
+            )
+            app = _configured_app(session, tmp_path, short_term=short_term)
+            async with app.run_test() as pilot:
+                await pilot.pause()  # let layout settle before clicking
+                sidebar = app.query_one(Sidebar)
+                # refresh_sidebar() reverses short_term.list_sessions()'s
+                # order, so def456 is index 1 and abc123 (already current)
+                # is index 2.
+                target = next(
+                    item for item in sidebar._session_list.children
+                    if isinstance(item, _SessionListItem) and item.session_index == 1
+                )
+                await pilot.click(target)
+                await pilot.pause()
+
+                assert session.switch_calls == ["def456"]
+
+        _run(_test())
+
+
+class TestStatusBar:
+    """Phase 3: a condensed, periodically-refreshed view of the same two
+    data sources /status deep reads (worker_health, SessionDB.queue_lag_summary)."""
+
+    def test_shows_the_active_agent(self, tmp_path):
+        async def _test():
+            session = _FakeSession()
+            app = _configured_app(session, tmp_path)
+            async with app.run_test():
+                assert "Agent: main" in _plain_text(app.query_one("#status-bar"))
+
+        _run(_test())
+
+    def test_shows_healthy_worker_count(self, tmp_path):
+        async def _test():
+            wh = {"capture_worker": WorkerHealth("capture_worker")}
+            wh["capture_worker"].record_poll()
+            session = _FakeSession()
+            app = _configured_app(session, tmp_path, worker_health=wh)
+            async with app.run_test():
+                assert "Workers: 1/1 ok" in _plain_text(app.query_one("#status-bar"))
+
+        _run(_test())
+
+    def test_shows_failing_worker_count(self, tmp_path):
+        async def _test():
+            wh = {"capture_worker": WorkerHealth("capture_worker")}
+            wh["capture_worker"].record_failure("boom")
+            session = _FakeSession()
+            app = _configured_app(session, tmp_path, worker_health=wh)
+            async with app.run_test():
+                assert "Workers: 1 failing" in _plain_text(app.query_one("#status-bar"))
+
+        _run(_test())
+
+    def test_shows_queue_lag_from_the_database(self, tmp_path):
+        async def _test():
+            db = _FakeDB(lag={
+                "capture": {"pending_count": 2},
+                "commitment": {"pending_count": 1},
+                "message_embedding": {"pending_count": 0},
+            })
+            session = _FakeSession()
+            app = _configured_app(session, tmp_path, db=db)
+            async with app.run_test():
+                assert "Queue: 3 pending" in _plain_text(app.query_one("#status-bar"))
+
+        _run(_test())
+
+    def test_queue_lag_query_failure_is_reported_not_raised(self, tmp_path):
+        async def _test():
+            db = _FakeDB(raises=RuntimeError("db down"))
+            session = _FakeSession()
+            app = _configured_app(session, tmp_path, db=db)
+            async with app.run_test():
+                assert "Queue: unavailable" in _plain_text(app.query_one("#status-bar"))
+
+        _run(_test())
+
+    def test_no_database_configured_omits_the_queue_line(self, tmp_path):
+        async def _test():
+            session = _FakeSession()
+            app = _configured_app(session, tmp_path)
+            async with app.run_test():
+                assert "Queue:" not in _plain_text(app.query_one("#status-bar"))
+
+        _run(_test())
+
+    def test_refreshes_after_a_turn_completes(self, tmp_path):
+        async def _test():
+            db = _FakeDB(lag={
+                "capture": {"pending_count": 5},
+                "commitment": {"pending_count": 0},
+                "message_embedding": {"pending_count": 0},
+            })
+            session = _FakeSession(response="ok")
+            app = _configured_app(session, tmp_path, db=db)
+            async with app.run_test():
+                app._process_input("hello")
+                await app.workers.wait_for_complete()
+
+                assert "Queue: 5 pending" in _plain_text(app.query_one("#status-bar"))
+
+        _run(_test())
+
+
+class TestCommandPalette:
+    """Phase 3: Ctrl+P palette entries mirror the composer's own slash-
+    command suggestions and run through the identical dispatch path."""
+
+    def test_run_command_text_dispatches_like_typing_it(self, tmp_path):
+        async def _test():
+            session = _FakeSession()
+            app = _configured_app(session, tmp_path)
+            async with app.run_test():
+                app.run_command_text("/help")
+                await app.workers.wait_for_complete()
+
+                assert session.send_calls == []
+                assert "Built-in commands:" in _chat_log_text(app)
+
+        _run(_test())
+
+    def test_completion_items_are_exposed_for_the_provider(self, tmp_path):
+        async def _test():
+            session = _FakeSession()
+            app = MinionApp()
+            app.configure(
+                sessions={"main": session},
+                agents_cfg=_agents_cfg(),
+                session_store=None,
+                mcp_manager=None,
+                skills=None,
+                short_term=None,
+                db=None,
+                worker_health=None,
+                media_dir=tmp_path,
+                active_agent_id="main",
+                use_streaming=False,
+                completion_items=[("/help", "show help"), ("/new", "clear history")],
+            )
+            async with app.run_test():
+                assert app.completion_items == [("/help", "show help"), ("/new", "clear history")]
+
+        _run(_test())
+
+    def test_provider_search_matches_by_prefix_and_carries_help_text(self, tmp_path):
+        async def _test():
+            from minion_assist.tui.app import SlashCommandProvider
+
+            session = _FakeSession()
+            app = MinionApp()
+            app.configure(
+                sessions={"main": session},
+                agents_cfg=_agents_cfg(),
+                session_store=None,
+                mcp_manager=None,
+                skills=None,
+                short_term=None,
+                db=None,
+                worker_health=None,
+                media_dir=tmp_path,
+                active_agent_id="main",
+                use_streaming=False,
+                completion_items=[("/help", "show help"), ("/new", "clear history")],
+            )
+            async with app.run_test():
+                provider = SlashCommandProvider(app.screen)
+
+                hits = [hit async for hit in provider.search("help")]
+                assert [(hit.text, hit.help) for hit in hits] == [("/help", "show help")]
+
+                discovered = [hit async for hit in provider.discover()]
+                assert [(hit.text, hit.help) for hit in discovered] == [
+                    ("/help", "show help"),
+                    ("/new", "clear history"),
+                ]
+
+        _run(_test())
+
+    def test_selecting_a_palette_hit_dispatches_the_command(self, tmp_path):
+        async def _test():
+            from minion_assist.tui.app import SlashCommandProvider
+
+            session = _FakeSession()
+            app = _configured_app(session, tmp_path, completion_items=[("/help", "show help")])
+            async with app.run_test():
+                provider = SlashCommandProvider(app.screen)
+                hits = [hit async for hit in provider.search("help")]
+
+                hits[0].command()  # a Hit's command is the palette's on-select callback
+                await app.workers.wait_for_complete()
+
+                assert session.send_calls == []
+                assert "Built-in commands:" in _chat_log_text(app)
 
         _run(_test())

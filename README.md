@@ -1157,7 +1157,9 @@ A full-screen chat interface (built on [Textual](https://github.com/Textualize/t
 
 **Phase 1 (core chat shell):** scrollback chat pane with rendered markdown, single-line composer with slash-command suggestions, streaming responses, and TUI-native modal replacements for every console prompt (bash approval, git-commit confirmation, `AskUserTool` questions, Codex permission requests) so tool use works identically to the REPL.
 
-**Phase 2 (multimedia):** images and audio attached to a turn render inline in the chat log, and `/attach` gained an interactive file picker. A sidebar/status bar are planned for a later phase — not yet implemented.
+**Phase 2 (multimedia):** images and audio attached to a turn render inline in the chat log, and `/attach` gained an interactive file picker.
+
+**Phase 3 (sidebar, status bar, command palette):** an agent/session switcher sidebar, a live status bar, and full Ctrl+P command-palette support for every slash command.
 
 **Details:**
 - Every slash command (`/new`, `/attach`, `/status`, `/session`, etc.) works exactly as in the REPL — `tui/app.py` dispatches through the same `commands.py` machinery the REPL and Matrix channel already share, not a separate reimplementation.
@@ -1171,15 +1173,22 @@ A full-screen chat interface (built on [Textual](https://github.com/Textualize/t
 - Audio files get a waveform preview and a **Play** button (local playback via the existing voice pipeline's `sounddevice` output — requires the `voice` extra too: `uv sync --extra voice`). Audio is **not** sent to the LLM — no provider in this codebase understands an audio input block yet — its filename and duration are folded into the prompt text instead, so the model at least knows the file was attached.
 - Supported audio formats: WAV, MP3, FLAC, OGG (50 MB cap — generous versus images' 15 MB, since audio is never base64-encoded into a provider request).
 
+**Sidebar, status bar, command palette (Phase 3):**
+- The right-hand sidebar lists every configured agent (with turn counts) and the active agent's past sessions (most recent first, named sessions shown by name). **Click** a row, or **Tab** to focus the sidebar and use arrow keys + **Enter** — either way it runs the exact same `/switch <id>` / `/session <N>` command text the composer accepts, through the identical `commands.py` dispatch path (no separate switching logic to keep in sync).
+- The status bar (above the composer) shows the active agent, a worker-health summary (`Workers: 8/8 ok`, or `Workers: N failing` if any worker's last poll ended in an error), and — when a database is configured — pending queue-lag count for the active agent. Refreshes every 5 seconds and immediately after each turn completes. Same two data sources `/status deep` reads (`worker_health`, `SessionDB.queue_lag_summary()`), condensed to one line instead of a full report.
+- **Ctrl+P** opens Textual's command palette, pre-populated with every slash command (same list the composer's inline suggestions use) — fuzzy-searchable, selecting one runs it exactly as if typed.
+
 ### Module layout
 
 ```
 src/minion_assist/tui/
 ├── __init__.py
-├── app.py                   # MinionApp — chat log, composer, turn dispatch, console-callback bridges
+├── app.py                   # MinionApp — chat log, composer, turn dispatch, console-callback bridges,
+│                             # SlashCommandProvider (Ctrl+P palette)
 ├── widgets.py                # ApprovalModal, ConfirmModal, AskUserModal, CodexApprovalModal, AttachFilePickerModal
 ├── attachment_widgets.py     # ImageAttachmentView, AudioAttachmentView (inline chat-log rendering)
-└── waveform.py                # build_waveform() — audio -> downsampled amplitude envelope for the preview
+├── waveform.py                # build_waveform() — audio -> downsampled amplitude envelope for the preview
+└── sidebar.py                 # Sidebar — agent/session lists, AgentSelected/SessionSelected messages
 ```
 
 ---
@@ -2985,7 +2994,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **3230 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **3247 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic

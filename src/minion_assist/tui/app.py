@@ -20,10 +20,23 @@ OS thread. Everything that worker thread needs to do to the UI (append a
 chat message, show an approval modal and wait for the result) goes through
 ``App.call_from_thread()``, the only sanctioned way to touch widgets or
 await screen results from a non-Textual thread.
+
+Phase 3 (sidebar, status bar, command palette)
+------------------------------------------------
+The agent/session sidebar (tui/sidebar.py) and the Ctrl+P command palette
+never duplicate command logic — a sidebar click or a palette selection both
+resolve to exactly the same text ``_process_input()`` already accepts from
+the composer (``/switch <id>``, ``/session <N>``), so ``commands.py``'s
+``dispatch_command()`` remains the single place that logic lives, shared
+with the REPL. The status bar polls ``worker_health``/``SessionDB`` on a
+timer — the same two data sources ``/status deep`` already reads (see
+``commands.py``'s ``_format_deep_status``) — condensed to one line instead
+of a full text dump.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,7 +45,8 @@ from rich.markdown import Markdown as RichMarkdown
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
+from textual.command import DiscoveryHit, Hit, Hits, Provider
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.suggester import SuggestFromList
 from textual.widgets import Input, Static
 
@@ -52,6 +66,7 @@ from ..commands import CommandContext, dispatch_command, parse_command
 from ..media import MediaAttachment, describe_attachment, stage_attachment
 from ..tools.audit import ApprovalDecision
 from .attachment_widgets import AudioAttachmentView, ImageAttachmentView, PlayAudioRequested
+from .sidebar import AgentSelected, SessionSelected, Sidebar
 from .widgets import (
     ApprovalModal,
     AskUserModal,
@@ -64,21 +79,64 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 _WELCOME = "Mini-Minion ready. Type /help for commands, /quit to quit."
+# Status bar auto-refresh interval — matches no particular data source's own
+# cadence, just frequent enough to feel "live" without hammering the
+# database with queue_lag_summary() queries every render.
+_STATUS_BAR_INTERVAL_S = 5.0
+
+
+class SlashCommandProvider(Provider):
+    """Command-palette (Ctrl+P) entries — one per slash command.
+
+    Same (value, help) pairs the composer's inline SuggestFromList already
+    uses (build_completion_items(), threaded through configure()) — this is
+    a second view onto the identical list, not a separate command registry.
+    """
+
+    async def search(self, query: str) -> Hits:
+        app = self.app
+        assert isinstance(app, MinionApp)
+        matcher = self.matcher(query)
+        for value, meta in app.completion_items:
+            score = matcher.match(value)
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(value),
+                    functools.partial(app.run_command_text, value),
+                    help=meta,
+                )
+
+    async def discover(self) -> Hits:
+        app = self.app
+        assert isinstance(app, MinionApp)
+        for value, meta in app.completion_items:
+            yield DiscoveryHit(value, functools.partial(app.run_command_text, value), help=meta)
 
 
 class MinionApp(App[None]):
     """Full-screen chat TUI. See module docstring for the two-phase build order."""
 
     CSS = """
-    #chat-log {
+    #main-area {
         height: 1fr;
+    }
+    #chat-log {
+        width: 3fr;
         padding: 0 1;
     }
-    #composer {
+    #bottom-group {
         dock: bottom;
+        height: auto;
+    }
+    #status-bar {
+        height: 1;
+        background: $panel;
+        padding: 0 1;
     }
     """
     TITLE = "minion-assist"
+    COMMANDS = App.COMMANDS | {SlashCommandProvider}
 
     def __init__(self) -> None:
         super().__init__()
@@ -96,6 +154,7 @@ class MinionApp(App[None]):
         self._use_streaming: bool = False
         self._pending_attachments: dict[str, list[MediaAttachment]] = {}
         self._completion_words: list[str] = []
+        self._completion_items: list[tuple[str, str]] = []
         # --- Per-turn streaming state (single turn in flight at a time — the
         # composer is disabled for the duration of run_turn, so there is
         # never more than one "current" streamed widget to track). ---
@@ -138,19 +197,40 @@ class MinionApp(App[None]):
         self._active_agent_id = active_agent_id
         self._use_streaming = use_streaming
         self._pending_attachments = {aid: [] for aid in sessions}
+        self._completion_items = list(completion_items)
         self._completion_words = [value for value, _meta in completion_items]
+
+    @property
+    def completion_items(self) -> list[tuple[str, str]]:
+        """(value, help) pairs for every known slash command — read by
+        SlashCommandProvider. Public because the provider is a separate
+        class, constructed by Textual itself, not a method on this one."""
+        return self._completion_items
+
+    def run_command_text(self, text: str) -> None:
+        """Run a slash command as if it had been typed into the composer.
+
+        Used by the command palette (Ctrl+P) — a palette selection and
+        typing the same text are exactly equivalent, both going through
+        _process_input()'s one dispatch path.
+        """
+        self._process_input(text)
 
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield VerticalScroll(id="chat-log")
-        yield Input(
-            placeholder="Message... (/help for commands)",
-            id="composer",
-            suggester=SuggestFromList(self._completion_words, case_sensitive=False),
-        )
+        with Horizontal(id="main-area"):
+            yield VerticalScroll(id="chat-log")
+            yield Sidebar(id="sidebar")
+        with Vertical(id="bottom-group"):
+            yield Static(id="status-bar")
+            yield Input(
+                placeholder="Message... (/help for commands)",
+                id="composer",
+                suggester=SuggestFromList(self._completion_words, case_sensitive=False),
+            )
 
     def on_mount(self) -> None:
         log = self.query_one("#chat-log", VerticalScroll)
@@ -160,6 +240,87 @@ class MinionApp(App[None]):
                 agent_name = AGENTS[agent_id].name
                 log.mount(Static(Text(f"  {cfg_entry.route_prefix} <message>  -> {agent_name}")))
         self.query_one("#composer", Input).focus()
+        self.refresh_sidebar()
+        self._refresh_status_bar()
+        self.set_interval(_STATUS_BAR_INTERVAL_S, self._refresh_status_bar)
+
+    # ------------------------------------------------------------------
+    # Sidebar (Phase 3) — agent/session lists are display-only; selecting a
+    # row runs the exact same /switch or /session command text the composer
+    # accepts, through the same _process_input() dispatch path.
+    # ------------------------------------------------------------------
+
+    def refresh_sidebar(self) -> None:
+        sidebar = self.query_one(Sidebar)
+
+        turn_counts: dict[str, int] = {}
+        if self._session_store is not None:
+            for info in self._session_store.list_sessions():
+                turn_counts[info.agent_id] = info.turn_count
+        agents: list[tuple[str, str]] = []
+        for agent_id in self._sessions:
+            name = AGENTS[agent_id].name if agent_id in AGENTS else agent_id
+            turns = turn_counts.get(agent_id)
+            label = f"{name} ({turns} turns)" if turns is not None else name
+            agents.append((agent_id, label))
+        sidebar.update_agents(agents, self._active_agent_id)
+
+        sessions: list[tuple[int, str]] = []
+        current_index: int | None = None
+        if self._short_term is not None:
+            paths = list(reversed(self._short_term.list_sessions(self._active_agent_id)))
+            current_id = getattr(self._sessions.get(self._active_agent_id), "session_id", None)
+            for i, p in enumerate(paths, 1):
+                name = self._short_term.get_name(self._active_agent_id, p.stem)
+                sessions.append((i, name if name else p.stem[:8]))
+                if p.stem == current_id:
+                    current_index = i
+        sidebar.update_sessions(sessions, current_index)
+
+    def on_agent_selected(self, event: AgentSelected) -> None:
+        event.stop()
+        self.run_command_text(f"/switch {event.agent_id}")
+
+    def on_session_selected(self, event: SessionSelected) -> None:
+        event.stop()
+        self.run_command_text(f"/session {event.index}")
+
+    # ------------------------------------------------------------------
+    # Status bar (Phase 3) — condensed one-line view of the same two data
+    # sources /status deep reads (worker_health, SessionDB.queue_lag_summary),
+    # refreshed on a timer plus after anything that would visibly change it.
+    # ------------------------------------------------------------------
+
+    def _refresh_status_bar(self) -> None:
+        bar = self.query_one("#status-bar", Static)
+        bar.update(Text(self._compute_status_text()))
+
+    def _compute_status_text(self) -> str:
+        parts = [f"Agent: {self._active_agent_id}"]
+
+        worker_health = self._worker_health or {}
+        if worker_health:
+            unhealthy = sum(
+                1 for h in worker_health.values() if h.snapshot()["consecutive_failures"] > 0
+            )
+            total = len(worker_health)
+            parts.append(
+                f"Workers: {unhealthy} failing" if unhealthy else f"Workers: {total}/{total} ok"
+            )
+
+        if self._db is not None:
+            try:
+                lag = self._db.queue_lag_summary(self._active_agent_id)
+                pending = (
+                    lag["capture"]["pending_count"]
+                    + lag["commitment"]["pending_count"]
+                    + lag["message_embedding"]["pending_count"]
+                )
+                parts.append(f"Queue: {pending} pending")
+            except Exception:
+                parts.append("Queue: unavailable")
+
+        return "  |  ".join(parts)
 
     # ------------------------------------------------------------------
     # Input handling — mirrors minion.py's REPL loop body (attach commands,
@@ -244,6 +405,12 @@ class MinionApp(App[None]):
                         self._log_system(result.message)
                     if result.activate_agent_id:
                         self._active_agent_id = result.activate_agent_id
+                    if result.activate_agent_id or result.new_session_id:
+                        # Covers both a typed /switch or /session command
+                        # and a sidebar click (which runs through this same
+                        # path via run_command_text) — one refresh site for
+                        # both, not one per trigger.
+                        self.refresh_sidebar()
                     if result.should_exit:
                         self.exit()
                     return
@@ -318,6 +485,10 @@ class MinionApp(App[None]):
         composer = self.query_one("#composer", Input)
         composer.disabled = False
         composer.focus()
+        # Turn counts (sidebar) and queue lag (status bar) both just
+        # changed — no need to wait for the next timer tick.
+        self.refresh_sidebar()
+        self._refresh_status_bar()
 
     def on_agent_event(self, event: object) -> None:
         """Called synchronously, on the worker thread, by session.send()'s
