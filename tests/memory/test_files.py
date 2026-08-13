@@ -6,12 +6,20 @@ side effects outside the test's own temp directory.
 
 from __future__ import annotations
 
+import os
 import threading
+import time
 from datetime import date
 
 import pytest
 
-from minion_assist.memory.files import MemoryFileRepository, _sanitize_key
+import minion_assist.memory.files as files_module
+from minion_assist.memory.files import (
+    CrossProcessLockTimeout,
+    MemoryFileRepository,
+    _cross_process_lock,
+    _sanitize_key,
+)
 from minion_assist.memory.models import MemoryLocator
 
 # ---------------------------------------------------------------------------
@@ -665,3 +673,128 @@ def test_concurrent_remember_to_different_keys_does_not_interfere(tmp_path):
 
     for i in range(thread_count):
         assert repo.load(f"topic-{i}") == f"content-{i}"
+
+
+# ---------------------------------------------------------------------------
+# _cross_process_lock (R3-GAP-010)
+# ---------------------------------------------------------------------------
+
+def test_cross_process_lock_creates_and_removes_the_lock_file(tmp_path):
+    target = tmp_path / "note.md"
+    lock_path = tmp_path / ".note.md.lock"
+
+    with _cross_process_lock(target):
+        assert lock_path.exists()
+
+    assert not lock_path.exists()
+
+
+def test_cross_process_lock_removes_the_lock_file_even_on_exception(tmp_path):
+    target = tmp_path / "note.md"
+    lock_path = tmp_path / ".note.md.lock"
+
+    with pytest.raises(ValueError):
+        with _cross_process_lock(target):
+            raise ValueError("boom")
+
+    assert not lock_path.exists()
+
+
+def test_cross_process_lock_blocks_a_second_acquirer_until_released(tmp_path):
+    target = tmp_path / "note.md"
+    order: list[str] = []
+    first_holder_ready = threading.Event()
+    second_may_release_first = threading.Event()
+
+    def _hold_first():
+        with _cross_process_lock(target):
+            order.append("first-acquired")
+            first_holder_ready.set()
+            second_may_release_first.wait(timeout=5)
+        order.append("first-released")
+
+    def _try_second():
+        first_holder_ready.wait(timeout=5)
+        with _cross_process_lock(target):
+            order.append("second-acquired")
+
+    t1 = threading.Thread(target=_hold_first)
+    t2 = threading.Thread(target=_try_second)
+    t1.start()
+    t2.start()
+    time.sleep(0.2)  # give thread 2 a real chance to (wrongly) acquire early if the lock is broken
+    second_may_release_first.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert order == ["first-acquired", "first-released", "second-acquired"]
+
+
+def test_cross_process_lock_recovers_a_stale_lock_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(files_module, "_STALE_LOCK_SECONDS", 1.0)
+    monkeypatch.setattr(files_module, "_LOCK_TIMEOUT_SECONDS", 5.0)
+    target = tmp_path / "note.md"
+    lock_path = tmp_path / ".note.md.lock"
+
+    # Simulate a crashed holder: create the lock file directly, then
+    # backdate its mtime past the stale threshold.
+    fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.close(fd)
+    stale_time = time.time() - 10.0
+    os.utime(lock_path, (stale_time, stale_time))
+
+    start = time.monotonic()
+    with _cross_process_lock(target):
+        pass
+    elapsed = time.monotonic() - start
+
+    # Recovered via the staleness check, not by waiting out the full timeout.
+    assert elapsed < 5.0
+    assert not lock_path.exists()
+
+
+def test_cross_process_lock_raises_timeout_when_never_released(tmp_path, monkeypatch):
+    monkeypatch.setattr(files_module, "_LOCK_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(files_module, "_LOCK_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(files_module, "_STALE_LOCK_SECONDS", 60.0)
+    target = tmp_path / "note.md"
+    lock_path = tmp_path / ".note.md.lock"
+
+    # A fresh (non-stale) lock file simulating a live holder in another process.
+    fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        with pytest.raises(CrossProcessLockTimeout):
+            with _cross_process_lock(target):
+                pass
+    finally:
+        os.close(fd)
+        lock_path.unlink()
+
+
+def test_append_daily_cross_process_lock_prevents_lost_update(tmp_path):
+    """R3-GAP-010: two SEPARATE MemoryFileRepository instances (simulating
+    two OS processes -- each with its own, entirely unrelated in-memory
+    lock dict) append concurrently. Only the OS-level lock can close this
+    race; the in-process threading.Lock alone cannot, since neither
+    instance shares any state with the other."""
+    repo_a = MemoryFileRepository(tmp_path)
+    repo_b = MemoryFileRepository(tmp_path)
+    day = date(2026, 7, 21)
+    barrier = threading.Barrier(2)
+
+    def _append(repo, text):
+        barrier.wait()
+        repo.append_daily(text, when=day)
+
+    t1 = threading.Thread(target=_append, args=(repo_a, "from-repo-a"))
+    t2 = threading.Thread(target=_append, args=(repo_b, "from-repo-b"))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    text = (tmp_path / "memory" / "2026-07-21.md").read_text(encoding="utf-8")
+    assert "from-repo-a" in text
+    assert "from-repo-b" in text
+    bullet_lines = [ln for ln in text.splitlines() if ln.startswith("- ")]
+    assert len(bullet_lines) == 2

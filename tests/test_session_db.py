@@ -1434,6 +1434,32 @@ def test_list_incomplete_deletion_tombstones_empty_when_nothing_started(db):
 
 
 # ---------------------------------------------------------------------------
+# ping (R3-GAP-008)
+# ---------------------------------------------------------------------------
+
+def test_ping_returns_none_when_the_database_is_reachable(db):
+    assert db.ping() is None
+
+
+def test_ping_returns_a_description_instead_of_raising_when_unreachable():
+    import minion_assist.session.db as db_module
+
+    unreachable = db_module.SessionDB.__new__(db_module.SessionDB)
+
+    class _BrokenConn:
+        def execute(self, *a, **kw):
+            raise RuntimeError("connection refused")
+
+    unreachable._conn = lambda: _BrokenConn()
+
+    result = unreachable.ping()
+
+    assert result is not None
+    assert "RuntimeError" in result
+    assert "connection refused" in result
+
+
+# ---------------------------------------------------------------------------
 # queue_lag_summary (MEM-GAP-016)
 #
 # Uses a fresh, unique agent_id per test (not "main") since this method

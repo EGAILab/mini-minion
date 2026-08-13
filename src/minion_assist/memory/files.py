@@ -40,24 +40,40 @@ Talks to
 - ``memory/migration.py`` — Phase 0's migration populates the directories
   this class reads from.
 
-Concurrency (MEM-GAP-007/009)
--------------------------------
-Every writer that can touch this agent's files (an interactive turn,
-``CaptureWorker``, ``MemoryConsolidationScheduler``, ``KnowledgeDigestScheduler``,
-...) is a thread inside the *same* process, not a separate process — this
-deployment doesn't run separate worker processes. ``_atomic_write_text``'s
-own temp-file-then-rename swap already makes a *reader* never see a
-half-written file; what it doesn't protect against on its own is two
-*writers* targeting the same path concurrently (the read-modify-write in
-:meth:`~MemoryFileRepository.append_daily` could lose an update, and two
-overwrites could interleave unpredictably). Each write method acquires
-this path's lock (:meth:`~MemoryFileRepository._lock_for`) for its full
-read-modify-write sequence, which fully closes that race for this
-deployment's actual (single-process, multi-thread) concurrency model — see
+Concurrency (MEM-GAP-007/009, R3-GAP-010)
+-------------------------------------------
+Every background writer that can touch this agent's files (an interactive
+turn, ``CaptureWorker``, ``MemoryConsolidationScheduler``,
+``KnowledgeDigestScheduler``, ...) is a thread inside the *same* live bot
+process. ``_atomic_write_text``'s own temp-file-then-rename swap already
+makes a *reader* never see a half-written file; what it doesn't protect
+against on its own is two *writers* targeting the same path concurrently
+(the read-modify-write in :meth:`~MemoryFileRepository.append_daily`
+could lose an update, and two overwrites could interleave
+unpredictably). Each write method acquires this path's lock
+(:meth:`~MemoryFileRepository._lock_for`) for its full read-modify-write
+sequence, which fully closes that race for same-process concurrency — see
 ``session/db.py``'s module docstring for the same reasoning applied to
 PostgreSQL writes. A per-*instance* lock dict, not a global one: two
 different agents' repositories never touch the same file (separate
 workspace roots), so they never need to share locks.
+
+That in-process lock is not the whole story, though: the separate
+``minion-assist memory ...`` CLI is a genuinely different OS process that
+can touch the same files while the bot is live (e.g. ``consolidate
+approve`` while a turn is in flight) — its own ``_write_locks`` dict is
+empty and shares no state with the bot process's. For every write method
+except :meth:`~MemoryFileRepository.append_daily`, that's harmless: a
+blind overwrite/delete racing another blind overwrite/delete just picks
+whichever wrote last, ordinary filesystem semantics, not a lost update
+(and ``MemoryConsolidator.approve()`` additionally has its own
+content-hash pre-image check — ``StaleProposalError`` — which is a
+*better* guard against a stale write than a lock would be, since it
+refuses the write outright rather than silently clobbering a since-changed
+target). ``append_daily`` is the one genuine read-modify-write, so it
+additionally holds :func:`_cross_process_lock` — an OS-level, no-new-
+dependency lock — for the same critical section, closing the one race
+where a second process really could lose an entry.
 """
 
 from __future__ import annotations
@@ -65,6 +81,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
@@ -74,6 +91,83 @@ from .models import MemoryExcerpt, MemoryHit, MemoryLocator
 # Mirrors LongTermMemory._SEARCH_MAX_RESULTS — same cap, same reasoning:
 # prevents context flooding when many notes match a broad query.
 _SEARCH_MAX_RESULTS = 20
+
+# R3-GAP-010: how long _cross_process_lock will wait for a contested lock
+# before giving up, and how old an unreleased lock file must be before it's
+# treated as abandoned by a crashed holder rather than a live one. A real
+# append_daily() write finishes in low milliseconds, so both are generous
+# by a wide margin — not tuned for throughput, tuned to never be the thing
+# that makes a normal write wait noticeably or a crash deadlock forever.
+_LOCK_TIMEOUT_SECONDS = 10.0
+_LOCK_POLL_SECONDS = 0.05
+_STALE_LOCK_SECONDS = 30.0
+
+
+class CrossProcessLockTimeout(Exception):
+    """Raised by :func:`_cross_process_lock` when a contested lock isn't freed in time."""
+
+
+@contextmanager
+def _cross_process_lock(path: Path):
+    """Serialize a read-modify-write sequence on ``path`` across OS processes (R3-GAP-010).
+
+    ``MemoryFileRepository._lock_for``'s ``threading.Lock`` only serializes
+    threads *inside one process* — a completely separate process (e.g. a
+    future ``minion-assist memory ...`` CLI command that also appends to
+    the same daily note) has its own, entirely unrelated lock dict, so it
+    provides no protection at all against a second process racing the
+    same read-modify-write. This closes that gap without a new dependency:
+    ``os.O_CREAT | os.O_EXCL`` atomically creates a sidecar ``.lock`` file
+    only if it doesn't already exist — identical semantics on POSIX and
+    Windows — so "I created it" unambiguously means "I hold the lock."
+
+    Callers should still take the cheap in-process ``threading.Lock``
+    first (see :meth:`MemoryFileRepository._lock_for`'s callers) — this is
+    the *additional* cross-process guarantee, not a replacement for it;
+    filesystem-based locking is far slower than an in-memory lock for the
+    common case (same-process threads), so there's no reason to pay its
+    cost for a race this doesn't actually need to close.
+
+    A crashed holder never gets to run this context manager's ``finally``
+    block, so its lock file lingers forever unless something recovers it —
+    a lock file older than :data:`_STALE_LOCK_SECONDS` is assumed abandoned
+    and forcibly removed rather than left to deadlock every future writer.
+
+    Args:
+        path: The file being protected — the lock file is a sibling named
+            ``.{path.name}.lock``, never the target file itself (so a
+            reader that only ever calls ``path.read_text()`` — never this
+            lock — is completely unaffected).
+
+    Raises:
+        CrossProcessLockTimeout: If the lock is still held by another
+            process/thread after :data:`_LOCK_TIMEOUT_SECONDS` of waiting.
+    """
+    lock_path = path.with_name(f".{path.name}.lock")
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    fd = None
+    while fd is None:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+            except FileNotFoundError:
+                continue  # released between our failed open() and this stat() -- just retry
+            if age > _STALE_LOCK_SECONDS:
+                lock_path.unlink(missing_ok=True)
+                continue
+            if time.monotonic() > deadline:
+                raise CrossProcessLockTimeout(
+                    f"Could not acquire cross-process lock for {path} "
+                    f"within {_LOCK_TIMEOUT_SECONDS}s (held by {lock_path})"
+                )
+            time.sleep(_LOCK_POLL_SECONDS)
+    try:
+        os.close(fd)
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
 
 
 def _sanitize_key(key: str) -> str:
@@ -365,8 +459,13 @@ class MemoryFileRepository:
         # appends (e.g. an interactive turn and MemoryConsolidationScheduler
         # both writing today's note) could otherwise both read the same
         # "before" content and one append would silently overwrite the
-        # other's (MEM-GAP-009).
-        with self._lock_for(path):
+        # other's (MEM-GAP-009). The in-process threading.Lock is the fast
+        # path for that (the common case); nested inside it, the OS-level
+        # lock (R3-GAP-010) closes the same race for a second, separate
+        # process racing this exact file — something the threading.Lock
+        # alone can never see, since a different process has its own,
+        # completely unrelated lock dict.
+        with self._lock_for(path), _cross_process_lock(path):
             existing = path.read_text(encoding="utf-8") if path.exists() else ""
             stamp = datetime.now().strftime("%H:%M")
             entry = f"- {stamp}: {text}"

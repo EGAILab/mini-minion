@@ -635,6 +635,15 @@ def _run_status(args: argparse.Namespace) -> int:
     # command, which had always shown them. Same "never raises, degrade to
     # unavailable" contract as _build_index().
     db = _build_db() if args.deep else None
+    # R3-GAP-008: one clear signal up front, printed once (not per agent) —
+    # an operator shouldn't have to notice several per-agent lines going
+    # bad below and infer a shared PostgreSQL outage from the pattern.
+    if db is not None:
+        ping_error = db.ping()
+        if ping_error is None:
+            print("database: reachable")
+        else:
+            print(f"database: UNREACHABLE — {ping_error}")
 
     for agent_id in _selected_agents(sorted(agents_cfg), args.agent):
         service = _build_service(workspace, agent_id, bootstrap_cfg, index=index)

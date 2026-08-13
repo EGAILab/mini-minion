@@ -656,6 +656,37 @@ def test_dispatch_status_deep_survives_a_queue_lag_query_failure():
     assert "connection lost" in result.message
 
 
+def test_dispatch_status_deep_reports_database_reachable():
+    db = MagicMock()
+    db.ping.return_value = None
+    db.queue_lag_summary.return_value = {
+        "capture": _empty_lag_lane(),
+        "commitment": _empty_lag_lane(),
+        "message_embedding": _empty_lag_lane(),
+    }
+    db.embedding_coverage_summary.return_value = None
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    assert "Database: reachable" in result.message
+
+
+def test_dispatch_status_deep_reports_database_unreachable():
+    # R3-GAP-008: one clear signal, distinct from the several separate
+    # per-agent lines that already go bad on their own during an outage —
+    # this must appear even though queue_lag_summary/embedding_coverage_summary
+    # below it also fail for the exact same underlying reason.
+    db = MagicMock()
+    db.ping.return_value = "OperationalError: connection refused"
+    db.queue_lag_summary.side_effect = Exception("connection refused")
+    db.embedding_coverage_summary.side_effect = Exception("connection refused")
+    with patch("minion_assist.config.streaming") as mock_streaming:
+        mock_streaming.chat_mode = False
+        result = dispatch_command(_make_ctx("/status", args="deep", db=db))
+    assert "Database: UNREACHABLE" in result.message
+    assert "OperationalError: connection refused" in result.message
+
+
 # ---------------------------------------------------------------------------
 # dispatch_command — unknown command
 # ---------------------------------------------------------------------------

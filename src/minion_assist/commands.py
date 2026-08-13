@@ -471,6 +471,15 @@ def _format_deep_status(ctx: CommandContext) -> list[str]:
         lines.append("  Database: not configured — no queue lag / index data available.")
         return lines
 
+    # R3-GAP-008: one clear, direct signal at the top of the report — an
+    # operator shouldn't have to notice several scattered per-agent/per-worker
+    # lines going bad at once below and infer a shared PostgreSQL outage.
+    ping_error = ctx.db.ping()
+    if ping_error is None:
+        lines.append("  Database: reachable")
+    else:
+        lines.append(f"  Database: UNREACHABLE — {ping_error}")
+
     lines.append("  Queues and index (per agent):")
     for aid in ctx.agents_cfg:
         try:

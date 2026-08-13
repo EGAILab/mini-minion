@@ -229,6 +229,41 @@ def test_status_deep_reports_queue_lag_from_the_database(monkeypatch, tmp_path, 
     assert "capture_pending=3" in out
 
 
+def test_status_deep_reports_database_reachable(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+    mock_db = Mock()
+    mock_db.ping.return_value = None
+    mock_db.queue_lag_summary.return_value = _mock_lag()
+    mock_db.embedding_coverage_summary.return_value = None
+    monkeypatch.setattr(cli, "_build_db", lambda: mock_db)
+
+    exit_code = cli.main(["status", "--deep"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "database: reachable" in out
+
+
+def test_status_deep_reports_database_unreachable(monkeypatch, tmp_path, capsys):
+    _agent_root(tmp_path, "main")
+    _patch_config(monkeypatch, tmp_path)
+    _patch_index(monkeypatch, None)
+    mock_db = Mock()
+    mock_db.ping.return_value = "OperationalError: connection refused"
+    mock_db.queue_lag_summary.side_effect = Exception("connection refused")
+    mock_db.embedding_coverage_summary.side_effect = Exception("connection refused")
+    monkeypatch.setattr(cli, "_build_db", lambda: mock_db)
+
+    exit_code = cli.main(["status", "--deep"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "database: UNREACHABLE" in out
+    assert "OperationalError: connection refused" in out
+
+
 def test_status_deep_reports_stuck_running_and_failed_jobs(monkeypatch, tmp_path, capsys):
     _agent_root(tmp_path, "main")
     _patch_config(monkeypatch, tmp_path)

@@ -3054,6 +3054,39 @@ class SessionDB:
     # Queue health (MEM-GAP-016)
     # ------------------------------------------------------------------
 
+    def ping(self) -> str | None:
+        """Check whether PostgreSQL is currently reachable, right now (R3-GAP-008).
+
+        Every DB-backed write/read path already degrades safely and
+        records its own failure independently (``WorkerHealth`` per
+        worker, ``session_writes:{agent}``, a per-agent
+        ``queue_lag_summary`` try/except in ``/status deep``, etc.) — an
+        outage was never actually *unsafe*, but it also wasn't visible in
+        one place: an operator had to notice several scattered lines
+        going bad at once and infer a shared cause, rather than seeing a
+        single clear "the database is down" signal. This is that signal:
+        a cheap, direct probe a caller can check first, before reading
+        (and needing to correlate) anything else.
+
+        A cached, already-open connection can look healthy
+        (``conn.closed`` false) even after the underlying TCP connection
+        has actually dropped — the failure only surfaces on the next real
+        query. ``SELECT 1`` is that real query: cheap enough to run on
+        every ``/status deep`` without meaningfully adding to its cost,
+        but a genuine round-trip, not just an in-memory flag check.
+
+        Returns:
+            str | None: ``None`` if reachable. Otherwise a short
+                ``"{ExceptionType}: {message}"`` description of what went
+                wrong — never raises itself, so a caller never needs its
+                own try/except just to check reachability.
+        """
+        try:
+            self._conn().execute("SELECT 1")
+            return None
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"
+
     def queue_lag_summary(self, agent_id: str) -> dict:
         """Report how far behind the capture/commitment job queues are for one agent.
 
