@@ -298,6 +298,74 @@ def _format_budget_context(history: list[dict], compactor: Compactor) -> str:
     )
 
 
+# R3-GAP-004: how many prior user turns _build_recall_query prepends to the
+# current message, and how many characters of each it keeps — both kept
+# small and fixed so the query stays bounded regardless of how long the
+# conversation or any individual prior turn is.
+_RECALL_QUERY_RECENT_TURNS = 2
+_RECALL_QUERY_TURN_CHAR_LIMIT = 200
+
+
+def _build_recall_query(
+    message: str, history: list[dict], recent_turns: int = _RECALL_QUERY_RECENT_TURNS
+) -> str:
+    """Build a bounded, deterministic memory-recall query for one turn (R3-GAP-004).
+
+    ``message`` alone is a weak recall query for an elliptical follow-up —
+    a bare pronoun ("what about that one?"), a one-word reply, or anything
+    else that only makes sense next to what came right before it. The
+    actual topic usually lives in the turns just before ``message``, not
+    in ``message`` itself, so the plain lexical/hybrid search this feeds
+    (:func:`build_prompt_section` -> ``MemoryService.search()``) had
+    nothing to match against.
+
+    Fix: prepend a small, bounded number of the most recent PRIOR user
+    turns (oldest first, so ``message`` reads last) — enough for an
+    elliptical follow-up to inherit its antecedent's keywords, without
+    unboundedly growing the query as a session gets long, and without
+    diluting ``message`` itself, which is never truncated and stays the
+    dominant, most-recent signal in the joined string.
+
+    Only ever pulls from ``role == "user"`` entries — every other role
+    (assistant replies, tool calls/results) is skipped, which structurally
+    satisfies "exclude tool trace text." The other thing to exclude,
+    previously-recalled memory text, needs no special-casing here at all:
+    the ``<relevant_memories>`` block :func:`build_prompt_section` builds
+    is injected straight into the system prompt each turn and is never
+    written into ``history`` in the first place (see that function's own
+    docstring).
+
+    Args:
+        message: The current turn's raw message — always included in
+            full, unlike the bounded/truncated prior turns.
+        history: ``AgentSession._history``. The just-appended current
+            turn is expected to be its last entry (its content IS
+            ``message`` — skipped here to avoid duplicating the primary
+            signal, not because it's the wrong role).
+        recent_turns: How many prior user turns to prepend, at most.
+
+    Returns:
+        str: ``message``, prefixed by up to ``recent_turns`` prior user
+            turns (oldest first), each capped at
+            :data:`_RECALL_QUERY_TURN_CHAR_LIMIT` characters. Exactly
+            ``message`` (unchanged) if there's no usable prior context —
+            e.g. a session's very first turn.
+    """
+    prior_texts: list[str] = []
+    for msg in reversed(history[:-1]):
+        if msg.get("role") != "user":
+            continue
+        text = _msg_text(msg)
+        if text:
+            prior_texts.append(text.strip()[:_RECALL_QUERY_TURN_CHAR_LIMIT])
+        if len(prior_texts) >= recent_turns:
+            break
+    if not prior_texts:
+        return message
+    prior_texts.reverse()
+    return "\n".join([*prior_texts, message])
+
+
 def build_prompt_section(
     memory: MemoryService,
     message: str,
@@ -808,8 +876,12 @@ class AgentSession:
         # now (see the module docstring's "Memory integration" note) — there is
         # no separate block to inject here.
         if self._memory is not None:
+            # R3-GAP-004: a bounded, deterministic query built from `message`
+            # plus a little recent user-turn context — not `message` alone,
+            # which is a weak recall query for an elliptical follow-up.
+            _recall_query = _build_recall_query(message, self._history)
             mem_block, _injected_hits, _mem_tokens = build_prompt_section(
-                self._memory, message, self._memory_injection_tokens
+                self._memory, _recall_query, self._memory_injection_tokens
             )
             if mem_block:
                 system += f"\n\n{mem_block}"

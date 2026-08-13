@@ -11,7 +11,7 @@ from minion_assist.agents.events import (
     MemoryInjected,
     ToolCalled,
 )
-from minion_assist.agents.session import AgentSession, build_prompt_section
+from minion_assist.agents.session import AgentSession, _build_recall_query, build_prompt_section
 from minion_assist.context import Compactor
 from minion_assist.media import MediaAttachment
 from minion_assist.memory.files import MemoryFileRepository
@@ -515,6 +515,143 @@ def test_no_relevant_memories_block_when_nothing_matches(tmp_path):
     session.send("hello")
 
     assert "<relevant_memories>" not in captured_system[0]
+
+
+def test_elliptical_follow_up_recalls_memory_via_recent_turn_context(tmp_path):
+    """R3-GAP-004: a bare follow-up alone carries no keywords -- the prior
+    turn's context is what makes the note findable at all."""
+    memory = MemoryService(MemoryFileRepository(tmp_path))
+    memory.remember("editor-prefs", "User prefers dark mode in the editor.")
+
+    short_term = ShortTermMemory(tmp_path / "sessions")
+    session_store = SessionStore(tmp_path / "sessions.json")
+    compactor = Compactor(context_window=100_000, preserve_tokens=2_000)
+    provider = _mock_provider()
+
+    session = AgentSession(
+        agent_id="main",
+        session_id="test-session",
+        agent=AgentConfig(name="Ada", soul="Base soul."),
+        provider=provider,
+        max_output_tokens=512,
+        tools=ToolRegistry(),
+        compactor=compactor,
+        short_term=short_term,
+        session_store=session_store,
+        memory=memory,
+    )
+
+    captured_system: list[str] = []
+
+    def _capture(system, msgs, tools, max_tokens, on_token=None):
+        captured_system.append(system)
+        return LLMResponse(text="ok", finish_reason="stop")
+
+    provider.chat = Mock(side_effect=_capture)
+    session.send("I like dark mode in my editor")
+    session.send("what about that")
+
+    assert "<relevant_memories>" in captured_system[1]
+    assert "dark mode" in captured_system[1]
+
+
+# ---------------------------------------------------------------------------
+# _build_recall_query (R3-GAP-004)
+# ---------------------------------------------------------------------------
+
+def _user(content) -> dict:
+    return {"role": "user", "content": content}
+
+
+def _assistant(content) -> dict:
+    return {"role": "assistant", "content": content}
+
+
+def test_build_recall_query_returns_message_unchanged_with_no_prior_history():
+    # history contains only the just-appended current turn -- nothing to
+    # prepend, so the result must be exactly `message`, byte for byte
+    # (this is the common single-turn case, and must behave identically
+    # to the pre-R3-GAP-004 code that passed `message` straight through).
+    history = [_user("hello")]
+
+    assert _build_recall_query("hello", history) == "hello"
+
+
+def test_build_recall_query_prepends_one_prior_user_turn():
+    history = [_user("I like dark mode in my editor"), _user("what about that")]
+
+    result = _build_recall_query("what about that", history)
+
+    assert result == "I like dark mode in my editor\nwhat about that"
+
+
+def test_build_recall_query_skips_assistant_and_tool_turns():
+    history = [
+        _user("I like dark mode"),
+        _assistant("Noted!"),
+        {"role": "tool", "content": "raw tool output", "tool_name": "read"},
+        _user("what about that"),
+    ]
+
+    result = _build_recall_query("what about that", history)
+
+    assert result == "I like dark mode\nwhat about that"
+
+
+def test_build_recall_query_limits_to_recent_turns_count():
+    history = [
+        _user("first topic"),
+        _user("second topic"),
+        _user("third topic"),
+        _user("latest"),
+    ]
+
+    result = _build_recall_query("latest", history, recent_turns=2)
+
+    # Only the two most recent PRIOR turns -- "first topic" fell out of the window.
+    assert result == "second topic\nthird topic\nlatest"
+
+
+def test_build_recall_query_truncates_a_long_prior_turn():
+    long_turn = "x" * 500
+    history = [_user(long_turn), _user("latest")]
+
+    result = _build_recall_query("latest", history)
+
+    prefix, _, suffix = result.rpartition("\n")
+    assert suffix == "latest"
+    assert len(prefix) == 200
+
+
+def test_build_recall_query_never_truncates_the_current_message():
+    long_message = "y" * 500
+    history = [_user("earlier"), _user(long_message)]
+
+    result = _build_recall_query(long_message, history)
+
+    assert result.endswith(long_message)
+
+
+def test_build_recall_query_extracts_text_from_multimodal_content():
+    # A prior turn with an attachment stores content as a list of blocks
+    # (messages.py's make_user_content shape) -- _msg_text already knows
+    # how to pull just the text block out of that.
+    history = [
+        _user([{"type": "text", "text": "check this screenshot"}, {"type": "image", "path": "x.png"}]),
+        _user("what does it show"),
+    ]
+
+    result = _build_recall_query("what does it show", history)
+
+    assert result == "check this screenshot\nwhat does it show"
+
+
+def test_build_recall_query_preserves_oldest_first_ordering():
+    history = [_user("alpha"), _user("beta"), _user("gamma")]
+
+    result = _build_recall_query("gamma", history, recent_turns=2)
+
+    assert result.split("\n") == ["alpha", "beta", "gamma"]
 
 
 # ---------------------------------------------------------------------------

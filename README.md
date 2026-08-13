@@ -2579,6 +2579,8 @@ Replaces the old `_inject_relevant_memories()`: a real per-agent token budget (c
 
 Both drop/trim decisions are logged at `DEBUG` (`minion_assist.agent_session`) for explainability, without changing `build_prompt_section()`'s return shape or `MemoryInjected`'s event shape.
 
+**Bounded recall-query context (R3-GAP-004).** `build_prompt_section()`'s search query used to be the current turn's raw `message` alone — a weak recall query for an elliptical follow-up ("what about that one?", a bare pronoun, a one-word reply), since the actual topic usually lives in the turn(s) just before it, not in `message` itself. `_send_locked()` now builds the query via `_build_recall_query(message, self._history)` instead: up to 2 prior **user**-role turns (oldest first, each capped at 200 characters) are prepended ahead of `message`, which is itself never truncated and always comes last — so it stays the dominant, most-recent signal, and a genuine topic shift isn't dragged down by stale context for more than a couple of turns. Assistant replies, tool calls/results, and previously-injected `<relevant_memories>` blocks (which are never written into `history` at all) are structurally excluded, not filtered after the fact. A session's very first turn (no prior history) behaves identically to before the fix — the query is exactly `message`, unchanged.
+
 `AgentSession._context_generation` (starts at 0) increments on `reset()` and after any successful compaction (both the automatic path in `send()` and the manual `/compact` command) — each `MemoryInjected` event carries the generation it fired in, so a consumer can tell "these were injected in the same stretch of history" from "context has since been reset/compacted." A forked session starts its own count at 0 rather than inheriting the parent's — `fork()` only writes history/session-store state to disk, and the child's `AgentSession` object (constructed later, when something switches to it) begins an independently tracked branch; the parent/child relationship is already preserved via `SessionInfo.parent_id`, so threading the counter through a disk round-trip would just duplicate that lineage tracking for no behavioral benefit.
 
 #### Background extractor (`extractor.py`) and durable capture (`capture_worker.py`)
@@ -2999,7 +3001,7 @@ uv run pytest tests/test_memory_long_term.py -v
 uv run pytest -k "task" -v
 ```
 
-The test suite covers **3313 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
+The test suite covers **3324 cases** across all modules. Three are skipped by default: one (`tests/test_providers_base.py`) requires the `anthropic` package; one (`tests/test_mcp_schema.py`) is a Windows-specific test skipped when its own environment precondition isn't met; one requires a live PostgreSQL instance (see below). The Matrix channel tests in `tests/matrix/` pass without any Matrix server or matrix-nio installation.
 
 ```bash
 uv add anthropic
